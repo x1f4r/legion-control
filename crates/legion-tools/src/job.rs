@@ -14,11 +14,15 @@ mod store;
 mod supervise;
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use legion_core::proto::{Effect, ErrorBody, ErrorCode};
-use legion_core::{Access, BoxFuture, Ctx, Paths, Registry, ToolError};
+use legion_core::policy::{Grant, Policy};
+use legion_core::proto::{Effect, ErrorBody, ErrorCode, EventKind, ToolSpec};
+use legion_core::{
+    Access, BoxFuture, Ctx, Paths, Registry, Tool, ToolError, input_schema, parse_args,
+};
 use legion_os::OsError;
 use legion_os::detach::{
     DetachHandle, DetachOptions, WINDOWS_WMI_LAUNCH_DEADLINE, detached_active, spawn_detached,
@@ -29,18 +33,19 @@ use legion_os::procid;
 use legion_os::shell::CommandSpec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 
-pub use store::{ExclusiveJob, JobState};
+pub use store::{ExclusiveJob, JobKind, JobProgress, JobState};
 pub use supervise::try_supervise_cli;
 
 use logs::{DEFAULT_LOG_LIMIT, DEFAULT_TAIL_LINES, MAX_LOG_LIMIT, MAX_TAIL_LINES};
 use store::{
-    ExitOutcome, ExitRecord, JobRecord, LaunchingState, command_summary, compare_newest_first,
+    CANCEL_FILE, EXIT_FILE, ExitOutcome, ExitRecord, JobRecord, LOCK_FILE, LOG_FILE,
+    LaunchingState, ProgressFile, command_summary, compare_newest_first, create_exit_reserve,
     default_job_name, derive_status_async, find_by_key, generate_job_id, job_dir, jobs_dir,
     jobs_lock_path, load_all_records, now_rfc3339, probe_lock, prune_retention, read_exit_record,
-    read_job_record, remove_env_file, validate_job_id, write_cancel_request, write_env_file,
-    write_exit_record, write_job_record,
+    read_job_record, read_progress_file, remove_env_file, remove_exit_reserve, validate_job_id,
+    write_cancel_request, write_env_file, write_exit_record, write_job_record, write_progress_file,
 };
 
 /// Default and maximum `limit` for `job.list`.
@@ -102,12 +107,70 @@ pub fn register(registry: &mut Registry) {
         "Wait until a background job is no longer starting or running and return the same status object as `job.status`, plus `timed_out`. Returns as soon as the job reaches a terminal state, or returns with `timed_out: true` when `timeout_s` elapses (default 60, max 3600). Stops waiting immediately if this call is cancelled. Use this after `job.start` instead of polling `job.status` in a tight loop.",
         wait,
     );
-    registry.add_fn(
-        "job.cancel",
-        Effect::Exec,
-        "Stop a running background job and its entire process tree. Asks the job supervisor to terminate the command cleanly and escalates to stopping the detached process group or systemd scope if it does not finish within a short grace period; set `force: true` to stop the detached handle immediately. Returns only once the job is gone or reports any surviving process ids. Any principal with the exec effect can cancel any job on this node. Cancelling a job that already finished is not an error and returns its final state.",
-        cancel,
-    );
+    registry.add(JobCancelTool {
+        spec: ToolSpec {
+            name: "job.cancel".to_owned(),
+            description: "Stop a running background job and its entire process tree. Asks the job supervisor to terminate the command cleanly and escalates to stopping the detached process group or systemd scope if it does not finish within a short grace period; set `force: true` to stop the detached handle immediately. Returns only once the job is gone or reports any surviving process ids. Any principal with the exec effect can cancel any job on this node. A caller without the exec effect may still cancel a transfer job they started themselves (matched by principal and `kind: \"transfer\"`), and nothing else. Cancelling a job that already finished is not an error and returns its final state.".to_owned(),
+            effect: Effect::Exec,
+            input_schema: input_schema::<CancelArgs>(),
+        },
+    });
+}
+
+struct JobCancelTool {
+    spec: ToolSpec,
+}
+
+impl Tool for JobCancelTool {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn authorize(
+        &self,
+        policy: &Policy,
+        principal: &str,
+        paths: &Paths,
+        args: &Value,
+    ) -> Result<Grant, ErrorBody> {
+        match policy.authorize(principal, &self.spec, paths) {
+            Ok(grant) => Ok(grant),
+            Err(denied) => {
+                // Only callers not explicitly denied `job.cancel` by name/glob may use the
+                // narrow owner exception, and only for a `kind: "transfer"` job whose recorded
+                // principal matches the caller. Anything else returns the original denial so no
+                // information leaks about other jobs or principals.
+                if !policy.is_denied_by_name(principal, &self.spec.name)
+                    && let Some(id) = args.get("id").and_then(Value::as_str)
+                    && validate_job_id(id).is_ok()
+                {
+                    let dir = job_dir(paths.state_dir(), id);
+                    if let Ok(record) = read_job_record(&dir, id)
+                        && record.kind == JobKind::Transfer
+                        && record.principal == principal
+                    {
+                        return Ok(policy.grant(principal, paths));
+                    }
+                }
+                Err(denied)
+            }
+        }
+    }
+
+    fn call<'a>(&'a self, ctx: &'a Ctx, args: Value) -> BoxFuture<'a, Result<Value, ToolError>> {
+        Box::pin(async move {
+            let parsed = parse_args::<CancelArgs>(&self.spec.name, args)?;
+            let out = cancel(ctx, parsed).await?;
+            serde_json::to_value(&out).map_err(|error| {
+                ErrorBody::new(
+                    ErrorCode::Internal,
+                    format!(
+                        "job.cancel returned a result that cannot be written as JSON: {error}."
+                    ),
+                )
+            })
+        })
+    }
 }
 
 /// Lists every `exclusive` background job that is currently starting or running on this node.
@@ -134,6 +197,291 @@ pub(crate) fn running_job_ids_for_device(
     principal: &str,
 ) -> Vec<String> {
     store::running_job_ids_for_device_in(paths.state_dir(), device, principal)
+}
+
+/// Parameters for creating a `kind: "transfer"` job directory under `<state_dir>/jobs/<id>/`.
+#[derive(Clone, Debug)]
+pub struct TransferJobSpec {
+    /// Short name for the job.
+    pub name: String,
+    /// Human-readable title shown in `job.list` and `job.status`.
+    pub title: String,
+    /// Principal that started the transfer (preserved as the job owner).
+    pub principal: String,
+    /// Paired device name, when started through a paired device gate.
+    pub device: Option<String>,
+    /// Whether the job marks this machine busy while running.
+    pub exclusive: bool,
+}
+
+/// Newly created transfer job directory and identifier.
+#[derive(Clone, Debug)]
+pub struct CreatedTransferJob {
+    /// Allocated job identifier.
+    pub id: String,
+    /// Directory `<state_dir>/jobs/<id>/`.
+    pub dir: PathBuf,
+    /// RFC 3339 UTC creation timestamp.
+    pub created: String,
+}
+
+/// Allocates a new `kind: "transfer"` job under `<state_dir>/jobs/<id>/`, writing `job.json`
+/// atomically under the node-wide jobs lock.
+pub async fn create_transfer_job(
+    state_dir: &Path,
+    spec: TransferJobSpec,
+) -> Result<CreatedTransferJob, ErrorBody> {
+    let state_dir = state_dir.to_path_buf();
+    let state_dir_for_prepare = state_dir.clone();
+    blocking("fs.transfer", move || {
+        std::fs::create_dir_all(&state_dir_for_prepare).map_err(|err| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Cannot create state directory {}: {err}.",
+                    state_dir_for_prepare.display()
+                ),
+            )
+        })
+    })
+    .await?;
+
+    let lock_path = jobs_lock_path(&state_dir);
+    let jobs_lock =
+        FileLock::acquire_async(&lock_path, LockMode::Exclusive, Some(JOBS_LOCK_TIMEOUT))
+            .await
+            .map_err(|err| match err {
+                OsError::TimedOut { .. } => ErrorBody::new(
+                    ErrorCode::Timeout,
+                    "Timed out waiting for another background job to start.",
+                )
+                .with_hint("Retry the call shortly."),
+                other => ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!("Cannot lock job state {}: {other}.", lock_path.display()),
+                ),
+            })?;
+
+    let state_dir_for_create = state_dir.clone();
+    let created = blocking("fs.transfer", move || {
+        let now = jiff::Timestamp::now();
+        let jobs_root = jobs_dir(&state_dir_for_create);
+        platform::ensure_private_dir(&jobs_root).map_err(|err| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Cannot create jobs directory {}: {err}.",
+                    jobs_root.display()
+                ),
+            )
+        })?;
+
+        prune_retention(&state_dir_for_create, now);
+
+        let (id, dir) = allocate_job_dir(&state_dir_for_create)?;
+        let boot_id = procid::boot_id().map_err(|err| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!("Cannot determine the system boot id: {err}."),
+            )
+        })?;
+        let launch_deadline = now
+            .checked_add(jiff::SignedDuration::try_from(LAUNCH_DEADLINE_WINDOW).unwrap_or_default())
+            .unwrap_or(now);
+        let created = store::format_timestamp(now);
+        let record = JobRecord {
+            id: id.clone(),
+            name: spec.name,
+            kind: JobKind::Transfer,
+            title: Some(spec.title),
+            key: None,
+            cmd: None,
+            argv: None,
+            cwd: None,
+            env_names: Vec::new(),
+            principal: spec.principal,
+            device: spec.device,
+            created: created.clone(),
+            boot_id,
+            exclusive: spec.exclusive,
+            launching: Some(LaunchingState {
+                deadline: store::format_timestamp(launch_deadline),
+            }),
+            detach: None,
+        };
+        write_job_record(&dir, &record)?;
+        Ok(CreatedTransferJob { id, dir, created })
+    })
+    .await;
+
+    let _ = jobs_lock.unlock();
+    created
+}
+
+/// Records the detached supervisor handle on a transfer job's `job.json`.
+pub async fn attach_transfer_detach(
+    state_dir: &Path,
+    id: &str,
+    handle: DetachHandle,
+) -> Result<(), ErrorBody> {
+    validate_job_id(id)?;
+    let dir = job_dir(state_dir, id);
+    let id = id.to_owned();
+    blocking("fs.transfer", move || {
+        let mut record = read_job_record(&dir, &id)?;
+        record.detach = Some(handle);
+        if let Ok(wait_deadline) = jiff::Timestamp::now().checked_add(
+            jiff::SignedDuration::try_from(STARTUP_TIMEOUT + Duration::from_secs(5))
+                .unwrap_or_default(),
+        ) {
+            record.launching = Some(LaunchingState {
+                deadline: store::format_timestamp(wait_deadline),
+            });
+        }
+        write_job_record(&dir, &record)
+    })
+    .await
+}
+
+/// Waits until a transfer job's detached supervisor holds its lock or writes `exit.json`.
+pub async fn wait_transfer_supervisor_ready(
+    state_dir: &Path,
+    id: &str,
+    handle: &DetachHandle,
+) -> Result<JobState, ErrorBody> {
+    validate_job_id(id)?;
+    let dir = job_dir(state_dir, id);
+    wait_for_supervisor_ready(&dir, id, handle).await
+}
+
+/// Records a startup failure on a transfer job if the supervisor never took its lock.
+pub async fn record_transfer_start_failure(state_dir: &Path, id: &str, detail: &str) {
+    if validate_job_id(id).is_ok() {
+        let dir = job_dir(state_dir, id);
+        record_start_failure(&dir, detail).await;
+    }
+}
+
+/// Validates a job id for a transfer job.
+pub fn validate_transfer_job_id(id: &str) -> Result<(), ErrorBody> {
+    validate_job_id(id)
+}
+
+/// Returns `<state_dir>/jobs/<id>` after validating `id`.
+pub fn transfer_job_dir(state_dir: &Path, id: &str) -> Result<PathBuf, ErrorBody> {
+    validate_job_id(id)?;
+    Ok(job_dir(state_dir, id))
+}
+
+/// Acquires the exclusive supervisor lock on `<dir>/lock`. Returns `Ok(None)` if another
+/// supervisor already holds it.
+pub async fn acquire_transfer_supervisor_lock(dir: &Path) -> Result<Option<FileLock>, String> {
+    let lock_path = dir.join(LOCK_FILE);
+    match FileLock::acquire_async(
+        &lock_path,
+        LockMode::Exclusive,
+        Some(Duration::from_secs(1)),
+    )
+    .await
+    {
+        Ok(guard) => Ok(Some(guard)),
+        Err(OsError::WouldBlock { .. } | OsError::TimedOut { .. }) => Ok(None),
+        Err(err) => Err(format!(
+            "cannot acquire job lock {}: {err}",
+            lock_path.display()
+        )),
+    }
+}
+
+/// Whether `<dir>/exit.json` already exists.
+pub fn transfer_exit_exists(dir: &Path) -> bool {
+    dir.join(EXIT_FILE).exists()
+}
+
+/// Whether `<dir>/cancel` has been requested by `job.cancel`.
+pub fn transfer_cancel_requested(dir: &Path) -> bool {
+    dir.join(CANCEL_FILE).exists()
+}
+
+/// Reserves space for `exit.json` on disk so a full filesystem cannot lose completion state.
+pub fn prepare_transfer_exit_reserve(dir: &Path) {
+    let _ = create_exit_reserve(dir);
+}
+
+/// Releases the `exit.reserve` placeholder without writing `exit.json`.
+pub fn remove_transfer_exit_reserve(dir: &Path) {
+    remove_exit_reserve(dir);
+}
+
+/// Atomically writes `<dir>/progress.json` for a transfer job.
+pub fn write_transfer_progress(
+    dir: &Path,
+    progress: &JobProgress,
+    title: Option<String>,
+) -> Result<(), ErrorBody> {
+    write_progress_file(
+        dir,
+        &ProgressFile {
+            progress: progress.clone(),
+            title,
+        },
+    )
+}
+
+/// Appends one line to `<dir>/output.log` for a transfer job (best effort).
+pub fn append_transfer_log(dir: &Path, line: &str) {
+    if let Ok(mut file) = platform::open_private_append(&dir.join(LOG_FILE)) {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+/// Writes a successful `exit.json` carrying the foreground transfer result object.
+pub fn finish_transfer_job_ok(dir: &Path, result: Value) -> Result<(), ErrorBody> {
+    let exit = ExitRecord {
+        outcome: ExitOutcome::Succeeded,
+        exit_code: Some(0),
+        signal: None,
+        finished: now_rfc3339(),
+        forced: false,
+        startup_failed: false,
+        detail: None,
+        result: Some(result),
+        error: None,
+    };
+    write_exit_record(dir, &exit)
+}
+
+/// Writes a failed `exit.json` carrying the structured transfer error.
+pub fn finish_transfer_job_err(dir: &Path, error: ErrorBody) -> Result<(), ErrorBody> {
+    let detail = Some(error.message.clone());
+    let exit = ExitRecord {
+        outcome: ExitOutcome::Failed,
+        exit_code: Some(1),
+        signal: None,
+        finished: now_rfc3339(),
+        forced: false,
+        startup_failed: false,
+        detail,
+        result: None,
+        error: Some(error),
+    };
+    write_exit_record(dir, &exit)
+}
+
+/// Writes a cancelled `exit.json` for a transfer job.
+pub fn finish_transfer_job_cancelled(dir: &Path, detail: &str) -> Result<(), ErrorBody> {
+    let exit = ExitRecord {
+        outcome: ExitOutcome::Cancelled,
+        exit_code: None,
+        signal: None,
+        finished: now_rfc3339(),
+        forced: false,
+        startup_failed: false,
+        detail: Some(detail.to_owned()),
+        result: None,
+        error: None,
+    };
+    write_exit_record(dir, &exit)
 }
 
 /// Arguments of `job.start`.
@@ -208,6 +556,11 @@ pub struct JobSummary {
     pub id: String,
     /// The job's name.
     pub name: String,
+    /// What kind of work this job runs (`exec` or `transfer`).
+    pub kind: JobKind,
+    /// Readable title for the job, when present (such as `"Copy Holiday.mp4 to pi"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// Current derived state.
     pub state: JobState,
     /// When the job was created (RFC 3339 UTC).
@@ -218,6 +571,9 @@ pub struct JobSummary {
     /// Process exit code, when the command exited normally.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
+    /// Latest progress snapshot for transfer jobs, when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<JobProgress>,
     /// Command string or joined argv, cut at 200 characters.
     pub command: String,
 }
@@ -246,6 +602,11 @@ pub struct JobStatus {
     pub id: String,
     /// The job's name.
     pub name: String,
+    /// What kind of work this job runs (`exec` or `transfer`).
+    pub kind: JobKind,
+    /// Readable title for the job, when present (such as `"Copy Holiday.mp4 to pi"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// Caller-chosen idempotency key, when one was given.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
@@ -291,6 +652,15 @@ pub struct JobStatus {
     pub duration_s: Option<f64>,
     /// Current size of captured log files (`output.log.1` and `output.log`) in bytes.
     pub output_bytes: u64,
+    /// Latest progress snapshot for transfer jobs, when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<JobProgress>,
+    /// Structured tool result when the job finished with one (such as a transfer report).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    /// Structured error when a tool job failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorBody>,
     /// Explanation when the job was interrupted or failed to start.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -514,6 +884,8 @@ where
         let record = JobRecord {
             id,
             name,
+            kind: JobKind::Exec,
+            title: None,
             key,
             cmd: args.cmd,
             argv: args.argv,
@@ -644,6 +1016,8 @@ async fn record_start_failure(dir: &Path, detail: &str) {
         forced: false,
         startup_failed: true,
         detail: Some(detail.to_owned()),
+        result: None,
+        error: None,
     };
     let _ = tokio::task::spawn_blocking(move || {
         // Never overwrite an existing exit record or write one while the supervisor holds `lock`.
@@ -851,14 +1225,23 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<JobList, ToolError> {
             truncated = true;
             break;
         }
+        let progress_file = read_progress_file(&dir);
+        let title = progress_file
+            .as_ref()
+            .and_then(|pf| pf.title.clone())
+            .or_else(|| record.title.clone());
+        let command = command_summary(&record, title.as_deref());
         jobs.push(JobSummary {
-            command: command_summary(&record),
+            command,
             id: record.id,
             name: record.name,
+            kind: record.kind,
+            title,
             state: derived.state,
             created: record.created,
             finished: derived.finished,
             exit_code: derived.exit_code,
+            progress: progress_file.map(|pf| pf.progress),
         });
     }
     Ok(JobList { jobs, truncated })
@@ -874,18 +1257,25 @@ async fn load_status_async(state_dir: &Path, id: &str) -> Result<JobStatus, Erro
     let dir = job_dir(state_dir, id);
     let dir_for_read = dir.clone();
     let id_for_read = id.to_owned();
-    let (record, boot) = blocking("job.status", move || {
+    let (record, boot, progress_file) = blocking("job.status", move || {
         let record = read_job_record(&dir_for_read, &id_for_read)?;
         let boot = procid::boot_id().ok();
-        Ok((record, boot))
+        let progress = read_progress_file(&dir_for_read);
+        Ok((record, boot, progress))
     })
     .await?;
 
     let now = jiff::Timestamp::now();
     let derived = derive_status_async(&dir, &record, boot.as_deref(), now).await;
+    let title = progress_file
+        .as_ref()
+        .and_then(|pf| pf.title.clone())
+        .or(record.title);
     Ok(JobStatus {
         id: record.id,
         name: record.name,
+        kind: record.kind,
+        title,
         key: record.key,
         cmd: record.cmd,
         argv: record.argv,
@@ -903,6 +1293,9 @@ async fn load_status_async(state_dir: &Path, id: &str) -> Result<JobStatus, Erro
         finished: derived.finished,
         duration_s: derived.duration_s,
         output_bytes: derived.output_bytes,
+        progress: progress_file.map(|pf| pf.progress),
+        result: derived.result,
+        error: derived.error,
         detail: derived.detail,
     })
 }
@@ -981,9 +1374,18 @@ async fn wait(ctx: &Ctx, args: WaitArgs) -> Result<JobWait, ToolError> {
 
     let deadline = tokio::time::Instant::now() + timeout;
     let mut pause = WAIT_INITIAL_POLL;
+    let mut last_progress: Option<JobProgress> = None;
 
     loop {
         let current = load_status_async(&state_dir, &id).await?;
+        if let Some(ref progress) = current.progress
+            && last_progress.as_ref() != Some(progress)
+        {
+            if let Ok(value) = serde_json::to_value(progress) {
+                ctx.emit(EventKind::Progress, value);
+            }
+            last_progress = Some(progress.clone());
+        }
         if !current.state.is_active() {
             return Ok(JobWait {
                 status: current,
@@ -1196,6 +1598,8 @@ async fn cancel(ctx: &Ctx, args: CancelArgs) -> Result<CancelledJob, ToolError> 
                     detail: Some(
                         "Cancelled forcefully; detached process tree was stopped.".to_owned(),
                     ),
+                    result: None,
+                    error: None,
                 };
                 write_exit_record(&dir_for_finalize, &exit)?;
                 Ok(Some(JobState::Cancelled))
@@ -1603,6 +2007,8 @@ mod tests {
                                 forced: false,
                                 startup_failed: false,
                                 detail: None,
+                                result: None,
+                                error: None,
                             };
                             write_exit_record(&dir, &exit).unwrap();
                             Ok(DetachHandle {

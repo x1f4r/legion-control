@@ -43,6 +43,9 @@ fn main() -> ExitCode {
     if let Some(code) = legion_tools::job::try_supervise_cli(std::env::args_os().skip(1)) {
         return code;
     }
+    if let Some(code) = legion_net::transfer::try_supervise_cli(std::env::args_os().skip(1)) {
+        return code;
+    }
     if let Some(code) = legion_tools::power::try_delay_cli(std::env::args_os().skip(1)) {
         return code;
     }

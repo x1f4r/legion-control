@@ -11,7 +11,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
-use crate::Ctx;
+use crate::policy::{Grant, Policy};
+use crate::{Ctx, Paths};
 
 /// A future a tool returns. Boxed, so [`Tool`] can be used as `dyn Tool` and a registry can hold
 /// tools of every type.
@@ -37,6 +38,21 @@ pub type ToolError = ErrorBody;
 pub trait Tool: Send + Sync + 'static {
     /// How the tool describes itself.
     fn spec(&self) -> &ToolSpec;
+
+    /// Authorises a call to this tool.
+    ///
+    /// Most tools use the default implementation, which delegates directly to
+    /// [`Policy::authorize`]. Tools with a narrowly scoped exception (such as allowing a
+    /// principal to cancel its own transfer job without `effect:exec`) override this method.
+    fn authorize(
+        &self,
+        policy: &Policy,
+        principal: &str,
+        paths: &Paths,
+        _args: &Value,
+    ) -> Result<Grant, ErrorBody> {
+        policy.authorize(principal, self.spec(), paths)
+    }
 
     /// Runs the tool. `args` is whatever the caller sent; checking it is the tool's job.
     fn call<'a>(&'a self, ctx: &'a Ctx, args: Value) -> BoxFuture<'a, Result<Value, ToolError>>;

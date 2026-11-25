@@ -355,6 +355,8 @@ async fn supervise_with_cap(state_dir: &Path, id: &str, max_log_bytes: u64) -> R
             forced: false,
             startup_failed: false,
             detail: Some("Cancelled before the command started.".to_owned()),
+            result: None,
+            error: None,
         };
         let _ = write_exit_record(&dir, &exit);
         let _ = lock.unlock();
@@ -483,6 +485,8 @@ async fn supervise_with_cap(state_dir: &Path, id: &str, max_log_bytes: u64) -> R
                 forced: false,
                 startup_failed: false,
                 detail: write_error.map(|err| format!("Writing output.log failed: {err}.")),
+                result: None,
+                error: None,
             }
         }
         Err(os_err) => ExitRecord {
@@ -493,6 +497,8 @@ async fn supervise_with_cap(state_dir: &Path, id: &str, max_log_bytes: u64) -> R
             forced: false,
             startup_failed: false,
             detail: Some(describe_spawn_error(&os_err, &record)),
+            result: None,
+            error: None,
         },
     };
 
@@ -510,6 +516,8 @@ fn record_failure(dir: &Path, detail: String) {
         forced: false,
         startup_failed: false,
         detail: Some(detail),
+        result: None,
+        error: None,
     };
     let _ = write_exit_record(dir, &exit);
 }
@@ -564,6 +572,8 @@ mod tests {
         let record = JobRecord {
             id: id.to_owned(),
             name: "probe-test".to_owned(),
+            kind: store::JobKind::Exec,
+            title: None,
             key: None,
             cmd: Some("echo lock-retry-ok".to_owned()),
             argv: None,
@@ -623,6 +633,8 @@ mod tests {
         let record = JobRecord {
             id: id.to_owned(),
             name: "rotate-test".to_owned(),
+            kind: store::JobKind::Exec,
+            title: None,
             key: None,
             cmd: Some(cmd),
             argv: None,
@@ -729,6 +741,8 @@ mod tests {
         let record = JobRecord {
             id: id.to_owned(),
             name: "late-start".to_owned(),
+            kind: store::JobKind::Exec,
+            title: None,
             key: Some("late-key".to_owned()),
             cmd: Some(cmd),
             argv: None,
@@ -758,6 +772,8 @@ mod tests {
             forced: false,
             startup_failed: true,
             detail: Some("Could not launch the detached job supervisor: timed out.".to_owned()),
+            result: None,
+            error: None,
         };
         write_exit_record(&dir, &startup_exit).unwrap();
 

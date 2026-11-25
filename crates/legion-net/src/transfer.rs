@@ -12,12 +12,24 @@
 //! packed at the source and unpacked at the destination, so a second run sends nothing.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use legion_core::{BoxFuture, Ctx, Registry, Tool, ToolError, input_schema, parse_args};
+use legion_core::policy::Policy;
+use legion_core::{
+    Access, BoxFuture, Call, CancellationToken, Ctx, Door, EventSink, Node, Paths, Registry, Tool,
+    ToolError, input_schema, parse_args,
+};
+use legion_os::atomic::{WriteOptions, write_atomic};
+use legion_os::detach::{DetachOptions, spawn_detached};
+use legion_os::shell::CommandSpec;
 use legion_proto::{Effect, ErrorBody, ErrorCode, EventKind, ToolSpec};
+use legion_tools::job::{self as transfer_job, JobProgress, TransferJobSpec};
 use legion_xfer::{
     CaseCollision, Entry, EntryKind, Hash, IfExists, Manifest, Plan, PlanConflict, PlanOptions,
     RenamedEntry, SkippedEntry,
@@ -112,7 +124,7 @@ pub fn register(registry: &mut Registry, fleet: Fleet) {
     registry.add(TransferTool {
         spec: ToolSpec {
             name: "fs.transfer".to_owned(),
-            description: "Copy or move a file or a directory tree between machines, or within one. Each of from and to is machine:/path or a path on this node; to names the destination itself, except that a file sent to an existing directory (or to a path ending in /) lands inside it under its own name. A file resumes where an interrupted transfer stopped and is renamed into place only once its BLAKE3 hash matches. A tree sends only what differs (size and modification time, or hash with checksum), so a second run sends nothing; if_exists chooses fail, skip, replace (default) or rename (name (2).ext); move removes each source file only after its destination copy is verified by hash (refused up front unless the caller may fs.remove the source); delete removes what the source no longer has, exclude leaves paths out at both ends, and dry_run reports what would be sent, deleted and removed without changing anything.".to_owned(),
+            description: "Copy or move a file or a directory tree between machines, or within one. Each of from and to is machine:/path or a path on this node; to names the destination itself, except that a file sent to an existing directory (or to a path ending in /) lands inside it under its own name. A file resumes where an interrupted transfer stopped and is renamed into place only once its BLAKE3 hash matches. A tree sends only what differs (size and modification time, or hash with checksum), so a second run sends nothing; if_exists chooses fail, skip, replace (default) or rename (name (2).ext); move removes each source file only after its destination copy is verified by hash (refused up front unless the caller may fs.remove the source); background runs the transfer as a detached job on this node under the caller's principal and grant, returning {job: {id, machine}} immediately (track with job.list, job.status, job.wait, and job.cancel); delete removes what the source no longer has, exclude leaves paths out at both ends, and dry_run reports what would be sent, deleted and removed without changing anything.".to_owned(),
             effect: Effect::Write,
             input_schema: input_schema::<TransferArgs>(),
         },
@@ -133,6 +145,9 @@ impl Tool for TransferTool {
     fn call<'a>(&'a self, ctx: &'a Ctx, args: Value) -> BoxFuture<'a, Result<Value, ToolError>> {
         Box::pin(async move {
             let args = parse_args::<TransferArgs>(&self.spec.name, args)?;
+            if args.background {
+                return start_background(ctx, args).await;
+            }
             let report = transfer(&self.fleet, ctx, args).await?;
             serde_json::to_value(&report).map_err(|error| {
                 ErrorBody::new(
@@ -202,6 +217,11 @@ pub(crate) struct TransferArgs {
     /// `fs.remove` permission on the source; refused up front otherwise).
     #[serde(default, rename = "move")]
     pub(crate) move_source: bool,
+    /// Run the transfer as a detached job on this node and return `{job: {id, machine}}` at once.
+    /// The job runs under the caller's principal and grant, survives the caller disconnecting, and
+    /// finishes with the same result object a foreground transfer returns.
+    #[serde(default)]
+    pub(crate) background: bool,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -469,6 +489,534 @@ impl Drop for Owned {
             self.ends.push(process);
         }
     }
+}
+
+/// Hidden CLI subcommand invoked by `fs.transfer` (`background: true`) to supervise a detached
+/// transfer job.
+const TRANSFER_SUPERVISE_SUBCOMMAND: &str = "transfer-supervise";
+const STATE_DIR_FLAG: &str = "--state-dir";
+const CONFIG_DIR_FLAG: &str = "--config-dir";
+const HOME_DIR_FLAG: &str = "--home";
+const TRANSFER_REQUEST_FILE: &str = "transfer.json";
+const TRANSFER_CANCEL_POLL: Duration = Duration::from_millis(100);
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TransferJobRequest {
+    args: TransferArgs,
+    principal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pairing_id: Option<String>,
+    door: Door,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_expires: Option<String>,
+    to_machine: String,
+}
+
+fn initial_transfer_title(from: &End, to: &End, move_source: bool) -> String {
+    let verb = if move_source { "Move" } else { "Copy" };
+    let item = file_name(&from.path);
+    let label = if item.is_empty() { &from.path } else { item };
+    format!("{verb} {label} to {}", to.machine)
+}
+
+fn initial_transfer_name(from: &End, move_source: bool) -> String {
+    let prefix = if move_source { "move" } else { "copy" };
+    let item = file_name(&from.path);
+    if item.is_empty() {
+        prefix.to_owned()
+    } else {
+        let raw = format!("{prefix}-{item}");
+        match raw.char_indices().nth(60) {
+            Some((end, _)) => format!("{}…", &raw[..end]),
+            None => raw,
+        }
+    }
+}
+
+async fn start_background(ctx: &Ctx, mut args: TransferArgs) -> Result<Value, ErrorBody> {
+    let from = resolve(ctx, &args.from)?;
+    let to = resolve(ctx, &args.to)?;
+
+    // Enforce local policy checks up front so obvious denials fail before spawning a job; the
+    // detached supervisor also runs through `Node::call` under `pinned: Some(principal)` so every
+    // local and remote check runs under the caller's exact grant.
+    if !from.remote {
+        ctx.grant().check_path(&from.path, Access::Read)?;
+    }
+    if !to.remote {
+        ctx.grant().check_path(&to.path, Access::Write)?;
+    }
+    if args.move_source {
+        let policy = ctx.config().get::<Policy>()?;
+        policy
+            .authorize_name(
+                ctx.principal(),
+                "fs.remove",
+                Some(Effect::Write),
+                ctx.paths(),
+            )
+            .map_err(|err| err.with_machine(ctx.node_name()))?;
+        if !from.remote {
+            ctx.grant().check_path(&from.path, Access::Write)?;
+        }
+    }
+
+    let title = initial_transfer_title(&from, &to, args.move_source);
+    let name = initial_transfer_name(&from, args.move_source);
+    let state_dir = ctx.paths().state_dir().to_path_buf();
+    let config_dir = ctx.paths().config_dir().to_path_buf();
+    let home_dir = ctx.paths().home().map(Path::to_path_buf);
+
+    let created = transfer_job::create_transfer_job(
+        &state_dir,
+        TransferJobSpec {
+            name,
+            title: title.clone(),
+            principal: ctx.principal().to_owned(),
+            device: ctx.device().map(str::to_owned),
+            exclusive: false,
+        },
+    )
+    .await?;
+
+    args.background = false;
+    let request = TransferJobRequest {
+        args,
+        principal: ctx.principal().to_owned(),
+        device: ctx.device().map(str::to_owned),
+        pairing_id: ctx.pairing_id().map(str::to_owned),
+        door: ctx.door(),
+        credential_expires: ctx
+            .credential_expires()
+            .map(|ts| ts.strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()),
+        to_machine: to.machine.clone(),
+    };
+    let request_path = created.dir.join(TRANSFER_REQUEST_FILE);
+    let req_bytes = serde_json::to_vec_pretty(&request).map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Internal,
+            format!("Cannot serialize background transfer request: {err}."),
+        )
+    })?;
+    let initial_progress = JobProgress {
+        bytes_done: 0,
+        bytes_total: None,
+        files_done: 0,
+        files_total: None,
+        current: None,
+        rate: 0,
+    };
+    let job_dir_for_write = created.dir.clone();
+    if let Err(err) = tokio::task::spawn_blocking(move || {
+        write_atomic(&request_path, &req_bytes, WriteOptions::with_mode(0o600)).map_err(|e| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Cannot write transfer request {}: {e}.",
+                    request_path.display()
+                ),
+            )
+        })?;
+        transfer_job::write_transfer_progress(&job_dir_for_write, &initial_progress, None)
+    })
+    .await
+    .map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Internal,
+            format!("fs.transfer stopped unexpectedly while preparing job files: {err}."),
+        )
+    })? {
+        transfer_job::record_transfer_start_failure(&state_dir, &created.id, &err.message).await;
+        return Err(err);
+    }
+
+    let exe = match legion_core::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => {
+            transfer_job::record_transfer_start_failure(&state_dir, &created.id, &err.message)
+                .await;
+            return Err(err);
+        }
+    };
+
+    let mut argv = vec![
+        TRANSFER_SUPERVISE_SUBCOMMAND.to_owned(),
+        created.id.clone(),
+        STATE_DIR_FLAG.to_owned(),
+        state_dir.to_string_lossy().into_owned(),
+        CONFIG_DIR_FLAG.to_owned(),
+        config_dir.to_string_lossy().into_owned(),
+    ];
+    if let Some(ref home) = home_dir {
+        argv.push(HOME_DIR_FLAG.to_owned());
+        argv.push(home.to_string_lossy().into_owned());
+    }
+    let supervisor_cmd = CommandSpec::argv(exe, argv);
+    let handle = match spawn_detached(DetachOptions::new(supervisor_cmd).name(&created.id)).await {
+        Ok(handle) => handle,
+        Err(err) => {
+            let message = format!("Could not launch the detached transfer supervisor: {err}.");
+            transfer_job::record_transfer_start_failure(&state_dir, &created.id, &message).await;
+            return Err(ErrorBody::new(ErrorCode::Failed, message)
+                .with_hint("Check `job.status` for the recorded failure details."));
+        }
+    };
+
+    transfer_job::attach_transfer_detach(&state_dir, &created.id, handle.clone()).await?;
+    let _state =
+        transfer_job::wait_transfer_supervisor_ready(&state_dir, &created.id, &handle).await?;
+
+    Ok(json!({
+        "job": {
+            "id": created.id,
+            "machine": ctx.node_name(),
+        }
+    }))
+}
+
+/// Runs the hidden `transfer-supervise` subcommand when `args` starts with `"transfer-supervise"`.
+///
+/// Returns `None` for any other command line so callers (such as `legion-cli`'s `main`) can
+/// dispatch normally without adding the subcommand to user-facing help.
+pub fn try_supervise_cli(args: impl IntoIterator<Item = OsString>) -> Option<ExitCode> {
+    let mut iter = args.into_iter();
+    let first = iter.next()?;
+    if first != OsStr::new(TRANSFER_SUPERVISE_SUBCOMMAND) {
+        return None;
+    }
+    let rest: Vec<OsString> = iter.collect();
+    Some(run_transfer_supervise_cli(&rest))
+}
+
+struct SuperviseArgs {
+    id: String,
+    state_dir: Option<PathBuf>,
+    config_dir: Option<PathBuf>,
+    home_dir: Option<PathBuf>,
+}
+
+fn parse_supervise_args(rest: &[OsString]) -> Result<SuperviseArgs, String> {
+    let mut id: Option<String> = None;
+    let mut state_dir: Option<PathBuf> = None;
+    let mut config_dir: Option<PathBuf> = None;
+    let mut home_dir: Option<PathBuf> = None;
+    let mut index = 0usize;
+
+    while index < rest.len() {
+        let arg = &rest[index];
+        if arg == OsStr::new(STATE_DIR_FLAG) {
+            let value = rest
+                .get(index + 1)
+                .ok_or_else(|| format!("{STATE_DIR_FLAG} needs a path."))?;
+            if state_dir.replace(PathBuf::from(value)).is_some() {
+                return Err(format!("{STATE_DIR_FLAG} was given twice."));
+            }
+            index += 2;
+            continue;
+        }
+        if arg == OsStr::new(CONFIG_DIR_FLAG) {
+            let value = rest
+                .get(index + 1)
+                .ok_or_else(|| format!("{CONFIG_DIR_FLAG} needs a path."))?;
+            if config_dir.replace(PathBuf::from(value)).is_some() {
+                return Err(format!("{CONFIG_DIR_FLAG} was given twice."));
+            }
+            index += 2;
+            continue;
+        }
+        if arg == OsStr::new(HOME_DIR_FLAG) {
+            let value = rest
+                .get(index + 1)
+                .ok_or_else(|| format!("{HOME_DIR_FLAG} needs a path."))?;
+            if home_dir.replace(PathBuf::from(value)).is_some() {
+                return Err(format!("{HOME_DIR_FLAG} was given twice."));
+            }
+            index += 2;
+            continue;
+        }
+        let text = arg
+            .to_str()
+            .ok_or_else(|| "job id must be valid Unicode.".to_owned())?;
+        if id.replace(text.to_owned()).is_some() {
+            return Err(format!("unexpected argument {text:?}."));
+        }
+        index += 1;
+    }
+
+    let id = id.ok_or_else(|| "missing job id.".to_owned())?;
+    Ok(SuperviseArgs {
+        id,
+        state_dir,
+        config_dir,
+        home_dir,
+    })
+}
+
+fn run_transfer_supervise_cli(rest: &[OsString]) -> ExitCode {
+    let parsed = match parse_supervise_args(rest) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "legion {TRANSFER_SUPERVISE_SUBCOMMAND}: {message}"
+            );
+            return ExitCode::from(2);
+        }
+    };
+    if let Err(error) = transfer_job::validate_transfer_job_id(&parsed.id) {
+        let _ = writeln!(
+            std::io::stderr(),
+            "legion {TRANSFER_SUPERVISE_SUBCOMMAND}: {}",
+            error.message
+        );
+        return ExitCode::from(2);
+    }
+    let paths = match (parsed.config_dir, parsed.state_dir) {
+        (Some(cfg), Some(st)) => match Paths::from_explicit_dirs(cfg, st) {
+            Ok(p) => match parsed.home_dir {
+                Some(home) => p.with_home(home),
+                None => p,
+            },
+            Err(error) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "legion {TRANSFER_SUPERVISE_SUBCOMMAND}: {}",
+                    error.message
+                );
+                return ExitCode::from(1);
+            }
+        },
+        _ => match Paths::from_env() {
+            Ok(p) => match parsed.home_dir {
+                Some(home) => p.with_home(home),
+                None => p,
+            },
+            Err(error) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "legion {TRANSFER_SUPERVISE_SUBCOMMAND}: {}",
+                    error.message
+                );
+                return ExitCode::from(1);
+            }
+        },
+    };
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "legion {TRANSFER_SUPERVISE_SUBCOMMAND}: failed to start async runtime: {error}"
+            );
+            return ExitCode::from(1);
+        }
+    };
+
+    match runtime.block_on(supervise_transfer(paths, &parsed.id)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "legion {TRANSFER_SUPERVISE_SUBCOMMAND}: {message}"
+            );
+            ExitCode::from(1)
+        }
+    }
+}
+
+async fn supervise_transfer(paths: Paths, id: &str) -> Result<(), String> {
+    let dir = transfer_job::transfer_job_dir(paths.state_dir(), id).map_err(|err| err.message)?;
+    let Some(lock) = transfer_job::acquire_transfer_supervisor_lock(&dir).await? else {
+        return Ok(());
+    };
+
+    if transfer_job::transfer_exit_exists(&dir) {
+        let _ = std::fs::remove_file(dir.join(TRANSFER_REQUEST_FILE));
+        transfer_job::remove_transfer_exit_reserve(&dir);
+        let _ = lock.unlock();
+        return Ok(());
+    }
+
+    if transfer_job::transfer_cancel_requested(&dir) {
+        let _ = std::fs::remove_file(dir.join(TRANSFER_REQUEST_FILE));
+        let _ = transfer_job::finish_transfer_job_cancelled(
+            &dir,
+            "Cancelled before the transfer started.",
+        );
+        let _ = lock.unlock();
+        return Ok(());
+    }
+
+    transfer_job::prepare_transfer_exit_reserve(&dir);
+
+    let req_path = dir.join(TRANSFER_REQUEST_FILE);
+    let req_bytes = match std::fs::read(&req_path) {
+        Ok(bytes) => {
+            let _ = std::fs::remove_file(&req_path);
+            bytes
+        }
+        Err(err) => {
+            let _ = transfer_job::finish_transfer_job_err(
+                &dir,
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "Cannot read transfer request {}: {err}.",
+                        req_path.display()
+                    ),
+                ),
+            );
+            let _ = lock.unlock();
+            return Ok(());
+        }
+    };
+    let req: TransferJobRequest = match serde_json::from_slice(&req_bytes) {
+        Ok(req) => req,
+        Err(err) => {
+            let _ = transfer_job::finish_transfer_job_err(
+                &dir,
+                ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "Transfer request {} is not valid JSON: {err}.",
+                        req_path.display()
+                    ),
+                ),
+            );
+            let _ = lock.unlock();
+            return Ok(());
+        }
+    };
+
+    transfer_job::append_transfer_log(
+        &dir,
+        &format!(
+            "{} {} -> {} (principal: {})",
+            if req.args.move_source { "move" } else { "copy" },
+            req.args.from,
+            req.args.to,
+            req.principal
+        ),
+    );
+
+    let fleet = Fleet::new(&paths);
+    let mut registry = legion_tools::registry();
+    crate::register(&mut registry, fleet.clone());
+    let node = Node::new(paths, registry);
+
+    let cancel_token = CancellationToken::new();
+    let watcher_stop = CancellationToken::new();
+    let dir_for_watcher = dir.clone();
+    let watcher = tokio::spawn({
+        let cancel_token = cancel_token.clone();
+        let watcher_stop = watcher_stop.clone();
+        async move {
+            loop {
+                if transfer_job::transfer_cancel_requested(&dir_for_watcher) {
+                    cancel_token.cancel();
+                    break;
+                }
+                tokio::select! {
+                    biased;
+                    () = watcher_stop.cancelled() => break,
+                    () = tokio::time::sleep(TRANSFER_CANCEL_POLL) => {}
+                }
+            }
+        }
+    });
+
+    #[derive(Default)]
+    struct MonotonicProgress {
+        bytes_done: u64,
+        files_done: u64,
+        title: Option<String>,
+    }
+
+    let state = Arc::new(Mutex::new(MonotonicProgress::default()));
+    let dir_for_events = dir.clone();
+    let move_source = req.args.move_source;
+    let to_machine = req.to_machine.clone();
+    let events = EventSink::new(move |kind, data| {
+        if kind != EventKind::Progress {
+            return;
+        }
+        let Ok(mut progress) = serde_json::from_value::<JobProgress>(data) else {
+            return;
+        };
+        let title_update = {
+            let mut guard = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            progress.bytes_done = progress.bytes_done.max(guard.bytes_done);
+            progress.files_done = progress.files_done.max(guard.files_done);
+            guard.bytes_done = progress.bytes_done;
+            guard.files_done = progress.files_done;
+            if guard.title.is_none()
+                && let Some(total) = progress.files_total
+                && total > 1
+            {
+                let verb = if move_source { "Move" } else { "Copy" };
+                guard.title = Some(format!("{verb} {total} items to {to_machine}"));
+            }
+            guard.title.clone()
+        };
+        let _ = transfer_job::write_transfer_progress(&dir_for_events, &progress, title_update);
+    });
+
+    let mut foreground_args = req.args;
+    foreground_args.background = false;
+    let args_value = serde_json::to_value(&foreground_args).unwrap_or(Value::Null);
+    let credential_expires = req
+        .credential_expires
+        .as_deref()
+        .and_then(|s| s.parse::<jiff::Timestamp>().ok());
+
+    let call = Call {
+        tool: "fs.transfer".to_owned(),
+        args: args_value,
+        as_principal: None,
+        door: req.door,
+        // Pin to the caller's principal so the detached job NEVER escalates to `owner` or
+        // `policy.default` and always evaluates live `policy.toml` for that exact principal.
+        pinned: Some(req.principal),
+        device: req.device,
+        pairing_id: req.pairing_id,
+        cancel: cancel_token.clone(),
+        events,
+        hops: 0,
+        credential_expires,
+    };
+
+    let outcome = node.call(call).await;
+    fleet.close().await;
+    watcher_stop.cancel();
+    let _ = watcher.await;
+
+    let write_res = match outcome {
+        Ok(result) => {
+            transfer_job::append_transfer_log(&dir, "transfer completed");
+            transfer_job::finish_transfer_job_ok(&dir, result)
+        }
+        Err(error) if error.code == ErrorCode::Cancelled || cancel_token.is_cancelled() => {
+            transfer_job::append_transfer_log(
+                &dir,
+                &format!("transfer cancelled: {}", error.message),
+            );
+            transfer_job::finish_transfer_job_cancelled(&dir, &error.message)
+        }
+        Err(error) => {
+            transfer_job::append_transfer_log(&dir, &format!("transfer failed: {}", error.message));
+            transfer_job::finish_transfer_job_err(&dir, error)
+        }
+    };
+    let _ = lock.unlock();
+    write_res.map_err(|err| err.message)
 }
 
 async fn transfer(
@@ -793,6 +1341,7 @@ impl Transfer<'_> {
             Some(file_name(&from.path).to_owned()),
             false,
         );
+        meter.emit(true);
         let relayed = relay(
             &mut source,
             &mut dest,
@@ -1003,6 +1552,7 @@ impl Transfer<'_> {
             None,
             true,
         );
+        meter.emit(true);
         // A destination that does not exist yet is made even when there is nothing to put in it,
         // so an empty tree arrives as an empty directory.
         let mut rounds = if args.move_source {

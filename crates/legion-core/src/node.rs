@@ -383,7 +383,7 @@ impl Node {
         let Some(tool) = self.resolve_tool(&call.tool) else {
             return (Some(principal), Err(self.unknown_tool(&call.tool, name)));
         };
-        let grant = match policy.authorize(&principal, tool.spec(), &self.inner.paths) {
+        let grant = match tool.authorize(&policy, &principal, &self.inner.paths, &call.args) {
             Ok(grant) => grant,
             Err(error) => return (Some(principal), Err(error)),
         };

@@ -621,6 +621,16 @@ impl Policy {
             .with_details(json!({"principal": principal, "role": role, "tool": tool})))
     }
 
+    /// Whether `principal`'s role has a `deny` rule that matches `tool` by name or glob (ignoring
+    /// `effect:*` deny rules).
+    pub fn is_denied_by_name(&self, principal: &str, tool: &str) -> bool {
+        let (_, rules) = self.role_of(principal);
+        rules
+            .deny
+            .iter()
+            .any(|rule| matches!(rule, Rule::Tools(pattern) if glob::matches(pattern, tool)))
+    }
+
     /// Whether `principal` might be allowed to call `tool` once the target reports its effect.
     ///
     /// Returns `false` when `tool` is already denied by name/glob or when no allow rule could
