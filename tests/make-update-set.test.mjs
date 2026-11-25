@@ -261,9 +261,19 @@ function buildMiniAppImage({ desktopText = null, binBytes = null, elfSize = 128 
     const deskOff = pushInode(makeFileInode(addFileData(Buffer.from(desktopText, 'utf8'))));
     rootEntries.push({ name: 'legion-app.desktop', inodeOff: deskOff, type: 2 });
   }
-  if (binBytes !== null) {
-    const binOff = pushInode(makeFileInode(addFileData(Buffer.isBuffer(binBytes) ? binBytes : Buffer.from(binBytes))));
-    const binDirMeta = addDirTable([{ name: 'legion-app', inodeOff: binOff, type: 2 }]);
+  const extraBins = Array.isArray(binBytes)
+    ? binBytes
+    : binBytes !== null
+      ? [{ name: 'legion-app', data: binBytes }]
+      : [];
+  if (extraBins.length > 0) {
+    const binEntries = extraBins.map((entry) => {
+      const off = pushInode(
+        makeFileInode(addFileData(Buffer.isBuffer(entry.data) ? entry.data : Buffer.from(entry.data))),
+      );
+      return { name: entry.name, inodeOff: off, type: 2 };
+    });
+    const binDirMeta = addDirTable(binEntries);
     const binDirOff = pushInode(makeDirInode(binDirMeta));
     const usrDirMeta = addDirTable([{ name: 'bin', inodeOff: binDirOff, type: 1 }]);
     const usrDirOff = pushInode(makeDirInode(usrDirMeta));
@@ -780,4 +790,119 @@ test('parseArtifactSpec rejects invalid filenames and mismatched combinations', 
     () => parseArtifactSpec('/tmp/a.apk:program=app,os=android,arch=aarch64,kind=apk,name=../evil.apk'),
     /not a valid bare filename/,
   );
+});
+
+test('main executable must itself carry markers even when a helper has them, and stable create forbids preview keys', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-update-main-bin-'));
+  try {
+    const seq = 202611250140;
+    const now = new Date('2026-11-25T01:40:00Z');
+    const priv = path.join(tmp, 'release.key');
+    const pub = path.join(tmp, 'release.pub.pem');
+    createPreviewKey({ privateKeyPath: priv, publicKeyPath: pub });
+
+    // 1. .deb whose usr/bin/legion has NO markers MUST fail even if usr/bin/legion-helper has them.
+    const debUnmarkedMain = path.join(tmp, 'legion_0.2.0_amd64.deb');
+    fs.writeFileSync(
+      debUnmarkedMain,
+      buildDeb([
+        {
+          name: 'control.tar.gz',
+          data: zlib.gzipSync(buildTar([{
+            name: './control',
+            data: Buffer.from(`Package: legion\nVersion: 0.2.0+${seq}\nArchitecture: amd64\n`),
+          }])),
+        },
+        {
+          name: 'data.tar.gz',
+          data: zlib.gzipSync(buildTar([
+            { name: './usr/bin/legion', data: Buffer.from('\x7fELF unmarked main binary') },
+            { name: './usr/bin/legion-helper', data: compiledPayload(seq) },
+          ])),
+        },
+      ]),
+    );
+    assert.throws(
+      () => verifyArtifactSequence(debUnmarkedMain, { name: path.basename(debUnmarkedMain), kind: 'deb' }, seq),
+      /\[usr\/bin\/legion\].*no compiled LEGION_UPDATE_SEQUENCE marker/,
+    );
+
+    // 2. AppImage whose usr/bin/legion-app has NO markers MUST fail even if usr/bin/helper has them.
+    const appImageUnmarkedMain = path.join(tmp, 'Legion-unmarked-main.AppImage');
+    fs.writeFileSync(
+      appImageUnmarkedMain,
+      buildMiniAppImage({
+        desktopText: `[Desktop Entry]\nName=Legion\nExec=legion-app\nX-AppImage-Version=0.2.0+${seq}\n`,
+        binBytes: [
+          { name: 'legion-app', data: Buffer.from('\x7fELF unmarked main binary') },
+          { name: 'helper', data: compiledPayload(seq) },
+        ],
+      }),
+    );
+    assert.throws(
+      () => verifyArtifactSequence(appImageUnmarkedMain, { name: path.basename(appImageUnmarkedMain), kind: 'appimage' }, seq),
+      /\[usr\/bin\/legion-app\].*no compiled LEGION_UPDATE_SEQUENCE marker/,
+    );
+
+    // 3. macOS app-tar whose CFBundleExecutable has NO markers MUST fail even if a helper has them.
+    const appTarUnmarkedMain = path.join(tmp, 'Legion-unmarked-main.app.tar.gz');
+    const plist = `<?xml version="1.0"?><plist><dict><key>CFBundleExecutable</key><string>legion-app</string><key>CFBundleVersion</key><string>${seq}</string></dict></plist>`;
+    fs.writeFileSync(
+      appTarUnmarkedMain,
+      zlib.gzipSync(buildTar([
+        { name: 'Legion.app/Contents/Info.plist', data: Buffer.from(plist) },
+        { name: 'Legion.app/Contents/MacOS/legion-app', data: Buffer.from('\xcf\xfa\xed\xfe unmarked main') },
+        { name: 'Legion.app/Contents/MacOS/helper', data: compiledPayload(seq) },
+      ])),
+    );
+    assert.throws(
+      () => verifyArtifactSequence(appTarUnmarkedMain, { name: path.basename(appTarUnmarkedMain), kind: 'app-tar' }, seq),
+      /\[Legion\.app\/Contents\/MacOS\/legion-app\].*no compiled LEGION_UPDATE_SEQUENCE marker/,
+    );
+
+    // 4. `makeUpdateSet({ channel: 'stable' })` automatically enforces forbidPreviewKey!
+    const previewBin = path.join(tmp, 'legion-0.2.0-x86_64-unknown-linux-musl');
+    fs.writeFileSync(previewBin, compiledPayload(seq, 'SHA256:throwawayPreviewKey'));
+    assert.throws(
+      () =>
+        makeUpdateSet({
+          outDir: path.join(tmp, 'stable-bad'),
+          channel: 'stable',
+          version: '0.2.0',
+          build: 'abc123def456',
+          sequence: seq,
+          privateKeyPath: priv,
+          artifacts: [`${previewBin}:program=node,os=linux,arch=x86_64,kind=binary`],
+          now,
+        }),
+      /trusts a compiled-in preview update key/,
+    );
+
+    // The same artifact succeeds on preview channel, while a clean (`none`) artifact succeeds on stable.
+    makeUpdateSet({
+      outDir: path.join(tmp, 'preview-ok'),
+      channel: 'preview',
+      version: '0.2.0',
+      build: 'abc123def456',
+      sequence: seq,
+      privateKeyPath: priv,
+      artifacts: [`${previewBin}:program=node,os=linux,arch=x86_64,kind=binary`],
+      now,
+    });
+
+    const cleanBin = path.join(tmp, 'legion-clean-x86_64-unknown-linux-musl');
+    fs.writeFileSync(cleanBin, compiledPayload(seq, 'none'));
+    makeUpdateSet({
+      outDir: path.join(tmp, 'stable-ok'),
+      channel: 'stable',
+      version: '0.2.0',
+      build: 'abc123def456',
+      sequence: seq,
+      privateKeyPath: priv,
+      artifacts: [`${cleanBin}:program=node,os=linux,arch=x86_64,kind=binary`],
+      now,
+    });
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });

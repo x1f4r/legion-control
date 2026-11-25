@@ -9,6 +9,8 @@ pub mod transfers;
 pub mod updater;
 
 use std::sync::Arc;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(not(target_os = "android"))]
 use tauri::WindowEvent;
@@ -49,6 +51,12 @@ struct SharedAndroidTransferPlugin(Arc<transfers::android::AndroidTransferPlugin
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 struct SharedDesktopTransferPlatform(Arc<transfers::desktop::DesktopTransferPlatform>);
+
+/// Tracks whether the application has begun quitting or the OS session is ending so window-close
+/// and drain-exit hooks never start a close-time update supervisor while the OS is tearing down
+/// processes.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+struct SharedExitRequested(Arc<AtomicBool>);
 
 /// Returns `true` only for the bundled app origin on the current platform.
 ///
@@ -109,16 +117,36 @@ pub(crate) fn should_defer_to_active_update_in(
     verify_only: bool,
     supervised_launch: bool,
 ) -> bool {
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    should_defer_to_active_update_in_at(updates_dir, verify_only, supervised_launch, now_unix)
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) fn should_defer_to_active_update_in_at(
+    updates_dir: &std::path::Path,
+    verify_only: bool,
+    supervised_launch: bool,
+    now_unix: u64,
+) -> bool {
     if verify_only || supervised_launch {
         return false;
     }
-    let Some(active_lock) = updater::desktop::inspect_active_update_lock(updates_dir) else {
-        return false;
-    };
-    if active_lock.verify_only {
-        updater::desktop::request_reopen_after_update(updates_dir);
+    match updater::desktop::inspect_update_lock_at(updates_dir, now_unix) {
+        updater::desktop::UpdateLockInspection::Active(active_lock) => {
+            if active_lock.verify_only {
+                updater::desktop::request_reopen_after_update(updates_dir);
+            }
+            true
+        }
+        updater::desktop::UpdateLockInspection::StaleCleared { reason } => {
+            updater::desktop::record_stale_lock_notice(updates_dir, &reason);
+            false
+        }
+        updater::desktop::UpdateLockInspection::None => false,
     }
-    true
 }
 
 /// Returns `true` when this desktop launch should defer to an in-progress update instead of
@@ -332,6 +360,11 @@ pub fn run() {
             return Ok(());
         }
 
+        // Clear any leftover `reopen-requested` flag on every normal interactive start (never
+        // inside a `verify_only` probe, which must leave the flag for its supervisor to honor).
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        updater::desktop::clear_reopen_marker(&updates_base_dir.join("updates"));
+
         let store = AppStore::in_dir(&data_dir);
         store.prepare_dir()?;
         let backend: Arc<dyn Backend> = Arc::new(LinkBackend::from_store(store.clone()));
@@ -356,10 +389,13 @@ pub fn run() {
 
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let platform: Arc<dyn TransferPlatform> = {
+            let exit_requested = Arc::new(AtomicBool::new(false));
             let desktop_platform = Arc::new(transfers::desktop::DesktopTransferPlatform::new(
                 app.handle().clone(),
                 &data_dir,
+                Arc::clone(&exit_requested),
             ));
+            app.manage(SharedExitRequested(exit_requested));
             app.manage(SharedDesktopTransferPlatform(Arc::clone(&desktop_platform)));
             desktop_platform
         };
@@ -499,6 +535,13 @@ pub fn run() {
             event: WindowEvent::CloseRequested { api, .. },
             ..
         } => {
+            // Never spawn a close-time update once an app quit or OS session shutdown has begun.
+            if app_handle
+                .try_state::<SharedExitRequested>()
+                .is_some_and(|flag| flag.0.load(Ordering::SeqCst))
+            {
+                return;
+            }
             if let (Some(updater), Some(backend), Some(transfers)) = (
                 app_handle.try_state::<SharedUpdater>(),
                 app_handle.try_state::<SharedBackend>(),
@@ -567,24 +610,17 @@ pub fn run() {
             }
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             {
-                if code.is_none() {
-                    if transfers.0.has_active_work() {
-                        if !transfers::desktop::confirm_quit_with_active_transfers() {
-                            api.prevent_exit();
-                        } else {
-                            transfers.0.shutdown();
-                        }
-                    } else if let (Some(updater), Some(backend)) = (
-                        app_handle.try_state::<SharedUpdater>(),
-                        app_handle.try_state::<SharedBackend>(),
-                    ) && handle_desktop_close_request(
-                        &updater.0,
-                        backend.0.as_ref(),
-                        &transfers.0,
-                    ) == DesktopCloseOutcome::CloseWithUpdate
-                    {
-                        tauri_plugin_single_instance::destroy(app_handle);
+                if code.is_none() && transfers.0.has_active_work() {
+                    if !transfers::desktop::confirm_quit_with_active_transfers() {
+                        api.prevent_exit();
+                        return;
                     }
+                    transfers.0.shutdown();
+                }
+                // Close-time updates start ONLY from the user closing the window, never from
+                // quitting the app or the OS ending the session (`ExitRequested`).
+                if let Some(flag) = app_handle.try_state::<SharedExitRequested>() {
+                    flag.0.store(true, Ordering::SeqCst);
                 }
             }
             #[cfg(target_os = "ios")]
@@ -593,6 +629,10 @@ pub fn run() {
             }
         }
         RunEvent::Exit => {
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            if let Some(flag) = app_handle.try_state::<SharedExitRequested>() {
+                flag.0.store(true, Ordering::SeqCst);
+            }
             if let Some(transfers) = app_handle.try_state::<SharedTransfers>() {
                 transfers.0.shutdown();
             }
@@ -744,6 +784,46 @@ mod tests {
             false,
             false
         ));
+
+        // Normal start clears any leftover `reopen-requested` flag.
+        updater::desktop::clear_reopen_marker(&updates_dir);
+        assert!(
+            !updates_dir
+                .join(updater::desktop::REOPEN_REQUESTED_FILENAME)
+                .exists()
+        );
+
+        // Stale (> 3 minutes) or future-dated update.lock MUST NOT block startup, MUST clear the
+        // lock file, and MUST record `stale-lock.json` so Updates reports an unfinished update.
+        let now: u64 = 1_800_000_000;
+        let future_lock = updater::desktop::UpdateLockState {
+            owner_pid: std::process::id(),
+            supervisor_pid: Some(std::process::id()),
+            target_sequence: 202611250226,
+            stage: "supervising".to_owned(),
+            verify_only: false,
+            started_unix: now + 300,
+        };
+        std::fs::write(
+            updates_dir.join(updater::desktop::UPDATE_LOCK_FILENAME),
+            serde_json::to_vec(&future_lock)?,
+        )?;
+        assert!(
+            !should_defer_to_active_update_in_at(&updates_dir, false, false, now),
+            "future-dated update.lock must never block startup"
+        );
+        assert!(
+            !updates_dir
+                .join(updater::desktop::UPDATE_LOCK_FILENAME)
+                .exists(),
+            "future-dated update.lock must be cleared"
+        );
+        assert!(
+            updates_dir
+                .join(updater::desktop::STALE_LOCK_MARKER_FILENAME)
+                .is_file(),
+            "clearing a stale or future lock must leave stale-lock.json for Updates"
+        );
         Ok(())
     }
 }

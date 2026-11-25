@@ -196,17 +196,20 @@ export function describeUpdateSummary(updateState, { doorKind = 'app', nodeName 
 
   if (phase === 'ready') {
     const desktopAutoReady = !isAndroid && updateState.auto_update;
+    const readyDetail = updateState.last_error
+      ? updateState.last_error
+      : desktopAutoReady
+        ? avail
+          ? `Version ${avail.version} is downloaded and verified. It will install next time you open or close Legion.`
+          : 'The update is downloaded and verified. It will install next time you open or close Legion.'
+        : androidNote;
     return {
       line: desktopAutoReady
         ? 'Restart to finish'
         : avail
           ? `Version ${avail.version} is ready`
           : 'Update is ready',
-      detail: desktopAutoReady
-        ? avail
-          ? `Version ${avail.version} is downloaded and verified. It will install next time you open or close Legion.`
-          : 'The update is downloaded and verified. It will install next time you open or close Legion.'
-        : androidNote,
+      detail: readyDetail,
       actionLabel: 'Update now',
       canAction: Boolean(updateState.can_self_install),
       showCheck: false,

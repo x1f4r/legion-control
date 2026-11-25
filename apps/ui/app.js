@@ -787,11 +787,7 @@ function App() {
 
   const handleInstallUpdate = useCallback(async () => {
     if (typeof link.installUpdate !== 'function') return null;
-    if (
-      commandDraftRef.current.running ||
-      activeCallsRef.current > 0 ||
-      activeTransfersCountRef.current > 0
-    ) {
+    const promptConfirm = () => {
       if (!sheetHistoryRef.current) {
         window.history.pushState({ legionSheet: true }, '');
         sheetHistoryRef.current = true;
@@ -803,15 +799,30 @@ function App() {
         confirmLabel: 'Update now',
         danger: false,
         async onConfirm() {
-          const next = await link.installUpdate();
+          const next = await link.installUpdate({ confirmInterrupt: true });
           if (next) setUpdateState(next);
         },
       });
+    };
+    if (
+      commandDraftRef.current.running ||
+      activeCallsRef.current > 0 ||
+      activeTransfersCountRef.current > 0
+    ) {
+      promptConfirm();
       return null;
     }
-    const next = await link.installUpdate();
-    if (next) setUpdateState(next);
-    return next;
+    try {
+      const next = await link.installUpdate();
+      if (next) setUpdateState(next);
+      return next;
+    } catch (err) {
+      if (err?.code === 'conflict') {
+        promptConfirm();
+        return null;
+      }
+      throw err;
+    }
   }, [link]);
 
   const handleSetAutoUpdate = useCallback(
