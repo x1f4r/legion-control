@@ -618,7 +618,11 @@ export function formatDeviceTransferSubtitle(transfer, { deviceNoun = 'phone', t
   if (transfer.state === 'cancelling') {
     const fallback = 'Removing partial files…';
     if (!transfer.error) return fallback;
-    return plainErrorMessage(transfer.error, fallback, { technical, deviceNoun });
+    const errObj =
+      typeof transfer.error === 'object'
+        ? { ...transfer.error, machine: transfer.error.machine || transfer.machine || null }
+        : transfer.error;
+    return plainErrorMessage(errObj, fallback, { technical, deviceNoun });
   }
 
   if (transfer.state === 'running' || transfer.state === 'paused' || transfer.state === 'queued') {
@@ -639,7 +643,11 @@ export function formatDeviceTransferSubtitle(transfer, { deviceNoun = 'phone', t
 
   if (transfer.state === 'failed') {
     const fallback = 'Stopped before finishing. Tap Resume to continue from where it stopped.';
-    return plainErrorMessage(transfer.error, fallback, { technical, deviceNoun });
+    const errObj =
+      transfer.error && typeof transfer.error === 'object'
+        ? { ...transfer.error, machine: transfer.error.machine || transfer.machine || null }
+        : transfer.error;
+    return plainErrorMessage(errObj, fallback, { technical, deviceNoun });
   }
 
   if (transfer.state === 'done') {

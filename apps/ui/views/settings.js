@@ -28,6 +28,7 @@ import {
   formatDeviceRemovedNotice,
   formatDisagreementNotice,
   formatInvitedDeviceSyncNotice,
+  formatLearnRejectionTechnical,
   formatPairSyncNotice,
   isInviteOwnerStrength,
   normalizeNodeRoles,
@@ -1715,14 +1716,20 @@ function ConnectionsPage({
                 const info = describeConnectionRoute(entry, technical);
                 const sub =
                   info.hint && info.kind === 'not_synced'
-                    ? `${info.label} · ${info.hint}`
-                    : info.label;
+                    ? `${capitalize(info.label)} · ${info.hint}`
+                    : capitalize(info.label);
+                const rejLine = technical
+                  ? formatLearnRejectionTechnical(entry.learn_rejection)
+                  : null;
                 return html`
                   <div class="row" key=${`relay:${entry.node}`}>
                     <span class="dot off" aria-hidden="true"></span>
                     <span class="body">
                       <span class="title mono">${entry.node}</span>
                       <span class="sub wrap"><${CodeText} text=${sub} /></span>
+                      ${rejLine
+                        ? html`<span class="sub wrap mono">${rejLine}</span>`
+                        : null}
                     </span>
                   </div>
                 `;

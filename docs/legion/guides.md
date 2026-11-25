@@ -210,11 +210,14 @@ dry_run          false
 
 Progress is rendered on one line of `stderr` when `stderr` is a terminal. Bytes move over a
 dedicated `legion stream` pipe (never inside JSON), relayed through the calling node. Both ends
-exchange a `{"protocol": 1}` line first (60 s handshake/first-reply timeout, 120 s idle timeout,
-with `{"busy": true}` heartbeats every 10 s during long work); directory `unpack` receives the
-planned `entries` (`path`, `kind`, `size`, `hash`, `target`) and refuses anything else in the tar
-stream. Every operation is checked against the target machine's `policy.toml` (`fs.read`,
-`fs.write`, or `fs.remove`) and written to its audit log with door `stream`.
+exchange a `{"protocol": 1, "capabilities": ["stream.relay"]}` greeting first (older nodes emit
+`{"protocol": 1}`; 60 s handshake/first-reply timeout, 120 s idle timeout, with `{"busy": true}`
+heartbeats every 10 s during long work); directory `unpack` receives the planned `entries` (`path`,
+`kind`, `size`, `hash`, `target`) and refuses anything else in the tar stream. Every operation is
+checked against the target machine's `policy.toml` (`fs.read`, `fs.write`, or `fs.remove`) and
+written to its audit log with door `stream`. Controllers paired with only one node in a fleet can
+also send `op: "relay"` over `legion stream` to reach another fleet machine through that paired
+node when it advertises `stream.relay`.
 
 ### Collisions (`if_exists`) and background transfers
 

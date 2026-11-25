@@ -1125,6 +1125,23 @@ test('fleet connections routes, identity-change acceptance, pairing sync notice,
     await p.getByText(/SHA256:studioTowerKey1111/).waitFor();
     await p.getByText(/SHA256:studioPiKey2222/).waitFor();
 
+    // 8b. Relayed machine (`nas`) with a learn rejection (`reject`): plain mode shows only one
+    //     short line ("Through tower") and hides the rejection reason; Technical details reveals
+    //     the learn rejection reason on that machine's row.
+    await p.goto(`${server.url}/?mock=fleet,reject#/settings/connections`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await p.locator('.row', { hasText: 'nas' }).getByText('Through tower').waitFor();
+    const plainRejectText = await p.locator('main.main').innerText();
+    assert.ok(
+      !plainRejectText.includes('name_mismatch') && !plainRejectText.includes('someones-nas'),
+      `Learn rejection reason must stay hidden when Technical details is off:\n${plainRejectText}`,
+    );
+    await p.goto(`${server.url}/?mock=fleet,reject,tech#/settings/connections`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await p.getByText(/Direct route skipped \(name_mismatch\): nas calls itself someones-nas\./).waitFor();
+
     // 9. Effectful tool run from Tools with target "all" expands to the explicit list of machine
     //    names shown in the confirmation sheet and sends that exact array (never literal "all").
     await p.goto(`${server.url}/?mock=fleet,tech#/actions/all/power.restart`, {

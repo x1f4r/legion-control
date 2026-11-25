@@ -18,6 +18,11 @@ use std::time::Duration;
 /// bound rather than cutting it off.
 pub(crate) const BACKGROUND_REFRESH_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Maximum time the desktop updater exit path waits for cancelled transfers, active relayed
+/// content streams, and SSH sessions to tear down cleanly before terminating the process for swap.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) const UPDATE_EXIT_QUIESCE_TIMEOUT: Duration = Duration::from_secs(2);
+
 use tauri::WindowEvent;
 use tauri::webview::NewWindowResponse;
 use tauri::{Manager, RunEvent, Url, WebviewWindowBuilder};
@@ -617,6 +622,9 @@ pub fn run() {
                         }
                     }
                     DesktopCloseOutcome::CloseWithUpdate => {
+                        if let Some(content) = app_handle.try_state::<SharedContentServer>() {
+                            content.0.shutdown();
+                        }
                         tauri_plugin_single_instance::destroy(app_handle);
                     }
                     DesktopCloseOutcome::CloseNormally => {}

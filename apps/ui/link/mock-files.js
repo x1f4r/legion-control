@@ -628,6 +628,9 @@ export function createMockFilesState({
           ...(isMixed
             ? [makeEntry('/home/me/BigFolder', { kind: 'dir', mtime: isoAgo(day * 4) })]
             : []),
+          ...(isFormats
+            ? [makeEntry('/home/me/Formats', { kind: 'dir', mtime: isoAgo(day) })]
+            : []),
         ],
       ],
       [
@@ -912,6 +915,47 @@ export function createMockFilesState({
     ]);
     textFiles['tower:/home/me/Formats/README'] =
       'Formats fixture README\n\nPlain text without an extension.\n';
+    trees.studio.set('/home/me/Formats', [
+      makeEntry('/home/me/Formats/relay-mid-fail.flac', {
+        size: 43_000_000,
+        mtime: isoAgo(day),
+        sampleMedia: 'unplayable',
+        mockContentStatus: {
+          request_count: 1,
+          status: 206,
+          content_type: 'audio/flac',
+          stream_failed: true,
+          ticket_live: true,
+        },
+      }),
+      makeEntry('/home/me/Formats/relay-mid-fail.png', {
+        size: 6_200_000,
+        mtime: isoAgo(day),
+        sampleMedia: 'unplayable',
+        mockContentStatus: {
+          request_count: 1,
+          status: 200,
+          content_type: 'image/png',
+          stream_failed: true,
+          ticket_live: true,
+        },
+      }),
+      makeEntry('/home/me/Formats/relay-too-old.flac', {
+        size: 43_000_000,
+        mtime: isoAgo(day),
+        mockMintError: {
+          code: 'unsupported',
+          machine: 'tower',
+          message: 'tower needs an update before it can pass files along from studio.',
+          hint: 'Update legion on tower so it supports relayed streams.',
+          details: {
+            reason: 'relay_too_old',
+            relay: 'tower',
+            target: 'studio',
+          },
+        },
+      }),
+    ]);
   }
 
   let favCounter = 10;
@@ -2074,14 +2118,18 @@ export function createMockFilesState({
           const norm = normalizePath(path);
           const entry = findEntryOnMachine(target, norm);
           if (entry?.mockMintError) {
-            throw { ...entry.mockMintError, machine: target };
+            throw { machine: target, ...entry.mockMintError };
           }
           const name = entry?.name || baseFileName(norm);
           const ext = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1).toLowerCase() : '';
 
-          // Unplayable video/audio is driven strictly by payload (`sampleMedia === 'unplayable'`), never by extension.
+          const cat = categoryFromName(name);
+          // Unplayable video/audio/image is driven strictly by payload (`sampleMedia === 'unplayable'`), never by extension.
           if (entry?.sampleMedia === 'unplayable') {
-            const url = `${getUnplayableVideoUrl()}#mock-${mockUrlSeq++}`;
+            const url =
+              cat === 'image'
+                ? `data:image/png;base64,AA==#mock-${mockUrlSeq++}`
+                : `${getUnplayableVideoUrl()}#mock-${mockUrlSeq++}`;
             if (entry.mockContentStatus) {
               mockStatusByUrl.set(url, { ...entry.mockContentStatus });
             } else {
@@ -2098,7 +2146,6 @@ export function createMockFilesState({
               expires_in: 900,
             };
           }
-          const cat = categoryFromName(name);
           if (cat === 'video') {
             return { url: `${getVideoUrl()}#mock-${mockUrlSeq++}`, expires_in: 900 };
           }

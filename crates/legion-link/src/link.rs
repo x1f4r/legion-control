@@ -22,11 +22,15 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::content::{
-    ContentStream, ContentStreamOptions, DEFAULT_MAX_PARKED_STREAMS, ParkedStreamPool,
-    StreamOpenError, handshake_get,
+    CAP_STREAM_RELAY, CONTENT_STREAM_BUF_BYTES, ContentStream, ContentStreamOptions,
+    DEFAULT_MAX_PARKED_STREAMS, ParkedStreamPool, StreamOpenError, greet_raw_stream, handshake_get,
+    handshake_get_relayed,
 };
 use crate::invite::{Enrolled, SshTarget, SshTimeouts};
-use crate::put::{CAP_PUT_NO_REPLACE, PutRequest, PutStream, handshake_put, validate_blake3_hash};
+use crate::put::{
+    PUT_STREAM_BUF_BYTES, PutRequest, PutStream, handshake_put, handshake_put_relayed,
+    validate_blake3_hash,
+};
 use crate::session::{CallError, Session};
 
 /// Default idle duration after which unused sessions are closed (matches `legion serve`).
@@ -399,6 +403,21 @@ pub struct LearnDisagreement {
     pub reports: Vec<DisagreementReport>,
 }
 
+/// Structured reason why a learned `device.endpoint` answer was rejected.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LearnRejection {
+    /// Fleet machine name whose endpoint answer was rejected.
+    pub machine: String,
+    /// Machine-readable reason code: `"name_mismatch"`, `"malformed_endpoint"`,
+    /// `"shared_host_keys"`, or `"too_many"`.
+    pub code: String,
+    /// Technical explanation of why the endpoint was rejected.
+    pub reason: String,
+    /// Paired introducer that reported the rejected endpoint, if applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_by: Option<String>,
+}
+
 /// Summary returned by [`Link::learn`] and [`Link::learn_from`].
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LearnReport {
@@ -427,6 +446,9 @@ pub struct LearnReport {
     /// Machines whose `device.endpoint` reply failed validation (for example mismatched node name,
     /// disallowed host address, overlapping host keys, or malformed host keys).
     pub rejected: Vec<String>,
+    /// Structured rejection reasons for each rejected machine (sorted by machine name).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected_details: Vec<LearnRejection>,
 }
 
 /// One node entry inside [`LinkConfig`].
@@ -697,6 +719,23 @@ impl Drop for ActiveCallGuard {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&self.id);
     }
+}
+
+/// Restricts which route(s) [`Link::open_content_with_policy`] may use to reach a target machine.
+///
+/// Used by ticketed content servers to bind a ticket strictly to the paired relay (or upgraded
+/// direct entry) that minted it so a reopen never silently crosses into another paired fleet.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ContentRoutePolicy {
+    /// Normal routing: direct entry first when configured, falling back across all relay candidates.
+    #[default]
+    Any,
+    /// Direct entry only; never fall back to any relay.
+    DirectOnly,
+    /// Relay strictly through the named configured node; never try a direct entry or another relay.
+    RelayOnly(String),
+    /// Direct entry first, with relay fallback restricted strictly to the single named relay.
+    DirectOrRelay(String),
 }
 
 impl Link {
@@ -1228,6 +1267,19 @@ impl Link {
         let mut valid_by_introducer: Vec<(String, BTreeMap<String, SshTarget>)> = Vec::new();
         let mut unreachable_set: BTreeSet<String> = BTreeSet::new();
         let mut rejected_set: BTreeSet<String> = BTreeSet::new();
+        let mut rejected_map: BTreeMap<String, LearnRejection> = BTreeMap::new();
+        let mut record_rejection =
+            |machine: String, code: &str, reason: String, reported_by: Option<String>| {
+                rejected_set.insert(machine.clone());
+                rejected_map
+                    .entry(machine.clone())
+                    .or_insert(LearnRejection {
+                        machine,
+                        code: code.to_owned(),
+                        reason,
+                        reported_by,
+                    });
+            };
 
         for (introducer, value) in batches {
             let mut entries: Vec<(String, Value)> =
@@ -1247,23 +1299,69 @@ impl Link {
             let mut parsed: BTreeMap<String, SshTarget> = BTreeMap::new();
             for (idx, (machine_key, item)) in entries.into_iter().enumerate() {
                 if idx >= MAX_CONFIGURED_NODES {
-                    rejected_set.insert(machine_key);
+                    record_rejection(
+                        machine_key,
+                        "too_many",
+                        format!("Too many endpoints returned (limit is {MAX_CONFIGURED_NODES})."),
+                        Some(introducer.clone()),
+                    );
                     continue;
                 }
-                if item.get("error").is_some() {
-                    unreachable_set.insert(machine_key);
+                if let Some(err_val) = item.get("error") {
+                    let is_name_mismatch = err_val.get("code").and_then(Value::as_str)
+                        == Some("conflict")
+                        && err_val
+                            .get("details")
+                            .and_then(|d| d.get("kind"))
+                            .and_then(Value::as_str)
+                            == Some("name_mismatch");
+                    if is_name_mismatch {
+                        let reason = err_val
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| {
+                                let reported = err_val
+                                    .get("details")
+                                    .and_then(|d| d.get("reported"))
+                                    .and_then(Value::as_str);
+                                match reported {
+                                    Some(reported) => format!(
+                                        "Fleet knows this machine as `{machine_key}`, but it answered as `{reported}`."
+                                    ),
+                                    None => format!(
+                                        "Fleet knows this machine as `{machine_key}`, but it answered under a different name."
+                                    ),
+                                }
+                            });
+                        record_rejection(
+                            machine_key,
+                            "name_mismatch",
+                            reason,
+                            Some(introducer.clone()),
+                        );
+                    } else {
+                        unreachable_set.insert(machine_key);
+                    }
                     continue;
                 }
                 let Some(ok_val) = item.get("ok") else {
-                    rejected_set.insert(machine_key);
+                    record_rejection(
+                        machine_key,
+                        "malformed_endpoint",
+                        "Endpoint reply was missing its `ok` payload.".to_owned(),
+                        Some(introducer.clone()),
+                    );
                     continue;
                 };
                 match parse_and_validate_endpoint(&machine_key, ok_val, allow_loopback) {
                     Ok(target) => {
                         parsed.insert(machine_key, target);
                     }
-                    Err(()) => {
-                        rejected_set.insert(machine_key);
+                    Err((code, reason)) => {
+                        record_rejection(machine_key, code, reason, Some(introducer.clone()));
                     }
                 }
             }
@@ -1275,13 +1373,22 @@ impl Link {
                     key_owners.entry(key).or_default().insert(machine.clone());
                 }
             }
-            let mut dup_machines: Vec<String> = Vec::new();
+            let mut dup_machines: Vec<(String, Vec<String>)> = Vec::new();
             for (machine, target) in &parsed {
-                let has_dup = canonical_host_keys(&target.host_keys)
-                    .iter()
-                    .any(|k| key_owners.get(k).is_some_and(|owners| owners.len() > 1));
-                if has_dup {
-                    dup_machines.push(machine.clone());
+                let mut others: BTreeSet<String> = BTreeSet::new();
+                for k in canonical_host_keys(&target.host_keys) {
+                    if let Some(owners) = key_owners.get(&k)
+                        && owners.len() > 1
+                    {
+                        for owner in owners {
+                            if owner != machine {
+                                others.insert(owner.clone());
+                            }
+                        }
+                    }
+                }
+                if !others.is_empty() {
+                    dup_machines.push((machine.clone(), others.into_iter().collect()));
                 }
             }
             // Keep existing nodes intact (handled individually below) while stripping colliding
@@ -1292,10 +1399,15 @@ impl Link {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
-            for dup in dup_machines {
+            for (dup, others) in dup_machines {
                 if cfg_snapshot.node(&dup).is_none() {
                     parsed.remove(&dup);
-                    rejected_set.insert(dup);
+                    record_rejection(
+                        dup,
+                        "shared_host_keys",
+                        format!("Shares SSH host keys with {}.", others.join(", ")),
+                        Some(introducer.clone()),
+                    );
                 }
             }
 
@@ -1325,14 +1437,24 @@ impl Link {
             for (introducer, map) in &valid_by_introducer {
                 if let Some(target) = map.get(&machine) {
                     let new_keys = canonical_host_keys(&target.host_keys);
-                    let overlaps_other = cfg.nodes.iter().any(|other| {
-                        other.node != machine
-                            && other.target.as_ref().is_some_and(|t| {
-                                !canonical_host_keys(&t.host_keys).is_disjoint(&new_keys)
-                            })
-                    });
-                    if overlaps_other {
-                        rejected_set.insert(machine.clone());
+                    let colliding: Vec<String> = cfg
+                        .nodes
+                        .iter()
+                        .filter(|other| {
+                            other.node != machine
+                                && other.target.as_ref().is_some_and(|t| {
+                                    !canonical_host_keys(&t.host_keys).is_disjoint(&new_keys)
+                                })
+                        })
+                        .map(|other| other.node.clone())
+                        .collect();
+                    if !colliding.is_empty() {
+                        record_rejection(
+                            machine.clone(),
+                            "shared_host_keys",
+                            format!("Shares SSH host keys with {}.", colliding.join(", ")),
+                            Some(introducer.clone()),
+                        );
                     } else {
                         reports.push((introducer.as_str(), target));
                     }
@@ -1443,7 +1565,13 @@ impl Link {
                 }
             } else {
                 if cfg.nodes.len() >= MAX_CONFIGURED_NODES {
-                    rejected_set.insert(machine);
+                    let first_intro = reports.first().map(|(intro, _)| (*intro).to_owned());
+                    record_rejection(
+                        machine,
+                        "too_many",
+                        format!("Too many configured machines (limit is {MAX_CONFIGURED_NODES})."),
+                        first_intro,
+                    );
                     continue;
                 }
                 // When two or more paired introducers report this brand-new machine, pin it only
@@ -1503,6 +1631,7 @@ impl Link {
             .sort_by(|a, b| a.machine.cmp(&b.machine));
         report.unreachable = unreachable_set.into_iter().collect();
         report.rejected = rejected_set.into_iter().collect();
+        report.rejected_details = rejected_map.into_values().collect();
         report
     }
 
@@ -1671,6 +1800,7 @@ impl Link {
         let relays = self.relay_candidates(machine, entry_learned_from.as_deref());
         let mut last_relay_err: Option<ErrorBody> = None;
         let mut relay_auth_err: Option<ErrorBody> = None;
+        let mut unknown_machine_err: Option<ErrorBody> = None;
 
         for relay in relays {
             match self
@@ -1693,6 +1823,10 @@ impl Link {
                     });
                 }
                 Err(err) => {
+                    if is_unknown_machine(&err) {
+                        unknown_machine_err = Some(err);
+                        continue;
+                    }
                     if !is_unsent(&err) {
                         if in_unsynced_backoff || learned_auth_err.is_some() {
                             self.record_route(
@@ -1749,14 +1883,11 @@ impl Link {
             return Err(auth_err);
         }
 
-        Err(direct_err.or(last_relay_err).unwrap_or_else(|| {
-            ErrorBody::new(
-                ErrorCode::NotFound,
-                format!("No configured node can reach {machine:?}."),
-            )
-            .with_hint("Pair with at least one machine first.")
-            .with_machine(machine)
-        }))
+        if let Some(err) = direct_err.or(last_relay_err) {
+            return Err(err);
+        }
+        let _ = unknown_machine_err;
+        Err(unknown_machine_error(machine))
     }
 
     /// Calls `tool` on the first answering configured node (starting from `preferred` if given,
@@ -2079,6 +2210,7 @@ impl Link {
         let relays = self.relay_candidates(machine, entry_learned_from.as_deref());
         let mut last_relay_err: Option<ErrorBody> = None;
         let mut relay_auth_err: Option<ErrorBody> = None;
+        let mut unknown_machine_err: Option<ErrorBody> = None;
 
         for relay in relays {
             match self
@@ -2108,6 +2240,10 @@ impl Link {
                     });
                 }
                 Err(err) => {
+                    if is_unknown_machine(&err) {
+                        unknown_machine_err = Some(err);
+                        continue;
+                    }
                     if !is_unsent(&err) {
                         if in_unsynced_backoff || learned_auth_err.is_some() {
                             self.record_route(
@@ -2170,14 +2306,11 @@ impl Link {
             return Err(auth_err);
         }
 
-        Err(direct_err.or(last_relay_err).unwrap_or_else(|| {
-            ErrorBody::new(
-                ErrorCode::NotFound,
-                format!("No configured node can reach {machine:?}."),
-            )
-            .with_hint("Pair with at least one machine first.")
-            .with_machine(machine)
-        }))
+        if let Some(err) = direct_err.or(last_relay_err) {
+            return Err(err);
+        }
+        let _ = unknown_machine_err;
+        Err(unknown_machine_error(machine))
     }
 
     fn relay_candidates(&self, exclude: &str, preferred_introducer: Option<&str>) -> Vec<String> {
@@ -2287,13 +2420,13 @@ impl Link {
     }
 
     /// Opens a streaming byte-range reader for `path` on `machine` via `legion stream`'s `get`
-    /// operation over the session this [`Link`] holds for `machine`.
+    /// operation, using the same direct-first with relay fallback routing as [`Link::call_machine`].
     ///
-    /// Follows the same routing and identity rules as calls: `machine` must be configured on this
-    /// [`Link`], its pinned host keys and `hello.node` identity are verified, and the operation
-    /// never falls back to another machine. Multiple content streams may be open concurrently on
-    /// one SSH connection; cancelling or dropping the returned [`ContentStream`] closes its
-    /// channel immediately without affecting the parent session.
+    /// Connects directly when `machine` has a direct entry (unless in unsynced backoff) and falls
+    /// back through [`relay_candidates`](Self::relay_candidates) when `machine` has no direct entry
+    /// or the direct attempt failed before any stream bytes were sent. A relay must advertise
+    /// [`CAP_STREAM_RELAY`] in its stream greeting before `op: "relay"` is sent. A failure after
+    /// bytes were sent is never silently retried through another route.
     pub async fn open_content(
         &self,
         machine: &str,
@@ -2305,7 +2438,8 @@ impl Link {
             .await
     }
 
-    /// Like [`Link::open_content`], aborting the open handshake if `cancel` fires.
+    /// Like [`Link::open_content`], aborting the open handshake and the returned stream if `cancel`
+    /// fires.
     pub async fn open_content_with_cancel(
         &self,
         machine: &str,
@@ -2314,11 +2448,34 @@ impl Link {
         length: Option<u64>,
         cancel: CancellationToken,
     ) -> Result<ContentStream, ErrorBody> {
+        self.open_content_with_policy(
+            machine,
+            path,
+            offset,
+            length,
+            ContentRoutePolicy::Any,
+            cancel,
+        )
+        .await
+    }
+
+    /// Like [`Link::open_content_with_cancel`], enforcing `route_policy` so the open never falls
+    /// back outside the permitted direct entry or single pinned relay.
+    pub async fn open_content_with_policy(
+        &self,
+        machine: &str,
+        path: &str,
+        offset: u64,
+        length: Option<u64>,
+        route_policy: ContentRoutePolicy,
+        cancel: CancellationToken,
+    ) -> Result<ContentStream, ErrorBody> {
         self.open_content_inner(
             machine,
             path,
             offset,
             length,
+            route_policy,
             cancel,
             Some(Arc::clone(&self.inner.parked_streams)),
         )
@@ -2338,16 +2495,26 @@ impl Link {
         length: Option<u64>,
         cancel: CancellationToken,
     ) -> Result<ContentStream, ErrorBody> {
-        self.open_content_inner(machine, path, offset, length, cancel, None)
-            .await
+        self.open_content_inner(
+            machine,
+            path,
+            offset,
+            length,
+            ContentRoutePolicy::Any,
+            cancel,
+            None,
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn open_content_inner(
         &self,
         machine: &str,
         path: &str,
         offset: u64,
         length: Option<u64>,
+        route_policy: ContentRoutePolicy,
         cancel: CancellationToken,
         park_pool: Option<Arc<ParkedStreamPool>>,
     ) -> Result<ContentStream, ErrorBody> {
@@ -2360,14 +2527,307 @@ impl Link {
             );
         }
 
-        let (mut raw, opener, live, flight) = self
-            .open_stream_with_recovery(machine, cancel.clone())
-            .await
-            .map_err(|err| match err {
-                StreamOpenError::DeadSession(body)
-                | StreamOpenError::ChannelRefused(body)
-                | StreamOpenError::Failed(body) => body.with_machine(machine),
-            })?;
+        let entry = self
+            .inner
+            .config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .node(machine)
+            .cloned();
+
+        let allow_direct = !matches!(route_policy, ContentRoutePolicy::RelayOnly(_));
+        let allow_relay = !matches!(route_policy, ContentRoutePolicy::DirectOnly);
+        let pinned_relay: Option<&str> = match &route_policy {
+            ContentRoutePolicy::RelayOnly(relay) | ContentRoutePolicy::DirectOrRelay(relay) => {
+                Some(relay.as_str())
+            }
+            ContentRoutePolicy::Any | ContentRoutePolicy::DirectOnly => None,
+        };
+
+        // A local-only desktop pipe (e.g. `local`) cannot be relayed through remote SSH peers.
+        if allow_direct
+            && let Some(ref e) = entry
+            && e.local_program.is_some()
+            && e.target.is_none()
+        {
+            let stream = self
+                .open_content_direct(machine, path, offset, length, cancel, park_pool)
+                .await?;
+            self.record_route(machine, MachineRouteStatus::Direct);
+            return Ok(stream);
+        }
+
+        let entry_is_learned = entry
+            .as_ref()
+            .is_some_and(|e| e.origin == NodeOrigin::Learned);
+        let entry_learned_from = entry.as_ref().and_then(|e| e.learned_from.clone());
+        let in_unsynced_backoff = entry_is_learned && self.is_in_unsynced_backoff(machine);
+
+        let mut direct_err: Option<ErrorBody> = None;
+        let mut learned_auth_err: Option<ErrorBody> = None;
+
+        if allow_direct && entry.is_some() && !in_unsynced_backoff {
+            match self
+                .open_content_direct(
+                    machine,
+                    path,
+                    offset,
+                    length,
+                    cancel.clone(),
+                    park_pool.clone(),
+                )
+                .await
+            {
+                Ok(stream) => {
+                    self.clear_unsynced(machine);
+                    self.record_route(machine, MachineRouteStatus::Direct);
+                    return Ok(stream);
+                }
+                Err(err) => {
+                    if !allow_relay {
+                        return Err(err);
+                    }
+                    if !is_unsent(&err) {
+                        return Err(err);
+                    }
+                    if is_device_removed_or_unknown(&err) {
+                        if entry_is_learned {
+                            self.mark_unsynced(machine);
+                            learned_auth_err = Some(err);
+                        } else {
+                            return Err(err);
+                        }
+                    } else if matches!(err.code, ErrorCode::Unreachable | ErrorCode::Timeout) {
+                        direct_err = Some(err);
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        if !allow_relay {
+            if entry.is_none() {
+                return Err(ErrorBody::new(
+                    ErrorCode::Unreachable,
+                    format!("Can't reach {machine} right now."),
+                )
+                .with_machine(machine));
+            }
+            if in_unsynced_backoff {
+                match self
+                    .open_content_direct(machine, path, offset, length, cancel, park_pool)
+                    .await
+                {
+                    Ok(stream) => {
+                        self.clear_unsynced(machine);
+                        self.record_route(machine, MachineRouteStatus::Direct);
+                        return Ok(stream);
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+
+        let relays: Vec<String> = match pinned_relay {
+            Some(relay) => {
+                let configured = self
+                    .inner
+                    .config
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .node(relay)
+                    .is_some();
+                if configured && relay != machine {
+                    vec![relay.to_owned()]
+                } else {
+                    Vec::new()
+                }
+            }
+            None => self.relay_candidates(machine, entry_learned_from.as_deref()),
+        };
+        let mut last_relay_err: Option<ErrorBody> = None;
+        let mut relay_auth_err: Option<ErrorBody> = None;
+        let mut old_relay_err: Option<ErrorBody> = None;
+        let mut unknown_machine_err: Option<ErrorBody> = None;
+
+        for relay in relays {
+            match self
+                .open_content_via_relay(
+                    &relay,
+                    machine,
+                    path,
+                    offset,
+                    length,
+                    cancel.clone(),
+                    park_pool.clone(),
+                )
+                .await
+            {
+                Ok(stream) => {
+                    let status = if in_unsynced_backoff || learned_auth_err.is_some() {
+                        MachineRouteStatus::NotSyncedYet {
+                            introducer: entry_learned_from.clone(),
+                            via: Some(relay.clone()),
+                        }
+                    } else {
+                        MachineRouteStatus::Relay { via: relay }
+                    };
+                    self.record_route(machine, status);
+                    return Ok(stream);
+                }
+                Err(err) => {
+                    if is_relay_too_old(&err) {
+                        if old_relay_err.is_none() {
+                            old_relay_err = Some(err);
+                        }
+                        continue;
+                    }
+                    if is_unknown_machine(&err) {
+                        unknown_machine_err = Some(err);
+                        continue;
+                    }
+                    if !is_unsent(&err) {
+                        if in_unsynced_backoff || learned_auth_err.is_some() {
+                            self.record_route(
+                                machine,
+                                MachineRouteStatus::NotSyncedYet {
+                                    introducer: entry_learned_from.clone(),
+                                    via: None,
+                                },
+                            );
+                        }
+                        return Err(err);
+                    }
+                    if is_device_removed_or_unknown(&err) {
+                        let relay_is_learned = self.is_learned(&relay);
+                        if relay_is_learned {
+                            self.mark_unsynced(&relay);
+                        }
+                        if relay_auth_err.is_none() || !relay_is_learned {
+                            relay_auth_err = Some(err);
+                        }
+                    } else if matches!(err.code, ErrorCode::Unreachable | ErrorCode::Timeout) {
+                        last_relay_err = Some(err);
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        if allow_direct && in_unsynced_backoff {
+            match self
+                .open_content_direct(machine, path, offset, length, cancel, park_pool)
+                .await
+            {
+                Ok(stream) => {
+                    self.clear_unsynced(machine);
+                    self.record_route(machine, MachineRouteStatus::Direct);
+                    return Ok(stream);
+                }
+                Err(err) => {
+                    if is_device_removed_or_unknown(&err) {
+                        learned_auth_err = Some(err);
+                    } else if direct_err.is_none() {
+                        direct_err = Some(err);
+                    }
+                }
+            }
+        }
+
+        if let Some(relay) = pinned_relay
+            && direct_err.is_none()
+            && last_relay_err.is_none()
+            && relay_auth_err.is_none()
+            && old_relay_err.is_none()
+            && learned_auth_err.is_none()
+            && unknown_machine_err.is_none()
+        {
+            return Err(ErrorBody::new(
+                ErrorCode::Unreachable,
+                format!("Can't reach {relay} right now."),
+            )
+            .with_machine(relay));
+        }
+
+        Err(self.resolve_stream_fallback_error(
+            machine,
+            entry_learned_from,
+            in_unsynced_backoff,
+            learned_auth_err,
+            direct_err,
+            relay_auth_err,
+            old_relay_err,
+            last_relay_err,
+            unknown_machine_err,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_stream_fallback_error(
+        &self,
+        machine: &str,
+        entry_learned_from: Option<String>,
+        in_unsynced_backoff: bool,
+        learned_auth_err: Option<ErrorBody>,
+        direct_err: Option<ErrorBody>,
+        relay_auth_err: Option<ErrorBody>,
+        old_relay_err: Option<ErrorBody>,
+        last_relay_err: Option<ErrorBody>,
+        unknown_machine_err: Option<ErrorBody>,
+    ) -> ErrorBody {
+        if let Some(auth_err) = relay_auth_err {
+            if learned_auth_err.is_none() && !in_unsynced_backoff {
+                self.clear_unsynced(machine);
+            }
+            return auth_err;
+        }
+        if let Some(old_err) = old_relay_err {
+            if in_unsynced_backoff || learned_auth_err.is_some() {
+                self.mark_unsynced(machine);
+                self.record_route(
+                    machine,
+                    MachineRouteStatus::NotSyncedYet {
+                        introducer: entry_learned_from,
+                        via: None,
+                    },
+                );
+            } else if direct_err.is_some()
+                && let Some(relay_name) = old_err
+                    .details
+                    .as_ref()
+                    .and_then(|d| d.get("relay"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| old_err.machine.clone())
+            {
+                self.record_route(machine, MachineRouteStatus::Relay { via: relay_name });
+            }
+            return attach_direct_error(old_err, learned_auth_err.as_ref().or(direct_err.as_ref()));
+        }
+        if let Some(auth_err) = learned_auth_err {
+            self.clear_unsynced(machine);
+            return auth_err;
+        }
+        if let Some(err) = direct_err.or(last_relay_err) {
+            return err;
+        }
+        let _ = unknown_machine_err;
+        unknown_machine_error(machine)
+    }
+
+    async fn open_content_direct(
+        &self,
+        machine: &str,
+        path: &str,
+        offset: u64,
+        length: Option<u64>,
+        cancel: CancellationToken,
+        park_pool: Option<Arc<ParkedStreamPool>>,
+    ) -> Result<ContentStream, ErrorBody> {
+        let (mut raw, opener, live, flight) =
+            self.open_stream_on_peer(machine, cancel.clone()).await?;
 
         // Attach the in-flight session guard to the raw channel's lifecycle guard rather than to
         // `ContentStream` itself so parking an idle stream releases both its SSH channel slot and
@@ -2377,7 +2837,7 @@ impl Link {
 
         let reopener: Arc<dyn crate::content::StreamOpener> = Arc::new(LinkStreamOpener {
             link: self.clone(),
-            machine: machine.to_owned(),
+            peer: machine.to_owned(),
             window_policy: opener.window_policy(),
         });
 
@@ -2401,6 +2861,64 @@ impl Link {
                 ..ContentStreamOptions::default()
             },
             Some(&record_caps),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn open_content_via_relay(
+        &self,
+        relay: &str,
+        machine: &str,
+        path: &str,
+        offset: u64,
+        length: Option<u64>,
+        cancel: CancellationToken,
+        park_pool: Option<Arc<ParkedStreamPool>>,
+    ) -> Result<ContentStream, ErrorBody> {
+        if self.stream_supports(relay, CAP_STREAM_RELAY) == Some(false) {
+            return Err(relay_too_old_error(relay, machine));
+        }
+        let (mut raw, opener, relay_live, flight) =
+            self.open_stream_on_peer(relay, cancel.clone()).await?;
+        let prev_guard = raw.guard.take();
+        raw.guard = Some(Box::new((prev_guard, flight)));
+
+        let greeted = greet_raw_stream(
+            raw,
+            relay,
+            CONTENT_STREAM_BUF_BYTES,
+            self.inner.options.ssh_timeouts.handshake,
+            &cancel,
+        )
+        .await?;
+        relay_live.record_stream_capabilities(greeted.capabilities.clone());
+        if !greeted.capabilities.iter().any(|c| c == CAP_STREAM_RELAY) {
+            greeted.cancel.cancel();
+            return Err(relay_too_old_error(relay, machine));
+        }
+
+        let reopener: Arc<dyn crate::content::StreamOpener> = Arc::new(LinkStreamOpener {
+            link: self.clone(),
+            peer: relay.to_owned(),
+            window_policy: opener.window_policy(),
+        });
+
+        handshake_get_relayed(
+            greeted,
+            Some(reopener),
+            machine,
+            relay,
+            path,
+            offset,
+            length,
+            relay_live.config_snapshot.principal.as_deref(),
+            self.inner.options.ssh_timeouts.handshake,
+            cancel,
+            ContentStreamOptions {
+                park_pool,
+                ..ContentStreamOptions::default()
+            },
         )
         .await
     }
@@ -2434,12 +2952,10 @@ impl Link {
             .map(|caps| caps.iter().any(|c| c == capability))
     }
 
-    /// Opens a resumable bulk-pipe upload (`legion stream`'s `put`) to `request.path` on `machine`
-    /// over the session this [`Link`] holds for `machine`.
+    /// Opens a resumable bulk-pipe upload (`legion stream`'s `put`) to `request.path` on `machine`,
+    /// using the same direct-first with relay fallback routing as [`Link::call_machine`].
     ///
-    /// Follows the same routing and identity rules as [`Link::open_content`]: `machine` must be
-    /// configured on this [`Link`], its pinned host keys and `hello.node` identity are verified,
-    /// and uploads never fall back to another machine.
+    /// A failure after request bytes were sent is never silently retried through another route.
     pub async fn open_put(
         &self,
         machine: &str,
@@ -2467,14 +2983,164 @@ impl Link {
         }
         validate_blake3_hash(&request.hash, machine)?;
 
-        let (raw, _opener, live, flight) = self
-            .open_stream_with_recovery(machine, cancel.clone())
-            .await
-            .map_err(|err| match err {
-                StreamOpenError::DeadSession(body)
-                | StreamOpenError::ChannelRefused(body)
-                | StreamOpenError::Failed(body) => body.with_machine(machine),
-            })?;
+        let entry = self
+            .inner
+            .config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .node(machine)
+            .cloned();
+
+        // A local-only desktop pipe (e.g. `local`) cannot be relayed through remote SSH peers.
+        if let Some(ref e) = entry
+            && e.local_program.is_some()
+            && e.target.is_none()
+        {
+            let stream = self.open_put_direct(machine, &request, cancel).await?;
+            self.record_route(machine, MachineRouteStatus::Direct);
+            return Ok(stream);
+        }
+
+        let entry_is_learned = entry
+            .as_ref()
+            .is_some_and(|e| e.origin == NodeOrigin::Learned);
+        let entry_learned_from = entry.as_ref().and_then(|e| e.learned_from.clone());
+        let in_unsynced_backoff = entry_is_learned && self.is_in_unsynced_backoff(machine);
+
+        let mut direct_err: Option<ErrorBody> = None;
+        let mut learned_auth_err: Option<ErrorBody> = None;
+
+        if entry.is_some() && !in_unsynced_backoff {
+            match self
+                .open_put_direct(machine, &request, cancel.clone())
+                .await
+            {
+                Ok(stream) => {
+                    self.clear_unsynced(machine);
+                    self.record_route(machine, MachineRouteStatus::Direct);
+                    return Ok(stream);
+                }
+                Err(err) => {
+                    if !is_unsent(&err) {
+                        return Err(err);
+                    }
+                    if is_device_removed_or_unknown(&err) {
+                        if entry_is_learned {
+                            self.mark_unsynced(machine);
+                            learned_auth_err = Some(err);
+                        } else {
+                            return Err(err);
+                        }
+                    } else if matches!(err.code, ErrorCode::Unreachable | ErrorCode::Timeout) {
+                        direct_err = Some(err);
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        let relays = self.relay_candidates(machine, entry_learned_from.as_deref());
+        let mut last_relay_err: Option<ErrorBody> = None;
+        let mut relay_auth_err: Option<ErrorBody> = None;
+        let mut old_relay_err: Option<ErrorBody> = None;
+        let mut unknown_machine_err: Option<ErrorBody> = None;
+
+        for relay in relays {
+            match self
+                .open_put_via_relay(&relay, machine, &request, cancel.clone())
+                .await
+            {
+                Ok(stream) => {
+                    let status = if in_unsynced_backoff || learned_auth_err.is_some() {
+                        MachineRouteStatus::NotSyncedYet {
+                            introducer: entry_learned_from.clone(),
+                            via: Some(relay.clone()),
+                        }
+                    } else {
+                        MachineRouteStatus::Relay { via: relay }
+                    };
+                    self.record_route(machine, status);
+                    return Ok(stream);
+                }
+                Err(err) => {
+                    if is_relay_too_old(&err) {
+                        if old_relay_err.is_none() {
+                            old_relay_err = Some(err);
+                        }
+                        continue;
+                    }
+                    if is_unknown_machine(&err) {
+                        unknown_machine_err = Some(err);
+                        continue;
+                    }
+                    if !is_unsent(&err) {
+                        if in_unsynced_backoff || learned_auth_err.is_some() {
+                            self.record_route(
+                                machine,
+                                MachineRouteStatus::NotSyncedYet {
+                                    introducer: entry_learned_from.clone(),
+                                    via: None,
+                                },
+                            );
+                        }
+                        return Err(err);
+                    }
+                    if is_device_removed_or_unknown(&err) {
+                        let relay_is_learned = self.is_learned(&relay);
+                        if relay_is_learned {
+                            self.mark_unsynced(&relay);
+                        }
+                        if relay_auth_err.is_none() || !relay_is_learned {
+                            relay_auth_err = Some(err);
+                        }
+                    } else if matches!(err.code, ErrorCode::Unreachable | ErrorCode::Timeout) {
+                        last_relay_err = Some(err);
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        if in_unsynced_backoff {
+            match self.open_put_direct(machine, &request, cancel).await {
+                Ok(stream) => {
+                    self.clear_unsynced(machine);
+                    self.record_route(machine, MachineRouteStatus::Direct);
+                    return Ok(stream);
+                }
+                Err(err) => {
+                    if is_device_removed_or_unknown(&err) {
+                        learned_auth_err = Some(err);
+                    } else if direct_err.is_none() {
+                        direct_err = Some(err);
+                    }
+                }
+            }
+        }
+
+        Err(self.resolve_stream_fallback_error(
+            machine,
+            entry_learned_from,
+            in_unsynced_backoff,
+            learned_auth_err,
+            direct_err,
+            relay_auth_err,
+            old_relay_err,
+            last_relay_err,
+            unknown_machine_err,
+        ))
+    }
+
+    async fn open_put_direct(
+        &self,
+        machine: &str,
+        request: &PutRequest,
+        cancel: CancellationToken,
+    ) -> Result<PutStream, ErrorBody> {
+        let (raw, _opener, live, flight) =
+            self.open_stream_on_peer(machine, cancel.clone()).await?;
 
         let cap_session = live.clone();
         let record_caps = move |caps: Vec<String>| {
@@ -2484,18 +3150,86 @@ impl Link {
         let mut stream = handshake_put(
             raw,
             machine,
-            &request,
+            request,
             live.config_snapshot.principal.as_deref(),
             self.inner.options.ssh_timeouts.handshake,
             cancel,
             Some(&record_caps),
         )
         .await?;
-        if stream.no_replace_confirmed() {
-            live.record_stream_capabilities(vec![CAP_PUT_NO_REPLACE.to_owned()]);
-        }
         stream.attach_flight(Box::new(flight));
         Ok(stream)
+    }
+
+    async fn open_put_via_relay(
+        &self,
+        relay: &str,
+        machine: &str,
+        request: &PutRequest,
+        cancel: CancellationToken,
+    ) -> Result<PutStream, ErrorBody> {
+        if self.stream_supports(relay, CAP_STREAM_RELAY) == Some(false) {
+            return Err(relay_too_old_error(relay, machine));
+        }
+        let (raw, _opener, relay_live, flight) =
+            self.open_stream_on_peer(relay, cancel.clone()).await?;
+
+        let greeted = greet_raw_stream(
+            raw,
+            relay,
+            PUT_STREAM_BUF_BYTES,
+            self.inner.options.ssh_timeouts.handshake,
+            &cancel,
+        )
+        .await?;
+        relay_live.record_stream_capabilities(greeted.capabilities.clone());
+        if !greeted.capabilities.iter().any(|c| c == CAP_STREAM_RELAY) {
+            greeted.cancel.cancel();
+            return Err(relay_too_old_error(relay, machine));
+        }
+
+        let mut stream = handshake_put_relayed(
+            greeted,
+            machine,
+            relay,
+            request,
+            relay_live.config_snapshot.principal.as_deref(),
+            self.inner.options.ssh_timeouts.handshake,
+            cancel,
+        )
+        .await?;
+        stream.attach_flight(Box::new(flight));
+        Ok(stream)
+    }
+
+    async fn open_stream_on_peer(
+        &self,
+        peer: &str,
+        cancel: CancellationToken,
+    ) -> Result<
+        (
+            crate::content::RawStream,
+            Arc<dyn crate::content::StreamOpener>,
+            LiveSession,
+            InFlightGuard,
+        ),
+        ErrorBody,
+    > {
+        self.open_stream_with_recovery(peer, cancel)
+            .await
+            .map_err(|err| match err {
+                StreamOpenError::DeadSession(body) | StreamOpenError::ChannelRefused(body) => {
+                    mark_not_sent(body.with_machine(peer))
+                }
+                StreamOpenError::Failed(body) => {
+                    let body = body.with_machine(peer);
+                    if matches!(body.code, ErrorCode::Unreachable | ErrorCode::Timeout) {
+                        mark_not_sent(body)
+                    } else {
+                        body
+                    }
+                }
+            })
     }
 
     fn try_claim_channel_refused_reconnect(&self, machine: &str) -> bool {
@@ -2630,10 +3364,10 @@ fn is_channel_refused_with_free_permits(body: &ErrorBody) -> bool {
 
 /// Session-backed [`crate::content::StreamOpener`] used by [`ContentStream`] when reopening a
 /// parked or idle-closed channel, transparently acquiring the current (or freshly reconnected)
-/// session for `machine`.
+/// session for `peer` (either the direct target machine or the relay carrying it).
 struct LinkStreamOpener {
     link: Link,
-    machine: String,
+    peer: String,
     window_policy: Option<crate::content::WindowPolicy>,
 }
 
@@ -2650,7 +3384,7 @@ impl crate::content::StreamOpener for LinkStreamOpener {
         Box::pin(async move {
             let (mut raw, _, _, flight) = self
                 .link
-                .open_stream_with_recovery(&self.machine, cancel)
+                .open_stream_with_recovery(&self.peer, cancel)
                 .await?;
             let prev_guard = raw.guard.take();
             raw.guard = Some(Box::new((prev_guard, flight)));
@@ -3279,6 +4013,73 @@ fn is_device_removed_or_unknown(err: &ErrorBody) -> bool {
             == Some(crate::REASON_DEVICE_REMOVED_OR_UNKNOWN)
 }
 
+fn is_relay_too_old(err: &ErrorBody) -> bool {
+    err.code == ErrorCode::Unsupported
+        && err
+            .details
+            .as_ref()
+            .and_then(|d| d.get("reason"))
+            .and_then(Value::as_str)
+            == Some(crate::REASON_RELAY_TOO_OLD)
+}
+
+fn is_unknown_machine(err: &ErrorBody) -> bool {
+    err.code == ErrorCode::NotFound
+        && err
+            .details
+            .as_ref()
+            .and_then(|d| d.get("reason"))
+            .and_then(Value::as_str)
+            == Some(crate::REASON_UNKNOWN_MACHINE)
+}
+
+fn attach_direct_error(mut err: ErrorBody, direct: Option<&ErrorBody>) -> ErrorBody {
+    if let Some(direct_err) = direct
+        && let Ok(direct_val) = serde_json::to_value(direct_err)
+    {
+        let mut details = err.details.take().unwrap_or_else(|| json!({}));
+        if let Some(obj) = details.as_object_mut() {
+            obj.insert("direct_error".to_owned(), direct_val);
+        } else {
+            details = json!({
+                "detail": details,
+                "direct_error": direct_val,
+            });
+        }
+        err.details = Some(details);
+    }
+    err
+}
+
+fn relay_too_old_error(relay: &str, target: &str) -> ErrorBody {
+    ErrorBody::new(
+        ErrorCode::Unsupported,
+        format!("{relay} needs an update before it can pass files along from {target}."),
+    )
+    .with_hint(format!(
+        "Update legion on {relay} so it advertises `{CAP_STREAM_RELAY}`."
+    ))
+    .with_machine(relay)
+    .with_details(json!({
+        "reason": crate::REASON_RELAY_TOO_OLD,
+        "relay": relay,
+        "target": target,
+    }))
+}
+
+fn unknown_machine_error(machine: &str) -> ErrorBody {
+    ErrorBody::new(
+        ErrorCode::NotFound,
+        format!("This device doesn't know a machine called {machine}."),
+    )
+    .with_hint("Pair with that machine or check its name in the fleet.")
+    .with_machine(machine)
+    .with_details(json!({
+        "reason": crate::REASON_UNKNOWN_MACHINE,
+        "target": machine,
+    }))
+}
+
 #[derive(Deserialize)]
 struct EndpointAnswer {
     node: String,
@@ -3292,36 +4093,78 @@ fn parse_and_validate_endpoint(
     expected_machine: &str,
     value: &Value,
     allow_loopback: bool,
-) -> Result<SshTarget, ()> {
-    let ep: EndpointAnswer = serde_json::from_value(value.clone()).map_err(|_| ())?;
+) -> Result<SshTarget, (&'static str, String)> {
+    let ep: EndpointAnswer = serde_json::from_value(value.clone()).map_err(|err| {
+        (
+            "malformed_endpoint",
+            format!("Malformed endpoint JSON: {err}."),
+        )
+    })?;
     if ep.node != expected_machine {
-        return Err(());
+        return Err((
+            "name_mismatch",
+            format!(
+                "Fleet knows this machine as `{expected_machine}`, but it reported its own name as `{}`.",
+                ep.node
+            ),
+        ));
     }
     if ep.node.len() > MAX_ENDPOINT_FIELD_LEN || ep.user.len() > MAX_ENDPOINT_FIELD_LEN {
-        return Err(());
+        return Err((
+            "malformed_endpoint",
+            format!("Endpoint node or user field exceeds {MAX_ENDPOINT_FIELD_LEN} bytes."),
+        ));
     }
-    crate::invite::validate_token_field("node", &ep.node).map_err(|_| ())?;
-    crate::invite::validate_token_field("user", &ep.user).map_err(|_| ())?;
-    if ep.port == 0 || ep.hosts.is_empty() || ep.hosts.len() > MAX_ENDPOINT_HOSTS {
-        return Err(());
+    crate::invite::validate_token_field("node", &ep.node)
+        .map_err(|err| ("malformed_endpoint", err.message))?;
+    crate::invite::validate_token_field("user", &ep.user)
+        .map_err(|err| ("malformed_endpoint", err.message))?;
+    if ep.port == 0 {
+        return Err((
+            "malformed_endpoint",
+            "Endpoint port must be non-zero.".to_owned(),
+        ));
+    }
+    if ep.hosts.is_empty() || ep.hosts.len() > MAX_ENDPOINT_HOSTS {
+        return Err((
+            "malformed_endpoint",
+            format!("Endpoint must list between 1 and {MAX_ENDPOINT_HOSTS} hosts."),
+        ));
     }
     for host in &ep.hosts {
         if host.len() > MAX_ENDPOINT_FIELD_LEN {
-            return Err(());
+            return Err((
+                "malformed_endpoint",
+                format!("Endpoint host exceeds {MAX_ENDPOINT_FIELD_LEN} bytes."),
+            ));
         }
-        crate::invite::validate_token_field("hosts", host).map_err(|_| ())?;
+        crate::invite::validate_token_field("hosts", host)
+            .map_err(|err| ("malformed_endpoint", err.message))?;
         if !is_allowed_endpoint_host(host, allow_loopback) {
-            return Err(());
+            return Err((
+                "malformed_endpoint",
+                format!("Endpoint host `{host}` is not an allowed address."),
+            ));
         }
     }
     if ep.host_keys.is_empty() || ep.host_keys.len() > MAX_ENDPOINT_HOST_KEYS {
-        return Err(());
+        return Err((
+            "malformed_endpoint",
+            format!("Endpoint must list between 1 and {MAX_ENDPOINT_HOST_KEYS} host keys."),
+        ));
     }
     for (idx, line) in ep.host_keys.iter().enumerate() {
         if line.len() > MAX_ENDPOINT_HOST_KEY_LEN {
-            return Err(());
+            return Err((
+                "malformed_endpoint",
+                format!(
+                    "Endpoint host key #{} exceeds {MAX_ENDPOINT_HOST_KEY_LEN} bytes.",
+                    idx + 1
+                ),
+            ));
         }
-        crate::invite::validate_openssh_public_key_line(idx, line).map_err(|_| ())?;
+        crate::invite::validate_openssh_public_key_line(idx, line)
+            .map_err(|err| ("malformed_endpoint", err.message))?;
     }
     Ok(SshTarget {
         hosts: ep.hosts,
@@ -3579,18 +4422,8 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     out
 }
 
-fn mark_not_sent(mut err: ErrorBody) -> ErrorBody {
-    let mut details = err.details.take().unwrap_or_else(|| json!({}));
-    if let Some(obj) = details.as_object_mut() {
-        obj.insert(crate::DETAIL_SENT.to_owned(), Value::Bool(false));
-    } else {
-        details = json!({
-            crate::DETAIL_SENT: false,
-            "detail": details,
-        });
-    }
-    err.details = Some(details);
-    err
+fn mark_not_sent(err: ErrorBody) -> ErrorBody {
+    crate::mark_not_sent(err)
 }
 
 fn classify_open_error(node: &str, mut err: ErrorBody) -> ErrorBody {
@@ -7203,6 +8036,1409 @@ mod tests {
             "tower"
         );
         assert!(link.config().node("studio").is_none());
+        link.close().await;
+    }
+
+    #[tokio::test]
+    async fn learn_rejections_record_structured_reasons_for_all_four_causes() {
+        let key_tower = test_host_key(140);
+        let key_shared_pair = test_host_key(141);
+        let key_older_mismatch = test_host_key(142);
+        let key_malformed = test_host_key(143);
+
+        let answers: Arc<Mutex<HashMap<String, Value>>> = Arc::new(Mutex::new(HashMap::new()));
+        let answers_c = Arc::clone(&answers);
+        let opener: SessionOpener = Arc::new(move |entry, _, cancel| {
+            let answers_c = Arc::clone(&answers_c);
+            Box::pin(async move {
+                let node_name = entry.node.clone();
+                let (client, server) = tokio::io::duplex(64 * 1024);
+                let (client_r, client_w) = tokio::io::split(client);
+                tokio::spawn(async move {
+                    let (server_r, mut server_w) = tokio::io::split(server);
+                    let mut lines = BufReader::new(server_r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let req: Request = serde_json::from_str(&line).unwrap();
+                        let resp = if req.method == method::HELLO {
+                            Response::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: node_name.clone(),
+                                    node_explicit: None,
+                                    node_id: None,
+                                    version: "0.1.0".to_owned(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: Vec::new(),
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap(),
+                            )
+                        } else {
+                            let body = answers_c
+                                .lock()
+                                .unwrap()
+                                .get(&node_name)
+                                .cloned()
+                                .unwrap_or_else(|| json!({ "results": {} }));
+                            Response::ok(req.id, body)
+                        };
+                        let _ = server_w
+                            .write_all(
+                                format!("{}\n", serde_json::to_string(&resp).unwrap()).as_bytes(),
+                            )
+                            .await;
+                        let _ = server_w.flush().await;
+                    }
+                });
+                Session::open_io(
+                    client_r,
+                    client_w,
+                    &entry.node,
+                    None,
+                    Duration::from_secs(5),
+                    cancel,
+                )
+                .await
+            })
+        });
+
+        let link = Link::with_opener(
+            LinkConfig {
+                device_key: Some("dummy".to_owned()),
+                nodes: vec![NodeLink::ssh(
+                    "tower",
+                    SshTarget {
+                        hosts: vec!["tower.example.net".to_owned()],
+                        port: 22,
+                        user: "me".to_owned(),
+                        host_keys: vec![key_tower.clone()],
+                    },
+                    Some("device:pixel".to_owned()),
+                )],
+                forgotten_nodes: Vec::new(),
+            },
+            LinkOptions::default(),
+            opener,
+        );
+
+        // Part A: name_mismatch (both new error.code == "name_mismatch" AND older ok-with-wrong-name),
+        // malformed_endpoint, shared_host_keys (both vs existing paired node and in-batch pair).
+        answers.lock().unwrap().insert(
+            "tower".to_owned(),
+            json!({
+                "results": {
+                    "studio": {
+                        "error": {
+                            "code": "conflict",
+                            "message": "studio calls itself someones-laptop.",
+                            "hint": "Run legion fleet.sync.",
+                            "details": {
+                                "kind": "name_mismatch",
+                                "expected": "studio",
+                                "reported": "someones-laptop"
+                            }
+                        }
+                    },
+                    "legacy-misnamed": {
+                        "ok": {
+                            "node": "other-box",
+                            "hosts": ["legacy.example.net"],
+                            "port": 22,
+                            "user": "me",
+                            "host_keys": [key_older_mismatch],
+                        }
+                    },
+                    "bad-host": {
+                        "ok": {
+                            "node": "bad-host",
+                            "hosts": ["127.0.0.1"],
+                            "port": 22,
+                            "user": "me",
+                            "host_keys": [key_malformed],
+                        }
+                    },
+                    "clone-of-tower": {
+                        "ok": {
+                            "node": "clone-of-tower",
+                            "hosts": ["clone.example.net"],
+                            "port": 22,
+                            "user": "me",
+                            "host_keys": [key_tower],
+                        }
+                    },
+                    "twin-a": {
+                        "ok": {
+                            "node": "twin-a",
+                            "hosts": ["twin-a.example.net"],
+                            "port": 22,
+                            "user": "me",
+                            "host_keys": [key_shared_pair],
+                        }
+                    },
+                    "twin-b": {
+                        "ok": {
+                            "node": "twin-b",
+                            "hosts": ["twin-b.example.net"],
+                            "port": 22,
+                            "user": "me",
+                            "host_keys": [key_shared_pair],
+                        }
+                    },
+                    "sleeping": {
+                        "error": {
+                            "code": "unreachable",
+                            "message": "sleeping did not answer."
+                        }
+                    }
+                }
+            }),
+        );
+
+        let r1 = link.learn().await.unwrap();
+        assert_eq!(r1.unreachable, vec!["sleeping".to_owned()]);
+        assert!(
+            !r1.unreachable.contains(&"studio".to_owned()),
+            "name_mismatch error must be a rejection, never unreachable: {r1:?}"
+        );
+
+        let by_machine: HashMap<String, &LearnRejection> = r1
+            .rejected_details
+            .iter()
+            .map(|r| (r.machine.clone(), r))
+            .collect();
+
+        let studio = by_machine.get("studio").expect("studio rejection missing");
+        assert_eq!(studio.code, "name_mismatch");
+        assert_eq!(studio.reason, "studio calls itself someones-laptop.");
+        assert_eq!(studio.reported_by.as_deref(), Some("tower"));
+
+        let legacy = by_machine
+            .get("legacy-misnamed")
+            .expect("legacy-misnamed rejection missing");
+        assert_eq!(legacy.code, "name_mismatch");
+        assert!(
+            legacy.reason.contains("other-box"),
+            "older ok wrong-name rejection should name what the machine reported: {}",
+            legacy.reason
+        );
+
+        let bad_host = by_machine
+            .get("bad-host")
+            .expect("bad-host rejection missing");
+        assert_eq!(bad_host.code, "malformed_endpoint");
+
+        let clone_tower = by_machine
+            .get("clone-of-tower")
+            .expect("clone-of-tower rejection missing");
+        assert_eq!(clone_tower.code, "shared_host_keys");
+
+        let twin_a = by_machine.get("twin-a").expect("twin-a rejection missing");
+        let twin_b = by_machine.get("twin-b").expect("twin-b rejection missing");
+        assert_eq!(twin_a.code, "shared_host_keys");
+        assert_eq!(twin_b.code, "shared_host_keys");
+
+        // Part B: exceeding MAX_CONFIGURED_NODES records `too_many`.
+        let mut big = serde_json::Map::new();
+        for i in 0..=MAX_CONFIGURED_NODES {
+            let name = format!("node-{i:03}");
+            let key = test_host_key((150 + i) as u8);
+            big.insert(
+                name.clone(),
+                json!({
+                    "ok": {
+                        "node": name,
+                        "hosts": [format!("n{i}.example.net")],
+                        "port": 22,
+                        "user": "me",
+                        "host_keys": [key],
+                    }
+                }),
+            );
+        }
+        answers
+            .lock()
+            .unwrap()
+            .insert("tower".to_owned(), json!({ "results": Value::Object(big) }));
+        let r2 = link.learn().await.unwrap();
+        assert!(
+            r2.rejected_details.iter().any(|r| r.code == "too_many"),
+            "expected too_many rejection when exceeding MAX_CONFIGURED_NODES: {:?}",
+            r2.rejected_details
+        );
+
+        link.close().await;
+    }
+
+    #[tokio::test]
+    async fn relayed_streams_route_through_paired_node_respect_no_midstream_failover_and_switch_to_direct()
+     {
+        use crate::content::{RawStream, StreamOpener};
+        use crate::session::TransportHandle;
+        use tokio::io::AsyncReadExt;
+
+        struct RelayTestTransport {
+            opener: Arc<dyn StreamOpener>,
+        }
+        impl TransportHandle for RelayTestTransport {
+            fn collect_exit_info(
+                &mut self,
+                _wait_limit: Duration,
+            ) -> Pin<Box<dyn Future<Output = (Option<i32>, String)> + Send + '_>> {
+                Box::pin(async { (Some(0), String::new()) })
+            }
+            fn close(
+                self: Box<Self>,
+                _grace: Duration,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                Box::pin(async {})
+            }
+            fn stream_opener(&self) -> Option<Arc<dyn StreamOpener>> {
+                Some(Arc::clone(&self.opener))
+            }
+        }
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum DirectMode {
+            FailBeforeSend,
+            FailAfterSend,
+            ServeDirect,
+        }
+
+        struct RelayAwareOpener {
+            node: String,
+            payload: Arc<Vec<u8>>,
+            direct_mode: Arc<Mutex<DirectMode>>,
+            uploaded: Arc<Mutex<Vec<u8>>>,
+            relay_opens: Arc<AtomicUsize>,
+            direct_opens: Arc<AtomicUsize>,
+        }
+
+        impl StreamOpener for RelayAwareOpener {
+            fn open_stream(
+                &self,
+                _cancel: CancellationToken,
+            ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>>
+            {
+                let node = self.node.clone();
+                let payload = Arc::clone(&self.payload);
+                let direct_mode = Arc::clone(&self.direct_mode);
+                let uploaded = Arc::clone(&self.uploaded);
+                let relay_opens = Arc::clone(&self.relay_opens);
+                let direct_opens = Arc::clone(&self.direct_opens);
+                Box::pin(async move {
+                    if node == "studio" {
+                        direct_opens.fetch_add(1, Ordering::SeqCst);
+                        let mode = *direct_mode.lock().unwrap();
+                        if mode == DirectMode::FailBeforeSend {
+                            return Err(StreamOpenError::Failed(
+                                ErrorBody::new(
+                                    ErrorCode::Unreachable,
+                                    "direct ssh channel refused",
+                                )
+                                .with_machine("studio"),
+                            ));
+                        }
+                        let (client_in, mut server_out) = tokio::io::duplex(64 * 1024);
+                        let (server_in, client_out) = tokio::io::duplex(64 * 1024);
+                        tokio::spawn(async move {
+                            let mut reader = BufReader::new(server_in);
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                                return;
+                            }
+                            if mode == DirectMode::FailAfterSend {
+                                // Emit greeting then drop mid-handshake (after client sent header).
+                                let _ = server_out
+                                    .write_all(
+                                        format!(
+                                            "{}\n",
+                                            json!({
+                                                "protocol": 1,
+                                                "capabilities": [CAP_STREAM_RELAY]
+                                            })
+                                        )
+                                        .as_bytes(),
+                                    )
+                                    .await;
+                                let _ = server_out
+                                    .write_all(
+                                        format!(
+                                            "{}\n",
+                                            json!({
+                                                "error": {
+                                                    "code": "unreachable",
+                                                    "message": "dropped after request sent",
+                                                    "machine": "studio"
+                                                }
+                                            })
+                                        )
+                                        .as_bytes(),
+                                    )
+                                    .await;
+                                return;
+                            }
+                            let _ = server_out
+                                .write_all(
+                                    format!(
+                                        "{}\n",
+                                        json!({
+                                            "protocol": 1,
+                                            "capabilities": [CAP_STREAM_RELAY]
+                                        })
+                                    )
+                                    .as_bytes(),
+                                )
+                                .await;
+                            let req: Value = serde_json::from_str(&line).unwrap();
+                            match req["op"].as_str().unwrap_or("") {
+                                "get" => {
+                                    let offset = req["offset"].as_u64().unwrap_or(0) as usize;
+                                    let len = req
+                                        .get("length")
+                                        .and_then(Value::as_u64)
+                                        .map_or(payload.len() - offset, |n| {
+                                            (n as usize).min(payload.len() - offset)
+                                        });
+                                    let keep_open =
+                                        req.get("keep_open").and_then(Value::as_bool) == Some(true);
+                                    let mut ready = json!({
+                                        "size": payload.len(),
+                                        "offset": offset,
+                                        "length": len,
+                                        "mtime": { "secs": 1_700_000_000i64, "nanos": 0u32 },
+                                        "file_id": 7u64,
+                                    });
+                                    if keep_open {
+                                        ready["keep_open"] = json!(true);
+                                    }
+                                    let _ =
+                                        server_out.write_all(format!("{ready}\n").as_bytes()).await;
+                                    let _ =
+                                        server_out.write_all(&payload[offset..offset + len]).await;
+                                    if keep_open {
+                                        let _ = server_out.write_all(b"{\"done\":true}\n").await;
+                                    }
+                                }
+                                "put" => {
+                                    let size = req["size"].as_u64().unwrap() as usize;
+                                    let hash = req["hash"].as_str().unwrap().to_owned();
+                                    let _ = server_out.write_all(b"{\"offset\":0}\n").await;
+                                    let mut buf = vec![0u8; size];
+                                    reader.read_exact(&mut buf).await.unwrap();
+                                    *uploaded.lock().unwrap() = buf;
+                                    let _ = server_out
+                                        .write_all(
+                                            format!(
+                                                "{}\n",
+                                                json!({ "ok": true, "size": size, "hash": hash })
+                                            )
+                                            .as_bytes(),
+                                        )
+                                        .await;
+                                }
+                                _ => {}
+                            }
+                        });
+                        return Ok(RawStream {
+                            reader: Box::new(client_in),
+                            writer: Box::new(client_out),
+                            stderr: None,
+                            cancel: CancellationToken::new(),
+                            park: None,
+                            guard: None,
+                        });
+                    }
+
+                    // Relay node `tower`: emits greeting with `stream.relay` immediately before
+                    // reading stdin, and handles `op: "relay"` (including `keep_open` multi-window).
+                    relay_opens.fetch_add(1, Ordering::SeqCst);
+                    let (client_in, mut server_out) = tokio::io::duplex(64 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(64 * 1024);
+                    tokio::spawn(async move {
+                        let _ = server_out
+                            .write_all(
+                                format!(
+                                    "{}\n",
+                                    json!({
+                                        "protocol": 1,
+                                        "capabilities": [CAP_STREAM_RELAY]
+                                    })
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                        let mut reader = BufReader::new(server_in);
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                                break;
+                            }
+                            let env: Value = serde_json::from_str(&line).unwrap();
+                            assert_eq!(env["op"], json!("relay"));
+                            let target = env["on"].as_str().unwrap_or("");
+                            if target != "studio" {
+                                let _ = server_out
+                                    .write_all(
+                                        format!(
+                                            "{}\n",
+                                            json!({
+                                                "error": {
+                                                    "code": "not_found",
+                                                    "message": format!("No machine called `{target}` in fleet.toml."),
+                                                    "machine": "tower",
+                                                    "details": { "reason": "unknown_machine", "target": target }
+                                                }
+                                            })
+                                        )
+                                        .as_bytes(),
+                                    )
+                                    .await;
+                                break;
+                            }
+                            let inner = &env["request"];
+                            match inner["op"].as_str().unwrap_or("") {
+                                "get" => {
+                                    let offset = inner["offset"].as_u64().unwrap_or(0) as usize;
+                                    let len = inner
+                                        .get("length")
+                                        .and_then(Value::as_u64)
+                                        .map_or(payload.len() - offset, |n| {
+                                            (n as usize).min(payload.len() - offset)
+                                        });
+                                    let keep_open = inner.get("keep_open").and_then(Value::as_bool)
+                                        == Some(true);
+                                    let mut ready = json!({
+                                        "size": payload.len(),
+                                        "offset": offset,
+                                        "length": len,
+                                        "mtime": { "secs": 1_700_000_000i64, "nanos": 0u32 },
+                                        "file_id": 7u64,
+                                    });
+                                    if keep_open {
+                                        ready["keep_open"] = json!(true);
+                                    }
+                                    let _ =
+                                        server_out.write_all(format!("{ready}\n").as_bytes()).await;
+                                    let _ =
+                                        server_out.write_all(&payload[offset..offset + len]).await;
+                                    if keep_open {
+                                        let _ = server_out.write_all(b"{\"done\":true}\n").await;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                "put" => {
+                                    let size = inner["size"].as_u64().unwrap() as usize;
+                                    let hash = inner["hash"].as_str().unwrap().to_owned();
+                                    let resume_offset = 1024usize.min(size);
+                                    let _ = server_out
+                                        .write_all(
+                                            format!("{}\n", json!({ "offset": resume_offset }))
+                                                .as_bytes(),
+                                        )
+                                        .await;
+                                    let mut buf = vec![0u8; size - resume_offset];
+                                    reader.read_exact(&mut buf).await.unwrap();
+                                    *uploaded.lock().unwrap() = buf;
+                                    let _ = server_out
+                                        .write_all(
+                                            format!(
+                                                "{}\n",
+                                                json!({ "ok": true, "size": size, "hash": hash })
+                                            )
+                                            .as_bytes(),
+                                        )
+                                        .await;
+                                    break;
+                                }
+                                _ => break,
+                            }
+                        }
+                    });
+                    Ok(RawStream {
+                        reader: Box::new(client_in),
+                        writer: Box::new(client_out),
+                        stderr: None,
+                        cancel: CancellationToken::new(),
+                        park: None,
+                        guard: None,
+                    })
+                })
+            }
+        }
+
+        let payload: Vec<u8> = (0..128 * 1024usize).map(|i| (i % 251) as u8).collect();
+        let payload = Arc::new(payload);
+        let direct_mode = Arc::new(Mutex::new(DirectMode::FailBeforeSend));
+        let uploaded = Arc::new(Mutex::new(Vec::new()));
+        let relay_opens = Arc::new(AtomicUsize::new(0));
+        let direct_opens = Arc::new(AtomicUsize::new(0));
+        let studio_key = test_host_key(199);
+
+        let opener: SessionOpener = {
+            let payload = Arc::clone(&payload);
+            let direct_mode = Arc::clone(&direct_mode);
+            let uploaded = Arc::clone(&uploaded);
+            let relay_opens = Arc::clone(&relay_opens);
+            let direct_opens = Arc::clone(&direct_opens);
+            let studio_key = studio_key.clone();
+            Arc::new(move |entry, _, cancel| {
+                let payload = Arc::clone(&payload);
+                let direct_mode = Arc::clone(&direct_mode);
+                let uploaded = Arc::clone(&uploaded);
+                let relay_opens = Arc::clone(&relay_opens);
+                let direct_opens = Arc::clone(&direct_opens);
+                let studio_key = studio_key.clone();
+                Box::pin(async move {
+                    let node_name = entry.node.clone();
+                    let (client, server) = tokio::io::duplex(64 * 1024);
+                    let (client_r, client_w) = tokio::io::split(client);
+                    let node_for_rpc = node_name.clone();
+                    tokio::spawn(async move {
+                        let (server_r, mut server_w) = tokio::io::split(server);
+                        let mut lines = BufReader::new(server_r).lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            let req: Request = serde_json::from_str(&line).unwrap();
+                            let resp = if req.method == method::HELLO {
+                                Response::ok(
+                                    req.id,
+                                    serde_json::to_value(HelloResult {
+                                        node: node_for_rpc.clone(),
+                                        node_explicit: None,
+                                        node_id: None,
+                                        version: "0.1.0".to_owned(),
+                                        build: None,
+                                        protocol: PROTOCOL,
+                                        os: "linux".to_owned(),
+                                        arch: "x86_64".to_owned(),
+                                        systems: Vec::new(),
+                                        system: None,
+                                        boot_id: None,
+                                    })
+                                    .unwrap(),
+                                )
+                            } else {
+                                // `device.endpoint` fan-out from tower reports studio.
+                                Response::ok(
+                                    req.id,
+                                    json!({
+                                        "results": {
+                                            "studio": {
+                                                "ok": {
+                                                    "node": "studio",
+                                                    "hosts": ["studio.example.net"],
+                                                    "port": 22,
+                                                    "user": "me",
+                                                    "host_keys": [studio_key],
+                                                }
+                                            }
+                                        }
+                                    }),
+                                )
+                            };
+                            let _ = server_w
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&resp).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                        }
+                    });
+                    let stream_opener = Arc::new(RelayAwareOpener {
+                        node: node_name.clone(),
+                        payload,
+                        direct_mode,
+                        uploaded,
+                        relay_opens,
+                        direct_opens,
+                    });
+                    Session::open_transport(
+                        client_r,
+                        client_w,
+                        Box::new(RelayTestTransport {
+                            opener: stream_opener,
+                        }),
+                        &node_name,
+                        None,
+                        Duration::from_secs(5),
+                        cancel,
+                    )
+                    .await
+                    .map_err(|e| e.into_error())
+                })
+            })
+        };
+
+        let link = Link::with_opener(
+            LinkConfig {
+                device_key: Some("dummy".to_owned()),
+                nodes: vec![NodeLink::ssh(
+                    "tower",
+                    SshTarget {
+                        hosts: vec!["tower.example.net".to_owned()],
+                        port: 22,
+                        user: "me".to_owned(),
+                        host_keys: vec![test_host_key(198)],
+                    },
+                    Some("device:pixel".to_owned()),
+                )],
+                forgotten_nodes: Vec::new(),
+            },
+            LinkOptions::default(),
+            opener,
+        );
+
+        // 1. Phone is paired ONLY with `tower`: `open_content("studio", ...)` and
+        //    `open_put("studio", ...)` succeed over `Route::Relay { via: "tower" }`.
+        let mut s = link
+            .open_content("studio", "~/media/clip.bin", 500, Some(90_000))
+            .await
+            .unwrap();
+        assert_eq!(
+            s.route(),
+            &Route::Relay {
+                via: "tower".to_owned()
+            }
+        );
+        let mut got = Vec::new();
+        s.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, &payload[500..90_500]);
+        assert_eq!(
+            link.route_status().get("studio"),
+            Some(&MachineRouteStatus::Relay {
+                via: "tower".to_owned()
+            })
+        );
+
+        let upload_bytes = vec![0x5Au8; 4096];
+        let fake_hash = format!("blake3:{}", "a".repeat(64));
+        let mut put = link
+            .open_put(
+                "studio",
+                PutRequest {
+                    path: "~/uploads/pic.bin".to_owned(),
+                    size: upload_bytes.len() as u64,
+                    hash: fake_hash.clone(),
+                    mode: None,
+                    mtime: None,
+                    if_exists: crate::put::PutIfExists::Replace,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            put.route(),
+            &Route::Relay {
+                via: "tower".to_owned()
+            }
+        );
+        assert_eq!(put.offset(), 1024);
+        put.write_all(&upload_bytes[1024..]).await.unwrap();
+        let done = put.finish().await.unwrap();
+        assert_eq!(done.size, 4096);
+        assert_eq!(*uploaded.lock().unwrap(), upload_bytes[1024..]);
+
+        // 2. Unknown machine through capable relay returns plain unknown-machine NotFound.
+        let ghost_err = link
+            .open_content("ghost", "~/a.txt", 0, None)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(ghost_err.code, ErrorCode::NotFound);
+        assert_eq!(
+            ghost_err.message,
+            "This device doesn't know a machine called ghost."
+        );
+        assert_eq!(
+            ghost_err.details.as_ref().and_then(|d| d.get("reason")),
+            Some(&json!(crate::REASON_UNKNOWN_MACHINE))
+        );
+
+        // 3. Learn `studio` directly:
+        //    3a) When direct fails BEFORE anything was sent -> falls back to relay `tower`.
+        let learned = link.learn().await.unwrap();
+        assert_eq!(learned.added, vec!["studio".to_owned()]);
+        *direct_mode.lock().unwrap() = DirectMode::FailBeforeSend;
+        let relay_before = relay_opens.load(Ordering::SeqCst);
+        let mut fallback = link
+            .open_content("studio", "~/media/clip.bin", 0, Some(1024))
+            .await
+            .unwrap();
+        assert_eq!(
+            fallback.route(),
+            &Route::Relay {
+                via: "tower".to_owned()
+            }
+        );
+        assert!(relay_opens.load(Ordering::SeqCst) > relay_before);
+        let mut head = Vec::new();
+        fallback.read_to_end(&mut head).await.unwrap();
+        assert_eq!(head, &payload[..1024]);
+
+        //    3b) When direct fails AFTER the request was sent -> MUST NOT silently fail over!
+        *direct_mode.lock().unwrap() = DirectMode::FailAfterSend;
+        let relay_before_nosilent = relay_opens.load(Ordering::SeqCst);
+        let err_after_send = link
+            .open_put(
+                "studio",
+                PutRequest {
+                    path: "~/uploads/no-failover.bin".to_owned(),
+                    size: 16,
+                    hash: fake_hash.clone(),
+                    mode: None,
+                    mtime: None,
+                    if_exists: crate::put::PutIfExists::Replace,
+                },
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err_after_send.code, ErrorCode::Unreachable);
+        assert_eq!(
+            relay_opens.load(Ordering::SeqCst),
+            relay_before_nosilent,
+            "failure after bytes were sent on direct route must NEVER silently retry through relay"
+        );
+
+        //    3c) Once direct works -> both `open_content` and `open_put` switch to `Route::Direct`.
+        *direct_mode.lock().unwrap() = DirectMode::ServeDirect;
+        let mut direct_get = link
+            .open_content("studio", "~/media/clip.bin", 100, Some(2048))
+            .await
+            .unwrap();
+        assert_eq!(direct_get.route(), &Route::Direct);
+        let mut got_direct = Vec::new();
+        direct_get.read_to_end(&mut got_direct).await.unwrap();
+        assert_eq!(got_direct, &payload[100..2148]);
+        assert_eq!(
+            link.route_status().get("studio"),
+            Some(&MachineRouteStatus::Direct)
+        );
+
+        let mut direct_put = link
+            .open_put(
+                "studio",
+                PutRequest {
+                    path: "~/uploads/direct.bin".to_owned(),
+                    size: 2048,
+                    hash: fake_hash,
+                    mode: None,
+                    mtime: None,
+                    if_exists: crate::put::PutIfExists::Replace,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(direct_put.route(), &Route::Direct);
+        direct_put.write_all(&vec![0x33u8; 2048]).await.unwrap();
+        let done_direct = direct_put.finish().await.unwrap();
+        assert_eq!(done_direct.size, 2048);
+
+        link.close().await;
+    }
+
+    #[tokio::test]
+    async fn learned_direct_refusal_with_old_relay_prefers_relay_too_old_and_keeps_truthful_route()
+    {
+        use crate::content::{RawStream, StreamOpenError, StreamOpener};
+        use crate::session::TransportHandle;
+        use legion_proto::{HelloResult, PROTOCOL, VERSION};
+
+        #[derive(Clone, Copy)]
+        enum StudioFailure {
+            AuthRefused,
+            Unreachable,
+        }
+
+        struct OldRelayStreamOpener;
+
+        impl StreamOpener for OldRelayStreamOpener {
+            fn open_stream(
+                &self,
+                _cancel: CancellationToken,
+            ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send>>
+            {
+                Box::pin(async move {
+                    let (client_in, mut server_out) = tokio::io::duplex(4 * 1024);
+                    let (_server_in, client_out) = tokio::io::duplex(4 * 1024);
+                    let stream_cancel = CancellationToken::new();
+                    tokio::spawn(async move {
+                        // Older relay omits `capabilities: ["stream.relay"]`.
+                        let _ = server_out.write_all(b"{\"protocol\":1}\n").await;
+                        let _ = server_out.shutdown().await;
+                    });
+                    Ok(RawStream {
+                        reader: Box::new(client_in),
+                        writer: Box::new(client_out),
+                        stderr: None,
+                        cancel: stream_cancel,
+                        park: None,
+                        guard: None,
+                    })
+                })
+            }
+        }
+
+        struct OldRelayTransport;
+
+        impl TransportHandle for OldRelayTransport {
+            fn collect_exit_info(
+                &mut self,
+                _wait_limit: Duration,
+            ) -> Pin<Box<dyn Future<Output = (Option<i32>, String)> + Send + '_>> {
+                Box::pin(async { (Some(0), String::new()) })
+            }
+
+            fn close(
+                self: Box<Self>,
+                _grace: Duration,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                Box::pin(async {})
+            }
+
+            fn stream_opener(&self) -> Option<Arc<dyn StreamOpener>> {
+                Some(Arc::new(OldRelayStreamOpener))
+            }
+        }
+
+        let failure_mode = Arc::new(Mutex::new(StudioFailure::AuthRefused));
+        let opener: SessionOpener = {
+            let failure_mode = Arc::clone(&failure_mode);
+            Arc::new(move |entry, _, cancel| {
+                let failure_mode = Arc::clone(&failure_mode);
+                Box::pin(async move {
+                    if entry.node == "studio" {
+                        return match *failure_mode.lock().unwrap() {
+                            StudioFailure::AuthRefused => Err(ErrorBody::new(
+                                ErrorCode::Denied,
+                                "The device key was rejected by studio.",
+                            )
+                            .with_machine("studio")
+                            .with_details(json!({
+                                "reason": crate::REASON_DEVICE_REMOVED_OR_UNKNOWN,
+                            }))),
+                            StudioFailure::Unreachable => Err(ErrorBody::new(
+                                ErrorCode::Unreachable,
+                                "studio could not be reached directly.",
+                            )
+                            .with_machine("studio")
+                            .with_details(json!({
+                                "reason": crate::REASON_UNREACHABLE,
+                            }))),
+                        };
+                    }
+                    let (client_in, mut server_out) = tokio::io::duplex(8 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(8 * 1024);
+                    tokio::spawn(async move {
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                            let req: Request = serde_json::from_str(&line).unwrap();
+                            let reply = if req.method == "hello" {
+                                Response::ok(
+                                    req.id,
+                                    serde_json::to_value(HelloResult {
+                                        node: "tower".to_owned(),
+                                        node_explicit: None,
+                                        node_id: None,
+                                        version: VERSION.to_owned(),
+                                        build: None,
+                                        protocol: PROTOCOL,
+                                        os: "linux".to_owned(),
+                                        arch: "x86_64".to_owned(),
+                                        systems: Vec::new(),
+                                        system: None,
+                                        boot_id: None,
+                                    })
+                                    .unwrap(),
+                                )
+                            } else {
+                                Response::ok(req.id, json!({}))
+                            };
+                            let _ = server_out
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&reply).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            line.clear();
+                        }
+                    });
+                    Session::open_transport(
+                        client_in,
+                        client_out,
+                        Box::new(OldRelayTransport),
+                        &entry.node,
+                        None,
+                        Duration::from_secs(5),
+                        cancel,
+                    )
+                    .await
+                    .map_err(|e| e.into_error())
+                })
+            })
+        };
+
+        let make_link = || {
+            let mut studio = NodeLink::ssh(
+                "studio",
+                SshTarget {
+                    hosts: vec!["studio.example.net".to_owned()],
+                    port: 22,
+                    user: "me".to_owned(),
+                    host_keys: vec![test_host_key(202)],
+                },
+                Some("device:pixel".to_owned()),
+            );
+            studio.origin = NodeOrigin::Learned;
+            studio.learned_from = Some("tower".to_owned());
+            Link::with_opener(
+                LinkConfig {
+                    device_key: Some("dummy".to_owned()),
+                    nodes: vec![
+                        NodeLink::ssh(
+                            "tower",
+                            SshTarget {
+                                hosts: vec!["tower.example.net".to_owned()],
+                                port: 22,
+                                user: "me".to_owned(),
+                                host_keys: vec![test_host_key(201)],
+                            },
+                            Some("device:pixel".to_owned()),
+                        ),
+                        studio,
+                    ],
+                    forgotten_nodes: Vec::new(),
+                },
+                LinkOptions::default(),
+                Arc::clone(&opener),
+            )
+        };
+
+        let put_req = || PutRequest {
+            path: "~/uploads/photo.jpg".to_owned(),
+            size: 16,
+            hash: format!("blake3:{}", "a".repeat(64)),
+            mode: None,
+            mtime: None,
+            if_exists: crate::put::PutIfExists::Replace,
+        };
+
+        // 1. Learned direct refuses device key + old relay -> both `open_content` and `open_put`
+        //    return `relay_too_old` with the direct refusal in `details.direct_error` and record
+        //    `NotSyncedYet` (never `Direct`), both on first attempt and during unsynced backoff.
+        {
+            *failure_mode.lock().unwrap() = StudioFailure::AuthRefused;
+            let link = make_link();
+
+            for attempt in 1..=2 {
+                let err = link
+                    .open_content("studio", "~/file.txt", 0, None)
+                    .await
+                    .err()
+                    .unwrap();
+                assert_eq!(
+                    err.code,
+                    ErrorCode::Unsupported,
+                    "attempt {attempt}: {err:?}"
+                );
+                assert_eq!(
+                    err.message,
+                    "tower needs an update before it can pass files along from studio."
+                );
+                let details = err.details.as_ref().expect("relay_too_old details");
+                assert_eq!(details["reason"], json!(crate::REASON_RELAY_TOO_OLD));
+                assert_eq!(details["direct_error"]["code"], json!("denied"));
+                assert_eq!(
+                    details["direct_error"]["details"]["reason"],
+                    json!(crate::REASON_DEVICE_REMOVED_OR_UNKNOWN)
+                );
+                assert_eq!(
+                    link.route_status().get("studio"),
+                    Some(&MachineRouteStatus::NotSyncedYet {
+                        introducer: Some("tower".to_owned()),
+                        via: None,
+                    }),
+                    "attempt {attempt}: route_status must not report Direct"
+                );
+            }
+            link.close().await;
+
+            let link_put = make_link();
+            for attempt in 1..=2 {
+                let err = link_put.open_put("studio", put_req()).await.err().unwrap();
+                assert_eq!(
+                    err.code,
+                    ErrorCode::Unsupported,
+                    "put attempt {attempt}: {err:?}"
+                );
+                assert_eq!(
+                    err.message,
+                    "tower needs an update before it can pass files along from studio."
+                );
+                let details = err.details.as_ref().expect("relay_too_old details");
+                assert_eq!(details["reason"], json!(crate::REASON_RELAY_TOO_OLD));
+                assert_eq!(details["direct_error"]["code"], json!("denied"));
+                assert_eq!(
+                    details["direct_error"]["details"]["reason"],
+                    json!(crate::REASON_DEVICE_REMOVED_OR_UNKNOWN)
+                );
+                assert_eq!(
+                    link_put.route_status().get("studio"),
+                    Some(&MachineRouteStatus::NotSyncedYet {
+                        introducer: Some("tower".to_owned()),
+                        via: None,
+                    }),
+                    "put attempt {attempt}: route_status must not report Direct"
+                );
+            }
+            link_put.close().await;
+        }
+
+        // 2. Learned direct unreachable + old relay -> both `open_content` and `open_put` return
+        //    `relay_too_old` with `details.direct_error.code == "unreachable"` and non-Direct
+        //    route status.
+        {
+            *failure_mode.lock().unwrap() = StudioFailure::Unreachable;
+            let link = make_link();
+            let err = link
+                .open_content("studio", "~/file.txt", 0, None)
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(err.code, ErrorCode::Unsupported);
+            let details = err.details.as_ref().unwrap();
+            assert_eq!(details["reason"], json!(crate::REASON_RELAY_TOO_OLD));
+            assert_eq!(details["direct_error"]["code"], json!("unreachable"));
+            assert_ne!(
+                link.route_status().get("studio"),
+                Some(&MachineRouteStatus::Direct)
+            );
+            link.close().await;
+
+            let link_put = make_link();
+            let err = link_put.open_put("studio", put_req()).await.err().unwrap();
+            assert_eq!(err.code, ErrorCode::Unsupported);
+            let details = err.details.as_ref().unwrap();
+            assert_eq!(details["reason"], json!(crate::REASON_RELAY_TOO_OLD));
+            assert_eq!(details["direct_error"]["code"], json!("unreachable"));
+            assert_ne!(
+                link_put.route_status().get("studio"),
+                Some(&MachineRouteStatus::Direct)
+            );
+            link_put.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn open_content_with_policy_pins_relay_and_direct_routes() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let tower_down = Arc::new(AtomicBool::new(false));
+        let other_hits = Arc::new(AtomicUsize::new(0));
+        let studio_down = Arc::new(AtomicBool::new(false));
+
+        struct TaggedRelayStreamOpener {
+            peer: String,
+            payload: Vec<u8>,
+            hits: Option<Arc<AtomicUsize>>,
+        }
+
+        impl crate::content::StreamOpener for TaggedRelayStreamOpener {
+            fn open_stream(
+                &self,
+                _cancel: CancellationToken,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<crate::content::RawStream, StreamOpenError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                let peer = self.peer.clone();
+                let payload = self.payload.clone();
+                let hits = self.hits.clone();
+                Box::pin(async move {
+                    if let Some(h) = hits {
+                        h.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let (client_in, mut server_out) = tokio::io::duplex(16 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(16 * 1024);
+                    tokio::spawn(async move {
+                        let greeting = json!({
+                            "protocol": 1,
+                            "capabilities": [CAP_STREAM_RELAY],
+                        });
+                        let _ = server_out
+                            .write_all(format!("{greeting}\n").as_bytes())
+                            .await;
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let req: Value = serde_json::from_str(&line).unwrap();
+                        let inner = if req["op"] == "relay" {
+                            &req["request"]
+                        } else {
+                            &req
+                        };
+                        let offset = inner["offset"].as_u64().unwrap_or(0) as usize;
+                        let len = inner
+                            .get("length")
+                            .and_then(Value::as_u64)
+                            .map(|n| n as usize)
+                            .unwrap_or(payload.len().saturating_sub(offset))
+                            .min(payload.len().saturating_sub(offset));
+                        let ready = json!({
+                            "size": payload.len(),
+                            "offset": offset,
+                            "length": len,
+                            "mtime": { "secs": 1_700_000_000i64, "nanos": 0u32 },
+                            "file_id": if peer == "other-hub" { 2u64 } else { 1u64 },
+                        });
+                        let _ = server_out.write_all(format!("{ready}\n").as_bytes()).await;
+                        let _ = server_out.write_all(&payload[offset..offset + len]).await;
+                        let _ = server_out.shutdown().await;
+                    });
+                    Ok(crate::content::RawStream {
+                        reader: Box::new(client_in),
+                        writer: Box::new(client_out),
+                        stderr: None,
+                        cancel: CancellationToken::new(),
+                        park: None,
+                        guard: None,
+                    })
+                })
+            }
+        }
+
+        struct PolicyTransport(Arc<dyn crate::content::StreamOpener>);
+        impl crate::session::TransportHandle for PolicyTransport {
+            fn collect_exit_info(
+                &mut self,
+                _: Duration,
+            ) -> Pin<Box<dyn Future<Output = (Option<i32>, String)> + Send + '_>> {
+                Box::pin(async { (Some(0), String::new()) })
+            }
+            fn close(self: Box<Self>, _: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                Box::pin(async {})
+            }
+            fn stream_opener(&self) -> Option<Arc<dyn crate::content::StreamOpener>> {
+                Some(Arc::clone(&self.0))
+            }
+        }
+
+        let opener: SessionOpener = {
+            let tower_down = Arc::clone(&tower_down);
+            let other_hits = Arc::clone(&other_hits);
+            let studio_down = Arc::clone(&studio_down);
+            Arc::new(move |entry, _, cancel| {
+                let tower_down = Arc::clone(&tower_down);
+                let other_hits = Arc::clone(&other_hits);
+                let studio_down = Arc::clone(&studio_down);
+                Box::pin(async move {
+                    if entry.node == "tower" && tower_down.load(Ordering::SeqCst) {
+                        return Err(ErrorBody::new(
+                            ErrorCode::Unreachable,
+                            "Can't reach tower right now.",
+                        )
+                        .with_machine("tower"));
+                    }
+                    if entry.node == "studio" && studio_down.load(Ordering::SeqCst) {
+                        return Err(ErrorBody::new(
+                            ErrorCode::Unreachable,
+                            "Can't reach studio right now.",
+                        )
+                        .with_machine("studio"));
+                    }
+                    let (client_in, mut server_out) = tokio::io::duplex(16 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(16 * 1024);
+                    let node_name = entry.node.clone();
+                    tokio::spawn(async move {
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                            let req: legion_proto::Request = serde_json::from_str(&line).unwrap();
+                            let reply = legion_proto::Response::ok(
+                                req.id,
+                                serde_json::to_value(legion_proto::HelloResult {
+                                    node: node_name.clone(),
+                                    node_explicit: None,
+                                    node_id: None,
+                                    version: legion_proto::VERSION.to_owned(),
+                                    build: None,
+                                    protocol: legion_proto::PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: vec![],
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap(),
+                            );
+                            let _ = server_out
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&reply).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            line.clear();
+                        }
+                    });
+                    let (payload, hits) = match entry.node.as_str() {
+                        "tower" => (b"studio-via-tower".to_vec(), None),
+                        "other-hub" => (b"studio-via-other".to_vec(), Some(other_hits)),
+                        _ => (b"studio-direct-ok".to_vec(), None),
+                    };
+                    Session::open_transport(
+                        client_in,
+                        client_out,
+                        Box::new(PolicyTransport(Arc::new(TaggedRelayStreamOpener {
+                            peer: entry.node.clone(),
+                            payload,
+                            hits,
+                        }))),
+                        &entry.node,
+                        None,
+                        Duration::from_secs(5),
+                        cancel,
+                    )
+                    .await
+                    .map_err(|e| e.into_error())
+                })
+            })
+        };
+
+        let link = Link::with_opener(
+            LinkConfig {
+                nodes: vec![
+                    NodeLink::ssh(
+                        "tower",
+                        SshTarget {
+                            hosts: vec!["192.0.2.1".to_owned()],
+                            port: 22,
+                            user: "me".to_owned(),
+                            host_keys: vec!["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITowerPinKey000000000000000000000000000000000".to_owned()],
+                        },
+                        Some("device:pixel".to_owned()),
+                    ),
+                    NodeLink::ssh(
+                        "other-hub",
+                        SshTarget {
+                            hosts: vec!["192.0.2.2".to_owned()],
+                            port: 22,
+                            user: "me".to_owned(),
+                            host_keys: vec!["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOtherPinKey000000000000000000000000000000000".to_owned()],
+                        },
+                        Some("device:pixel".to_owned()),
+                    ),
+                ],
+                ..LinkConfig::default()
+            },
+            LinkOptions::default(),
+            opener,
+        );
+
+        // 1. RelayOnly("tower") reads via tower.
+        let mut s1 = link
+            .open_content_with_policy(
+                "studio",
+                "/home/me/f.bin",
+                0,
+                None,
+                ContentRoutePolicy::RelayOnly("tower".to_owned()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            s1.route(),
+            &Route::Relay {
+                via: "tower".to_owned()
+            }
+        );
+        let mut buf = Vec::new();
+        s1.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, b"studio-via-tower");
+        assert_eq!(other_hits.load(Ordering::SeqCst), 0);
+
+        // 2. When tower goes down, RelayOnly("tower") fails with Unreachable and NEVER falls back
+        //    to `other-hub`.
+        tower_down.store(true, Ordering::SeqCst);
+        link.close().await;
+        let err = link
+            .open_content_with_policy(
+                "studio",
+                "/home/me/f.bin",
+                0,
+                None,
+                ContentRoutePolicy::RelayOnly("tower".to_owned()),
+                CancellationToken::new(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.code, ErrorCode::Unreachable, "{err:?}");
+        assert_eq!(err.machine.as_deref(), Some("tower"));
+        assert_eq!(
+            other_hits.load(Ordering::SeqCst),
+            0,
+            "pinned relay must never fall back to another paired machine"
+        );
+
+        // 3. DirectOnly never falls back to `other-hub` when direct `studio` is unreachable.
+        let mut learned = NodeLink::ssh(
+            "studio",
+            SshTarget {
+                hosts: vec!["192.0.2.3".to_owned()],
+                port: 22,
+                user: "me".to_owned(),
+                host_keys: vec!["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIStudioPinKey00000000000000000000000000000000".to_owned()],
+            },
+            Some("device:pixel".to_owned()),
+        );
+        learned.origin = NodeOrigin::Learned;
+        learned.learned_from = Some("tower".to_owned());
+        link.upsert_node(learned);
+
+        studio_down.store(true, Ordering::SeqCst);
+        let err = link
+            .open_content_with_policy(
+                "studio",
+                "/home/me/f.bin",
+                0,
+                None,
+                ContentRoutePolicy::DirectOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.code, ErrorCode::Unreachable, "{err:?}");
+        assert_eq!(err.machine.as_deref(), Some("studio"));
+        assert_eq!(other_hits.load(Ordering::SeqCst), 0);
+
+        // 4. DirectOrRelay("tower") when both studio and tower are down also never touches other-hub.
+        let err = link
+            .open_content_with_policy(
+                "studio",
+                "/home/me/f.bin",
+                0,
+                None,
+                ContentRoutePolicy::DirectOrRelay("tower".to_owned()),
+                CancellationToken::new(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.code, ErrorCode::Unreachable, "{err:?}");
+        assert_eq!(other_hits.load(Ordering::SeqCst), 0);
+
         link.close().await;
     }
 }
