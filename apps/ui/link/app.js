@@ -411,6 +411,11 @@ export function createAppLink() {
     }
   }
 
+  // Optional native file & transfer queue hooks (see `apps/ui/link/files-contract.js`):
+  // `contentUrl`, `download`, `upload`, `openExternally`, `transfers`, `transferControl`,
+  // `openTransfer`, and `onTransferEvent` will be wired to Tauri commands when the native
+  // content server and transfer queue service land. Leaving them undefined lets the UI hide
+  // unsupported controls cleanly.
   return {
     kind: 'app',
     state,

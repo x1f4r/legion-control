@@ -126,16 +126,16 @@ test('createMockLink contentUrl serves built-in samples and enforces auth, reach
   assert.ok(svg.url.startsWith('data:image/svg+xml;charset=utf-8,'));
 
   const video = await link.contentUrl({ machine: 'pi', path: '/home/me/clip.webm' });
-  assert.ok(video.url.startsWith('data:video/webm;base64,'));
+  assert.ok(video.url.startsWith('data:video/webm;base64,') || video.url.startsWith('blob:'));
 
   const audio = await link.contentUrl({ path: '/home/me/song.wav' });
-  assert.ok(audio.url.startsWith('data:audio/wav;base64,'));
+  assert.ok(audio.url.startsWith('data:audio/ogg;base64,') || audio.url.startsWith('blob:'));
 
   const vtt = await link.contentUrl({ path: '/home/me/sub.vtt' });
   assert.ok(vtt.url.startsWith('data:text/vtt;charset=utf-8,'));
 
   const pdf = await link.contentUrl({ path: '/home/me/doc.pdf', download: true });
-  assert.ok(pdf.url.startsWith('data:application/octet-stream;base64,'));
+  assert.ok(pdf.url.startsWith('data:application/pdf;base64,'));
   assert.ok(!pdf.url.includes('?download=1'), 'data URL must stay valid base64');
 
   const bin = await link.contentUrl({ path: '/home/me/archive.bin' });

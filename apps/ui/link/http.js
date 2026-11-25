@@ -287,6 +287,11 @@ export function createHttpLink() {
     return nextState;
   }
 
+  async function forget() {
+    token = '';
+    writeToken('');
+  }
+
   async function contentUrl(options = {}) {
     const { machine, path, download = false, signal } = options || {};
     const current = token || readToken();
@@ -368,9 +373,24 @@ export function createHttpLink() {
     };
   }
 
-  async function forget() {
-    token = '';
-    writeToken('');
+  let browserDownloadSeq = 1;
+
+  /**
+   * Non-blocking browser download using a ticketed `?download=1` content address.
+   */
+  async function download({ machine, path, name } = {}) {
+    const id = `browser-dl-${browserDownloadSeq++}`;
+    const res = await contentUrl({ machine, path, download: true });
+    if (res?.url && typeof document !== 'undefined') {
+      const a = document.createElement('a');
+      a.href = res.url;
+      a.download = name || '';
+      a.rel = 'noopener noreferrer';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    }
+    return { id };
   }
 
   return {
@@ -378,8 +398,9 @@ export function createHttpLink() {
     state,
     tools,
     call,
-    contentUrl,
     setToken,
     forget,
+    contentUrl,
+    download,
   };
 }
