@@ -52,10 +52,16 @@ fn exclude_from_backup(path: &Path) {
         APPLE_BACKUP_EXCLUDE_VALUE,
         rustix::fs::XattrFlags::empty(),
     ) {
+        #[cfg(debug_assertions)]
         eprintln!(
             "legion-app: could not exclude {} from Apple backups: {err}",
             path.display()
         );
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = err;
+            eprintln!("legion-app: could not set Apple backup exclusion attribute");
+        }
     }
 }
 

@@ -2,7 +2,6 @@
 
 use std::cmp::Ordering;
 use std::fmt;
-use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::str::FromStr;
@@ -162,9 +161,18 @@ pub fn hash_reader<R: Read>(reader: &mut R) -> Result<(Hash, u64)> {
     Ok((Hash(hasher.finalize()), total))
 }
 
-/// Computes the BLAKE3 digest of a file on disk using constant memory.
+/// Computes the BLAKE3 digest of a regular file on disk using constant memory without blocking on
+/// FIFOs or special files.
 pub fn hash_file(path: &Path) -> Result<Hash> {
-    let mut file = File::open(path).map_err(|e| classify_io(path, e))?;
+    let (mut file, _meta) =
+        legion_os::open_regular::open_regular_read(path).map_err(|err| match err {
+            legion_os::open_regular::OpenRegularError::IsDirectory
+            | legion_os::open_regular::OpenRegularError::NotRegularFile => Error::Conflict {
+                path: path.to_path_buf(),
+                reason: "source path is not a regular file".to_string(),
+            },
+            legion_os::open_regular::OpenRegularError::Io(io_err) => classify_io(path, io_err),
+        })?;
     let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; STREAM_BUFFER_SIZE];
     loop {

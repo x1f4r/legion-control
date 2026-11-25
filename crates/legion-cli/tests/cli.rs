@@ -461,3 +461,28 @@ fn every_example_config_and_extension_loads_with_real_loaders() {
         tools_dir.display()
     );
 }
+
+#[test]
+fn thumb_reports_unsupported_with_hint_when_ffmpeg_is_not_on_path() {
+    let home = Home::new();
+    let clip = home.home().join("clip.mp4");
+    std::fs::write(&clip, b"not decoded without ffmpeg").unwrap();
+
+    let payload = json!({"paths": [clip.to_string_lossy()]}).to_string();
+    let output = home
+        .command(&["fs.thumb", "--args", &payload])
+        .env("PATH", "")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let err = &reply["results"][0]["error"];
+    assert_eq!(err["code"], json!("unsupported"), "{reply}");
+    let hint = err["hint"].as_str().unwrap_or_default();
+    assert!(hint.contains("ffmpeg"), "expected ffmpeg hint: {reply}");
+}

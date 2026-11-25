@@ -285,6 +285,10 @@ function App() {
   const lastHashRef = useRef(window.location.hash);
   const filesBulkHandlersRef = useRef({});
   const toastTimerRef = useRef(null);
+  const toastSeqRef = useRef(0);
+  const toastRef = useRef(null);
+  const deviceTransfersRef = useRef([]);
+  const prevTransferStatesRef = useRef(null);
 
   const [settings, setSettings] = useState(() => {
     const loaded = readSettings(safeLocalStorage());
@@ -393,41 +397,236 @@ function App() {
 
   const routeRef = useRef(route);
   routeRef.current = route;
+  toastRef.current = toast;
+  deviceTransfersRef.current = deviceTransfers;
 
-  const showToast = useCallback((message, opts = {}) => {
-    if (!message) return;
-    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
-    setToast({ message, actionLabel: opts.actionLabel || null, actionHref: opts.actionHref || null });
-    toastTimerRef.current = window.setTimeout(() => {
+  const isTerminalTransferState = (state) => state === 'done' || state === 'failed' || state === 'cancelled';
+
+  const allTrackedTransfersTerminal = (ids, list) => {
+    if (!Array.isArray(ids) || ids.length === 0) return false;
+    const byId = new Map((list || []).map((t) => [t.id, t.state]));
+    return ids.every((id) => isTerminalTransferState(byId.get(id)));
+  };
+
+  const formatTransferFailureToast = (failedList) => {
+    if (!Array.isArray(failedList) || failedList.length === 0) return '';
+    if (failedList.length === 1) {
+      const item = failedList[0];
+      const verb = item.direction === 'upload' ? 'Upload' : 'Download';
+      const name = item.name || 'file';
+      const detail = item.error?.message ? ` ${item.error.message}` : '';
+      return `${verb} of ${name} failed.${detail}`;
+    }
+    return `${failedList.length} transfers failed.`;
+  };
+
+  const clearToast = useCallback(() => {
+    if (toastTimerRef.current) {
+      clearTimeout(toastTimerRef.current);
       toastTimerRef.current = null;
-      setToast(null);
-    }, 4500);
+    }
+    toastRef.current = null;
+    setToast(null);
   }, []);
+
+  useEffect(() => () => {
+    if (toastTimerRef.current) {
+      clearTimeout(toastTimerRef.current);
+      toastTimerRef.current = null;
+    }
+  }, []);
+
+  const showToast = useCallback(
+    (message, opts = {}) => {
+      if (!message) return;
+      const actionHref = opts.actionHref || null;
+      const suppressOnActivity =
+        opts.suppressOnActivity !== undefined
+          ? Boolean(opts.suppressOnActivity)
+          : actionHref === '#/activity';
+      if (suppressOnActivity && routeRef.current?.section === 'activity') {
+        return;
+      }
+      const transferIds = Array.isArray(opts.transferIds) ? opts.transferIds.filter(Boolean) : [];
+      if (transferIds.length > 0 && allTrackedTransfersTerminal(transferIds, deviceTransfersRef.current)) {
+        return;
+      }
+      const transferJobs = Array.isArray(opts.transferJobs)
+        ? opts.transferJobs.filter((j) => j && j.id)
+        : [];
+      if (toastTimerRef.current) {
+        clearTimeout(toastTimerRef.current);
+        toastTimerRef.current = null;
+      }
+      const seq = ++toastSeqRef.current;
+      const tracksTransfer =
+        transferIds.length > 0 ||
+        transferJobs.length > 0 ||
+        Boolean(opts.transferIdsPromise) ||
+        Boolean(opts.transferJobsPromise);
+      const nextToast = {
+        seq,
+        message,
+        actionLabel: opts.actionLabel || null,
+        actionHref,
+        tone: opts.tone || null,
+        suppressOnActivity,
+        transferIds,
+        transferJobs,
+      };
+      toastRef.current = nextToast;
+      setToast(nextToast);
+      const ttlMs = tracksTransfer ? 8000 : opts.tone === 'error' ? 6000 : 4500;
+      toastTimerRef.current = window.setTimeout(() => {
+        toastTimerRef.current = null;
+        if (toastRef.current?.seq === seq) {
+          toastRef.current = null;
+          setToast(null);
+        }
+      }, ttlMs);
+
+      if (opts.transferIdsPromise && typeof opts.transferIdsPromise.then === 'function') {
+        opts.transferIdsPromise
+          .then((ids) => {
+            const clean = Array.isArray(ids) ? ids.filter(Boolean) : [];
+            if (clean.length === 0 || toastRef.current?.seq !== seq) return;
+            if (allTrackedTransfersTerminal(clean, deviceTransfersRef.current)) {
+              clearToast();
+              return;
+            }
+            const updated = { ...toastRef.current, transferIds: clean };
+            toastRef.current = updated;
+            setToast(updated);
+          })
+          .catch(() => {});
+      }
+
+      if (opts.transferJobsPromise && typeof opts.transferJobsPromise.then === 'function') {
+        opts.transferJobsPromise
+          .then((jobs) => {
+            const clean = Array.isArray(jobs) ? jobs.filter((j) => j && j.id) : [];
+            if (clean.length === 0 || toastRef.current?.seq !== seq) return;
+            const updated = { ...toastRef.current, transferJobs: clean };
+            toastRef.current = updated;
+            setToast(updated);
+          })
+          .catch(() => {});
+      }
+    },
+    [clearToast],
+  );
+
+  useEffect(() => {
+    if (
+      route.section === 'activity' &&
+      (toastRef.current?.suppressOnActivity || toastRef.current?.actionHref === '#/activity')
+    ) {
+      clearToast();
+    }
+  }, [route.section, clearToast]);
 
   // Keep device transfer queue in sync when the link supports it.
   useEffect(() => {
+    prevTransferStatesRef.current = null;
     if (!linkState?.ready || typeof link.transfers !== 'function') {
+      deviceTransfersRef.current = [];
       setDeviceTransfers([]);
       return undefined;
     }
     let alive = true;
+    const applyTransfers = (list) => {
+      if (!alive || !Array.isArray(list)) return;
+      const prevStates = prevTransferStatesRef.current;
+      const nextStates = new Map(list.map((t) => [t.id, t.state]));
+      const newlyFailed = [];
+      if (prevStates !== null) {
+        for (const item of list) {
+          if (item.state === 'failed' && prevStates.get(item.id) !== 'failed') {
+            newlyFailed.push(item);
+          }
+        }
+      }
+      prevTransferStatesRef.current = nextStates;
+      deviceTransfersRef.current = list;
+      setDeviceTransfers(list);
+
+      const currentToast = toastRef.current;
+      if (
+        currentToast?.transferIds?.length > 0 &&
+        allTrackedTransfersTerminal(currentToast.transferIds, list)
+      ) {
+        clearToast();
+      }
+
+      if (newlyFailed.length > 0) {
+        const onActivity = routeRef.current?.section === 'activity';
+        showToast(formatTransferFailureToast(newlyFailed), {
+          tone: 'error',
+          suppressOnActivity: false,
+          ...(onActivity ? {} : { actionLabel: 'Activity', actionHref: '#/activity' }),
+        });
+      }
+    };
     link
       .transfers()
-      .then((list) => {
-        if (alive && Array.isArray(list)) setDeviceTransfers(list);
-      })
+      .then(applyTransfers)
       .catch(() => {});
     const unsub =
       typeof link.onTransferEvent === 'function'
-        ? link.onTransferEvent((list) => {
-            if (alive && Array.isArray(list)) setDeviceTransfers(list);
-          })
+        ? link.onTransferEvent(applyTransfers)
         : null;
     return () => {
       alive = false;
       if (typeof unsub === 'function') unsub();
     };
-  }, [link, linkState?.ready]);
+  }, [link, linkState?.ready, clearToast, showToast]);
+
+  const trackedTransferJobs = toast?.transferJobs;
+  const trackedTransferToastSeq = toast?.seq;
+  useEffect(() => {
+    if (!trackedTransferJobs || trackedTransferJobs.length === 0 || !linkState?.ready) {
+      return undefined;
+    }
+    let alive = true;
+    let timer = null;
+    const checkJobs = async () => {
+      if (!alive || toastRef.current?.seq !== trackedTransferToastSeq) return;
+      const statuses = await Promise.all(
+        trackedTransferJobs.map((job) =>
+          link
+            .call('job.status', { id: job.id }, { on: job.machine || nodeInfoRef.current?.node })
+            .then((st) => ({ job, status: st }))
+            .catch(() => ({ job, status: null })),
+        ),
+      );
+      if (!alive || toastRef.current?.seq !== trackedTransferToastSeq) return;
+      const isTerminalJob = (s) => s === 'succeeded' || s === 'failed' || s === 'cancelled';
+      if (statuses.every((entry) => entry.status && isTerminalJob(entry.status.state))) {
+        clearToast();
+        const failed = statuses.filter((entry) => entry.status?.state === 'failed');
+        if (failed.length > 0) {
+          const onActivity = routeRef.current?.section === 'activity';
+          const first = failed[0].job;
+          const msg =
+            failed.length === 1
+              ? `${first.move ? 'Move' : 'Copy'} of ${first.label || 'item'} to ${first.destMachine || 'machine'} failed.`
+              : `${failed.length} transfers failed.`;
+          showToast(msg, {
+            tone: 'error',
+            suppressOnActivity: false,
+            ...(onActivity ? {} : { actionLabel: 'Activity', actionHref: '#/activity' }),
+          });
+        }
+        return;
+      }
+      timer = window.setTimeout(checkJobs, 700);
+    };
+    timer = window.setTimeout(checkJobs, 700);
+    return () => {
+      alive = false;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [trackedTransferJobs, trackedTransferToastSeq, link, linkState?.ready, clearToast, showToast]);
 
   useEffect(() => {
     if (mainRef.current && route.section !== 'files') mainRef.current.scrollTop = 0;
@@ -1988,6 +2187,11 @@ function App() {
     `;
   }
 
+  const hideToastOnRoute =
+    route.section === 'activity' &&
+    Boolean(toast?.suppressOnActivity || toast?.actionHref === '#/activity');
+  const visibleToast = hideToastOnRoute ? null : toast;
+
   const appClasses = [
     'app',
     !showBottomNav ? 'standalone' : '',
@@ -2027,6 +2231,35 @@ function App() {
           : html`
               <div class=${appClasses}>
                 ${renderHeader()}
+                ${visibleToast
+                  ? html`
+                      <div
+                        class=${visibleToast.tone === 'error' ? 'toast-banner error' : 'toast-banner'}
+                        role=${visibleToast.tone === 'error' ? 'alert' : 'status'}
+                      >
+                        <span>${visibleToast.message}</span>
+                        ${visibleToast.actionLabel && visibleToast.actionHref
+                          ? html`
+                              <a
+                                class="btn small primary"
+                                href=${visibleToast.actionHref}
+                                onClick=${clearToast}
+                              >
+                                ${visibleToast.actionLabel}
+                              </a>
+                            `
+                          : null}
+                        <button
+                          type="button"
+                          class="btn small quiet"
+                          aria-label="Dismiss"
+                          onClick=${clearToast}
+                        >
+                          OK
+                        </button>
+                      </div>
+                    `
+                  : null}
                 <main
                   ref=${mainRef}
                   class=${isPhoneCommand ? 'main command-stream' : 'main'}
@@ -2211,32 +2444,6 @@ function App() {
                 </main>
                 ${renderDock()}
                 ${renderNav()}
-                ${toast
-                  ? html`
-                      <div class="toast-banner" role="status">
-                        <span>${toast.message}</span>
-                        ${toast.actionLabel && toast.actionHref
-                          ? html`
-                              <a
-                                class="btn small primary"
-                                href=${toast.actionHref}
-                                onClick=${() => setToast(null)}
-                              >
-                                ${toast.actionLabel}
-                              </a>
-                            `
-                          : null}
-                        <button
-                          type="button"
-                          class="btn small quiet"
-                          aria-label="Dismiss"
-                          onClick=${() => setToast(null)}
-                        >
-                          OK
-                        </button>
-                      </div>
-                    `
-                  : null}
               </div>
             `}
       ${whatIsNewOpen && updateState?.just_updated

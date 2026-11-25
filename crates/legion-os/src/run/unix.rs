@@ -22,7 +22,11 @@ pub(super) struct TreeDropGuard {
 }
 
 impl TreeDropGuard {
-    pub(super) fn new(child_pid: Option<u32>) -> Self {
+    pub(super) fn new(
+        child_pid: Option<u32>,
+        _memory_limit: Option<u64>,
+        _memory_headroom: u64,
+    ) -> Self {
         let pgid = child_pid
             .and_then(|pid| i32::try_from(pid).ok())
             .map(Pid::from_raw);
@@ -31,6 +35,72 @@ impl TreeDropGuard {
 
     pub(super) fn disarm(&mut self) {
         self.armed = false;
+    }
+}
+
+/// Applies the platform hard memory limit to `cmd` before `exec` when `memory_limit` is set.
+///
+/// - **Linux**: sets `RLIMIT_AS` to `memory_limit + rlimit_as_headroom` (clamped to the current
+///   hard limit) so runaway allocations fail with `ENOMEM` immediately in the kernel.
+/// - **Other non-macOS Unix**: sets `RLIMIT_DATA` to `memory_limit`.
+/// - **macOS**: skipped because macOS `dyld` maps >2 GiB of shared cache into virtual space and
+///   ignores `RLIMIT_DATA`; enforcement is provided by the parent RSS watchdog.
+#[allow(unused_variables)]
+pub(super) fn configure_pre_exec_memory_limit(
+    cmd: &mut tokio::process::Command,
+    memory_limit: Option<u64>,
+    rlimit_as_headroom: u64,
+) {
+    let Some(limit) = memory_limit else {
+        return;
+    };
+
+    #[cfg(target_os = "linux")]
+    {
+        let target = limit.saturating_add(rlimit_as_headroom);
+        // SAFETY: `pre_exec` runs between `fork` and `exec` and calls only async-signal-safe
+        // `getrlimit`/`setrlimit` syscalls with stack-allocated structs.
+        #[allow(unsafe_code)]
+        unsafe {
+            cmd.pre_exec(move || {
+                let mut cur = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_AS, &mut cur) == 0 {
+                    let capped = (target as libc::rlim_t).min(cur.rlim_max);
+                    let next = libc::rlimit {
+                        rlim_cur: capped,
+                        rlim_max: capped,
+                    };
+                    let _ = libc::setrlimit(libc::RLIMIT_AS, &next);
+                }
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        // SAFETY: `pre_exec` calls only async-signal-safe `getrlimit`/`setrlimit` syscalls.
+        #[allow(unsafe_code)]
+        unsafe {
+            cmd.pre_exec(move || {
+                let mut cur = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_DATA, &mut cur) == 0 {
+                    let capped = (limit as libc::rlim_t).min(cur.rlim_max);
+                    let next = libc::rlimit {
+                        rlim_cur: capped,
+                        rlim_max: capped,
+                    };
+                    let _ = libc::setrlimit(libc::RLIMIT_DATA, &next);
+                }
+                Ok(())
+            });
+        }
     }
 }
 
@@ -44,7 +114,7 @@ impl Drop for TreeDropGuard {
     }
 }
 
-pub(super) fn configure_containment(wrapped: &mut CommandWrap) {
+pub(super) fn configure_containment(wrapped: &mut CommandWrap, _suspend_for_memory_job: bool) {
     wrapped.wrap(ProcessGroup::leader()).wrap(KillOnDrop);
 }
 

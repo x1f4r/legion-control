@@ -63,6 +63,8 @@ blake3 = "1.8.7"
 getrandom = "0.4.3"
 globset = "0.4.22"
 ignore = "0.4.35"
+# Pure-Rust image decoders/encoders for fs.thumb: only the five supported raster formats, no rayon.
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
 # Pure-Rust QR encoder (no image/svg features) for terminal pairing codes in `legion pair`.
 qrcode = { version = "0.15.0", default-features = false }
 regex = "1.13.2"
@@ -92,6 +94,37 @@ dbg_macro = "warn"
 # Failing is the rare path and the type crosses crate and process boundaries as a plain value, so
 # boxing it everywhere would cost readability for no measurable gain.
 result_large_err = "allow"
+
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+[profile.dev.package.zune-core]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.fdeflate]
+opt-level = 3
+[profile.dev.package.flate2]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.adler2]
+opt-level = 3
+[profile.dev.package.simd-adler32]
+opt-level = 3
+[profile.dev.package.crc32fast]
+opt-level = 3
+[profile.dev.package.gif]
+opt-level = 3
+[profile.dev.package.weezl]
+opt-level = 3
+[profile.dev.package.image-webp]
+opt-level = 3
+[profile.dev.package.bytemuck]
+opt-level = 3
+[profile.dev.package.color_quant]
+opt-level = 3
 
 [profile.release]
 # Produce a small, stripped static binary for fleet distribution. `panic` is intentionally left at
