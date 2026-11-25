@@ -689,11 +689,19 @@ fn helper_env_remove_driver(args: &[String]) -> ExitCode {
         .as_deref()
         .expect("spawn_detached should stamp DetachHandle.marker");
 
-    let detach_text = rt.block_on(wait_for_detached_file(
+    // The helper prints one line per variable and the marker last; reading the file as soon as
+    // it has any content can see only the first line.
+    let last_line = format!("{DETACH_MARKER_ENV}=");
+    let detach_text = rt.block_on(wait_for_detached_file_until(
         &detach_out,
         Duration::from_secs(20),
         &handle,
         &[&detach_out],
+        |content| {
+            content
+                .lines()
+                .any(|line| line.starts_with(&last_line) && content.ends_with('\n'))
+        },
     ));
     assert!(
         detach_text.contains("LEGION_DROP_ME=<unset>"),
@@ -842,10 +850,27 @@ async fn wait_for_detached_file(
     handle: &DetachHandle,
     log_paths: &[&Path],
 ) -> String {
+    wait_for_detached_file_until(path, timeout, handle, log_paths, |content| {
+        !content.trim().is_empty()
+    })
+    .await
+}
+
+/// Waits until `complete` accepts what the detached process has written to `path`.
+///
+/// A file the child writes line by line is not finished when it stops being empty, so a caller
+/// that needs all of it names what the end looks like.
+async fn wait_for_detached_file_until(
+    path: &Path,
+    timeout: Duration,
+    handle: &DetachHandle,
+    log_paths: &[&Path],
+    complete: impl Fn(&str) -> bool,
+) -> String {
     let deadline = Instant::now() + timeout;
     loop {
         if let Ok(content) = fs::read_to_string(path)
-            && !content.trim().is_empty()
+            && complete(&content)
         {
             return content;
         }

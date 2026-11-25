@@ -152,9 +152,12 @@ if [[ "$LEGION_DISTRO_KIND" == "deb" ]]; then
     ca-certificates jq openssh-client openssh-server systemd >/dev/null
 
   step "Installing .deb with apt-get install"
-  dpkg-deb --contents "$LEGION_PKG_FILE" | grep -q 'usr/share/man/man1/legion\.1\.gz$' || fail "package archive missing man page"
-  dpkg-deb --contents "$LEGION_PKG_FILE" | grep -q 'usr/share/doc/legion/copyright$' || fail "package archive missing copyright"
-  dpkg-deb --contents "$LEGION_PKG_FILE" | grep -q 'usr/share/doc/legion/changelog\.Debian\.gz$' || fail "package archive missing changelog"
+  # List the archive once and search the text: `grep -q` leaving a pipe early kills the writer
+  # with SIGPIPE, which `pipefail` then reports as a failure.
+  PKG_CONTENTS="$(dpkg-deb --contents "$LEGION_PKG_FILE")"
+  grep -q 'usr/share/man/man1/legion\.1\.gz$' <<<"$PKG_CONTENTS" || fail "package archive missing man page"
+  grep -q 'usr/share/doc/legion/copyright$' <<<"$PKG_CONTENTS" || fail "package archive missing copyright"
+  grep -q 'usr/share/doc/legion/changelog\.Debian\.gz$' <<<"$PKG_CONTENTS" || fail "package archive missing changelog"
 
   apt-get install -y -qq "$LEGION_PKG_FILE" >/dev/null
   REINSTALL_PKG="$LEGION_PKG_FILE"
@@ -226,7 +229,7 @@ elif [[ "$LEGION_DISTRO_KIND" == "arch" ]]; then
     step "Checking built source package with namcap"
     NAMCAP_OUT="$(namcap "$BUILT_PKG")"
     printf '%s\n' "$NAMCAP_OUT"
-    if printf '%s\n' "$NAMCAP_OUT" | grep -q ' E: '; then
+    if grep -q ' E: ' <<<"$NAMCAP_OUT"; then
       fail "namcap reported errors on source package"
     fi
 
@@ -247,7 +250,7 @@ elif [[ "$LEGION_DISTRO_KIND" == "arch" ]]; then
       [[ -n "$BUILT_BIN_PKG" ]] || fail "makepkg did not produce a legion-bin package"
       NAMCAP_BIN_OUT="$(namcap "$BUILT_BIN_PKG")"
       printf '%s\n' "$NAMCAP_BIN_OUT"
-      if printf '%s\n' "$NAMCAP_BIN_OUT" | grep -q ' E: '; then
+      if grep -q ' E: ' <<<"$NAMCAP_BIN_OUT"; then
         fail "namcap reported errors on legion-bin package"
       fi
     fi
@@ -273,7 +276,8 @@ elif [[ "$LEGION_DISTRO_KIND" == "arch" ]]; then
   test -f /usr/lib/legion/managed-by || fail "/usr/lib/legion/managed-by not installed"
   [[ "$(cat /usr/lib/legion/managed-by)" == "pacman" ]] || fail "unexpected managed-by content"
   test -f /usr/lib/systemd/user/legion-serve.service || fail "systemd user unit not installed"
-  pacman -Ql legion | grep -q '/usr/share/man/man1/legion\.1\.gz$' || fail "package manifest missing man page"
+  PACMAN_FILES="$(pacman -Ql legion)"
+  grep -q '/usr/share/man/man1/legion\.1\.gz$' <<<"$PACMAN_FILES" || fail "package manifest missing man page"
   # Official archlinux container images set NoExtract for usr/share/man/* in /etc/pacman.conf;
   # verify the man page on disk whenever pacman does not exclude it.
   if ! grep -Eq '^[[:space:]]*NoExtract[[:space:]]*=.*usr/share/man/' /etc/pacman.conf 2>/dev/null; then
