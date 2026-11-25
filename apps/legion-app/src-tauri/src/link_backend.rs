@@ -4,7 +4,7 @@
 //! rpc`) on desktops when a `legion` binary is installed. State is persisted atomically in
 //! [`AppStore`] without ever logging keys or invites.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -20,9 +20,9 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::backend::{
     AppError, AppState, Backend, BoxFuture, CallId, CallRequest, CancelResult,
-    ConflictingIdentityInfo, DisagreementEntryView, DisagreementView, ErrorCode,
+    ConflictingIdentityInfo, ContentTarget, DisagreementEntryView, DisagreementView, ErrorCode,
     IdentityChangedInfo, LearnResult, MachineRouteView, Needs, NodeLink, PairPendingPeer,
-    PairSummary, RepairInfo, RepairResult, UnpairResult,
+    PairSummary, RepairInfo, RepairResult, TransferCapabilities, UnpairResult,
 };
 use crate::commands::default_device_name;
 use crate::store::{AppStore, AppStoreData, StoredNodeMeta};
@@ -119,13 +119,74 @@ struct BackendState {
     data: AppStoreData,
     store_error: Option<AppError>,
     local_program: Option<String>,
+    /// Live node identity observed from `meta.whoami` over the implicit desktop `local` pipe.
+    /// Never guessed from disk files and never shadows a paired or learned SSH node of the same
+    /// name.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    attached_local_node: Option<String>,
     active_node: Option<String>,
     /// Expiring route preference for door-level discovery reads when the user's preferred node is
     /// offline. Never changes `active_node` and never acts as a target for machine calls.
     preferred_relay: Option<(String, Instant)>,
     last_paired: Option<PairSummary>,
     disagreements: Vec<DisagreementView>,
+    /// Monotonic pairing epoch per configured link node (`"local"` or node name). Bumped on pair
+    /// / identity-change acceptance and removed on unpair / repair so content tickets issued under
+    /// a removed or replaced pairing die immediately.
+    pairing_epochs: HashMap<String, u64>,
+    next_pairing_epoch: u64,
     link: Link,
+}
+
+impl BackendState {
+    fn alloc_epoch(&mut self) -> u64 {
+        let next = self.next_pairing_epoch;
+        self.next_pairing_epoch = self.next_pairing_epoch.saturating_add(1);
+        next
+    }
+
+    fn set_fresh_epoch(&mut self, node: &str) -> u64 {
+        let epoch = self.alloc_epoch();
+        self.pairing_epochs.insert(node.to_owned(), epoch);
+        epoch
+    }
+
+    fn sync_pairing_epochs(&mut self) {
+        #[allow(unused_mut)]
+        let mut live: Vec<String> = self
+            .data
+            .link
+            .nodes
+            .iter()
+            .map(|n| n.node.clone())
+            .collect();
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if self.local_program.is_some() && !live.iter().any(|n| n == LOCAL_NODE_ID) {
+            live.push(LOCAL_NODE_ID.to_owned());
+        }
+        self.pairing_epochs
+            .retain(|node, _| live.iter().any(|l| l == node));
+        for node in live {
+            if !self.pairing_epochs.contains_key(&node) {
+                let epoch = self.alloc_epoch();
+                self.pairing_epochs.insert(node, epoch);
+            }
+        }
+    }
+}
+
+fn format_pairing_holder(link_node: &str, epoch: u64) -> String {
+    format!("pairing:{link_node}:{epoch}")
+}
+
+fn parse_pairing_holder(holder: &str) -> Option<(&str, u64)> {
+    let rest = holder.strip_prefix("pairing:")?;
+    let (node, epoch_str) = rest.rsplit_once(':')?;
+    if node.is_empty() {
+        return None;
+    }
+    let epoch = epoch_str.parse::<u64>().ok()?;
+    Some((node, epoch))
 }
 
 impl LinkBackend {
@@ -182,18 +243,27 @@ impl LinkBackend {
             None => Link::with_options(link_cfg, link_options),
         };
 
+        let mut state = BackendState {
+            data,
+            store_error,
+            local_program,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            attached_local_node: None,
+            active_node,
+            preferred_relay: None,
+            last_paired: None,
+            disagreements: Vec::new(),
+            pairing_epochs: HashMap::new(),
+            next_pairing_epoch: 1,
+            link,
+        };
+        if state.store_error.is_none() {
+            state.sync_pairing_epochs();
+        }
+
         Self {
             store,
-            state: Mutex::new(BackendState {
-                data,
-                store_error,
-                local_program,
-                active_node,
-                preferred_relay: None,
-                last_paired: None,
-                disagreements: Vec::new(),
-                link,
-            }),
+            state: Mutex::new(state),
             mutate_lock: AsyncMutex::new(()),
             next_call_seq: AtomicU64::new(1),
         }
@@ -287,6 +357,29 @@ impl LinkBackend {
             ),
         }
     }
+
+    fn resolve_link_node_for_call(&self, machine: &str) -> String {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            let guard = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Paired and learned SSH nodes ALWAYS take precedence by identity so a remote node
+            // sharing a name with the local machine can never be silently redirected over the
+            // local pipe.
+            if guard.data.link.node(machine).is_some() {
+                return machine.to_owned();
+            }
+            if guard.local_program.is_some()
+                && (machine == LOCAL_NODE_ID
+                    || guard.attached_local_node.as_deref() == Some(machine))
+            {
+                return LOCAL_NODE_ID.to_owned();
+            }
+        }
+        machine.to_owned()
+    }
 }
 
 impl Backend for LinkBackend {
@@ -344,10 +437,33 @@ impl Backend for LinkBackend {
 
             match parsed_target {
                 Some(Target::One(machine)) => {
+                    let resolved = self.resolve_link_node_for_call(&machine);
                     let routed = link
-                        .call_machine_with_id(&call_id, &machine, &request.tool, request.args, emit)
+                        .call_machine_with_id(
+                            &call_id,
+                            &resolved,
+                            &request.tool,
+                            request.args,
+                            emit,
+                        )
                         .await
                         .map_err(AppError::from)?;
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                    if resolved == LOCAL_NODE_ID
+                        && request.tool == "meta.whoami"
+                        && let Some(actual_name) = routed
+                            .value
+                            .get("node")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                    {
+                        let mut guard = self
+                            .state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        guard.attached_local_node = Some(actual_name.to_owned());
+                    }
                     Ok(routed.value)
                 }
                 Some(Target::All | Target::Many(_)) => {
@@ -489,6 +605,7 @@ impl Backend for LinkBackend {
                 guard.preferred_relay = None;
                 guard.last_paired = Some(pair_summary);
                 guard.disagreements.retain(|d| d.machine != node_name);
+                guard.set_fresh_epoch(&node_name);
                 build_app_state(&guard, self.store.path())
             };
 
@@ -566,6 +683,7 @@ impl Backend for LinkBackend {
                 guard.data = next;
                 guard.active_node = resolve_active_node(&guard.data, local_program.as_deref());
                 guard.preferred_relay = None;
+                guard.sync_pairing_epochs();
                 guard.disagreements.retain_mut(|d| {
                     if d.machine == trimmed {
                         return false;
@@ -676,6 +794,8 @@ impl Backend for LinkBackend {
                 guard.preferred_relay = None;
                 guard.last_paired = None;
                 guard.disagreements.clear();
+                guard.pairing_epochs.clear();
+                guard.sync_pairing_epochs();
                 (old, build_app_state(&guard, self.store.path()))
             };
 
@@ -742,6 +862,7 @@ impl Backend for LinkBackend {
                 if updated != guard.data {
                     self.store.save(&updated)?;
                     guard.data = updated;
+                    guard.sync_pairing_epochs();
                 }
                 guard.disagreements = report
                     .disagreement_details
@@ -809,6 +930,7 @@ impl Backend for LinkBackend {
                     .accept_identity_change(trimmed, &fingerprints)
                     .map_err(AppError::from)?;
                 guard.data = updated;
+                guard.set_fresh_epoch(trimmed);
                 build_app_state(&guard, self.store.path())
             };
             Ok(state)
@@ -849,6 +971,107 @@ impl Backend for LinkBackend {
             };
             Ok(state)
         })
+    }
+
+    fn update_sources(&self) -> Result<Option<(Link, Vec<String>)>, AppError> {
+        let guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(err) = &guard.store_error {
+            return Err(err.clone());
+        }
+        let mut nodes: Vec<String> = Vec::new();
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if guard.local_program.is_some() && guard.data.link.node(LOCAL_NODE_ID).is_none() {
+            nodes.push(LOCAL_NODE_ID.to_owned());
+        }
+        for entry in &guard.data.link.nodes {
+            if entry.origin == NodeOrigin::Paired && entry.identity_changed.is_none() {
+                nodes.push(entry.node.clone());
+            }
+        }
+        Ok(Some((guard.link.clone(), nodes)))
+    }
+
+    fn content_target(&self, machine: &str) -> Result<ContentTarget, AppError> {
+        let trimmed = machine.trim();
+        if trimmed.is_empty() {
+            return Err(
+                AppError::new(ErrorCode::InvalidArgs, "Machine name cannot be empty.")
+                    .with_hint("Pass the name of a paired machine."),
+            );
+        }
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(err) = &guard.store_error {
+            return Err(err.clone());
+        }
+        let link = guard.link.clone();
+        // Paired and learned SSH nodes ALWAYS match first so a paired remote machine sharing the
+        // local hostname routes over its authenticated SSH connection with host-key verification
+        // instead of silently redirecting to the local pipe.
+        if let Some(entry) = guard.data.link.node(trimmed).cloned() {
+            let epoch = match guard.pairing_epochs.get(&entry.node).copied() {
+                Some(ep) => ep,
+                None => guard.set_fresh_epoch(&entry.node),
+            };
+            let principal = entry.principal.unwrap_or_else(|| {
+                if entry.local_program.is_some() {
+                    "local".to_owned()
+                } else {
+                    "device".to_owned()
+                }
+            });
+            return Ok(ContentTarget {
+                link,
+                link_node: entry.node.clone(),
+                machine: entry.node.clone(),
+                principal,
+                holder: format_pairing_holder(&entry.node, epoch),
+            });
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if guard.local_program.is_some()
+            && (trimmed == LOCAL_NODE_ID || guard.attached_local_node.as_deref() == Some(trimmed))
+        {
+            let epoch = match guard.pairing_epochs.get(LOCAL_NODE_ID).copied() {
+                Some(ep) => ep,
+                None => guard.set_fresh_epoch(LOCAL_NODE_ID),
+            };
+            return Ok(ContentTarget {
+                link,
+                link_node: LOCAL_NODE_ID.to_owned(),
+                machine: trimmed.to_owned(),
+                principal: "local".to_owned(),
+                holder: format_pairing_holder(LOCAL_NODE_ID, epoch),
+            });
+        }
+        let any_configured = !guard.data.link.nodes.is_empty() || guard.local_program.is_some();
+        if !any_configured {
+            return Err(AppError::not_paired());
+        }
+        Err(AppError::new(
+            ErrorCode::NotFound,
+            format!("Machine `{trimmed}` is not paired on this device."),
+        )
+        .with_hint("Pair with that machine or refresh learned fleet routes first."))
+    }
+
+    fn is_pairing_holder_live(&self, holder: &str) -> bool {
+        let Some((node, epoch)) = parse_pairing_holder(holder) else {
+            return false;
+        };
+        let guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.store_error.is_some() {
+            return false;
+        }
+        guard.pairing_epochs.get(node).copied() == Some(epoch)
     }
 }
 
@@ -957,6 +1180,7 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
             routes: BTreeMap::new(),
             disagreements: Vec::new(),
             last_paired: None,
+            transfer_capabilities: TransferCapabilities::current_platform(),
         };
     }
 
@@ -1126,6 +1350,7 @@ fn build_app_state(state: &BackendState, store_path: &std::path::Path) -> AppSta
         routes,
         disagreements: state.disagreements.clone(),
         last_paired: state.last_paired.clone(),
+        transfer_capabilities: TransferCapabilities::current_platform(),
     }
 }
 
@@ -1166,35 +1391,150 @@ fn discover_local_legion_from(
     path_var: Option<&std::ffi::OsStr>,
     conventional: &[std::path::PathBuf],
 ) -> Option<String> {
-    use std::path::Path;
+    let appdir = std::env::var_os("APPDIR")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from);
+    discover_local_legion_with_env(path_var, conventional, appdir.as_deref())
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn discover_local_legion_with_env(
+    path_var: Option<&std::ffi::OsStr>,
+    conventional: &[std::path::PathBuf],
+    appdir: Option<&std::path::Path>,
+) -> Option<String> {
+    use std::path::{Path, PathBuf};
 
     #[cfg(windows)]
     const BIN_NAME: &str = "legion.exe";
     #[cfg(not(windows))]
     const BIN_NAME: &str = "legion";
 
-    fn is_executable_file(path: &Path) -> bool {
-        let Ok(meta) = std::fs::metadata(path) else {
-            return false;
-        };
-        if !meta.is_file() {
-            return false;
+    let mut forbidden_roots: Vec<PathBuf> = Vec::new();
+    let sys_tmp = std::env::temp_dir();
+    forbidden_roots.push(sys_tmp.clone());
+    if let Ok(canon_tmp) = std::fs::canonicalize(&sys_tmp) {
+        forbidden_roots.push(canon_tmp);
+    }
+    #[cfg(unix)]
+    for raw in [
+        "/tmp",
+        "/var/tmp",
+        "/dev/shm",
+        "/private/tmp",
+        "/private/var/tmp",
+    ] {
+        let p = PathBuf::from(raw);
+        forbidden_roots.push(p.clone());
+        if let Ok(c) = std::fs::canonicalize(&p) {
+            forbidden_roots.push(c);
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            meta.permissions().mode() & 0o111 != 0
-        }
-        #[cfg(not(unix))]
-        {
-            true
+    }
+    if let Some(dir) = appdir {
+        forbidden_roots.push(dir.to_path_buf());
+        if let Ok(c) = std::fs::canonicalize(dir) {
+            forbidden_roots.push(c);
         }
     }
 
-    fn resolve_candidate(candidate: &Path) -> Option<String> {
-        let canonical = std::fs::canonicalize(candidate).ok()?;
-        if !is_executable_file(&canonical) {
+    let is_in_forbidden_root = |path: &Path| -> bool {
+        #[cfg(windows)]
+        {
+            let norm = |p: &Path| -> String {
+                let s = p.to_string_lossy();
+                let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
+                s.trim_end_matches(['\\', '/']).to_ascii_lowercase()
+            };
+            let target = norm(path);
+            forbidden_roots.iter().any(|root| {
+                let r = norm(root);
+                !r.is_empty()
+                    && (target == r
+                        || target.starts_with(&format!("{r}\\"))
+                        || target.starts_with(&format!("{r}/")))
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            forbidden_roots.iter().any(|root| path.starts_with(root))
+        }
+    };
+
+    #[cfg(unix)]
+    let is_safe_unix_path = |raw_candidate: &Path, canonical: &Path| -> bool {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        if is_in_forbidden_root(raw_candidate) || is_in_forbidden_root(canonical) {
+            return false;
+        }
+        let euid = rustix::process::geteuid().as_raw();
+
+        // Check every ancestor directory of both the raw candidate parent and the canonical binary:
+        // refuse any world-writable directory (including sticky temp dirs like 0o1777).
+        for check_start in [raw_candidate.parent(), canonical.parent()] {
+            let Some(mut cur) = check_start else {
+                return false;
+            };
+            loop {
+                let Ok(meta) = std::fs::symlink_metadata(cur) else {
+                    return false;
+                };
+                if meta.permissions().mode() & 0o002 != 0 {
+                    return false;
+                }
+                match cur.parent() {
+                    Some(parent) if parent != cur => cur = parent,
+                    _ => break,
+                }
+            }
+        }
+
+        let Ok(file_meta) = std::fs::symlink_metadata(canonical) else {
+            return false;
+        };
+        if !file_meta.file_type().is_file() {
+            return false;
+        }
+        let file_mode = file_meta.permissions().mode();
+        if file_mode & 0o111 == 0 || file_mode & 0o002 != 0 {
+            return false;
+        }
+        let file_uid = file_meta.uid();
+        if file_uid != euid && !(file_uid == 0 && file_mode & 0o022 == 0) {
+            return false;
+        }
+
+        // Immediate parent directory of the canonical binary must also be owned by the current
+        // user or root (never another local user).
+        let Some(parent) = canonical.parent() else {
+            return false;
+        };
+        let Ok(parent_meta) = std::fs::metadata(parent) else {
+            return false;
+        };
+        let parent_uid = parent_meta.uid();
+        let parent_mode = parent_meta.permissions().mode();
+        parent_uid == euid || (parent_uid == 0 && parent_mode & 0o002 == 0)
+    };
+
+    let resolve_candidate = |candidate: &Path| -> Option<String> {
+        if is_in_forbidden_root(candidate) {
             return None;
+        }
+        let canonical = std::fs::canonicalize(candidate).ok()?;
+        if is_in_forbidden_root(&canonical) {
+            return None;
+        }
+        #[cfg(unix)]
+        if !is_safe_unix_path(candidate, &canonical) {
+            return None;
+        }
+        #[cfg(not(unix))]
+        {
+            let meta = std::fs::metadata(&canonical).ok()?;
+            if !meta.is_file() {
+                return None;
+            }
         }
         let raw = canonical.to_string_lossy();
         #[cfg(windows)]
@@ -1204,7 +1544,7 @@ fn discover_local_legion_from(
             return Some(stripped.to_owned());
         }
         Some(raw.into_owned())
-    }
+    };
 
     if let Some(path_var) = path_var {
         for dir in std::env::split_paths(path_var) {
@@ -1943,7 +2283,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         use std::os::unix::fs::{PermissionsExt, symlink};
 
-        let dir = tempfile::tempdir()?;
+        // Place the valid test fixture inside the user-owned target directory (not /tmp, which
+        // discover_local_legion intentionally refuses as a world-writable temp location).
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-discover");
+        std::fs::create_dir_all(&base)?;
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))?;
+        let dir = tempfile::tempdir_in(&base)?;
         let real_dir = dir.path().join("real");
         let link_dir = dir.path().join("bin");
         std::fs::create_dir_all(&real_dir)?;
@@ -1966,6 +2311,73 @@ mod tests {
         let found = discover_local_legion_from(Some(&mixed_path), &[])
             .ok_or("expected canonical legion binary")?;
         assert_eq!(found, std::fs::canonicalize(&real_bin)?.to_string_lossy());
+        Ok(())
+    }
+
+    #[cfg(all(unix, not(any(target_os = "android", target_os = "ios"))))]
+    #[test]
+    fn discover_local_legion_refuses_tmp_appdir_and_world_writable_dirs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        // 1. A binary placed inside /tmp (system temp dir) must be refused.
+        let tmp_dir = tempfile::tempdir()?;
+        let tmp_bin = tmp_dir.path().join("legion");
+        std::fs::write(&tmp_bin, "#!/bin/sh\nexit 0\n")?;
+        std::fs::set_permissions(&tmp_bin, std::fs::Permissions::from_mode(0o755))?;
+        let tmp_path = std::env::join_paths([tmp_dir.path()])?;
+        assert_eq!(
+            discover_local_legion_with_env(Some(&tmp_path), &[], None),
+            None,
+            "legion binary in /tmp must be refused"
+        );
+
+        // 2. A binary inside a world-writable directory (or world-writable binary) outside /tmp
+        //    must be refused.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-discover");
+        std::fs::create_dir_all(&base)?;
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))?;
+        let safe_root = tempfile::tempdir_in(&base)?;
+
+        let ww_dir = safe_root.path().join("world-writable");
+        std::fs::create_dir_all(&ww_dir)?;
+        std::fs::set_permissions(&ww_dir, std::fs::Permissions::from_mode(0o777))?;
+        let ww_bin = ww_dir.join("legion");
+        std::fs::write(&ww_bin, "#!/bin/sh\nexit 0\n")?;
+        std::fs::set_permissions(&ww_bin, std::fs::Permissions::from_mode(0o755))?;
+        let ww_path = std::env::join_paths([&ww_dir])?;
+        assert_eq!(
+            discover_local_legion_with_env(Some(&ww_path), &[], None),
+            None,
+            "legion binary inside world-writable directory must be refused"
+        );
+
+        let ww_file_dir = safe_root.path().join("ww-file");
+        std::fs::create_dir_all(&ww_file_dir)?;
+        std::fs::set_permissions(&ww_file_dir, std::fs::Permissions::from_mode(0o700))?;
+        let ww_file_bin = ww_file_dir.join("legion");
+        std::fs::write(&ww_file_bin, "#!/bin/sh\nexit 0\n")?;
+        std::fs::set_permissions(&ww_file_bin, std::fs::Permissions::from_mode(0o777))?;
+        let ww_file_path = std::env::join_paths([&ww_file_dir])?;
+        assert_eq!(
+            discover_local_legion_with_env(Some(&ww_file_path), &[], None),
+            None,
+            "world-writable legion binary must be refused"
+        );
+
+        // 3. A binary inside $APPDIR must be refused even when permissions are 0700.
+        let fake_appdir = safe_root.path().join("appdir");
+        let fake_appdir_bin = fake_appdir.join("usr/bin");
+        std::fs::create_dir_all(&fake_appdir_bin)?;
+        let appdir_legion = fake_appdir_bin.join("legion");
+        std::fs::write(&appdir_legion, "#!/bin/sh\nexit 0\n")?;
+        std::fs::set_permissions(&appdir_legion, std::fs::Permissions::from_mode(0o755))?;
+        let appdir_path = std::env::join_paths([&fake_appdir_bin])?;
+        assert_eq!(
+            discover_local_legion_with_env(Some(&appdir_path), &[], Some(&fake_appdir)),
+            None,
+            "legion binary inside $APPDIR must be refused"
+        );
         Ok(())
     }
 
@@ -2471,5 +2883,50 @@ mod tests {
             summary.not_synced[0].reason.as_deref(),
             Some("live device changes refused")
         );
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[test]
+    fn paired_ssh_node_takes_precedence_over_local_pipe_and_never_guesses_from_disk()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = AppStore::in_dir(dir.path());
+        let mut initial = AppStoreData::default();
+        initial.link.upsert_node(sample_ssh_node("tower"));
+        store.save(&initial)?;
+
+        let backend = LinkBackend::with_local_program(store, Some("/usr/bin/legion".to_owned()));
+
+        // Even if the attached local node happened to report the same name `"tower"`, calls and
+        // content requests for `"tower"` MUST still route to the paired SSH node `"tower"` with
+        // its own pairing holder, while `"local"` addresses the local pipe.
+        {
+            let mut guard = backend.state.lock().unwrap_or_else(|p| p.into_inner());
+            guard.attached_local_node = Some("tower".to_owned());
+        }
+
+        assert_eq!(backend.resolve_link_node_for_call("tower"), "tower");
+        assert_eq!(backend.resolve_link_node_for_call("local"), "local");
+
+        let ssh_target = backend.content_target("tower")?;
+        assert_eq!(ssh_target.link_node, "tower");
+        assert_eq!(ssh_target.principal, "phone");
+        assert!(ssh_target.holder.starts_with("pairing:tower:"));
+
+        let local_target = backend.content_target("local")?;
+        assert_eq!(local_target.link_node, "local");
+        assert_eq!(local_target.principal, "local");
+        assert!(local_target.holder.starts_with("pairing:local:"));
+
+        // Without a live `meta.whoami` identity proof, an unpaired machine name is never guessed
+        // onto the local pipe.
+        let fresh_dir = tempfile::tempdir()?;
+        let fresh_backend = LinkBackend::with_local_program(
+            AppStore::in_dir(fresh_dir.path()),
+            Some("/usr/bin/legion".to_owned()),
+        );
+        assert!(fresh_backend.content_target("tower").is_err());
+        assert_eq!(fresh_backend.content_target("local")?.link_node, "local");
+        Ok(())
     }
 }

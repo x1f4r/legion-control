@@ -1,5 +1,6 @@
 package com.x1f4r.legion
 
+import android.app.Activity
 import android.Manifest
 import android.content.pm.PackageManager
 import android.content.res.Configuration
@@ -19,21 +20,28 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.webkit.JavaScriptReplyProxy
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+import app.tauri.plugin.Plugin
+import app.tauri.plugin.PluginManager
 import org.json.JSONArray
 import org.json.JSONObject
+import java.lang.ref.WeakReference
 
 class MainActivity : TauriActivity() {
   private var attachedWebView: WebView? = null
   @Volatile
   private var bridgeReplyProxy: JavaScriptReplyProxy? = null
   private lateinit var localNetworkPermissionLauncher: ActivityResultLauncher<String>
+  private lateinit var notificationPermissionLauncher: ActivityResultLauncher<String>
   private val pendingLocalNetworkRequests = mutableListOf<Int>()
+  private val pendingNotificationCallbacks = mutableListOf<(Boolean) -> Unit>()
 
   private val backCallback = object : OnBackPressedCallback(false) {
     override fun handleOnBackPressed() {
       val webView = attachedWebView
       if (webView != null && webView.canGoBack()) {
         webView.goBack()
+        webView.post { syncBackNavigation(webView) }
+        webView.postDelayed({ syncBackNavigation(webView) }, 80L)
       } else {
         isEnabled = false
         onBackPressedDispatcher.onBackPressed()
@@ -95,6 +103,33 @@ class MainActivity : TauriActivity() {
           localNetworkPermissionLauncher.launch(Manifest.permission.ACCESS_LOCAL_NETWORK)
         }
       }
+      "history_changed" -> {
+        runOnUiThread {
+          attachedWebView?.let { syncBackNavigation(it) }
+        }
+      }
+    }
+  }
+
+  fun requestNotificationPermission(callback: (Boolean) -> Unit) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+      callback(true)
+      return
+    }
+    if (ContextCompat.checkSelfPermission(
+        this,
+        Manifest.permission.POST_NOTIFICATIONS,
+      ) == PackageManager.PERMISSION_GRANTED
+    ) {
+      callback(true)
+      return
+    }
+    runOnUiThread {
+      val shouldLaunch = pendingNotificationCallbacks.isEmpty()
+      pendingNotificationCallbacks.add(callback)
+      if (shouldLaunch) {
+        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+      }
     }
   }
 
@@ -119,8 +154,20 @@ class MainActivity : TauriActivity() {
         pendingLocalNetworkRequests.clear()
         resolveLocalNetworkRequests(ids, granted)
       }
+    notificationPermissionLauncher =
+      registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        val cbs = pendingNotificationCallbacks.toList()
+        pendingNotificationCallbacks.clear()
+        for (cb in cbs) {
+          runCatching { cb(granted) }
+        }
+      }
+    TransferBridge.setActiveActivity(this)
     applySystemBarStyle(resources.configuration)
     super.onCreate(savedInstanceState)
+    // If the process stayed alive for TransferForegroundService after the user swiped Legion away
+    // from Recents, notify Rust so it rebuilds the main WebView inside this recreated Activity.
+    TransferBridge.sendEvent(JSONObject().put("event", "activity_created"))
 
     // Observe system bar + display cutout insets on the decor view without consuming them so the
     // WebView still receives raw WindowInsets and we can feed CSS variables whenever they change.
@@ -147,6 +194,7 @@ class MainActivity : TauriActivity() {
     super.onWebViewCreate(webView)
     attachedWebView = webView
     bridgeReplyProxy = null
+    rebindPluginsIfActivityRecreated(webView)
     applySystemBarStyle(resources.configuration)
 
     // Android 17 WebView reports 0px for CSS env(safe-area-inset-*). Expose insets, device model,
@@ -190,6 +238,41 @@ class MainActivity : TauriActivity() {
     } else {
       backCallback.isEnabled = false
     }
+  }
+
+  private fun rebindPluginsIfActivityRecreated(webView: WebView) {
+    // When TransferForegroundService keeps the process alive after MainActivity is swiped away,
+    // PluginManager still holds plugin instances bound to the destroyed Activity and WebView
+    // (because PluginManager.onWebViewCreated skips plugins whose `loaded` flag is already true).
+    // Re-registering fresh instances against this live Activity + WebView keeps the file picker,
+    // barcode scanner, and self-updater working after window recreation.
+    val previous = lastPluginActivityRef?.get()
+    if (pluginsInitializedOnce && previous !== this) {
+      PluginManager.activity = this
+      runCatching {
+        val cls = Class.forName("app.tauri.barcodescanner.BarcodeScannerPlugin")
+        val scanner = cls.getConstructor(Activity::class.java).newInstance(this) as Plugin
+        PluginManager.load(webView, "barcode-scanner", scanner, "{}")
+      }
+      PluginManager.load(webView, "app-updater", AppUpdaterPlugin(this), "{}")
+      PluginManager.load(webView, "files-transfer", FilesTransferPlugin(this), "{}")
+    }
+    pluginsInitializedOnce = true
+    lastPluginActivityRef = WeakReference(this)
+  }
+
+  override fun onResume() {
+    super.onResume()
+    PluginManager.activity = this
+    TransferBridge.setActiveActivity(this)
+    attachedWebView?.let { syncBackNavigation(it) }
+  }
+
+  override fun onDestroy() {
+    if (TransferBridge.currentActivity() === this) {
+      TransferBridge.setActiveActivity(null)
+    }
+    super.onDestroy()
   }
 
   override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -236,6 +319,11 @@ class MainActivity : TauriActivity() {
   }
 
   companion object {
+    @Volatile
+    private var pluginsInitializedOnce = false
+    @Volatile
+    private var lastPluginActivityRef: WeakReference<MainActivity>? = null
+
     private const val BRIDGE_NAME = "__LEGION_ANDROID_BRIDGE__"
     private val ALLOWED_APP_ORIGINS = setOf(
       "https://tauri.localhost",
@@ -315,6 +403,36 @@ class MainActivity : TauriActivity() {
         document.addEventListener('DOMContentLoaded', function(){
           if (cachedInsets) applyInsets(cachedInsets);
         }, { once: true });
+
+        function notifyHistoryChanged(){
+          try {
+            bridge.postMessage(JSON.stringify({ type: 'history_changed' }));
+          } catch (_) {
+            // Ignore if bridge is unavailable.
+          }
+        }
+        try {
+          var origPushState = history.pushState;
+          if (typeof origPushState === 'function') {
+            history.pushState = function(){
+              var res = origPushState.apply(this, arguments);
+              notifyHistoryChanged();
+              return res;
+            };
+          }
+          var origReplaceState = history.replaceState;
+          if (typeof origReplaceState === 'function') {
+            history.replaceState = function(){
+              var res = origReplaceState.apply(this, arguments);
+              notifyHistoryChanged();
+              return res;
+            };
+          }
+          window.addEventListener('hashchange', notifyHistoryChanged);
+          window.addEventListener('popstate', notifyHistoryChanged);
+        } catch (_) {
+          // Ignore if history hooks cannot be installed.
+        }
 
         try {
           bridge.postMessage(JSON.stringify({ type: 'init' }));

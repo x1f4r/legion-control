@@ -1,13 +1,17 @@
 //! Tauri command surface backed by [`Backend`].
 
+#[cfg(debug_assertions)]
 use std::fs;
 use std::io::Write;
+#[cfg(debug_assertions)]
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+#[cfg(target_os = "android")]
+use tauri::Manager;
 use tauri::State;
 use tauri::ipc::Channel;
 
@@ -15,12 +19,38 @@ use crate::backend::{
     AppError, AppState, Backend, CallId, CallRequest, CancelResult, ErrorCode, LearnResult,
     RepairResult, UnpairResult,
 };
+use crate::content::{ContentUrlResult, SharedContentServer};
+#[cfg(all(debug_assertions, feature = "test-upload-paths"))]
+use crate::transfers::UploadFileInput;
+use crate::transfers::{
+    DeviceTransfer, OpenExternallyResult, OpenTransferResult, PickedUploadHandle, SharedTransfers,
+    TransferControlAction, TransferIdResult, TransferSettings, UploadEnqueueResult,
+};
+#[cfg(target_os = "android")]
+use crate::updater::android::AndroidUpdaterHandle;
+use crate::updater::{SharedUpdater, UpdateState};
 
 /// Log line emitted when the web interface finishes its first paint.
 pub const INTERFACE_READY_MARKER: &str = "legion-app: interface ready";
 
 /// Optional environment variable naming a file to write [`INTERFACE_READY_MARKER`] to on ready.
+/// Compiled ONLY in debug builds so release binaries ignore environment switches and never write
+/// arbitrary paths.
+#[cfg(debug_assertions)]
 pub const READY_FILE_ENV: &str = "LEGION_APP_READY_FILE";
+
+/// Optional environment variable naming a JSON spec file for the CI content-media smoke check.
+/// Compiled ONLY in debug builds so release binaries ship with zero test hooks.
+#[cfg(debug_assertions)]
+pub const MEDIA_CHECK_FILE_ENV: &str = "LEGION_APP_MEDIA_CHECK_FILE";
+
+/// Log line emitted when the opt-in CI content-media smoke check decodes both image and video.
+#[cfg(debug_assertions)]
+pub const MEDIA_CHECK_OK_MARKER: &str = "legion-app: media check ok";
+
+/// Log line emitted when the opt-in CI content-media smoke check fails.
+#[cfg(debug_assertions)]
+pub const MEDIA_CHECK_FAILED_MARKER: &str = "legion-app: media check failed";
 
 /// Maximum accepted pairing invite length at the command seam (8 KiB).
 pub const MAX_INVITE_BYTES: usize = 8 * 1024;
@@ -147,14 +177,17 @@ pub async fn pair(
     backend.0.pair(invite, resolved_name).await
 }
 
-/// Removes a paired node from this device.
+/// Removes a paired node from this device and revokes any content tickets issued under it.
 #[tauri::command]
 pub async fn unpair(
     backend: State<'_, SharedBackend>,
+    content: State<'_, SharedContentServer>,
     node: String,
 ) -> Result<UnpairResult, AppError> {
     validate_label_size("Node name", &node)?;
-    backend.0.unpair(node).await
+    let result = backend.0.unpair(node).await?;
+    content.0.revoke_stale_pairings();
+    Ok(result)
 }
 
 /// Switches which configured node calls are sent through by default.
@@ -170,8 +203,13 @@ pub async fn select_node(
 /// Moves a damaged or unsupported state file aside (`legion-app.json.damaged-<timestamp>`) and
 /// resets the backend to a clean state.
 #[tauri::command]
-pub async fn repair_store(backend: State<'_, SharedBackend>) -> Result<RepairResult, AppError> {
-    backend.0.repair_store().await
+pub async fn repair_store(
+    backend: State<'_, SharedBackend>,
+    content: State<'_, SharedContentServer>,
+) -> Result<RepairResult, AppError> {
+    let result = backend.0.repair_store().await?;
+    content.0.revoke_all();
+    Ok(result)
 }
 
 /// Closes cached sessions on mobile platforms after resuming from background or sleep so the next
@@ -202,6 +240,7 @@ pub async fn learn(backend: State<'_, SharedBackend>) -> Result<LearnResult, App
 #[tauri::command]
 pub async fn accept_identity_change(
     backend: State<'_, SharedBackend>,
+    content: State<'_, SharedContentServer>,
     node: String,
     fingerprints: Vec<String>,
 ) -> Result<AppState, AppError> {
@@ -215,7 +254,189 @@ pub async fn accept_identity_change(
     for fp in &fingerprints {
         validate_label_size("Fingerprint", fp)?;
     }
-    backend.0.accept_identity_change(node, fingerprints).await
+    let state = backend.0.accept_identity_change(node, fingerprints).await?;
+    content.0.revoke_stale_pairings();
+    Ok(state)
+}
+
+/// Mints a short-lived ticketed content address (`{ url, expires_in }`) for viewing or streaming
+/// `path` on `machine` through `legion-content`.
+#[tauri::command]
+pub async fn content_url(
+    content: State<'_, SharedContentServer>,
+    machine: String,
+    path: String,
+    download: Option<bool>,
+) -> Result<ContentUrlResult, AppError> {
+    validate_label_size("Machine name", &machine)?;
+    content
+        .0
+        .mint_url(&machine, &path, download.unwrap_or(false))
+        .await
+}
+
+/// Enqueues a non-blocking download from `machine:path` into the device's Downloads folder.
+#[tauri::command]
+pub async fn transfer_download(
+    transfers: State<'_, SharedTransfers>,
+    machine: String,
+    path: String,
+    name: Option<String>,
+    size: Option<u64>,
+    mime: Option<String>,
+) -> Result<TransferIdResult, AppError> {
+    validate_label_size("Machine name", &machine)?;
+    if let Some(ref raw_name) = name {
+        validate_label_size("File name", raw_name)?;
+    }
+    let id = transfers
+        .0
+        .enqueue_download(machine, path, name, size, mime, false)
+        .await?;
+    Ok(TransferIdResult { id })
+}
+
+/// Opens the device's native file picker and returns session-only opaque handles for the chosen
+/// files. The web view never receives or supplies device filesystem paths or URIs.
+#[tauri::command]
+pub async fn transfer_pick_uploads(
+    transfers: State<'_, SharedTransfers>,
+) -> Result<Vec<PickedUploadHandle>, AppError> {
+    transfers.0.pick_uploads().await
+}
+
+/// Picks local files via the native picker (unless opaque `handles` from [`transfer_pick_uploads`]
+/// are supplied) and enqueues non-blocking bulk-pipe `put` uploads into `machine:dir`. Returns
+/// `None` if the user cancelled the file picker.
+#[tauri::command]
+pub async fn transfer_upload(
+    transfers: State<'_, SharedTransfers>,
+    machine: String,
+    dir: String,
+    handles: Option<Vec<String>>,
+) -> Result<Option<UploadEnqueueResult>, AppError> {
+    validate_label_size("Machine name", &machine)?;
+    if let Some(ref list) = handles {
+        if list.len() > 128 {
+            return Err(AppError::new(
+                ErrorCode::InvalidArgs,
+                "Too many upload handles supplied.",
+            ));
+        }
+        for h in list {
+            validate_label_size("Upload handle", h)?;
+        }
+    }
+    transfers.0.enqueue_upload(machine, dir, handles).await
+}
+
+/// Debug/test-only upload command accepting pre-selected local file paths. Compiled ONLY when
+/// BOTH `debug_assertions` AND the `test-upload-paths` Cargo feature are enabled.
+#[cfg(all(debug_assertions, feature = "test-upload-paths"))]
+#[tauri::command]
+pub async fn transfer_upload_test_files(
+    transfers: State<'_, SharedTransfers>,
+    machine: String,
+    dir: String,
+    files: Vec<UploadFileInput>,
+) -> Result<Option<UploadEnqueueResult>, AppError> {
+    validate_label_size("Machine name", &machine)?;
+    transfers
+        .0
+        .enqueue_upload_paths_for_test(machine, dir, files)
+        .await
+}
+
+/// Enqueues a download to the app cache that opens in another app once verified.
+#[tauri::command]
+pub async fn transfer_open_externally(
+    transfers: State<'_, SharedTransfers>,
+    machine: String,
+    path: String,
+    name: Option<String>,
+    mime: Option<String>,
+) -> Result<OpenExternallyResult, AppError> {
+    validate_label_size("Machine name", &machine)?;
+    if let Some(ref raw_name) = name {
+        validate_label_size("File name", raw_name)?;
+    }
+    let id = transfers
+        .0
+        .enqueue_download(machine, path, name, None, mime, true)
+        .await?;
+    Ok(OpenExternallyResult { id, ok: true })
+}
+
+/// Lists all current and recent device transfers (newest first).
+#[tauri::command]
+pub fn transfers(transfers: State<'_, SharedTransfers>) -> Vec<DeviceTransfer> {
+    transfers.0.list()
+}
+
+/// Pauses, resumes, or cancels one device transfer by id.
+#[tauri::command]
+pub async fn transfer_control(
+    transfers: State<'_, SharedTransfers>,
+    id: String,
+    action: TransferControlAction,
+) -> Result<DeviceTransfer, AppError> {
+    validate_label_size("Transfer id", &id)?;
+    transfers.0.control(&id, action).await
+}
+
+/// Opens a finished downloaded file using the platform's default viewer or chooser.
+#[tauri::command]
+pub async fn open_transfer(
+    transfers: State<'_, SharedTransfers>,
+    id: String,
+) -> Result<OpenTransferResult, AppError> {
+    validate_label_size("Transfer id", &id)?;
+    transfers.0.open_transfer(&id).await
+}
+
+/// Reveals a finished downloaded file in the device's file manager / Downloads folder.
+#[tauri::command]
+pub async fn show_transfer_in_folder(
+    transfers: State<'_, SharedTransfers>,
+    id: String,
+) -> Result<OpenTransferResult, AppError> {
+    validate_label_size("Transfer id", &id)?;
+    transfers.0.show_transfer_in_folder(&id).await
+}
+
+/// Subscribes `on_event` to throttled live snapshots of the transfer queue and returns the
+/// watcher's opaque subscription id for removal via [`transfer_unwatch`].
+#[tauri::command]
+pub fn transfer_watch(
+    transfers: State<'_, SharedTransfers>,
+    on_event: Channel<Vec<DeviceTransfer>>,
+) -> Result<u64, AppError> {
+    Ok(transfers.0.watch(on_event))
+}
+
+/// Removes a previously registered progress watcher by its subscription id.
+#[tauri::command]
+pub fn transfer_unwatch(
+    transfers: State<'_, SharedTransfers>,
+    watcher_id: u64,
+) -> Result<(), AppError> {
+    transfers.0.unwatch(watcher_id);
+    Ok(())
+}
+
+/// Returns the current transfer queue settings (`wifi_only_large`, `large_threshold_bytes`).
+#[tauri::command]
+pub fn transfer_settings(transfers: State<'_, SharedTransfers>) -> TransferSettings {
+    transfers.0.settings()
+}
+
+/// Updates the "large transfers on Wi-Fi only" setting.
+#[tauri::command]
+pub fn transfer_set_settings(
+    transfers: State<'_, SharedTransfers>,
+    wifi_only_large: bool,
+) -> TransferSettings {
+    transfers.0.set_wifi_only_large(wifi_only_large)
 }
 
 /// Dismisses a pending identity-change warning for `node` without altering its pinned target.
@@ -234,20 +455,240 @@ pub fn device_name() -> String {
     default_device_name()
 }
 
+/// Host-provided specification for the opt-in debug CI content-media smoke check
+/// (`LEGION_APP_MEDIA_CHECK_FILE`). Compiled ONLY in debug builds.
+#[cfg(debug_assertions)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MediaCheckSpec {
+    /// Target machine name (e.g. `"tower"`).
+    pub machine: String,
+    /// Optional single-use pairing invite for mobile targets without a local `legion` binary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite: Option<String>,
+    /// Remote path to a test image file (e.g. PNG).
+    pub image_path: String,
+    /// Remote path to a short WebM test video file.
+    pub video_path: String,
+    /// Optional timestamp (seconds) to seek the video to after initial metadata loads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seek_to: Option<f64>,
+    /// Optional remote HTML path to verify content-origin IPC isolation (framed & top-level).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub html_path: Option<String>,
+    /// Optional remote SVG path to verify content-origin IPC isolation (framed & top-level).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub svg_path: Option<String>,
+    /// Optional flag asking the page to also re-verify media decode after an iOS resume event.
+    #[serde(default)]
+    pub verify_resume: bool,
+    /// Optional host path where [`media_check_report`] writes the JSON result. Never read from JS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out_file: Option<String>,
+}
+
+/// Public subset of [`MediaCheckSpec`] exposed to the web view (omits host `out_file` path).
+#[cfg(debug_assertions)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PublicMediaCheckSpec {
+    /// Target machine name.
+    pub machine: String,
+    /// Optional single-use pairing invite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite: Option<String>,
+    /// Remote path to a test image file.
+    pub image_path: String,
+    /// Remote path to a short WebM test video file.
+    pub video_path: String,
+    /// Optional timestamp (seconds) to seek the video to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seek_to: Option<f64>,
+    /// Optional remote HTML path for IPC isolation verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub html_path: Option<String>,
+    /// Optional remote SVG path for IPC isolation verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub svg_path: Option<String>,
+    /// Whether to also wait for an app resume and re-verify media loading.
+    #[serde(default)]
+    pub verify_resume: bool,
+}
+
+/// Decoded media verification report submitted by the web view after loading content URLs.
+#[cfg(debug_assertions)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MediaCheckReport {
+    /// True when both the image and video decoded with non-zero dimensions.
+    pub ok: bool,
+    /// Decoded image natural width in pixels.
+    pub image_width: u32,
+    /// Decoded image natural height in pixels.
+    pub image_height: u32,
+    /// Decoded video width in pixels.
+    pub video_width: u32,
+    /// Decoded video height in pixels.
+    pub video_height: u32,
+    /// Decoded video duration in seconds (0 when unavailable).
+    #[serde(default)]
+    pub video_duration: f64,
+    /// Observed `video.currentTime` after seeking when `seek_to` was requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seeked_time: Option<f64>,
+    /// Origin/scheme prefix of the minted image content URL (ticket redacted).
+    #[serde(default)]
+    pub image_origin: String,
+    /// Origin/scheme prefix of the minted video content URL (ticket redacted).
+    #[serde(default)]
+    pub video_origin: String,
+    /// Result of HTML/SVG content-origin IPC isolation check when requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipc_isolation_ok: Option<bool>,
+    /// Result of post-resume loopback media reload check when requested (iOS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_ok: Option<bool>,
+    /// Failure description when `ok` is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[cfg(debug_assertions)]
+fn load_media_check_spec(app: &tauri::AppHandle) -> Result<Option<MediaCheckSpec>, AppError> {
+    let spec_path = if let Some(p) = std::env::var_os(MEDIA_CHECK_FILE_ENV)
+        .filter(|val| !val.is_empty())
+        .map(std::path::PathBuf::from)
+    {
+        Some(p)
+    } else {
+        #[cfg(target_os = "android")]
+        {
+            use tauri::Manager as _;
+            app.path()
+                .app_data_dir()
+                .ok()
+                .map(|d| d.join("media-check.json"))
+                .filter(|p| p.is_file())
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = app;
+            None
+        }
+    };
+
+    let Some(path) = spec_path else {
+        return Ok(None);
+    };
+    let raw = fs::read_to_string(&path).map_err(|err| {
+        AppError::new(
+            ErrorCode::Failed,
+            format!("Could not read media check spec {}: {err}", path.display()),
+        )
+    })?;
+    let spec: MediaCheckSpec = serde_json::from_str(&raw).map_err(|err| {
+        AppError::new(
+            ErrorCode::InvalidArgs,
+            format!("Invalid media check spec {}: {err}", path.display()),
+        )
+    })?;
+    Ok(Some(spec))
+}
+
+/// Returns the active opt-in debug CI content-media smoke check specification, or `None` in
+/// normal runs. Compiled ONLY in debug builds.
+#[cfg(debug_assertions)]
+#[tauri::command]
+pub fn media_check_spec(app: tauri::AppHandle) -> Result<Option<PublicMediaCheckSpec>, AppError> {
+    let Some(spec) = load_media_check_spec(&app)? else {
+        return Ok(None);
+    };
+    Ok(Some(PublicMediaCheckSpec {
+        machine: spec.machine,
+        invite: spec.invite,
+        image_path: spec.image_path,
+        video_path: spec.video_path,
+        seek_to: spec.seek_to,
+        html_path: spec.html_path,
+        svg_path: spec.svg_path,
+        verify_resume: spec.verify_resume,
+    }))
+}
+
+/// Records the result of the opt-in debug CI content-media smoke check (logs marker + writes
+/// configured `out_file` if any). Refuses calls when no host media-check spec is active.
+/// Compiled ONLY in debug builds.
+#[cfg(debug_assertions)]
+#[tauri::command]
+pub fn media_check_report(app: tauri::AppHandle, report: MediaCheckReport) -> Result<(), AppError> {
+    let Some(spec) = load_media_check_spec(&app)? else {
+        return Ok(());
+    };
+    let summary = format!(
+        "img={}x{} vid={}x{} dur={:.2}s origin={}",
+        report.image_width,
+        report.image_height,
+        report.video_width,
+        report.video_height,
+        report.video_duration,
+        report.image_origin
+    );
+    if report.ok {
+        let line = format!("{MEDIA_CHECK_OK_MARKER} ({summary})");
+        println!("{line}");
+        let _ = std::io::stdout().flush();
+        #[cfg(target_os = "android")]
+        log::info!(target: "legion-app", "{line}");
+    } else {
+        let reason = report.error.as_deref().unwrap_or("unknown error");
+        let line = format!("{MEDIA_CHECK_FAILED_MARKER} ({summary}; error={reason})");
+        eprintln!("{line}");
+        let _ = std::io::stderr().flush();
+        #[cfg(target_os = "android")]
+        log::error!(target: "legion-app", "{line}");
+    }
+
+    if let Some(out_file) = spec.out_file.as_deref().filter(|s| !s.trim().is_empty()) {
+        let out_path = Path::new(out_file);
+        if let Some(parent) = out_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(|err| {
+                AppError::new(
+                    ErrorCode::Internal,
+                    format!("Could not create media check report directory: {err}"),
+                )
+            })?;
+        }
+        let encoded = serde_json::to_string_pretty(&report).map_err(|err| {
+            AppError::new(
+                ErrorCode::Internal,
+                format!("Could not encode media check report: {err}"),
+            )
+        })?;
+        fs::write(out_path, format!("{encoded}\n")).map_err(|err| {
+            AppError::new(
+                ErrorCode::Internal,
+                format!("Could not write media check report: {err}"),
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
 /// Signals that the web interface has mounted and painted its initial view.
 ///
-/// Logs [`INTERFACE_READY_MARKER`] once to stdout (and logcat on Android). When
-/// `LEGION_APP_READY_FILE` is set, also writes the marker line to that path so automated smoke
-/// checks can assert startup without guessing a sleep duration.
+/// Logs [`INTERFACE_READY_MARKER`] once to stdout (and logcat on Android). In debug builds only,
+/// when `LEGION_APP_READY_FILE` is set, also writes the marker line to that path.
 #[tauri::command]
-pub fn ready() -> Result<(), AppError> {
+pub fn ready(updater: State<'_, SharedUpdater>) -> Result<(), AppError> {
     if !READY_LOGGED.swap(true, Ordering::SeqCst) {
         println!("{INTERFACE_READY_MARKER}");
         let _ = std::io::stdout().flush();
         #[cfg(target_os = "android")]
         log::info!(target: "legion-app", "{INTERFACE_READY_MARKER}");
+        updater.0.on_app_ready();
     }
 
+    #[cfg(debug_assertions)]
     if let Some(path) = std::env::var_os(READY_FILE_ENV).filter(|val| !val.is_empty()) {
         write_ready_marker(Path::new(&path))?;
     }
@@ -255,6 +696,170 @@ pub fn ready() -> Result<(), AppError> {
     Ok(())
 }
 
+/// Returns the current app update state without making network calls.
+#[tauri::command]
+pub async fn update_state(
+    app: tauri::AppHandle,
+    updater: State<'_, SharedUpdater>,
+) -> Result<UpdateState, AppError> {
+    #[cfg(target_os = "android")]
+    {
+        let android_updater = app.state::<AndroidUpdaterHandle>();
+        if let Ok(caps) = crate::updater::android::capabilities(&android_updater).await {
+            return Ok(updater.0.set_android_capabilities(caps));
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    let _ = app;
+    Ok(updater.0.snapshot())
+}
+
+/// Subscribes `on_state` to live updater state changes (and immediately sends the current state).
+#[tauri::command]
+pub fn update_watch(
+    updater: State<'_, SharedUpdater>,
+    on_state: Channel<UpdateState>,
+) -> Result<(), AppError> {
+    updater.0.watch(on_state);
+    Ok(())
+}
+
+/// Checks every reachable paired machine for a newer verified app update.
+#[tauri::command]
+pub async fn update_check(
+    app: tauri::AppHandle,
+    backend: State<'_, SharedBackend>,
+    updater: State<'_, SharedUpdater>,
+) -> Result<UpdateState, AppError> {
+    #[cfg(target_os = "android")]
+    let is_metered = {
+        let android_updater = app.state::<AndroidUpdaterHandle>();
+        if let Ok(caps) = crate::updater::android::capabilities(&android_updater).await {
+            let metered = caps.is_metered;
+            updater.0.set_android_capabilities(caps);
+            metered
+        } else {
+            false
+        }
+    };
+    #[cfg(not(target_os = "android"))]
+    let is_metered = {
+        let _ = app;
+        false
+    };
+    updater
+        .0
+        .check_with_backend(backend.0.as_ref(), false, is_metered)
+        .await
+}
+
+/// Downloads (if needed), re-verifies, and installs the available app update.
+#[tauri::command]
+pub async fn update_install(
+    app: tauri::AppHandle,
+    backend: State<'_, SharedBackend>,
+    updater: State<'_, SharedUpdater>,
+) -> Result<UpdateState, AppError> {
+    #[cfg(target_os = "android")]
+    {
+        let android_updater = app.state::<AndroidUpdaterHandle>();
+        updater
+            .0
+            .install_android(backend.0.as_ref(), &android_updater, false, false)
+            .await
+    }
+    #[cfg(target_os = "ios")]
+    {
+        let _ = (app, backend, updater);
+        Err(AppError::new(
+            ErrorCode::Unsupported,
+            "Updates on iOS are delivered through TestFlight or the App Store.",
+        ))
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let (st, should_exit) = updater.0.install_desktop(backend.0.as_ref(), false).await?;
+        if should_exit {
+            let handle = app.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                handle.exit(0);
+            });
+        }
+        Ok(st)
+    }
+}
+
+/// Enables or disables automatic updates (download when seen, install on start or leaving the app).
+#[tauri::command]
+pub fn update_set_auto(
+    updater: State<'_, SharedUpdater>,
+    enabled: bool,
+) -> Result<UpdateState, AppError> {
+    updater.0.set_auto_update(enabled)
+}
+
+/// Dismisses the one-time "Updated to …" or rollback notice.
+#[tauri::command]
+pub fn update_dismiss_notice(updater: State<'_, SharedUpdater>) -> Result<UpdateState, AppError> {
+    updater.0.dismiss_notice()
+}
+
+/// Installs an already-downloaded verified update at one of the two non-interrupting moments
+/// (`trigger`: `"startup"` before user interaction, or `"background"` when leaving the app).
+/// Never interrupts the user with an unexpected prompt or brings a backgrounded app forward.
+#[tauri::command]
+pub async fn update_maybe_auto_install(
+    app: tauri::AppHandle,
+    backend: State<'_, SharedBackend>,
+    updater: State<'_, SharedUpdater>,
+    trigger: Option<String>,
+) -> Result<UpdateState, AppError> {
+    let current = updater.0.snapshot();
+    let ready_or_checking_downloaded = current.phase == "ready"
+        || (current.phase == "checking"
+            && current.available.as_ref().is_some_and(|a| a.downloaded));
+    if !current.auto_update || !ready_or_checking_downloaded || !current.can_self_install {
+        return Ok(current);
+    }
+    let trigger_kind = trigger.as_deref().unwrap_or("startup");
+    if !matches!(trigger_kind, "startup" | "background") {
+        return Ok(current);
+    }
+    #[cfg(target_os = "android")]
+    {
+        let background = trigger_kind == "background";
+        let android_updater = app.state::<AndroidUpdaterHandle>();
+        updater
+            .0
+            .install_android(backend.0.as_ref(), &android_updater, true, background)
+            .await
+    }
+    #[cfg(target_os = "ios")]
+    {
+        let _ = (app, backend);
+        Ok(current)
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        // On desktop, window-close installs run via `WindowEvent::CloseRequested`; the frontend
+        // auto-install trigger applies only at startup before user interaction.
+        if trigger_kind != "startup" {
+            return Ok(current);
+        }
+        let (st, should_exit) = updater.0.install_desktop(backend.0.as_ref(), true).await?;
+        if should_exit {
+            let handle = app.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                handle.exit(0);
+            });
+        }
+        Ok(st)
+    }
+}
+
+#[cfg(debug_assertions)]
 fn write_ready_marker(path: &Path) -> Result<(), AppError> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -415,6 +1020,7 @@ pub async fn scan_invite() -> Result<ScanInviteResult, AppError> {
 mod tests {
     use super::*;
 
+    #[cfg(debug_assertions)]
     #[test]
     fn ready_marker_writes_expected_line() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;

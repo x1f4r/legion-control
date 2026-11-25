@@ -277,6 +277,24 @@ fn helper(mode: &str, args: Vec<String>) -> ExitCode {
             let _ = stdout.flush();
             let _ = grandchild.wait();
         }
+        // Spawns a worker thread, writes "<pid> <worker_tid>" to the given file (on Linux), and
+        // sleeps so tests can verify thread IDs are refused without harming the process.
+        "threaded" => {
+            let own = std::process::id();
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let _ = ready_tx.send(());
+                std::thread::sleep(Duration::from_secs(60));
+            });
+            let _ = ready_rx.recv();
+            let worker_tid = find_other_linux_tid(own).unwrap_or(own);
+            let line = format!("{own} {worker_tid}");
+            write_atomically(Path::new(&args[0]), &line);
+            let _ = writeln!(stdout, "started");
+            let _ = stdout.flush();
+            std::thread::sleep(Duration::from_secs(60));
+            let _ = worker.join();
+        }
         other => {
             let _ = writeln!(std::io::stderr(), "no helper called {other}");
             return ExitCode::from(101);
@@ -323,6 +341,22 @@ pub fn spawn_helper(mode: &str, args: &[&str]) -> std::process::Child {
         .stderr(Stdio::null())
         .spawn()
         .unwrap()
+}
+
+/// Find a non-leader Linux kernel thread id in `/proc/self/task` for `own_pid`.
+pub fn find_other_linux_tid(own_pid: u32) -> Option<u32> {
+    let entries = std::fs::read_dir("/proc/self/task").ok()?;
+    for entry in entries.flatten() {
+        if let Some(tid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+            && tid != own_pid
+        {
+            return Some(tid);
+        }
+    }
+    None
 }
 
 fn write_atomically(path: &Path, text: &str) {

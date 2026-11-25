@@ -11,6 +11,8 @@ import readline from 'node:readline';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
+import './files-browser.mjs';
+import './machine-browser.mjs';
 
 const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(TEST_DIR, '..', '..', '..');
@@ -204,7 +206,7 @@ async function dispatchSwipe(page, selector, { startX, startY, endX, endY }) {
 }
 
 const CATALOG_TOOL_RE =
-  /\b(?:power|fs|exec|job|svc|proj|fleet|sys|meta|device|token|config|net|env)\.[a-z_]+\b/g;
+  /\b(?:power|fs|fav|sync|exec|job|svc|proj|fleet|sys|meta|device|token|config|net|env)\.[a-z_]+\b/g;
 
 async function assertNoToolNames(page, label) {
   const text = await page.locator('body').innerText();
@@ -257,19 +259,19 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
     await page.getByLabel('Token', { exact: true }).fill(fleet.token);
     await page.getByRole('button', { name: 'Connect' }).click();
 
-    // Machines appear with labelled Processor / Memory / Disk, no wordmark/role chip/refresh button.
+    // Machines appear with labelled Processor / Memory / Storage, no wordmark/role chip/refresh button.
     await page.getByText('2 are on').waitFor({ timeout: 15_000 });
     assert.equal(await page.locator('.wordmark').count(), 0);
     assert.equal(await page.locator('header.top .chip').count(), 0);
     assert.equal(await page.locator('button[aria-label="Refresh"]').count(), 0);
     await page.locator('header.top a[aria-label="Settings"]').waitFor();
-    assert.equal(await page.locator('nav.nav a').count(), 3, 'Root bottom bar has 3 places');
+    assert.equal(await page.locator('nav.nav a').count(), 4, 'Root bottom bar has 4 places');
 
     const towerCard = page.locator('a.machine', { hasText: 'tower' });
     await towerCard.waitFor();
     await towerCard.getByText('Processor').waitFor();
     await towerCard.getByText('Memory').waitFor();
-    await towerCard.getByText('Disk').waitFor();
+    await towerCard.getByText('Storage').waitFor();
 
     const piCard = page.locator('a.machine', { hasText: 'pi' });
     await piCard.waitFor();
@@ -286,13 +288,17 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
     await dispatchSwipe(page, 'main.main', { startX: 195, startY: 160, endX: 195, endY: 280 });
     await page.getByText('2 are on').waitFor({ timeout: 10_000 });
 
-    // Horizontal swipe across root places: Machines -> Activity -> Actions -> Machines.
+    // Horizontal swipe across root places: Machines -> Files -> Activity -> Actions -> Activity -> Files -> Machines.
+    await dispatchSwipe(page, 'main.main', { startX: 300, startY: 360, endX: 100, endY: 365 });
+    await page.locator('header.top h1', { hasText: 'Files' }).waitFor();
     await dispatchSwipe(page, 'main.main', { startX: 300, startY: 360, endX: 100, endY: 365 });
     await page.locator('header.top h1', { hasText: 'Activity' }).waitFor();
     await dispatchSwipe(page, 'main.main', { startX: 300, startY: 360, endX: 100, endY: 365 });
     await page.locator('header.top h1', { hasText: 'Actions' }).waitFor();
     await dispatchSwipe(page, 'main.main', { startX: 100, startY: 360, endX: 300, endY: 365 });
     await page.locator('header.top h1', { hasText: 'Activity' }).waitFor();
+    await dispatchSwipe(page, 'main.main', { startX: 100, startY: 360, endX: 300, endY: 365 });
+    await page.locator('header.top h1', { hasText: 'Files' }).waitFor();
     await dispatchSwipe(page, 'main.main', { startX: 100, startY: 360, endX: 300, endY: 365 });
     await page.locator('header.top h1', { hasText: 'Machines' }).waitFor();
 
@@ -332,17 +338,17 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
     await maybeShot(page, 'real-phone-light-machine-overview');
     await setTheme(page, 'dark');
 
-    // Horizontal swipe across machine parts: Overview -> Files -> Power -> More.
+    // Horizontal swipe across machine parts: Overview -> Files; opens same Files browser at tower.
     await dispatchSwipe(page, 'main.main', { startX: 300, startY: 360, endX: 100, endY: 362 });
     await page.locator('nav.nav.parts a[aria-current="page"]', { hasText: 'Files' }).waitFor();
-    await page.locator('button.row', { hasText: 'docs/' }).click();
-    await page.locator('button.row', { hasText: 'hello.txt' }).click();
-    await page.locator('pre.out').getByText('Hello from Legion real server preview.').waitFor();
+    await page.locator('.list a.row', { hasText: 'docs' }).click();
+    await page.locator('.list a.row', { hasText: 'hello.txt' }).click();
+    await page.locator('.viewer pre.viewer-text').getByText('Hello from Legion real server preview.').waitFor();
     await assertNoToolNames(page, 'real phone tower files');
     await maybeShot(page, 'real-phone-dark-machine-files');
-
-    // Power part: plain dry run shows one plain sentence, no "Dry run commands" or raw commands.
-    await page.locator('nav.nav.parts a', { hasText: 'Power' }).click();
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.viewer').waitFor({ state: 'hidden' });
+    await page.goto(`${server.url}/#/machines/tower/power`, { waitUntil: 'domcontentloaded' });
     await page.getByText('Loading power state…').waitFor({ state: 'hidden' });
     await page.getByRole('button', { name: 'Sleep', exact: true }).waitFor();
     await page.getByRole('button', { name: 'Restart', exact: true }).waitFor();
@@ -573,17 +579,14 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
         await setTheme(p, 'dark');
       }
 
-      // Offline Wake button opens plain confirm sheet; confirming shows pending-wake feedback.
+      // Offline Wake button opens the shared wake sheet directly in the waking state.
       await laptopRow.getByRole('button', { name: 'Wake' }).click();
       const wakeDialog = p.getByRole('dialog');
       await wakeDialog.waitFor();
-      await wakeDialog.getByRole('heading', { name: 'Wake laptop?' }).waitFor();
-      await wakeDialog.getByText('Send a wake signal to laptop.').waitFor();
-      await wakeDialog.getByRole('button', { name: 'Try it (dry run)' }).click();
-      await wakeDialog.locator('.notice.neutral', { hasText: 'A wake signal would be sent to laptop.' }).waitFor();
-      assert.equal(await wakeDialog.locator('pre.out').count(), 0, 'Plain Wake dry run must not show raw WoL details');
-      await assertNoToolNames(p, `mock ${label} wake confirm sheet`);
-      await wakeDialog.getByRole('button', { name: 'Wake', exact: true }).click();
+      await wakeDialog.getByRole('heading', { name: 'Waking laptop…' }).waitFor();
+      await wakeDialog.getByText('The wake signal has already been sent.').waitFor();
+      await assertNoToolNames(p, `mock ${label} wake sheet`);
+      await wakeDialog.getByRole('button', { name: 'Stop waiting', exact: true }).click();
       await wakeDialog.waitFor({ state: 'hidden' });
       await p.locator('.machine.off', { hasText: 'laptop' }).getByText('Wake sent · waiting for it to answer').waitFor();
       assert.equal(
@@ -1089,9 +1092,659 @@ test('fleet connections routes, identity-change acceptance, pairing sync notice,
     assert.equal(lastCall.tool, 'power.restart');
     assert.deepEqual(lastCall.on, ['tower', 'pi', 'studio']);
 
+    // 10. Settings -> About -> Updates in browser door explains the browser stays as new as the server.
+    await p.goto(`${server.url}/?mock=basic#/settings/about`, { waitUntil: 'domcontentloaded' });
+    await p.getByText('Updates', { exact: true }).waitFor();
+    await p.getByText('Always up to date').waitFor();
+    await p.getByText(/browser interface is always as new as tower/i).waitFor();
+
+    // 11. Native app mode (`update`): plain mode hides channel/sequence/key, shows Update now & notes;
+    //     Technical details reveals channel, sequence, key fingerprint, and source machine.
+    await p.goto(`${server.url}/?mock=multi,update#/settings/about`, { waitUntil: 'domcontentloaded' });
+    await p.getByText('Version 0.2.0 is ready').waitFor();
+    await p.getByRole('button', { name: 'Update now' }).waitFor();
+    await p.getByText('Update automatically').waitFor();
+    await p.getByText('Automatic fleet updates and faster status refresh.').waitFor();
+    const plainAboutText = await p.locator('main.main').innerText();
+    assert.ok(!plainAboutText.includes('SHA256:MockPreviewKey'), 'Key fingerprint must be hidden when Technical details is off');
+    await assertNoToolNames(p, 'about updates plain');
+
+    await p.goto(`${server.url}/?mock=multi,update,tech#/settings/about`, { waitUntil: 'domcontentloaded' });
+    await p.getByText('Update details').waitFor();
+    await p.getByText('preview + stable').waitFor();
+    await p.getByText(/SHA256:MockPreviewKey/).waitFor();
+
+    // 12. Linux .deb mode (`update-deb`): never offers Update now, shows exact apt-get command
+    //     and verified private copy SHA-256.
+    await p.goto(`${server.url}/?mock=multi,update-deb#/settings/about`, { waitUntil: 'domcontentloaded' });
+    await p.getByText('Version 0.2.0 is available').waitFor();
+    await p.getByText(/sudo apt-get install /).waitFor();
+    await p.getByText(/SHA-256: a{64}/).waitFor();
+    assert.equal(await p.getByRole('button', { name: 'Update now' }).count(), 0);
+
+    // 12b. Failed update (`update-failed`): plain mode hides raw error detail and offers Try again;
+    //      Technical details exposes raw error detail.
+    await p.goto(`${server.url}/?mock=multi,update-failed#/settings/about`, { waitUntil: 'domcontentloaded' });
+    await p.getByText('Version 0.2.0 did not finish installing.').waitFor();
+    await p.getByRole('button', { name: 'Try again' }).waitFor();
+    assert.ok(
+      !(await p.locator('main.main').innerText()).includes('INSTALL_FAILED_VERIFICATION_FAILURE'),
+      'Raw installer error must stay hidden outside Technical details',
+    );
+    await p.goto(`${server.url}/?mock=multi,update-failed,tech#/settings/about`, { waitUntil: 'domcontentloaded' });
+    await p.getByText('INSTALL_FAILED_VERIFICATION_FAILURE').waitFor();
+
+    // 12c. Metered pause (`update-metered`) and sequence-0 build (`update-seq0`).
+    await p.goto(`${server.url}/?mock=multi,update-metered#/settings/about`, { waitUntil: 'domcontentloaded' });
+    await p.getByText(/metered connection/i).waitFor();
+    await p.getByRole('button', { name: 'Update now' }).waitFor();
+
+    await p.goto(`${server.url}/?mock=multi,update-seq0,tech#/settings/about`, { waitUntil: 'domcontentloaded' });
+    await p.getByText('Updates disabled in this build').waitFor();
+    await p.getByText('0 (updates disabled)').waitFor();
+
+    // 13. Quiet unbordered one-time "Updated to 0.2.0 · What is new" notice on first screen, sheet, and dismiss.
+    await p.goto(`${server.url}/?mock=multi,updated#/machines`, { waitUntil: 'domcontentloaded' });
+    const updateRow = p.locator('.update-note');
+    await updateRow.waitFor();
+    assert.equal(await updateRow.locator('.btn').count(), 0, 'Post-update row must not contain bordered buttons');
+    assert.equal(await p.locator('nav.nav a').count(), 4, 'Root bottom bar has 4 tabs alongside update notice');
+    await maybeShot(p, 'mock-phone-dark-updated');
+    await updateRow.locator('.update-note-link').click();
+    await p.locator('.sheet').getByText('What is new in 0.2.0').waitFor();
+    await p.locator('.sheet').getByText('Automatic fleet updates and faster status refresh.').waitFor();
+    await p.locator('.sheet').getByRole('button', { name: 'Done' }).click();
+    await p.locator('.update-note').waitFor({ state: 'hidden' });
+
     await ctx.close();
     assert.deepEqual(pageErrors, [], `Uncaught page errors: ${pageErrors.join('\n')}`);
     assert.deepEqual(consoleErrors, [], `Console/CSP errors: ${consoleErrors.join('\n')}`);
+  } finally {
+    await browser.close();
+    await server.stop();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('content URLs isolate HTML and SVG from the interface origin and allow <video> seeking', async () => {
+  assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
+  const sampleVideo = path.join(TEST_DIR, 'fixtures', 'sample.webm');
+  assert.ok(fs.existsSync(sampleVideo), `Sample video fixture not found at ${sampleVideo}`);
+
+  const root = makeWorkRoot();
+  const fleet = setupFleet(root);
+  const docsDir = path.join(fleet.towerUser, 'docs');
+
+  // Craft adversarial HTML and SVG files that try to read localStorage (token), mutate storage,
+  // access window.parent, and postMessage back to the interface origin.
+  fs.writeFileSync(
+    path.join(docsDir, 'xss.html'),
+    [
+      '<!doctype html>',
+      '<html><body><script>',
+      'window.__xss = true;',
+      'try { localStorage.setItem("pwn_html", localStorage.getItem("legion.token") || "ran"); } catch (e) {}',
+      'try { window.parent.postMessage({ pwn: "html", token: localStorage.getItem("legion.token") }, "*"); } catch (e) {}',
+      'try { window.parent.__pwned_html = true; } catch (e) {}',
+      '</script><p>malicious html</p></body></html>',
+    ].join('\n'),
+  );
+  fs.writeFileSync(
+    path.join(docsDir, 'xss.svg'),
+    [
+      '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" onload="window.__xss=true;try{localStorage.setItem(\'pwn_svg\',\'1\')}catch(e){}try{window.parent.__pwned_svg=true}catch(e){}try{window.parent.postMessage({pwn:\'svg\'},\'*\')}catch(e){}">',
+      '<rect width="64" height="64" fill="#16a34a"/>',
+      '<script>window.__xss=true;try{localStorage.setItem("pwn_svg_script",localStorage.getItem("legion.token")||"ran")}catch(e){}try{window.parent.__pwned_svg=true}catch(e){}try{window.parent.postMessage({pwn:"svg-script"},"*")}catch(e){}</script>',
+      '</svg>',
+    ].join('\n'),
+  );
+  fs.writeFileSync(
+    path.join(docsDir, 'doc.pdf'),
+    '%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n%%EOF\n',
+  );
+  fs.copyFileSync(sampleVideo, path.join(docsDir, 'sample.webm'));
+
+  const server = await startServer(fleet.towerHome, fleet.towerUser);
+  const browser = await chromium.launch({
+    executablePath: findBrowser(),
+    headless: true,
+    args: ['--no-sandbox', '--disable-gpu'],
+  });
+
+  const uiConsoleErrors = [];
+  const uiPageErrors = [];
+
+  try {
+    const ctx = await browser.newContext({
+      viewport: { width: 1100, height: 720 },
+      colorScheme: 'dark',
+    });
+
+    // 1. Connect the real Legion interface page so localStorage holds the live bearer token.
+    const uiPage = await ctx.newPage();
+    uiPage.on('console', (msg) => {
+      if (msg.type() === 'error') uiConsoleErrors.push(msg.text());
+    });
+    uiPage.on('pageerror', (err) => uiPageErrors.push(String(err)));
+
+    await uiPage.goto(`${server.url}/#token=${encodeURIComponent(fleet.token)}`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await uiPage.getByText('2 are on').waitFor({ timeout: 15_000 });
+    const storedToken = await uiPage.evaluate(() => localStorage.getItem('legion.token'));
+    assert.equal(storedToken, fleet.token, 'expected live token in interface localStorage');
+
+    // Mint content URLs through the UI's own createHttpLink().contentUrl helper.
+    const urls = await uiPage.evaluate(async () => {
+      const { createHttpLink } = await import('/link/http.js');
+      const link = createHttpLink();
+      const [html, svg, pdf, video] = await Promise.all([
+        link.contentUrl({ path: '~/docs/xss.html' }),
+        link.contentUrl({ path: '~/docs/xss.svg' }),
+        link.contentUrl({ path: '~/docs/doc.pdf' }),
+        link.contentUrl({ path: '~/docs/sample.webm' }),
+      ]);
+      return { html, svg, pdf, video };
+    });
+    assert.match(urls.html.url, /^\/v1\/content\/[^/]+\/xss\.html$/);
+    assert.match(urls.svg.url, /^\/v1\/content\/[^/]+\/xss\.svg$/);
+    assert.match(urls.pdf.url, /^\/v1\/content\/[^/]+\/doc\.pdf$/);
+    assert.match(urls.video.url, /^\/v1\/content\/[^/]+\/sample\.webm$/);
+
+    // 2. Verify <video> seeking and <img> loading directly on the real Legion UI page
+    //    (proving the UI CSP's `img-src 'self'` and `media-src 'self'` allow them with zero errors).
+    const rangeStatuses = [];
+    uiPage.on('response', (res) => {
+      if (res.url().endsWith('/sample.webm')) {
+        rangeStatuses.push(res.status());
+      }
+    });
+
+    const mediaResult = await uiPage.evaluate(async ({ videoUrl, svgUrl }) => {
+      const img = document.createElement('img');
+      img.src = svgUrl;
+      document.body.appendChild(img);
+      await new Promise((resolve, reject) => {
+        img.addEventListener('load', resolve, { once: true });
+        img.addEventListener('error', () => reject(new Error('img failed to load')), { once: true });
+      });
+
+      const video = document.createElement('video');
+      video.muted = true;
+      video.preload = 'auto';
+      video.src = videoUrl;
+      document.body.appendChild(video);
+
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('timed out waiting for loadeddata')), 10_000);
+        video.addEventListener(
+          'loadeddata',
+          () => {
+            clearTimeout(timer);
+            resolve();
+          },
+          { once: true },
+        );
+        video.addEventListener(
+          'error',
+          () => {
+            clearTimeout(timer);
+            reject(new Error(`video error code=${video.error?.code}`));
+          },
+          { once: true },
+        );
+      });
+
+      const initialDuration = video.duration;
+      const initialWidth = video.videoWidth;
+      const initialHeight = video.videoHeight;
+
+      const seekDone = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('timed out waiting for seeked')), 10_000);
+        video.addEventListener(
+          'seeked',
+          () => {
+            clearTimeout(timer);
+            resolve();
+          },
+          { once: true },
+        );
+        video.addEventListener(
+          'error',
+          () => {
+            clearTimeout(timer);
+            reject(new Error(`video seek error code=${video.error?.code}`));
+          },
+          { once: true },
+        );
+      });
+      video.currentTime = 1.5;
+      await seekDone;
+
+      return {
+        imgLoaded: img.complete && img.naturalWidth > 0,
+        duration: initialDuration,
+        width: initialWidth,
+        height: initialHeight,
+        currentTime: video.currentTime,
+        hasError: video.error !== null,
+      };
+    }, { videoUrl: urls.video.url, svgUrl: urls.svg.url });
+
+    assert.equal(mediaResult.imgLoaded, true, 'expected SVG <img> to load under UI CSP');
+    assert.ok(mediaResult.duration > 2.0, `expected >2s video duration, got ${mediaResult.duration}`);
+    assert.equal(mediaResult.width, 64);
+    assert.equal(mediaResult.height, 64);
+    assert.ok(
+      mediaResult.currentTime >= 1.2 && mediaResult.currentTime <= 2.0,
+      `expected seeked currentTime near 1.5, got ${mediaResult.currentTime}`,
+    );
+    assert.equal(mediaResult.hasError, false);
+    assert.ok(
+      rangeStatuses.includes(206),
+      `expected at least one 206 Partial Content response for MP4 video, got ${JSON.stringify(rangeStatuses)}`,
+    );
+
+    assert.deepEqual(uiPageErrors, [], `UI page errors during media test: ${uiPageErrors.join('\n')}`);
+    assert.deepEqual(uiConsoleErrors, [], `UI console/CSP errors during media test: ${uiConsoleErrors.join('\n')}`);
+
+    // 3. Top-level navigation to .html and .svg content URLs: neither may run script or reach
+    //    the interface's origin, storage, or token; PDF is always forced to download as
+    //    application/octet-stream with the same sandbox + frame-ancestors 'none' CSP.
+    const expectedCsp = "sandbox; default-src 'none'; frame-ancestors 'none'";
+    for (const [kind, relUrl, expectedType] of [
+      ['html', urls.html.url, 'text/plain; charset=utf-8'],
+      ['svg', urls.svg.url, 'image/svg+xml'],
+    ]) {
+      const navPage = await ctx.newPage();
+      const resp = await navPage.goto(`${server.url}${relUrl}`, { waitUntil: 'load' });
+      assert.equal(resp.status(), 200, `${kind} navigation status`);
+      assert.equal(resp.headers()['content-type'], expectedType, `${kind} content-type`);
+      assert.equal(
+        resp.headers()['content-security-policy'],
+        expectedCsp,
+        `${kind} CSP must sandbox, forbid script, and forbid framing`,
+      );
+      assert.equal(resp.headers()['x-content-type-options'], 'nosniff');
+      await navPage.waitForTimeout(150);
+
+      const probe = await navPage.evaluate(() => {
+        let storageBlocked = false;
+        let leakedToken = null;
+        try {
+          leakedToken = localStorage.getItem('legion.token');
+        } catch {
+          storageBlocked = true;
+        }
+        return {
+          origin: window.origin,
+          xssFlag: Boolean(window.__xss),
+          storageBlocked,
+          leakedToken,
+        };
+      });
+      assert.equal(probe.origin, 'null', `${kind} navigation must have opaque sandbox origin`);
+      assert.equal(probe.xssFlag, false, `${kind} navigation must not execute script`);
+      assert.equal(probe.storageBlocked, true, `${kind} navigation must be denied localStorage`);
+      assert.equal(probe.leakedToken, null, `${kind} navigation must never read token`);
+      await navPage.close();
+    }
+
+    // PDF is never served inline: octet-stream + attachment + unconditional sandbox CSP.
+    const pdfHeaders = await uiPage.evaluate(async (pdfUrl) => {
+      const res = await fetch(pdfUrl);
+      return {
+        status: res.status,
+        contentType: res.headers.get('content-type'),
+        disposition: res.headers.get('content-disposition'),
+        csp: res.headers.get('content-security-policy'),
+        corp: res.headers.get('cross-origin-resource-policy'),
+      };
+    }, urls.pdf.url);
+    assert.equal(pdfHeaders.status, 200);
+    assert.equal(pdfHeaders.contentType, 'application/octet-stream');
+    assert.equal(pdfHeaders.disposition, 'attachment; filename="doc.pdf"');
+    assert.equal(pdfHeaders.csp, expectedCsp);
+    assert.equal(pdfHeaders.corp, 'same-origin');
+
+    // 4. Inside <iframe>, <object>, and <embed> on a same-origin host page (sharing the
+    //    interface's origin and token): frame-ancestors 'none' + sandbox CSP prevent framing
+    //    or script execution in every embedding vector.
+    const hostPage = await ctx.newPage();
+    await hostPage.route(`${server.url}/__test-iframe-host`, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/html; charset=utf-8',
+        body: [
+          '<!doctype html><html><body>',
+          '<script>window.__messages = []; window.addEventListener("message", (e) => window.__messages.push(e.data));</script>',
+          `<iframe id="f-html" src="${urls.html.url}"></iframe>`,
+          `<iframe id="f-svg" src="${urls.svg.url}"></iframe>`,
+          `<object id="o-svg" data="${urls.svg.url}" type="image/svg+xml"></object>`,
+          `<embed id="e-svg" src="${urls.svg.url}" type="image/svg+xml">`,
+          '</body></html>',
+        ].join('\n'),
+      });
+    });
+
+    const embedResponses = new Map();
+    hostPage.on('response', (res) => {
+      if (res.url().includes('/v1/content/')) {
+        const key = new URL(res.url()).pathname;
+        embedResponses.set(key, (embedResponses.get(key) || 0) + 1);
+      }
+    });
+
+    await hostPage.goto(`${server.url}/__test-iframe-host`, { waitUntil: 'load' });
+    await hostPage.waitForTimeout(250);
+
+    assert.ok((embedResponses.get(urls.html.url) || 0) >= 1, 'HTML iframe must actually fetch from legion serve');
+    assert.ok((embedResponses.get(urls.svg.url) || 0) >= 1, 'SVG embeds must actually fetch from legion serve');
+
+    const embedCheck = await hostPage.evaluate(() => {
+      const checkIsolated = (id) => {
+        const el = document.getElementById(id);
+        let domBlocked = false;
+        try {
+          const doc = el.contentDocument;
+          // frame-ancestors 'none' or opaque sandbox leaves contentDocument null or empty error doc.
+          domBlocked =
+            doc === null ||
+            doc.URL === 'about:blank' ||
+            doc.URL === 'chrome-error://chromewebdata/' ||
+            !doc.body ||
+            doc.body.innerText === '';
+        } catch {
+          domBlocked = true;
+        }
+        return domBlocked;
+      };
+      return {
+        htmlIsolated: checkIsolated('f-html'),
+        svgFrameIsolated: checkIsolated('f-svg'),
+        svgObjectIsolated: checkIsolated('o-svg'),
+        pwnHtmlProp: Boolean(window.__pwned_html),
+        pwnSvgProp: Boolean(window.__pwned_svg),
+        messages: window.__messages,
+        storageKeys: Object.keys(localStorage),
+      };
+    });
+
+    assert.equal(embedCheck.htmlIsolated, true, 'HTML iframe must be isolated/blocked from parent origin');
+    assert.equal(embedCheck.svgFrameIsolated, true, 'SVG iframe must be isolated/blocked from parent origin');
+    assert.equal(embedCheck.svgObjectIsolated, true, 'SVG <object> must be isolated/blocked from parent origin');
+    assert.equal(embedCheck.pwnHtmlProp, false, 'HTML iframe must not mutate parent');
+    assert.equal(embedCheck.pwnSvgProp, false, 'SVG iframe/object/embed must not mutate parent');
+    assert.deepEqual(embedCheck.messages, [], 'Embedded content must not run script or postMessage');
+    assert.ok(!embedCheck.storageKeys.includes('pwn_html'), 'HTML must not write localStorage');
+    assert.ok(!embedCheck.storageKeys.includes('pwn_svg'), 'SVG onload must not write localStorage');
+    assert.ok(!embedCheck.storageKeys.includes('pwn_svg_script'), 'SVG script must not write localStorage');
+
+    await hostPage.close();
+    await ctx.close();
+  } finally {
+    await browser.close();
+    await server.stop();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('real Files tab opens pictures and plays/seeks video on local and remote nodes, with graceful older-node fallback', async () => {
+  assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
+  const root = makeWorkRoot();
+  const towerHome = path.join(root, 'tower-legion');
+  const towerUser = path.join(root, 'tower-user');
+  const piHome = path.join(root, 'pi-legion');
+  const piUser = path.join(root, 'pi-user');
+  const legacyHome = path.join(root, 'legacy-legion');
+  const legacyUser = path.join(root, 'legacy-user');
+
+  const samplePng = fs.readFileSync(path.join(REPO_ROOT, 'apps', 'ui', 'icons', 'icon-512.png'));
+  const sampleWebm = fs.readFileSync(path.join(TEST_DIR, 'fixtures', 'sample.webm'));
+
+  for (const [home, user] of [
+    [towerHome, towerUser],
+    [piHome, piUser],
+    [legacyHome, legacyUser],
+  ]) {
+    fs.mkdirSync(path.join(home, 'config'), { recursive: true });
+    fs.mkdirSync(path.join(home, 'state'), { recursive: true });
+    const mediaDir = path.join(user, 'media');
+    fs.mkdirSync(mediaDir, { recursive: true });
+    fs.writeFileSync(path.join(mediaDir, 'icon.png'), samplePng);
+    fs.writeFileSync(path.join(mediaDir, 'sample.webm'), sampleWebm);
+  }
+
+  const policy = [
+    'default = "owner"',
+    '',
+    '[principals.ui]',
+    'role = "observer"',
+    '',
+    '[roles.observer]',
+    'allow = ["effect:read"]',
+    '',
+  ].join('\n');
+
+  for (const [name, home] of [
+    ['tower', towerHome],
+    ['pi', piHome],
+    ['legacy', legacyHome],
+  ]) {
+    fs.writeFileSync(path.join(home, 'config', 'node.toml'), `name = "${name}"\nsystem = "linux"\n`);
+    fs.writeFileSync(path.join(home, 'config', 'policy.toml'), policy);
+  }
+
+  const piCmd = [process.execPath, path.join(TEST_DIR, 'rpc-helper.mjs'), LEGION_BIN, piHome, piUser, 'rpc'];
+  const legacyCmd = [
+    process.execPath,
+    path.join(TEST_DIR, 'legacy-node-helper.mjs'),
+    LEGION_BIN,
+    legacyHome,
+    legacyUser,
+    'rpc',
+  ];
+  fs.writeFileSync(
+    path.join(towerHome, 'config', 'fleet.toml'),
+    [
+      '[machines.tower]',
+      'ssh = "tower.example"',
+      '',
+      '[machines.pi]',
+      `command = ${JSON.stringify(piCmd)}`,
+      '',
+      '[machines.legacy]',
+      `command = ${JSON.stringify(legacyCmd)}`,
+      '',
+    ].join('\n'),
+  );
+
+  const tokenOut = JSON.parse(
+    runLegion(['token.add', 'name=ui', 'principal=ui', '--json'], towerHome, towerUser),
+  );
+  const server = await startServer(towerHome, towerUser);
+  const browser = await chromium.launch({
+    executablePath: findBrowser(),
+    headless: true,
+    args: ['--no-sandbox', '--disable-gpu'],
+  });
+
+  try {
+    const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, colorScheme: 'dark' });
+    const page = await ctx.newPage();
+    const consoleErrors = [];
+    const pageErrors = [];
+    const contentPostsByMachine = new Map();
+    const contentGetStatuses = [];
+
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => pageErrors.push(String(err)));
+    page.on('request', (req) => {
+      if (req.method() === 'POST' && new URL(req.url()).pathname === '/v1/content') {
+        try {
+          const parsed = JSON.parse(req.postData() || '{}');
+          const m = parsed.on || 'tower';
+          contentPostsByMachine.set(m, (contentPostsByMachine.get(m) || 0) + 1);
+        } catch {
+          // Ignore parse issues.
+        }
+      }
+    });
+    page.on('response', (res) => {
+      if (res.request().method() === 'GET' && new URL(res.url()).pathname.startsWith('/v1/content/')) {
+        contentGetStatuses.push(res.status());
+      }
+    });
+
+    // Connect to the real UI (no ?mock) with a real bearer token.
+    await page.goto(`${server.url}/#token=${encodeURIComponent(tokenOut.token)}`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.getByText('3 are on').waitFor({ timeout: 15_000 });
+
+    async function openMachineMedia(machine) {
+      await page.locator('nav.nav a', { hasText: 'Files' }).click();
+      await page.locator('header.top h1', { hasText: 'Files' }).waitFor();
+      await page.locator('.list a.row', { hasText: machine }).first().click();
+      await page.locator('a.row, a.cell', { hasText: 'media' }).waitFor({ timeout: 10_000 });
+      await page.locator('a.row, a.cell', { hasText: 'media' }).click();
+      await page.locator('a.row, a.cell', { hasText: 'icon.png' }).waitFor({ timeout: 10_000 });
+    }
+
+    async function verifyPictureAndVideo(machine) {
+      contentGetStatuses.length = 0;
+      await openMachineMedia(machine);
+
+      // Picture opens through real /v1/content and decodes cleanly.
+      await page.locator('a.row, a.cell', { hasText: 'icon.png' }).click();
+      const img = page.locator('.viewer img.viewer-img');
+      await img.waitFor({ timeout: 10_000 });
+      await page.waitForFunction(
+        () => {
+          const el = document.querySelector('.viewer img.viewer-img');
+          return Boolean(el && el.complete && el.naturalWidth > 0);
+        },
+        null,
+        { timeout: 10_000 },
+      );
+      const imgInfo = await img.evaluate((el) => ({
+        src: el.getAttribute('src') || '',
+        w: el.naturalWidth,
+        h: el.naturalHeight,
+      }));
+      assert.ok(imgInfo.src.startsWith('/v1/content/'), `${machine}: expected /v1/content img src, got ${imgInfo.src}`);
+      assert.equal(imgInfo.w, 512, `${machine}: expected 512px PNG width`);
+      assert.equal(imgInfo.h, 512, `${machine}: expected 512px PNG height`);
+      await page.locator('.viewer-top button[aria-label="Close"]').click();
+      await page.locator('.viewer').waitFor({ state: 'hidden' });
+
+      // Video opens through real /v1/content, decodes VP8 WebM, and seeks cleanly with 206 ranges.
+      await page.locator('a.row, a.cell', { hasText: 'sample.webm' }).click();
+      const video = page.locator('.viewer video.viewer-video');
+      await video.waitFor({ timeout: 10_000 });
+      const videoCheck = await video.evaluate(async (el) => {
+        el.muted = true;
+        if (el.readyState < 2) {
+          el.preload = 'auto';
+          el.load();
+          await new Promise((resolve, reject) => {
+            const t = setTimeout(() => reject(new Error('timed out waiting for loadeddata')), 10_000);
+            el.addEventListener('loadeddata', () => { clearTimeout(t); resolve(); }, { once: true });
+            el.addEventListener('error', () => { clearTimeout(t); reject(new Error(`video error ${el.error?.code}`)); }, { once: true });
+          });
+        }
+        try {
+          await el.play();
+          el.pause();
+        } catch {
+          // Headless autoplay policy may still allow seeking without play.
+        }
+        const seeked = new Promise((resolve, reject) => {
+          const t = setTimeout(() => reject(new Error('timed out waiting for seeked')), 10_000);
+          el.addEventListener('seeked', () => { clearTimeout(t); resolve(); }, { once: true });
+          el.addEventListener('error', () => { clearTimeout(t); reject(new Error(`seek error ${el.error?.code}`)); }, { once: true });
+        });
+        el.currentTime = 1.5;
+        await seeked;
+        return {
+          src: el.getAttribute('src') || '',
+          readyState: el.readyState,
+          duration: el.duration,
+          width: el.videoWidth,
+          height: el.videoHeight,
+          currentTime: el.currentTime,
+          hasError: el.error !== null,
+        };
+      });
+      assert.ok(videoCheck.src.startsWith('/v1/content/'), `${machine}: expected /v1/content video src`);
+      assert.ok(videoCheck.readyState >= 2, `${machine}: expected readyState >= 2, got ${videoCheck.readyState}`);
+      assert.ok(videoCheck.duration > 2.0, `${machine}: expected duration > 2s, got ${videoCheck.duration}`);
+      assert.equal(videoCheck.width, 64, `${machine}: videoWidth`);
+      assert.equal(videoCheck.height, 64, `${machine}: videoHeight`);
+      assert.ok(
+        videoCheck.currentTime >= 1.2 && videoCheck.currentTime <= 2.0,
+        `${machine}: seeked currentTime ${videoCheck.currentTime}`,
+      );
+      assert.equal(videoCheck.hasError, false, `${machine}: video error`);
+      assert.ok(
+        contentGetStatuses.includes(206),
+        `${machine}: expected 206 Partial Content for video range requests, got ${JSON.stringify(contentGetStatuses)}`,
+      );
+      await page.locator('.viewer-top button[aria-label="Close"]').click();
+      await page.locator('.viewer').waitFor({ state: 'hidden' });
+    }
+
+    // 1. Door's own machine (tower) and second remote node (pi).
+    await verifyPictureAndVideo('tower');
+    await verifyPictureAndVideo('pi');
+
+    // 2. Older node (legacy): graceful fallback on first unsupported response, remembered for the
+    //    rest of the session so the second file does not retry POST /v1/content.
+    await openMachineMedia('legacy');
+    await page.locator('a.row, a.cell', { hasText: 'icon.png' }).click();
+    await page.locator('.viewer .said', { hasText: "Can't show this picture here" }).waitFor({ timeout: 10_000 });
+    await page.locator('.viewer .said', { hasText: "doesn't serve picture previews yet" }).waitFor();
+    assert.equal(await page.locator('.viewer img.viewer-img').count(), 0);
+    assert.equal(await page.locator('.viewer button', { hasText: 'Download' }).count(), 0);
+    assert.equal(contentPostsByMachine.get('legacy') || 0, 1, 'expected exactly one POST /v1/content probe for legacy');
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.viewer').waitFor({ state: 'hidden' });
+
+    await page.locator('a.row, a.cell', { hasText: 'sample.webm' }).click();
+    await page.locator('.viewer .said', { hasText: "Video playback isn't available from legacy yet" }).waitFor({ timeout: 10_000 });
+    assert.equal(await page.locator('.viewer video.viewer-video').count(), 0);
+    assert.equal(
+      contentPostsByMachine.get('legacy') || 0,
+      1,
+      'legacy unsupported state must be remembered for the session without retrying POST /v1/content',
+    );
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.viewer').waitFor({ state: 'hidden' });
+
+    // 3. Supported remote machine still opens pictures after legacy was remembered unsupported.
+    await openMachineMedia('pi');
+    await page.locator('a.row, a.cell', { hasText: 'icon.png' }).click();
+    await page.waitForFunction(
+      () => {
+        const el = document.querySelector('.viewer img.viewer-img');
+        return Boolean(el && el.complete && el.naturalWidth === 512);
+      },
+      null,
+      { timeout: 10_000 },
+    );
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.viewer').waitFor({ state: 'hidden' });
+
+    // Only the single expected 501 network log from probing the older legacy node is allowed.
+    const unexpectedConsole = consoleErrors.filter(
+      (msg) => !msg.includes('status of 501'),
+    );
+    assert.deepEqual(unexpectedConsole, [], `Unexpected console/CSP errors: ${unexpectedConsole.join('\n')}`);
+    assert.deepEqual(pageErrors, [], `Unexpected page errors: ${pageErrors.join('\n')}`);
+
+    await ctx.close();
   } finally {
     await browser.close();
     await server.stop();

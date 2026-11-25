@@ -82,10 +82,404 @@ function writeCachedNodeIdentity(nodeName, entry) {
   }
 }
 
+function isIosPlatform() {
+  if (typeof navigator === 'undefined') return false;
+  const ua = String(navigator.userAgent || '');
+  if (/iPad|iPhone|iPod/i.test(ua)) return true;
+  return navigator.platform === 'MacIntel' && Number(navigator.maxTouchPoints || 0) > 1;
+}
+
 export function createAppLink() {
   const callPrefix = randomCallPrefix();
   let nextCallId = 1;
   let readySent = false;
+  const iosPlatform = isIosPlatform();
+  const unsupportedContentMachines = new Set();
+  const contentSupportListeners = new Set();
+
+  function machineKey(machine) {
+    return typeof machine === 'string' ? machine.trim() : '';
+  }
+
+  function notifyContentSupport() {
+    for (const listener of contentSupportListeners) {
+      try {
+        listener();
+      } catch {
+        // Keep notifying remaining listeners.
+      }
+    }
+  }
+
+  function markContentUnsupported(machine) {
+    const key = machineKey(machine);
+    if (!key) return;
+    if (!unsupportedContentMachines.has(key)) {
+      unsupportedContentMachines.add(key);
+      notifyContentSupport();
+    }
+  }
+
+  function clearUnsupportedContentMachines() {
+    if (unsupportedContentMachines.size > 0) {
+      unsupportedContentMachines.clear();
+      notifyContentSupport();
+    }
+  }
+
+  function supportsContentFor(machine) {
+    const key = machineKey(machine);
+    return !key || !unsupportedContentMachines.has(key);
+  }
+
+  function onContentSupportChange(listener) {
+    if (typeof listener !== 'function') return () => {};
+    contentSupportListeners.add(listener);
+    return () => {
+      contentSupportListeners.delete(listener);
+    };
+  }
+
+  async function runConfiguredMediaCheck() {
+    if (typeof document === 'undefined' || !document.body) return;
+    let spec;
+    try {
+      spec = await invoke('media_check_spec');
+    } catch {
+      return;
+    }
+    if (!spec || typeof spec !== 'object' || !spec.machine || !spec.image_path || !spec.video_path) {
+      return;
+    }
+
+    const originOf = (rawUrl) => {
+      try {
+        return new URL(rawUrl).origin;
+      } catch {
+        return '';
+      }
+    };
+
+    const loadImage = (url) =>
+      new Promise((resolve, reject) => {
+        const img = new Image();
+        const timer = window.setTimeout(() => reject(new Error('Image load timed out')), 20000);
+        const done = (ok, err) => {
+          window.clearTimeout(timer);
+          if (ok) {
+            resolve({ width: img.naturalWidth, height: img.naturalHeight });
+          } else {
+            reject(err || new Error('Image failed to load'));
+          }
+        };
+        img.onload = () => {
+          if (typeof img.decode === 'function') {
+            img.decode().then(
+              () => done(true),
+              () => done(img.naturalWidth > 0 && img.naturalHeight > 0),
+            );
+          } else {
+            done(true);
+          }
+        };
+        img.onerror = () => done(false, new Error('Image element errored'));
+        img.src = url;
+      });
+
+    const loadVideo = (url, seekTo) =>
+      new Promise((resolve, reject) => {
+        const video = document.createElement('video');
+        const wantSeek = typeof seekTo === 'number' && Number.isFinite(seekTo) && seekTo > 0;
+        video.muted = true;
+        video.playsInline = true;
+        video.setAttribute('playsinline', '');
+        video.preload = wantSeek ? 'metadata' : 'auto';
+        video.style.cssText =
+          'position:fixed;left:-9999px;top:-9999px;width:64px;height:64px;opacity:0;pointer-events:none;';
+        document.body.appendChild(video);
+        let seekStarted = false;
+        const cleanup = () => {
+          window.clearTimeout(timer);
+          video.removeEventListener('loadedmetadata', onMeta);
+          video.removeEventListener('loadeddata', onLoaded);
+          video.removeEventListener('canplay', onLoaded);
+          video.removeEventListener('seeked', onSeeked);
+          video.removeEventListener('error', onError);
+          try {
+            video.pause();
+            video.removeAttribute('src');
+            video.load();
+          } catch {
+            // Ignore cleanup errors.
+          }
+          video.remove();
+        };
+        const timer = window.setTimeout(() => {
+          const st = `readyState=${video.readyState} net=${video.networkState} t=${video.currentTime}`;
+          cleanup();
+          reject(new Error(`Video load timed out (${st})`));
+        }, 30000);
+        const onSeeked = () => {
+          const width = video.videoWidth || 0;
+          const height = video.videoHeight || 0;
+          const duration = Number.isFinite(video.duration) ? video.duration : 0;
+          const seekedTime = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+          cleanup();
+          resolve({ width, height, duration, seekedTime });
+        };
+        const onMeta = () => {
+          if (wantSeek && !seekStarted) {
+            seekStarted = true;
+            video.currentTime = seekTo;
+          }
+        };
+        const onLoaded = () => {
+          const width = video.videoWidth || 0;
+          const height = video.videoHeight || 0;
+          const duration = Number.isFinite(video.duration) ? video.duration : 0;
+          if (width <= 0 || height <= 0) return;
+          if (wantSeek) {
+            if (!seekStarted) {
+              seekStarted = true;
+              video.currentTime = seekTo;
+            }
+            return;
+          }
+          cleanup();
+          resolve({ width, height, duration, seekedTime: null });
+        };
+        const onError = () => {
+          const code = video.error ? video.error.code : 'unknown';
+          const msg = video.error?.message || '';
+          cleanup();
+          reject(new Error(`Video error code=${code} ${msg}`.trim()));
+        };
+        video.addEventListener('loadedmetadata', onMeta);
+        video.addEventListener('loadeddata', onLoaded);
+        video.addEventListener('canplay', onLoaded);
+        video.addEventListener('seeked', onSeeked);
+        video.addEventListener('error', onError);
+        video.src = url;
+        video.load();
+      });
+
+    const verifyContentIpcIsolation = async (machine, htmlPath, svgPath) => {
+      const checks = [];
+      if (htmlPath) checks.push({ kind: 'html', path: htmlPath });
+      if (svgPath) checks.push({ kind: 'svg', path: svgPath });
+      if (checks.length === 0) return null;
+
+      const appOrigin = window.location.origin;
+      let leakedIpc = false;
+      const onMsg = (evt) => {
+        if (evt?.data && typeof evt.data === 'object' && evt.data.legionProbe) {
+          leakedIpc = true;
+        }
+      };
+      window.addEventListener('message', onMsg);
+      try {
+        for (const item of checks) {
+          const ticket = await contentUrl({ machine, path: item.path });
+          // 1) App CSP restricts connect-src to Tauri IPC only, so fetch() to the content origin
+          // must either fail under CSP or (if ever permitted) return sandbox + frame-ancestors 'none'.
+          if (typeof fetch === 'function') {
+            try {
+              const resp = await fetch(ticket.url);
+              const csp = String(resp.headers.get('content-security-policy') || '').toLowerCase();
+              const nosniff = String(resp.headers.get('x-content-type-options') || '').toLowerCase();
+              const ctype = String(resp.headers.get('content-type') || '').toLowerCase();
+              if (!csp.includes('sandbox') || !csp.includes("frame-ancestors 'none'")) {
+                throw new Error(`Missing sandbox/frame-ancestors CSP on ${item.kind}: ${csp}`);
+              }
+              if (nosniff !== 'nosniff') {
+                throw new Error(`Missing nosniff on ${item.kind}: ${nosniff}`);
+              }
+              if (item.kind === 'html' && ctype.includes('text/html')) {
+                throw new Error(`HTML content must not be served as text/html: ${ctype}`);
+              }
+            } catch (fetchErr) {
+              const msg = String(fetchErr?.message || fetchErr || '');
+              if (msg.startsWith('Missing ') || msg.startsWith('HTML content ')) {
+                throw fetchErr;
+              }
+              // Expected: strict app CSP `connect-src` blocks fetch() to the content origin.
+            }
+          }
+
+          // 2) For SVG, load through <img> (allowed by img-src) and confirm it renders without
+          // executing its embedded <script>.
+          if (item.kind === 'svg') {
+            const svgImg = await loadImage(ticket.url);
+            if (svgImg.width <= 0 || svgImg.height <= 0) {
+              throw new Error('SVG content image did not decode');
+            }
+          }
+
+          // 3) Attempt to frame the content URL and ensure neither script nor IPC is reachable.
+          const iframe = document.createElement('iframe');
+          iframe.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:10px;height:10px;';
+          iframe.src = ticket.url;
+          document.body.appendChild(iframe);
+          await new Promise((r) => window.setTimeout(r, 400));
+          try {
+            const win = iframe.contentWindow;
+            if (win && win.__TAURI__) {
+              leakedIpc = true;
+            }
+          } catch {
+            // Cross-origin SecurityError is expected and proves isolation.
+          }
+          iframe.remove();
+
+          // 4) Attempt top-level navigation to the content URL; on_navigation must refuse it so
+          // the WebView stays on the bundled app origin.
+          try {
+            window.location.assign(ticket.url);
+          } catch {
+            // Blocked synchronously.
+          }
+          await new Promise((r) => window.setTimeout(r, 300));
+          if (window.location.origin !== appOrigin) {
+            throw new Error(`WebView navigated to content origin for ${item.kind}`);
+          }
+          if (leakedIpc) {
+            throw new Error(`Content ${item.kind} reached script or Tauri IPC`);
+          }
+        }
+        return true;
+      } finally {
+        window.removeEventListener('message', onMsg);
+      }
+    };
+
+    const waitForAppResume = () =>
+      new Promise((resolve, reject) => {
+        let sawBackground = false;
+        const cleanup = () => {
+          window.clearTimeout(timer);
+          document.removeEventListener('visibilitychange', onVis);
+          window.removeEventListener('pagehide', onBg);
+          window.removeEventListener('blur', onBg);
+          window.removeEventListener('focus', onFg);
+          window.removeEventListener('pageshow', onFg);
+        };
+        const timer = window.setTimeout(() => {
+          cleanup();
+          reject(new Error('Timed out waiting for app suspend/resume cycle'));
+        }, 45000);
+        const onBg = () => {
+          sawBackground = true;
+        };
+        const onFg = () => {
+          if (sawBackground && document.visibilityState !== 'hidden') {
+            cleanup();
+            resolve();
+          }
+        };
+        const onVis = () => {
+          if (document.visibilityState === 'hidden') {
+            sawBackground = true;
+          } else if (sawBackground) {
+            cleanup();
+            resolve();
+          }
+        };
+        document.addEventListener('visibilitychange', onVis);
+        window.addEventListener('pagehide', onBg);
+        window.addEventListener('blur', onBg);
+        window.addEventListener('focus', onFg);
+        window.addEventListener('pageshow', onFg);
+      });
+
+    const report = {
+      ok: false,
+      image_width: 0,
+      image_height: 0,
+      video_width: 0,
+      video_height: 0,
+      video_duration: 0,
+      image_origin: '',
+      video_origin: '',
+      ipc_isolation_ok: null,
+      resume_ok: spec.verify_resume ? false : null,
+      error: null,
+    };
+
+    try {
+      if (spec.invite) {
+        const current = await rawState().catch(() => null);
+        const alreadyPaired =
+          Array.isArray(current?.nodes) && current.nodes.some((n) => n.node === spec.machine);
+        if (!alreadyPaired) {
+          await pair(spec.invite, 'ci-media');
+        }
+      }
+
+      const [imgTicket, vidTicket] = await Promise.all([
+        contentUrl({ machine: spec.machine, path: spec.image_path }),
+        contentUrl({ machine: spec.machine, path: spec.video_path }),
+      ]);
+      report.image_origin = originOf(imgTicket?.url || '');
+      report.video_origin = originOf(vidTicket?.url || '');
+
+      const imgResult = await loadImage(imgTicket.url);
+      report.image_width = imgResult.width;
+      report.image_height = imgResult.height;
+
+      const vidResult = await loadVideo(vidTicket.url, spec.seek_to);
+      report.video_width = vidResult.width;
+      report.video_height = vidResult.height;
+      report.video_duration = vidResult.duration;
+      if (typeof vidResult.seekedTime === 'number') {
+        report.seeked_time = vidResult.seekedTime;
+      }
+
+      if (spec.html_path || spec.svg_path) {
+        report.ipc_isolation_ok = await verifyContentIpcIsolation(
+          spec.machine,
+          spec.html_path,
+          spec.svg_path,
+        );
+      }
+
+      const mediaPass =
+        report.image_width > 0 &&
+        report.image_height > 0 &&
+        report.video_width > 0 &&
+        report.video_height > 0 &&
+        (typeof spec.seek_to !== 'number' ||
+          (typeof vidResult.seekedTime === 'number' && Math.abs(vidResult.seekedTime - spec.seek_to) < 5)) &&
+        (report.ipc_isolation_ok === null || report.ipc_isolation_ok === true);
+      report.ok = mediaPass;
+
+      if (spec.verify_resume && mediaPass) {
+        // Emit intermediate report so the simulator harness knows initial playback succeeded and
+        // can now background and foreground the app.
+        await invoke('media_check_report', { report: { ...report, resume_ok: false } }).catch(() => {});
+        await waitForAppResume();
+        // Give native resume hook a beat to probe/rebind the loopback listener if needed.
+        await new Promise((r) => window.setTimeout(r, 400));
+        const [imgAfter, vidAfter] = await Promise.all([
+          contentUrl({ machine: spec.machine, path: spec.image_path }),
+          contentUrl({ machine: spec.machine, path: spec.video_path }),
+        ]);
+        const imgRes2 = await loadImage(imgAfter.url);
+        const vidRes2 = await loadVideo(vidAfter.url, spec.seek_to);
+        report.resume_ok =
+          imgRes2.width > 0 && imgRes2.height > 0 && vidRes2.width > 0 && vidRes2.height > 0;
+        report.ok = mediaPass && report.resume_ok;
+      }
+    } catch (err) {
+      report.ok = false;
+      report.error = err?.message ? String(err.message) : String(err);
+    }
+
+    try {
+      await invoke('media_check_report', { report });
+    } catch {
+      // Ignore reporting failures during shutdown.
+    }
+  }
 
   function signalReady() {
     if (readySent) return;
@@ -94,7 +488,11 @@ export function createAppLink() {
     const fire = () => {
       if (fired) return;
       fired = true;
-      invoke('ready').catch(() => {});
+      invoke('ready')
+        .catch(() => {})
+        .finally(() => {
+          runConfiguredMediaCheck().catch(() => {});
+        });
     };
     if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
       window.requestAnimationFrame(() => window.requestAnimationFrame(fire));
@@ -202,7 +600,7 @@ export function createAppLink() {
           call('meta.whoami', {}, { on: targetNode }),
           call('meta.version', {}, { on: targetNode }).catch(() => null),
         ]);
-        if (whoami?.node && whoami.node !== targetNode) {
+        if (!(primary.via === 'local' && targetNode === 'local') && whoami?.node && whoami.node !== targetNode) {
           throw {
             code: 'denied',
             message: `Expected identity from ${targetNode}, but ${whoami.node} answered.`,
@@ -315,6 +713,7 @@ export function createAppLink() {
     }
     try {
       const paired = await invoke('pair', { invite: inviteText, name: name || null });
+      clearUnsupportedContentMachines();
       const next = await state();
       return {
         ...next,
@@ -339,6 +738,7 @@ export function createAppLink() {
         node,
         fingerprints: Array.isArray(fingerprints) ? fingerprints : [],
       });
+      clearUnsupportedContentMachines();
       return await state();
     } catch (err) {
       throw normalizeError(err);
@@ -356,7 +756,9 @@ export function createAppLink() {
 
   async function unpair(node) {
     try {
-      return await invoke('unpair', { node });
+      const res = await invoke('unpair', { node });
+      clearUnsupportedContentMachines();
+      return res;
     } catch (err) {
       throw normalizeError(err);
     }
@@ -374,6 +776,7 @@ export function createAppLink() {
   async function repairStore() {
     try {
       const result = await invoke('repair_store');
+      clearUnsupportedContentMachines();
       const nextState = await state();
       return {
         archived_to: result?.archived_to || '',
@@ -388,6 +791,7 @@ export function createAppLink() {
   async function invalidateSessions() {
     try {
       await invoke('invalidate_sessions');
+      clearUnsupportedContentMachines();
     } catch {
       // Best-effort teardown on resume; subsequent calls still reconnect on error.
     }
@@ -411,8 +815,273 @@ export function createAppLink() {
     }
   }
 
-  return {
+  async function updateState() {
+    try {
+      return await invoke('update_state');
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  function watchUpdates(onState) {
+    const core = tauriCore();
+    if (!core || typeof core.Channel !== 'function' || typeof onState !== 'function') {
+      return () => {};
+    }
+    let active = true;
+    const channel = new core.Channel();
+    channel.onmessage = (st) => {
+      if (!active) return;
+      try {
+        onState(st);
+      } catch {
+        // Ignore view callback errors.
+      }
+    };
+    invoke('update_watch', { onState: channel }).catch(() => {});
+    return () => {
+      active = false;
+    };
+  }
+
+  async function checkUpdates() {
+    try {
+      return await invoke('update_check');
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function installUpdate() {
+    try {
+      return await invoke('update_install');
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function setAutoUpdate(enabled) {
+    try {
+      return await invoke('update_set_auto', { enabled: Boolean(enabled) });
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function dismissUpdateNotice() {
+    try {
+      return await invoke('update_dismiss_notice');
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function maybeAutoInstall(trigger = 'startup') {
+    try {
+      return await invoke('update_maybe_auto_install', { trigger });
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function contentUrl(req = {}) {
+    const { machine, path, download = false, signal } = req || {};
+    if (signal?.aborted) {
+      throw {
+        code: 'cancelled',
+        message: 'The content request was cancelled.',
+        hint: null,
+        machine: machine || null,
+        details: null,
+      };
+    }
+    try {
+      const result = await invoke('content_url', {
+        machine: machine || '',
+        path: path || '',
+        download: Boolean(download),
+      });
+      if (signal?.aborted) {
+        throw {
+          code: 'cancelled',
+          message: 'The content request was cancelled.',
+          hint: null,
+          machine: machine || null,
+          details: null,
+        };
+      }
+      return result;
+    } catch (err) {
+      const normalized = normalizeError(err);
+      if (
+        normalized.code === 'unsupported' &&
+        normalized.details?.reason !== 'too_large_for_inline'
+      ) {
+        const target = machineKey(machine) || machineKey(normalized.machine);
+        markContentUnsupported(target);
+        if (normalized.machine && machineKey(normalized.machine) !== target) {
+          markContentUnsupported(normalized.machine);
+        }
+      }
+      throw normalized;
+    }
+  }
+
+  async function download(req = {}) {
+    const { machine, path, name, size, mime } = req || {};
+    try {
+      return await invoke('transfer_download', {
+        machine: machine || '',
+        path: path || '',
+        name: name ?? null,
+        size: typeof size === 'number' && Number.isFinite(size) ? size : null,
+        mime: mime ?? null,
+      });
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function pickUploads() {
+    try {
+      const picked = await invoke('transfer_pick_uploads');
+      return Array.isArray(picked) ? picked : [];
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function upload(req = {}) {
+    const { machine, dir, handles } = req || {};
+    try {
+      return await invoke('transfer_upload', {
+        machine: machine || '',
+        dir: dir || '',
+        handles: Array.isArray(handles) ? handles : null,
+      });
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function openExternally(req = {}) {
+    const { machine, path, name, mime } = req || {};
+    try {
+      return await invoke('transfer_open_externally', {
+        machine: machine || '',
+        path: path || '',
+        name: name ?? null,
+        mime: mime ?? null,
+      });
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function transfers() {
+    try {
+      const list = await invoke('transfers');
+      return Array.isArray(list) ? list : [];
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function transferControl(id, action) {
+    try {
+      return await invoke('transfer_control', { id, action });
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function openTransfer(id) {
+    try {
+      return await invoke('open_transfer', { id });
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function showTransferInFolder(id) {
+    try {
+      return await invoke('show_transfer_in_folder', { id });
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  function onTransferEvent(listener) {
+    const core = tauriCore();
+    if (!core || typeof core.Channel !== 'function' || typeof listener !== 'function') {
+      return () => {};
+    }
+    let active = true;
+    let watcherId = null;
+    let unwatchSent = false;
+    const channel = new core.Channel();
+    channel.onmessage = (list) => {
+      if (!active) return;
+      try {
+        listener(Array.isArray(list) ? list : []);
+      } catch {
+        // Keep receiving queue updates if a view callback throws.
+      }
+    };
+    const releaseWatcher = () => {
+      active = false;
+      if (unwatchSent || watcherId == null) return;
+      unwatchSent = true;
+      const id = watcherId;
+      invoke('transfer_unwatch', { watcherId: id }).catch(() => {});
+    };
+    const onUnload = () => {
+      releaseWatcher();
+    };
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      window.addEventListener('pagehide', onUnload);
+      window.addEventListener('beforeunload', onUnload);
+    }
+    invoke('transfer_watch', { onEvent: channel })
+      .then((id) => {
+        if (typeof id === 'number') {
+          watcherId = id;
+          if (!active) releaseWatcher();
+        }
+      })
+      .catch(() => {});
+    return () => {
+      if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+        window.removeEventListener('pagehide', onUnload);
+        window.removeEventListener('beforeunload', onUnload);
+      }
+      releaseWatcher();
+    };
+  }
+
+  async function transferSettings() {
+    try {
+      return await invoke('transfer_settings');
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  async function setTransferSettings(req = {}) {
+    try {
+      return await invoke('transfer_set_settings', {
+        wifiOnlyLarge: Boolean(req?.wifi_only_large ?? req?.wifiOnlyLarge),
+      });
+    } catch (err) {
+      throw normalizeError(err);
+    }
+  }
+
+  const link = {
     kind: 'app',
+    supportsContent: true,
+    supportsContentFor,
+    onContentSupportChange,
     state,
     tools,
     call,
@@ -426,5 +1095,31 @@ export function createAppLink() {
     repairStore,
     invalidateSessions,
     scanInvite,
+    updateState,
+    watchUpdates,
+    checkUpdates,
+    installUpdate,
+    setAutoUpdate,
+    dismissUpdateNotice,
+    maybeAutoInstall,
+    contentUrl,
+    download,
+    transfers,
+    transferControl,
+    openTransfer,
+    showTransferInFolder,
+    onTransferEvent,
+    transferSettings,
+    setTransferSettings,
   };
+
+  // On iOS/iPadOS, native file-picker uploads and open-in-another-app are not yet wired; omit
+  // those methods so the interface hides unsupported actions instead of showing dead controls.
+  if (!iosPlatform) {
+    link.pickUploads = pickUploads;
+    link.upload = upload;
+    link.openExternally = openExternally;
+  }
+
+  return link;
 }

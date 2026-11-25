@@ -15,11 +15,13 @@ use tokio::process::{Child, ChildStderr, Command};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::content::{RawStream, StreamOpenError, StreamOpener};
 use crate::session::{Session, TransportHandle};
 use crate::stderr::StderrTail;
 
 /// Lifecycle handle for a locally spawned `legion rpc` child process.
 pub struct LocalPipeHandle {
+    program: String,
     child: Child,
     stderr: Arc<StderrTail>,
     stderr_task: Option<JoinHandle<()>>,
@@ -28,6 +30,12 @@ pub struct LocalPipeHandle {
 impl TransportHandle for LocalPipeHandle {
     fn stderr_tail(&self) -> Option<Arc<StderrTail>> {
         Some(Arc::clone(&self.stderr))
+    }
+
+    fn stream_opener(&self) -> Option<Arc<dyn StreamOpener>> {
+        Some(Arc::new(LocalStreamOpener {
+            program: self.program.clone(),
+        }))
     }
 
     fn collect_exit_info(
@@ -130,6 +138,7 @@ pub async fn open_local_session(
     let stderr = Arc::new(StderrTail::default());
     let stderr_task = tokio::spawn(drain_stderr(stderr_pipe, Arc::clone(&stderr)));
     let handle = LocalPipeHandle {
+        program: program.to_owned(),
         child,
         stderr,
         stderr_task: Some(stderr_task),
@@ -146,6 +155,96 @@ pub async fn open_local_session(
     )
     .await
     .map_err(|err| err.into_error())
+}
+
+struct LocalStreamOpener {
+    program: String,
+}
+
+struct LocalStreamGuard {
+    cancel: CancellationToken,
+}
+
+impl Drop for LocalStreamGuard {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+impl StreamOpener for LocalStreamOpener {
+    fn open_stream(
+        &self,
+        cancel: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>> {
+        Box::pin(async move {
+            if cancel.is_cancelled() {
+                return Err(StreamOpenError::Failed(ErrorBody::new(
+                    ErrorCode::Cancelled,
+                    "Opening local content stream was cancelled.",
+                )));
+            }
+            let mut cmd = Command::new(&self.program);
+            cmd.arg("stream")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            let mut child = cmd.spawn().map_err(|err| {
+                StreamOpenError::Failed(
+                    ErrorBody::new(
+                        ErrorCode::Unreachable,
+                        format!("Could not start `{} stream`: {err}.", self.program),
+                    )
+                    .with_hint("Check that `legion` is installed and executable at that path."),
+                )
+            })?;
+            let stdin = child.stdin.take().ok_or_else(|| {
+                StreamOpenError::Failed(ErrorBody::new(
+                    ErrorCode::Internal,
+                    format!("Spawned `{}` without a stdin pipe.", self.program),
+                ))
+            })?;
+            let stdout = child.stdout.take().ok_or_else(|| {
+                StreamOpenError::Failed(ErrorBody::new(
+                    ErrorCode::Internal,
+                    format!("Spawned `{}` without a stdout pipe.", self.program),
+                ))
+            })?;
+            let stderr_pipe = child.stderr.take().ok_or_else(|| {
+                StreamOpenError::Failed(ErrorBody::new(
+                    ErrorCode::Internal,
+                    format!("Spawned `{}` without a stderr pipe.", self.program),
+                ))
+            })?;
+
+            let stderr = Arc::new(StderrTail::default());
+            let stderr_task = tokio::spawn(drain_stderr(stderr_pipe, Arc::clone(&stderr)));
+            let stream_cancel = CancellationToken::new();
+            let watch_cancel = stream_cancel.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    biased;
+                    () = watch_cancel.cancelled() => {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                    }
+                    _ = child.wait() => {}
+                }
+                stderr_task.abort();
+            });
+
+            Ok(RawStream {
+                reader: Box::new(stdout),
+                writer: Box::new(stdin),
+                stderr: Some(stderr),
+                cancel: stream_cancel.clone(),
+                park: None,
+                guard: Some(Box::new(LocalStreamGuard {
+                    cancel: stream_cancel,
+                })),
+            })
+        })
+    }
 }
 
 async fn drain_stderr(stderr: ChildStderr, tail: Arc<StderrTail>) {

@@ -23,6 +23,7 @@ if [[ "$component" == all || "$component" == rust ]]; then
   # --locked holds the build to the committed Cargo.lock, so a check never resolves a dependency anew.
   cargo fmt --all --check
   cargo clippy --workspace --all-targets --locked -- -D warnings
-  cargo test --workspace --locked
+  # --no-fail-fast: one failing crate must not hide what every later crate would have said on this system.
+  cargo test --workspace --locked --no-fail-fast
   node scripts/legion-tools-doc.mjs --bin target/debug/legion --check
 fi

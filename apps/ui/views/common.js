@@ -2,7 +2,7 @@
 
 import { html, useEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
 import { Icon } from '../icons.js';
-import { clampPct, meterLevel, tokenizeCode } from '../lib/format.js';
+import { clampPct, formatElapsed, meterLevel, tokenizeCode } from '../lib/format.js';
 import { classifyRowSwipe } from '../lib/gestures.js';
 import { qrSvgData } from '../lib/qr.js';
 import { classifyResult, fanOutEntries, isFanOut } from '../lib/result.js';
@@ -27,6 +27,19 @@ export function Meter({ value, level, className = '' }) {
   }, [pct]);
   const cls = ['meter', lvl, className].filter(Boolean).join(' ');
   return html`<span ref=${ref} class=${cls}><i></i></span>`;
+}
+
+// Inline progress bar for transfer and sync rows (uses CSSOM for --v to stay CSP-safe).
+export function ProgressBar({ value, className = '' }) {
+  const ref = useRef(null);
+  const pct = clampPct(value);
+  useEffect(() => {
+    if (ref.current) {
+      ref.current.style.setProperty('--v', String(pct));
+    }
+  }, [pct]);
+  const cls = ['progress', className].filter(Boolean).join(' ');
+  return html`<span ref=${ref} class=${cls} role="progressbar" aria-valuenow=${pct} aria-valuemin="0" aria-valuemax="100"><i></i></span>`;
 }
 
 export function Notice({
@@ -160,14 +173,20 @@ export function QrCode({ text, label = 'Invite QR code' }) {
   `;
 }
 
-// Wraps a list row so a leftward pointer swipe reveals a destructive/secondary action button.
-export function SwipeRow({ actionLabel, onAction, disabled = false, children }) {
+// Wraps a list row so a leftward pointer swipe reveals one or more action buttons.
+export function SwipeRow({ actionLabel, onAction, actions = null, disabled = false, children }) {
   const [open, setOpen] = useState(false);
   const startRef = useRef(null);
   const suppressClickRef = useRef(false);
 
+  const resolvedActions = Array.isArray(actions) && actions.length > 0
+    ? actions
+    : actionLabel
+      ? [{ label: actionLabel, onAction, tone: 'danger' }]
+      : [];
+
   function onPointerDown(e) {
-    if (disabled || e.button > 0) return;
+    if (disabled || resolvedActions.length === 0 || e.button > 0) return;
     startRef.current = { x: e.clientX, y: e.clientY, id: e.pointerId };
   }
 
@@ -181,10 +200,16 @@ export function SwipeRow({ actionLabel, onAction, disabled = false, children }) 
     if (decision === 'reveal') {
       e.stopPropagation();
       suppressClickRef.current = true;
+      window.setTimeout(() => {
+        suppressClickRef.current = false;
+      }, 0);
       setOpen(true);
     } else if (decision === 'close') {
       e.stopPropagation();
       suppressClickRef.current = true;
+      window.setTimeout(() => {
+        suppressClickRef.current = false;
+      }, 0);
       setOpen(false);
     }
   }
@@ -194,6 +219,7 @@ export function SwipeRow({ actionLabel, onAction, disabled = false, children }) 
   }
 
   function onClickCapture(e) {
+    if (e.target?.closest?.('.swipe-actions')) return;
     if (suppressClickRef.current) {
       suppressClickRef.current = false;
       e.preventDefault();
@@ -211,20 +237,33 @@ export function SwipeRow({ actionLabel, onAction, disabled = false, children }) 
       onClickCapture=${onClickCapture}
     >
       ${children}
-      ${open && !disabled
+      ${open && !disabled && resolvedActions.length > 0
         ? html`
-            <button
-              type="button"
-              class="swipe-action"
-              onClick=${(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                setOpen(false);
-                if (onAction) onAction();
-              }}
-            >
-              ${actionLabel}
-            </button>
+            <div class="swipe-actions">
+              ${resolvedActions.map((act) => {
+                const cls = [
+                  'swipe-action',
+                  act.tone === 'accent' ? 'accent' : act.tone === 'neutral' ? 'neutral' : '',
+                ]
+                  .filter(Boolean)
+                  .join(' ');
+                return html`
+                  <button
+                    key=${act.label}
+                    type="button"
+                    class=${cls}
+                    onClick=${(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setOpen(false);
+                      if (act.onAction) act.onAction();
+                    }}
+                  >
+                    ${act.label}
+                  </button>
+                `;
+              })}
+            </div>
           `
         : null}
     </div>
@@ -272,6 +311,62 @@ export function Sheet({ title, onClose, children }) {
         ${children}
       </div>
     </div>
+  `;
+}
+
+/**
+ * Shared "Wake it and continue" sheet across every starting point.
+ */
+export function WakeSheet({ sheet, onConfirm, onRetry, onDismiss }) {
+  if (!sheet) return null;
+  const { machineName, phase, elapsedS, error, continueText } = sheet;
+
+  if (phase === 'waking') {
+    return html`
+      <${Sheet} title=${`Waking ${machineName}…`} onClose=${onDismiss}>
+        <p class="wake-elapsed">${formatElapsed(elapsedS || 0)}</p>
+        <div class="actions">
+          <button type="button" class="btn full" onClick=${onDismiss}>Stop waiting</button>
+        </div>
+        <p class="wake-note">The wake signal has already been sent.</p>
+      <//>
+    `;
+  }
+
+  if (phase === 'timeout') {
+    return html`
+      <${Sheet} title=${`${machineName} did not answer`} onClose=${onDismiss}>
+        <p>It has been 3 minutes. It may need longer to start, or waking it may not be working.</p>
+        <div class="actions">
+          <button type="button" class="btn" onClick=${onDismiss}>Not now</button>
+          <button type="button" class="btn primary full" onClick=${onRetry}>Try again</button>
+        </div>
+      <//>
+    `;
+  }
+
+  if (phase === 'error') {
+    return html`
+      <${Sheet} title=${`Could not wake ${machineName}`} onClose=${onDismiss}>
+        <${Notice} error=${error} />
+        <div class="actions">
+          <button type="button" class="btn" onClick=${onDismiss}>Not now</button>
+          <button type="button" class="btn primary full" onClick=${onRetry}>Try again</button>
+        </div>
+      <//>
+    `;
+  }
+
+  return html`
+    <${Sheet} title=${`${machineName} is off.`} onClose=${onDismiss}>
+      ${continueText ? html`<p class="wake-then">${continueText}</p>` : null}
+      <div class="actions">
+        <button type="button" class="btn" onClick=${onDismiss}>Not now</button>
+        <button type="button" class="btn primary full" onClick=${onConfirm}>
+          Wake it and continue
+        </button>
+      </div>
+    <//>
   `;
 }
 

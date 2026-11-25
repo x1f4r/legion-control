@@ -2,17 +2,37 @@
 
 pub mod backend;
 pub mod commands;
+pub mod content;
 pub mod link_backend;
 pub mod store;
+pub mod transfers;
+pub mod updater;
 
 use std::sync::Arc;
 
+#[cfg(not(target_os = "android"))]
+use tauri::WindowEvent;
 use tauri::webview::NewWindowResponse;
-use tauri::{Manager, Url, WebviewWindowBuilder};
+use tauri::{Manager, RunEvent, Url, WebviewWindowBuilder};
 
+use crate::backend::Backend;
 use crate::commands::SharedBackend;
+use crate::content::{AppContentServer, SharedContentServer};
 use crate::link_backend::LinkBackend;
 use crate::store::AppStore;
+#[cfg(target_os = "ios")]
+use crate::transfers::PauseReason;
+use crate::transfers::{SharedTransfers, TransferManager, TransferPlatform};
+use crate::updater::{SharedUpdater, UpdateManager};
+
+#[cfg(target_os = "android")]
+struct SharedAndroidTransferPlatform(Arc<transfers::android::AndroidTransferPlatform>);
+
+#[cfg(target_os = "android")]
+struct SharedAndroidTransferPlugin(Arc<transfers::android::AndroidTransferPluginHandle>);
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+struct SharedDesktopTransferPlatform(Arc<transfers::desktop::DesktopTransferPlatform>);
 
 /// Returns `true` only for the bundled app origin on the current platform.
 ///
@@ -49,20 +69,103 @@ fn android_barcode_scanner_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
         .build()
 }
 
+/// Registers the in-app `AppUpdaterPlugin` Kotlin plugin on Android so `commands::update_install`
+/// can install verified APKs via `PackageInstaller`.
+#[cfg(target_os = "android")]
+fn android_app_updater_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
+    tauri::plugin::Builder::new("app-updater")
+        .setup(|app, api| {
+            let handle = api.register_android_plugin("com.x1f4r.legion", "AppUpdaterPlugin")?;
+            app.manage(updater::android::AndroidUpdaterHandle(handle));
+            Ok(())
+        })
+        .build()
+}
+
+/// Registers the in-app `FilesTransferPlugin` Kotlin plugin on Android for the system file picker,
+/// lazy notification permission dialog, and `LocalSocket` bridge connection to
+/// `TransferForegroundService`.
+#[cfg(target_os = "android")]
+fn android_files_transfer_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
+    tauri::plugin::Builder::new("files-transfer")
+        .setup(|app, api| {
+            let handle = api.register_android_plugin("com.x1f4r.legion", "FilesTransferPlugin")?;
+            let shared = Arc::new(transfers::android::AndroidTransferPluginHandle(handle));
+            app.manage(SharedAndroidTransferPlugin(Arc::clone(&shared)));
+            if let Some(platform) = app.try_state::<SharedAndroidTransferPlatform>() {
+                platform.0.attach_plugin(shared);
+            }
+            Ok(())
+        })
+        .build()
+}
+
+/// Builds the main Legion WebView window from `tauri.conf.json` with our strict bundled-origin
+/// navigation guard and new-window denial.
+fn build_main_webview_window(app: &tauri::AppHandle) -> tauri::Result<tauri::WebviewWindow> {
+    let window_config = app
+        .config()
+        .app
+        .windows
+        .first()
+        .cloned()
+        .ok_or_else(|| tauri::Error::Io(std::io::Error::other("missing main window config")))?;
+    WebviewWindowBuilder::from_config(app, &window_config)?
+        .on_navigation(is_allowed_navigation_url)
+        .on_new_window(|_, _| NewWindowResponse::Deny)
+        .build()
+}
+
+/// Builds the main Legion WebView window from `tauri.conf.json` with our strict bundled-origin
+/// navigation guard and new-window denial.
+///
+/// Called on Android if `MainActivity` was swiped away while `TransferForegroundService` kept the
+/// process alive and the user later reopens Legion.
+pub fn create_main_webview_window(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let _ = build_main_webview_window(app)?;
+    Ok(())
+}
+
 /// Starts the Tauri application.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    #[cfg(target_os = "android")]
+    #[cfg(all(target_os = "android", debug_assertions))]
     android_logger::init_once(
         android_logger::Config::default()
             .with_max_level(log::LevelFilter::Info)
             .with_tag("legion-app"),
     );
+    #[cfg(all(target_os = "android", not(debug_assertions)))]
+    android_logger::init_once(
+        android_logger::Config::default()
+            .with_max_level(log::LevelFilter::Info)
+            .with_tag("legion-app")
+            .with_filter(
+                android_logger::FilterBuilder::new()
+                    .parse("error,legion-app=info,legion-transfers=info")
+                    .build(),
+            ),
+    );
 
     let builder = tauri::Builder::default();
 
+    #[cfg(target_os = "android")]
+    let builder = builder.register_asynchronous_uri_scheme_protocol(
+        content::CUSTOM_SCHEME_NAME,
+        |ctx, request, responder| {
+            let content_server = Arc::clone(&ctx.app_handle().state::<SharedContentServer>().0);
+            tauri::async_runtime::spawn(async move {
+                let response = content_server.handle_custom_scheme(request).await;
+                responder.respond(response);
+            });
+        },
+    );
+
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        if let Some(desktop) = app.try_state::<SharedDesktopTransferPlatform>() {
+            desktop.0.clear_hidden_for_drain();
+        }
         if let Some(window) = app.get_webview_window("main") {
             let _ = window.unminimize();
             let _ = window.show();
@@ -72,92 +175,283 @@ pub fn run() {
 
     let builder = builder.setup(|app| {
         let data_dir = app.path().app_data_dir()?;
-        let store = AppStore::in_dir(data_dir);
-        store.prepare_dir()?;
-        let backend = LinkBackend::from_store(store.clone());
-        app.manage(store);
-        app.manage(SharedBackend(Arc::new(backend)));
+        #[cfg(target_os = "windows")]
+        let updates_base_dir = app
+            .path()
+            .app_local_data_dir()
+            .unwrap_or_else(|_| data_dir.clone());
+        #[cfg(not(target_os = "windows"))]
+        let updates_base_dir = data_dir.clone();
 
-        let window_config = app
-            .config()
-            .app
-            .windows
-            .first()
-            .cloned()
-            .ok_or_else(|| std::io::Error::other("missing main window config"))?;
-        WebviewWindowBuilder::from_config(app.handle(), &window_config)?
-            .on_navigation(is_allowed_navigation_url)
-            .on_new_window(|_, _| NewWindowResponse::Deny)
-            .build()?;
+        let updater = Arc::new(UpdateManager::for_app(
+            &updates_base_dir,
+            Some(app.package_info().version.to_string()),
+        ));
+
+        // When spawned by the desktop swapper during a window-close update, confirm startup
+        // cleanly (writing `started-<seq>.ok`, `current-build.json`, advancing `floor.json`, and
+        // recording the post-update notice) and exit without popping a window open.
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if std::env::var_os("LEGION_UPDATE_VERIFY_ONLY").is_some_and(|v| v == "1") {
+            updater.on_app_ready();
+            app.handle().exit(0);
+            return Ok(());
+        }
+
+        let store = AppStore::in_dir(&data_dir);
+        store.prepare_dir()?;
+        let backend: Arc<dyn Backend> = Arc::new(LinkBackend::from_store(store.clone()));
+        let content_server = Arc::new(AppContentServer::new(Arc::clone(&backend)));
+
+        #[cfg(target_os = "android")]
+        let platform: Arc<dyn TransferPlatform> = {
+            let android_platform =
+                transfers::android::AndroidTransferPlatform::new(app.handle().clone(), &data_dir)
+                    .map_err(|err| std::io::Error::other(err.message))?;
+            app.manage(SharedAndroidTransferPlatform(Arc::clone(&android_platform)));
+            if let Some(plugin) = app.try_state::<SharedAndroidTransferPlugin>() {
+                android_platform.attach_plugin(Arc::clone(&plugin.0));
+            }
+            android_platform
+        };
+
+        #[cfg(target_os = "ios")]
+        let platform: Arc<dyn TransferPlatform> = Arc::new(
+            transfers::ios::IosTransferPlatform::new(app.handle(), &data_dir),
+        );
+
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let platform: Arc<dyn TransferPlatform> = {
+            let desktop_platform = Arc::new(transfers::desktop::DesktopTransferPlatform::new(
+                app.handle().clone(),
+                &data_dir,
+            ));
+            app.manage(SharedDesktopTransferPlatform(Arc::clone(&desktop_platform)));
+            desktop_platform
+        };
+
+        let transfers = TransferManager::load_or_new(&data_dir, Arc::clone(&backend), platform);
+        #[cfg(target_os = "android")]
+        if let Some(android_platform) = app.try_state::<SharedAndroidTransferPlatform>() {
+            android_platform.0.attach_manager(&transfers);
+        }
+        transfers.start();
+
+        app.manage(store);
+        app.manage(SharedBackend(backend));
+        app.manage(SharedContentServer(content_server));
+        app.manage(SharedTransfers(Arc::clone(&transfers)));
+        app.manage(SharedUpdater(Arc::clone(&updater)));
+
+        let window = build_main_webview_window(app.handle())?;
+
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            let close_updater = Arc::clone(&updater);
+            let close_transfers = Arc::clone(&transfers);
+            window.on_window_event(move |event| {
+                if let tauri::WindowEvent::CloseRequested { .. } = event
+                    && !close_transfers.has_active_work()
+                {
+                    let _ = close_updater.try_spawn_desktop_close_install();
+                }
+            });
+        }
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let _ = (window, transfers);
 
         Ok(())
     });
 
+    macro_rules! legion_invoke_handler {
+        ($($extra:path),* $(,)?) => {
+            tauri::generate_handler![
+                commands::state,
+                commands::tools,
+                commands::call,
+                commands::cancel,
+                commands::pair,
+                commands::unpair,
+                commands::select_node,
+                commands::repair_store,
+                commands::invalidate_sessions,
+                commands::learn,
+                commands::accept_identity_change,
+                commands::dismiss_identity_change,
+                commands::device_name,
+                commands::ready,
+                commands::content_url,
+                commands::transfer_download,
+                commands::transfer_pick_uploads,
+                commands::transfer_upload,
+                commands::transfer_open_externally,
+                commands::transfers,
+                commands::transfer_control,
+                commands::open_transfer,
+                commands::show_transfer_in_folder,
+                commands::transfer_watch,
+                commands::transfer_unwatch,
+                commands::transfer_settings,
+                commands::transfer_set_settings,
+                commands::update_state,
+                commands::update_watch,
+                commands::update_check,
+                commands::update_install,
+                commands::update_set_auto,
+                commands::update_dismiss_notice,
+                commands::update_maybe_auto_install,
+                $($extra,)*
+            ]
+        };
+    }
+
     #[cfg(target_os = "android")]
     let builder = builder
         .plugin(android_barcode_scanner_plugin())
-        .invoke_handler(tauri::generate_handler![
-            commands::state,
-            commands::tools,
-            commands::call,
-            commands::cancel,
-            commands::pair,
-            commands::unpair,
-            commands::select_node,
-            commands::repair_store,
-            commands::invalidate_sessions,
-            commands::learn,
-            commands::accept_identity_change,
-            commands::dismiss_identity_change,
-            commands::device_name,
-            commands::ready,
-            commands::scan_invite,
-        ]);
+        .plugin(android_app_updater_plugin())
+        .plugin(android_files_transfer_plugin());
 
     #[cfg(target_os = "ios")]
-    let builder = builder
-        .plugin(tauri_plugin_barcode_scanner::init())
-        .invoke_handler(tauri::generate_handler![
-            commands::state,
-            commands::tools,
-            commands::call,
-            commands::cancel,
-            commands::pair,
-            commands::unpair,
-            commands::select_node,
-            commands::repair_store,
-            commands::invalidate_sessions,
-            commands::learn,
-            commands::accept_identity_change,
-            commands::dismiss_identity_change,
-            commands::device_name,
-            commands::ready,
-            commands::scan_invite,
-        ]);
+    let builder = builder.plugin(tauri_plugin_barcode_scanner::init());
 
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    let builder = builder.invoke_handler(tauri::generate_handler![
-        commands::state,
-        commands::tools,
-        commands::call,
-        commands::cancel,
-        commands::pair,
-        commands::unpair,
-        commands::select_node,
-        commands::repair_store,
-        commands::invalidate_sessions,
-        commands::learn,
-        commands::accept_identity_change,
-        commands::dismiss_identity_change,
-        commands::device_name,
-        commands::ready,
-    ]);
+    #[cfg(all(
+        any(target_os = "android", target_os = "ios"),
+        debug_assertions,
+        feature = "test-upload-paths"
+    ))]
+    let builder = builder.invoke_handler(legion_invoke_handler!(
+        commands::scan_invite,
+        commands::media_check_spec,
+        commands::media_check_report,
+        commands::transfer_upload_test_files,
+    ));
+
+    #[cfg(all(
+        any(target_os = "android", target_os = "ios"),
+        debug_assertions,
+        not(feature = "test-upload-paths")
+    ))]
+    let builder = builder.invoke_handler(legion_invoke_handler!(
+        commands::scan_invite,
+        commands::media_check_spec,
+        commands::media_check_report,
+    ));
+
+    #[cfg(all(any(target_os = "android", target_os = "ios"), not(debug_assertions)))]
+    let builder = builder.invoke_handler(legion_invoke_handler!(commands::scan_invite));
+
+    #[cfg(all(
+        not(any(target_os = "android", target_os = "ios")),
+        debug_assertions,
+        feature = "test-upload-paths"
+    ))]
+    let builder = builder.invoke_handler(legion_invoke_handler!(
+        commands::media_check_spec,
+        commands::media_check_report,
+        commands::transfer_upload_test_files,
+    ));
+
+    #[cfg(all(
+        not(any(target_os = "android", target_os = "ios")),
+        debug_assertions,
+        not(feature = "test-upload-paths")
+    ))]
+    let builder = builder.invoke_handler(legion_invoke_handler!(
+        commands::media_check_spec,
+        commands::media_check_report,
+    ));
+
+    #[cfg(all(
+        not(any(target_os = "android", target_os = "ios")),
+        not(debug_assertions)
+    ))]
+    let builder = builder.invoke_handler(legion_invoke_handler!());
 
     #[allow(clippy::expect_used)]
     // Fatal startup failure before any UI can render; Tauri applications terminate here.
-    builder
-        .run(tauri::generate_context!())
-        .expect("error while running Legion application");
+    let app = builder
+        .build(tauri::generate_context!())
+        .expect("error while building Legion application");
+
+    app.run(|app_handle, event| match event {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        RunEvent::WindowEvent {
+            label,
+            event: WindowEvent::CloseRequested { api, .. },
+            ..
+        } => {
+            let transfers = app_handle.state::<SharedTransfers>();
+            if transfers.0.has_active_work() {
+                api.prevent_close();
+                if let Some(window) = app_handle.get_webview_window(&label) {
+                    let _ = window.hide();
+                }
+                if let Some(desktop) = app_handle.try_state::<SharedDesktopTransferPlatform>() {
+                    desktop.0.mark_hidden_for_drain();
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        RunEvent::Reopen { .. } => {
+            if let Some(desktop) = app_handle.try_state::<SharedDesktopTransferPlatform>() {
+                desktop.0.clear_hidden_for_drain();
+            }
+            if let Some(window) = app_handle.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }
+        #[cfg(target_os = "ios")]
+        RunEvent::WindowEvent {
+            event: WindowEvent::Suspended,
+            ..
+        } => {
+            app_handle
+                .state::<SharedTransfers>()
+                .0
+                .pause_all_active(PauseReason::Background);
+        }
+        #[cfg(target_os = "ios")]
+        RunEvent::WindowEvent {
+            event: WindowEvent::Resumed,
+            ..
+        } => {
+            app_handle.state::<SharedContentServer>().0.on_app_resumed();
+            app_handle
+                .state::<SharedTransfers>()
+                .0
+                .resume_paused_for(PauseReason::Background);
+        }
+        RunEvent::ExitRequested { code, api, .. } => {
+            let transfers = app_handle.state::<SharedTransfers>();
+            #[cfg(target_os = "android")]
+            {
+                if code.is_none() && transfers.0.has_unfinished_or_paused() {
+                    api.prevent_exit();
+                }
+            }
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            {
+                if code.is_none() && transfers.0.has_active_work() {
+                    if !transfers::desktop::confirm_quit_with_active_transfers() {
+                        api.prevent_exit();
+                    } else {
+                        transfers.0.shutdown();
+                    }
+                }
+            }
+            #[cfg(target_os = "ios")]
+            {
+                let _ = (code, api, transfers);
+            }
+        }
+        RunEvent::Exit => {
+            app_handle.state::<SharedTransfers>().0.shutdown();
+            app_handle.state::<SharedContentServer>().0.shutdown();
+        }
+        _ => {}
+    });
 }
 
 #[cfg(test)]
@@ -190,6 +484,12 @@ mod tests {
             "https://example.com/",
             "http://localhost:8080/",
             "http://127.0.0.1/",
+            "http://127.0.0.1:45123/v1/content/tok/evil.html",
+            "http://127.0.0.1:45123/v1/content/tok/evil.svg",
+            "http://legion-content.localhost/v1/content/tok/evil.html",
+            "http://legion-content.localhost/v1/content/tok/evil.svg",
+            "legion-content://localhost/v1/content/tok/evil.html",
+            "legion-content://localhost/v1/content/tok/evil.svg",
             "http://tauri.localhost:9999/",
             "http://user@tauri.localhost/",
             "tauri://evil.example/",

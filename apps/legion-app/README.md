@@ -41,8 +41,9 @@ The crate enforces `unsafe_code = "forbid"`.
   cargo install tauri-cli --version =2.12.6 --locked
   ```
 - **Linux desktop builds:** `webkit2gtk-4.1`, `gtk3`, `libayatana-appindicator`, `librsvg`,
-  `xdotool`, `patchelf`, `openssl`, `file`, `curl`, and a C toolchain (plus `xvfb` and `dbus-x11`
-  for headless smoke checks).
+  `xdotool`, `patchelf`, `openssl`, `file`, `curl`, GStreamer base/good plugins (for WebKitGTK
+  in-app WebM video decoding), and a C toolchain (plus `xvfb` and `dbus-x11` for headless smoke
+  checks).
 - **Android builds:** JDK 21 (`JAVA_HOME`), Android SDK (`ANDROID_HOME`) with `platform-tools`,
   `platforms;android-37.0`, `build-tools;37.0.0`, `ndk;30.0.16248370` (`NDK_HOME`), and the four
   Rust Android targets (`aarch64-linux-android`, `x86_64-linux-android`,
@@ -66,11 +67,11 @@ placeholder page and emits a Cargo warning.
 ### Startup ready marker (`ready`)
 
 Every platform registers a `ready` command. Once the interface has mounted and painted its first
-frame, it calls `invoke("ready")`. The Rust side logs one line — `legion-app: interface ready` —
-to stdout (and Android logcat under tag `legion-app`). When `LEGION_APP_READY_FILE` is set in the
-environment, it also writes that line to the given file path. Automated checks use this marker
-instead of fixed sleeps; in normal runs the environment variable is unset and the command is a
-harmless one-time log.
+frame, it calls `invoke("ready")`. The Rust side logs one fixed line — `legion-app: interface ready` —
+to stdout (and Android logcat under tag `legion-app`). In debug builds only, when
+`LEGION_APP_READY_FILE` is set in the environment, it also writes that line to the given file path.
+Release builds ignore all debug/test environment switches and signal readiness solely through the
+fixed log line.
 
 ### QR invite scanning (`scan_invite`)
 
@@ -119,9 +120,64 @@ harmless one-time log.
   a second launch focuses the existing main window.
 - **WebView isolation and Content Security Policy:** `tauri.conf.json` enforces `default-src 'none'`,
   restricts scripts, styles and images to `'self'` plus `tauri:` (needed for Apple `WKWebView`
-  custom-scheme assets), sets `connect-src` to Tauri's IPC endpoints, and adds
+  custom-scheme assets), opens `img-src` and `media-src` only to `http://127.0.0.1:*` (desktop and
+  iOS) or `http://legion-content.localhost` (`tauri.android.conf.json` on Android), sets
+  `connect-src` to Tauri's IPC endpoints, and adds
   `form-action 'none'; base-uri 'none'; frame-ancestors 'none'`. `lib.rs` attaches `on_navigation`
   to allow only the bundled app origin and denies all `on_new_window` requests.
+- **Content addresses (`content_url`) by platform:**
+  - **Linux, macOS, Windows, iOS and iPadOS:** `AppContentServer` mounts `legion-content` lazily on
+    `http://127.0.0.1:<ephemeral-port>` (capped at 32 simultaneous connections, 5-second
+    header-read timeout, exponential accept-error backoff, iOS resume recovery, and stopping 60
+    seconds after no live tickets or active streams remain), validates `Host` and `Origin` through
+    `HostOriginGuard` (`tauri://localhost` on Linux/macOS/iOS; `http://tauri.localhost` and
+    `https://tauri.localhost` on Windows; never `null`), and sets
+    `Cross-Origin-Resource-Policy: cross-origin`.
+  - **Android:** `AndroidManifest.xml` enforces `usesCleartextTraffic="false"`, so Android WebView
+    refuses cleartext `http://127.0.0.1:<port>` media loads. Android mounts the same
+    `legion-content` crate on Tauri's custom URI scheme `legion-content`
+    (`http://legion-content.localhost/v1/content/<ticket>/<name>`), intercepted in-process via
+    `shouldInterceptRequest`, answering open-ended ranges in bounded 2 MiB pieces, rejecting
+    unranged requests over 16 MiB with `413 Payload Too Large` before reading any bytes, and
+    bounding total concurrent buffered memory to 24 MiB.
+  - Tickets expire after 15 minutes idle / 6 hours max, and are revoked immediately on `unpair`,
+    `repair_store`, `accept_identity_change`, and app exit.
+- **Background transfer queue (`transfers/*`) and what survives what:**
+  - Shared Rust queue (`concurrency = 2`, 64 KiB streaming buffers, serialized monotonic
+    persistence in `<app_data_dir>/transfers/queue.json`, partial resume by byte offset, progress
+    stall timeouts, BLAKE3 verification via `fs.hash` for downloads and `Link::open_put` with
+    `fs.stat` non-overwrite naming for uploads, optional Wi-Fi-only rule for transfers >= 50 MB,
+    default off). Downloads sanitize file names against Windows/POSIX/Unicode rules, place without
+    overwriting, derive MIME on-device from pure ASCII-alphanumeric extensions, allow direct
+    opening ONLY for an explicit data-type allow-list (raster pictures, audio, video, PDF, plain
+    text, and macro-free documents — never HTML, SVG, XML, archives, scripts, shortcuts,
+    installers, or unknown types; offering Show in folder instead), remove all partial, saved,
+    MediaStore, and cache files on cancel, and write Mark-of-the-Web (`:Zone.Identifier`) on
+    Windows and `com.apple.quarantine` on macOS.
+    Uploads accept only session-scoped opaque handles minted by the native file picker; pre-selected
+    local paths exist only behind the debug compile-time flag `test-upload-paths`.
+  - **Android:** `TransferForegroundService` (`foregroundServiceType="dataSync"`,
+    `stopWithTask="false"`, `exported="false"`) bridged to Rust over an owner-only (`0o600`,
+    256-bit random token) Unix domain socket `<app_data_dir>/transfers/bridge.sock`. Survives app
+    switching, screen lock, swiping Legion from Recents (re-binding native plugins when
+    `MainActivity` recreates), and transient network outages; persists to disk and resumes from
+    partial files on next launch after `force-stop`, OOM, or reboot. Detaches foreground state
+    while paused to preserve Android 15+'s 6-hour rolling `dataSync` quota and handles `onTimeout`
+    cleanly by pausing active jobs and posting a tap-to-resume notification. Downloads save to
+    `Downloads/Legion` via `MediaStore.Downloads`; uploads use `ACTION_OPEN_DOCUMENT` with
+    persistable read grants released on completion/failure/cancel/pruning; "Open in another app"
+    stages into `cache/open-externally/` (pruned by count, age and size) behind a non-exported
+    `FileProvider` and always launches through `Intent.createChooser`.
+  - **Desktop (Linux, macOS, Windows):** downloads land in the user's Downloads folder, uploads use
+    the native file dialog (`rfd`), "Open in another app" uses `open`. Closing the window while the
+    queue is active hides the window, sends a system notification, and exits automatically once no
+    active transfers remain; quitting outright asks for confirmation first.
+  - **iOS and iPadOS:** runs in foreground, pauses on `WindowEvent::Suspended`, resumes on
+    `WindowEvent::Resumed` (also probing/recovering the loopback content listener), exposes
+    `Documents/Downloads` in Apple Files (`UIFileSharingEnabled` and
+    `LSSupportsOpeningDocumentsInPlace`), and reports `background: false`,
+    `pauses_in_background: true`, `can_upload: false`, `can_open_externally: false`, and
+    `can_open_downloads: false` in `state().transfer_capabilities`.
 
 ## Building
 
@@ -189,6 +245,11 @@ Legion from an iPhone or iPad.
   simulator) rather than a native `NSURL` call verified against a real iCloud backup.
 - **Edge-swipe back gesture:** `WKWebView.allowsBackForwardNavigationGestures` remains off because
   `tauri` `2.12.7` does not expose `wry`'s flag without `unsafe` pointer access.
+- **File uploads and open-in-another-app on iOS:** Native `UIDocumentPickerViewController` and
+  `UIDocumentInteractionController` Swift bridges are not wired yet, so `state().transfer_capabilities`
+  reports `can_upload: false`, `can_open_externally: false`, and `can_open_downloads: false`, the
+  app link omits those actions, and direct command calls return `unsupported`. Downloads still save
+  to `Documents/Downloads` visible in Apple Files.
 
 ### Android debug APK
 
@@ -214,23 +275,32 @@ signature with `apksigner`, and prints the path, size and certificate SHA-256. S
 - **Rust check (Linux):** `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`,
   and `cargo test --locked`.
 - **Android:** builds the universal debug APK (`arm64-v8a` + `x86_64`), boots an x86_64 Android
-  emulator under KVM, installs and launches the APK, waits for `legion-app: interface ready` in
-  `adb logcat`, captures dark and light screenshots, and uploads the APK and screenshots.
+  emulator under KVM, installs and launches the APK against a throwaway loopback SSH node, waits for
+  `legion-app: interface ready` and `legion-app: media check ok` (PNG + WebM decoded through the
+  `legion-content` custom scheme) in `adb logcat`, captures dark and light screenshots, and uploads
+  the APK and screenshots.
 - **iOS and iPadOS:** builds the `aarch64-sim` `.app`, boots a current iPhone simulator and a
-  current iPad simulator, installs and launches Legion on each, waits for `legion-app: interface ready`,
-  verifies Foundation reports `NSURLIsExcludedFromBackupKey == true` on the app data directory,
-  captures dark and light screenshots on both devices, builds the unsigned device `.ipa`
-  (`Legion-ios-unsigned.ipa`), and uploads the screenshots and unsigned `.ipa`.
+  current iPad simulator, launches Legion against a throwaway loopback SSH node on each, waits for
+  `legion-app: interface ready` and content-address PNG + WebM decoding, verifies Foundation reports
+  `NSURLIsExcludedFromBackupKey == true` on the app data directory, captures dark and light
+  screenshots on both devices, builds the unsigned device `.ipa` (`Legion-ios-unsigned.ipa`), and
+  uploads the screenshots and unsigned `.ipa`.
 - **macOS desktop:** runs `cargo test --locked` (including the Apple backup-exclusion attribute
-  test), builds the ad-hoc signed Apple Silicon `.app` and `.dmg`, launches the app, waits for
-  `legion-app: interface ready`, confirms the app window exists, captures a screenshot when
-  permitted, and uploads the `.dmg`.
+  test), builds the ad-hoc signed Apple Silicon `.app` and `.dmg`, launches the app against a local
+  node, waits for `legion-app: interface ready` and content-address PNG + WebM decoding, confirms
+  the app window exists, captures a screenshot when permitted, uploads the `.dmg`, and verifies
+  end-to-end `.app` self-update from a local node with a throwaway preview key (uploading full
+  diagnostics on failure).
 - **Windows desktop:** builds the NSIS installer (`.exe`), runs a silent install into a temporary
-  directory, launches the installed executable under WebView2, waits for `legion-app: interface ready`,
-  captures a screenshot when permitted, and uploads the installer.
+  directory, launches the installed executable under WebView2 against a local node, waits for
+  `legion-app: interface ready` and content-address PNG + WebM decoding, captures a screenshot when
+  permitted, uploads the installer, and verifies end-to-end silent NSIS self-update from a local
+  node with a throwaway preview key (uploading full diagnostics on failure).
 - **Linux desktop:** builds `.deb` and `.AppImage` bundles, launches the built binary under
-  `dbus-run-session` and `xvfb-run`, waits for `legion-app: interface ready`, and uploads the
-  bundles.
+  `dbus-run-session` and `xvfb-run` against a local node, waits for `legion-app: interface ready`
+  and content-address PNG + WebM decoding, uploads the bundles, and verifies end-to-end AppImage
+  self-update from a local node with a throwaway preview key (uploading full diagnostics on
+  failure).
 
 ## Headless Android emulator harness
 
@@ -273,3 +343,24 @@ first-start pairing, live machine metrics, streamed command execution, file list
 power confirmation with dry run only, force-stop/relaunch persistence, transparent reconnect after
 killing the node-side session, revocation recovery and re-pairing, plus a wide paired screenshot on
 `legion-tablet`. It never touches `~/.ssh`, the system `sshd`, `~/.config/legion`, or `/tmp`.
+
+## End-to-end Android self-update test (`e2e-android-updates.sh`)
+
+`apps/legion-app/e2e-android-updates.sh` verifies real release-signed Android self-updates in one
+command on a local emulator (`legion-test`):
+
+```sh
+./apps/legion-app/e2e-android-updates.sh
+./apps/legion-app/e2e-android-updates.sh --avd legion-test --shots-dir /home/me/shots/updates
+```
+
+It generates a throwaway preview signing keypair and throwaway release keystore under
+`${XDG_CACHE_HOME:-$HOME/.cache}/legion-app/`, builds a preview-keyed `legion` binary and three
+signed release APKs (`seq1 < seq2 < seq3`) via `build-android.sh --emulator`, packages `seq2` and
+`seq3` through `scripts/make-update-set.mjs create` (checking embedded APK binary AXML
+`versionCode`), pairs over loopback SSH (`10.0.2.2`), verifies `seq1 -> seq2` through Android's
+unknown-sources grant and the quiet post-update notice row, and then verifies `seq2 -> seq3`
+applies silently when Legion moves to the background (`KEYCODE_HOME`) without bringing Legion or an
+installer prompt back to the foreground. It runs as a local script rather than inside GitHub's
+existing `android` CI job because it requires building three signed release APKs and driving Android
+17 silent-update timing (`SilentUpdatePolicy`) end-to-end.

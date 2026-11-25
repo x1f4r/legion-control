@@ -38,6 +38,10 @@ const USAGE_ERROR: u8 = 2;
 /// Bounded wait for a cancelled call to stop and audit after a termination signal.
 const SHUTDOWN_GRACE: Duration = CANCEL_GRACE.saturating_add(Duration::from_secs(4));
 
+#[global_allocator]
+static ALLOCATOR: legion_os::capped_alloc::CappedAlloc =
+    legion_os::capped_alloc::CappedAlloc::new();
+
 fn main() -> ExitCode {
     legion_core::record_current_exe();
     if let Some(code) = legion_tools::job::try_supervise_cli(std::env::args_os().skip(1)) {
@@ -46,6 +50,10 @@ fn main() -> ExitCode {
     if let Some(code) = legion_tools::power::try_delay_cli(std::env::args_os().skip(1)) {
         return code;
     }
+    if let Some(code) = legion_tools::fs::try_thumb_worker_cli(std::env::args_os().skip(1)) {
+        return code;
+    }
+    legion_tools::fs::enable_thumb_worker_self();
     legion_tools::update::cleanup_old_binary();
     let command = match args::parse(std::env::args_os().skip(1)) {
         Ok(command) => command,
@@ -133,6 +141,7 @@ async fn run(command: Command) -> ExitCode {
     };
     let (node, router) = match paths_result {
         Ok(paths) => {
+            legion_net::updates::cleanup_stale_staging(&paths);
             let fleet = Fleet::new(&paths);
             let mut registry = legion_tools::registry();
             legion_net::register(&mut registry, fleet.clone());
@@ -292,13 +301,18 @@ async fn serve_stream(
     shutdown: CancellationToken,
 ) -> ExitCode {
     let host = Host::new(node.paths().clone(), node.name());
+    let stream_options = legion_net::stream::StreamServeOptions {
+        shutdown: Some(shutdown.clone()),
+        ..legion_net::stream::StreamServeOptions::default()
+    };
     let mut served = tokio::task::spawn_blocking(move || {
-        legion_net::stream::serve_with_door(
+        legion_net::stream::serve_with_options(
             &host,
             pinned.as_deref(),
             door,
             device.as_deref(),
-            io::stdin().lock(),
+            stream_options,
+            io::stdin(),
             io::stdout().lock(),
         )
     });

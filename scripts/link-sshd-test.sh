@@ -66,15 +66,24 @@ cat > "$FAR_HOME/config/node.toml" <<'EOF'
 name = "tower"
 EOF
 
-cat > "$FAR_HOME/config/policy.toml" <<'EOF'
+cat > "$FAR_HOME/config/policy.toml" <<EOF
 default = "owner"
 
 [principals.phone]
 role = "observer"
 
+[principals.writer]
+role = "editor"
+
 [roles.observer]
 allow = ["effect:read"]
+
+[roles.editor]
+allow = ["effect:read", "effect:write"]
+paths = ["$WORK/uploads", "$WORK/sample-content.bin"]
 EOF
+
+mkdir -p "$WORK/uploads"
 
 # Primary server holds both ed25519 and ecdsa host keys to exercise pin ordering & retry-once.
 ssh-keygen -q -t ed25519 -N '' -C "legion-link-host-ed25519" -f "$WORK/host_ed25519"
@@ -87,8 +96,13 @@ HOST_PUB_ECDSA="$(cat "$WORK/host_ecdsa.pub")"
 
 KEYGEN_OUT="$("$LINK_BIN" keygen "$WORK/device_key")"
 DEVICE_PUB="$(node -e 'const d = JSON.parse(process.argv[1]); console.log(d.public_key);' "$KEYGEN_OUT")"
+UPLOAD_KEYGEN_OUT="$("$LINK_BIN" keygen "$WORK/upload_key")"
+UPLOAD_PUB="$(node -e 'const d = JSON.parse(process.argv[1]); console.log(d.public_key);' "$UPLOAD_KEYGEN_OUT")"
 
-printf 'command="%s gate --as phone --home %s",restrict %s\n' "$LEGION_BIN" "$FAR_HOME" "$DEVICE_PUB" > "$WORK/authorized_keys"
+{
+  printf 'command="%s gate --as phone --home %s",restrict %s\n' "$LEGION_BIN" "$FAR_HOME" "$DEVICE_PUB"
+  printf 'command="%s gate --as writer --home %s",restrict %s\n' "$LEGION_BIN" "$FAR_HOME" "$UPLOAD_PUB"
+} > "$WORK/authorized_keys"
 chmod 600 "$WORK/authorized_keys"
 
 cat > "$WORK/sshd_config" <<EOF
@@ -213,16 +227,30 @@ EOF
 chmod 700 "$WORK/enrol-responder.sh"
 
 echo "1) Running legion-link sshd integration test..."
+SAMPLE_FILE="$WORK/sample-content.bin"
+node -e '
+const fs = require("node:fs");
+// 5 MiB (> russh 2 MiB window and 100-packet mpsc) so unread-stream non-blocking is proven.
+const buf = Buffer.alloc(5 * 1024 * 1024);
+for (let i = 0; i < buf.length; i++) buf[i] = (i * 31 + 7) & 0xff;
+fs.writeFileSync(process.argv[1], buf);
+' "$SAMPLE_FILE"
+
+LEGION_HOME="$FAR_HOME" \
 LEGION_LINK_SSHD="127.0.0.1:$PORT" \
 LEGION_LINK_USER="$USER_NAME" \
 LEGION_LINK_HOST_KEY="$HOST_PUB_ED25519" \
 LEGION_LINK_HOST_KEY_ECDSA="$HOST_PUB_ECDSA" \
 LEGION_LINK_MISMATCH_HOST="$MISMATCH_HOST" \
 LEGION_LINK_KEY_FILE="$WORK/device_key" \
+LEGION_LINK_UPLOAD_KEY_FILE="$WORK/upload_key" \
+LEGION_LINK_UPLOAD_DIR="$WORK/uploads" \
 LEGION_LINK_AUTH_KEYS="$WORK/authorized_keys" \
 LEGION_LINK_ENROL_SCRIPT="$WORK/enrol-responder.sh" \
+LEGION_LINK_SAMPLE_FILE="$SAMPLE_FILE" \
+LEGION_LINK_BIN="$LEGION_BIN" \
 LEGION_LINK_NODE="tower" \
-  cargo test -p legion-link --features ssh --test sshd -- --ignored --nocapture
+  cargo test -p legion-link --features ssh,local --test sshd -- --ignored --nocapture
 
 echo "2) Running example binary: link tools..."
 TOOLS_OUT="$("$LINK_BIN" tools --config "$WORK/config.json")"

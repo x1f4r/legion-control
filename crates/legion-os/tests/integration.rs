@@ -132,6 +132,13 @@ fn main() -> ExitCode {
         ("lock_contention_and_crash_release_across_processes", || {
             Box::pin(test_lock_contention_and_crash_release_across_processes())
         }),
+        ("run_memory_limit_kills_allocating_child", || {
+            Box::pin(test_run_memory_limit_kills_allocating_child())
+        }),
+        (
+            "run_stdin_file_and_raw_stdout_round_trip_binary_bytes",
+            || Box::pin(test_run_stdin_file_and_raw_stdout_round_trip_binary_bytes()),
+        ),
         #[cfg(target_os = "macos")]
         (
             "macos_is_alive_stays_true_until_killed_child_releases_flock",
@@ -237,6 +244,8 @@ fn run_helper(mode: &str) -> ExitCode {
         "dump_argv" => helper_dump_argv(&args),
         "setsid_reparent_root" => helper_setsid_reparent_root(&args),
         "setsid_reparent_mid" => helper_setsid_reparent_mid(&args),
+        "alloc_hog" => helper_alloc_hog(&args),
+        "cat_raw" => helper_cat_raw(),
         other => {
             eprintln!("unknown helper mode: {other}");
             ExitCode::from(2)
@@ -689,11 +698,19 @@ fn helper_env_remove_driver(args: &[String]) -> ExitCode {
         .as_deref()
         .expect("spawn_detached should stamp DetachHandle.marker");
 
-    let detach_text = rt.block_on(wait_for_detached_file(
+    // The helper prints one line per variable and the marker last; reading the file as soon as
+    // it has any content can see only the first line.
+    let last_line = format!("{DETACH_MARKER_ENV}=");
+    let detach_text = rt.block_on(wait_for_detached_file_until(
         &detach_out,
         Duration::from_secs(20),
         &handle,
         &[&detach_out],
+        |content| {
+            content
+                .lines()
+                .any(|line| line.starts_with(&last_line) && content.ends_with('\n'))
+        },
     ));
     assert!(
         detach_text.contains("LEGION_DROP_ME=<unset>"),
@@ -842,10 +859,27 @@ async fn wait_for_detached_file(
     handle: &DetachHandle,
     log_paths: &[&Path],
 ) -> String {
+    wait_for_detached_file_until(path, timeout, handle, log_paths, |content| {
+        !content.trim().is_empty()
+    })
+    .await
+}
+
+/// Waits until `complete` accepts what the detached process has written to `path`.
+///
+/// A file the child writes line by line is not finished when it stops being empty, so a caller
+/// that needs all of it names what the end looks like.
+async fn wait_for_detached_file_until(
+    path: &Path,
+    timeout: Duration,
+    handle: &DetachHandle,
+    log_paths: &[&Path],
+    complete: impl Fn(&str) -> bool,
+) -> String {
     let deadline = Instant::now() + timeout;
     loop {
         if let Ok(content) = fs::read_to_string(path)
-            && !content.trim().is_empty()
+            && complete(&content)
         {
             return content;
         }
@@ -2168,4 +2202,67 @@ async fn test_macos_is_alive_stays_true_until_killed_child_releases_flock() {
         drop(acquired);
         let _ = holder.wait();
     }
+}
+
+fn helper_alloc_hog(args: &[String]) -> ExitCode {
+    let target_mib: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(256);
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
+    for step in 0..target_mib {
+        let mut buf = vec![0u8; 1024 * 1024];
+        // Touch every 4 KiB page so RSS actually grows.
+        for offset in (0..buf.len()).step_by(4096) {
+            buf[offset] = (step & 0xFF) as u8;
+        }
+        chunks.push(buf);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::hint::black_box(&chunks);
+    ExitCode::SUCCESS
+}
+
+fn helper_cat_raw() -> ExitCode {
+    let mut buf = Vec::new();
+    if io::stdin().read_to_end(&mut buf).is_err() {
+        return ExitCode::from(1);
+    }
+    if io::stdout().write_all(&buf).is_err() || io::stdout().flush().is_err() {
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
+}
+
+async fn test_run_memory_limit_kills_allocating_child() {
+    let (spec, envs) = helper_spec("alloc_hog", &["256"]);
+    let limit = 48 * 1024 * 1024;
+    let out = run(RunOptions::new(spec)
+        .envs(envs)
+        .memory_limit(limit)
+        .timeout(Duration::from_secs(10)))
+    .await
+    .expect("run should complete when child is killed for memory");
+    assert!(
+        out.killed_for_memory,
+        "expected child exceeding 48 MiB to be killed for memory, got: {out:?}"
+    );
+    assert!(!out.success());
+    assert!(!out.timed_out);
+}
+
+async fn test_run_stdin_file_and_raw_stdout_round_trip_binary_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let payload: Vec<u8> = (0u8..=255).chain([0x00, 0xFF, 0xFE, 0x80, 0x7F]).collect();
+    let path = dir.path().join("bin.dat");
+    fs::write(&path, &payload).unwrap();
+    let file = fs::File::open(&path).unwrap();
+
+    let (spec, envs) = helper_spec("cat_raw", &[]);
+    let out = run(RunOptions::new(spec)
+        .envs(envs)
+        .stdin_file(file)
+        .raw_stdout(true)
+        .timeout(Duration::from_secs(5)))
+    .await
+    .unwrap();
+    assert!(out.success(), "cat_raw failed: {out:?}");
+    assert_eq!(out.stdout_bytes, payload);
 }

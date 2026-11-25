@@ -4,15 +4,20 @@ import { html } from '../vendor/preact-htm.js';
 import { Meter, Notice } from './common.js';
 import { formatMachineStatusPhrase } from '../lib/activity.js';
 import { machineMetrics } from '../lib/format.js';
+import { machineAttentionLabel } from '../lib/machine-monitor.js';
 import { routeHref } from '../lib/route.js';
 import { formatPairSyncNotice } from '../lib/settings.js';
 import { MachineDetail } from './machine.js';
 
 function OnlineMachineCard({ machine, selected, showMetrics }) {
   const metrics = machineMetrics(machine.sys);
+  const attention = machineAttentionLabel(machine.sys);
   const dotClass = machine.busy ? 'dot busy' : 'dot';
   const cls = ['machine', selected ? 'selected' : ''].filter(Boolean).join(' ');
   const href = routeHref({ section: 'machines', machine: machine.name, tab: 'overview' });
+  const hasCpu = Number.isFinite(machine.sys?.cpu?.usage_pct);
+  const hasMem = Number.isFinite(machine.sys?.memory?.total) && machine.sys.memory.total > 0;
+  const hasDisk = Boolean(metrics?.disk);
 
   return html`
     <a class=${cls} href=${href} aria-current=${selected ? 'true' : undefined}>
@@ -21,21 +26,34 @@ function OnlineMachineCard({ machine, selected, showMetrics }) {
         <strong>${machine.name}</strong>
         <span>${formatMachineStatusPhrase(machine)}</span>
       </header>
-      ${showMetrics && metrics
+      ${attention ? html`<div class="attention-word">${attention}</div>` : null}
+      ${showMetrics && metrics && (hasCpu || hasMem || hasDisk)
         ? html`
             <div class="stats">
-              <div class="stat">
-                <span>Processor <b>${metrics.cpuPct}%</b></span>
-                <${Meter} value=${metrics.cpuPct} />
-              </div>
-              <div class="stat">
-                <span>Memory <b>${metrics.memPct}%</b></span>
-                <${Meter} value=${metrics.memPct} />
-              </div>
-              <div class="stat">
-                <span>Disk <b>${metrics.diskPct}%</b></span>
-                <${Meter} value=${metrics.diskPct} />
-              </div>
+              ${hasCpu
+                ? html`
+                    <div class="stat">
+                      <span>Processor <b>${metrics.cpuPct}%</b></span>
+                      <${Meter} value=${metrics.cpuPct} />
+                    </div>
+                  `
+                : null}
+              ${hasMem
+                ? html`
+                    <div class="stat">
+                      <span>Memory <b>${metrics.memPct}%</b></span>
+                      <${Meter} value=${metrics.memPct} />
+                    </div>
+                  `
+                : null}
+              ${hasDisk
+                ? html`
+                    <div class="stat">
+                      <span>Storage <b>${metrics.diskPct}%</b></span>
+                      <${Meter} value=${metrics.diskPct} />
+                    </div>
+                  `
+                : null}
             </div>
           `
         : null}
@@ -43,7 +61,7 @@ function OnlineMachineCard({ machine, selected, showMetrics }) {
   `;
 }
 
-function OfflineMachineRow({ machine, selected, canWake, wakePending, onWake }) {
+function OfflineMachineRow({ machine, selected, canWake, wakePending, onEnsureAwake }) {
   const isAsking = machine.status === 'asking' || machine.asking;
   const cls = [
     'machine',
@@ -55,9 +73,22 @@ function OfflineMachineRow({ machine, selected, canWake, wakePending, onWake }) 
   const href = routeHref({ section: 'machines', machine: machine.name, tab: 'overview' });
   const showWake = !isAsking && !wakePending && machine.canWake && canWake;
 
+  function handleOpen(e) {
+    if (!isAsking && !machine.reachable && machine.canWake && canWake && onEnsureAwake) {
+      e.preventDefault();
+      onEnsureAwake(machine, {
+        kind: 'screen',
+        label: `open ${machine.name}`,
+        onContinue: () => {
+          window.location.hash = href;
+        },
+      });
+    }
+  }
+
   return html`
     <div class=${cls}>
-      <a class="machine-link" href=${href} aria-current=${selected ? 'true' : undefined}>
+      <a class="machine-link" href=${href} aria-current=${selected ? 'true' : undefined} onClick=${handleOpen}>
         <span class=${isAsking ? 'dot asking' : 'dot off'} aria-hidden="true"></span>
         <strong>${machine.name}</strong>
         <span>${formatMachineStatusPhrase(machine, Date.now(), { wakePending })}</span>
@@ -70,7 +101,9 @@ function OfflineMachineRow({ machine, selected, canWake, wakePending, onWake }) 
               onClick=${(e) => {
                 e.preventDefault();
                 e.stopPropagation();
-                if (onWake) onWake(machine);
+                if (onEnsureAwake) {
+                  onEnsureAwake(machine, { kind: 'wake', immediate: true, forgettable: true });
+                }
               }}
             >
               Wake
@@ -86,6 +119,9 @@ export function MachinesView({
   error,
   pairNotice,
   onDismissPairNotice,
+  updateState,
+  onOpenWhatIsNew,
+  onDismissUpdateNotice,
   loading,
   wide,
   route,
@@ -94,11 +130,14 @@ export function MachinesView({
   tools,
   allowedSet,
   settings,
+  deviceNoun,
+  thumbCache,
   wakePendingSet,
-  onWakeMachine,
+  onEnsureAwake,
   onWakeSent,
   onRequestConfirm,
   onRefresh,
+  onUpdateMachineSys,
   commandRuns,
   onCommandRunsChange,
 }) {
@@ -107,6 +146,8 @@ export function MachinesView({
   const showMetrics = settings?.showMetrics !== false;
   const showOffline = settings?.showOffline !== false;
   const syncBanner = formatPairSyncNotice(pairNotice, Boolean(settings?.technical));
+  const justUpdated = updateState?.just_updated || null;
+  const rolledBack = updateState?.rolled_back || null;
 
   const onlineMachines = machines.filter((m) => m.reachable);
   const askingMachines = machines.filter((m) => !m.reachable && (m.status === 'asking' || m.asking));
@@ -120,6 +161,40 @@ export function MachinesView({
   const listColumn = html`
     <section>
       ${error ? html`<${Notice} error=${error} />` : null}
+      ${rolledBack
+        ? html`
+            <${Notice}
+              title=${`Kept version ${updateState?.current?.version || ''}`.trim()}
+              hint=${rolledBack.reason ||
+                `Version ${rolledBack.version} did not start cleanly, so Legion kept the previous copy.`}
+              kind="warn"
+              onDismiss=${onDismissUpdateNotice}
+            />
+          `
+        : null}
+      ${justUpdated
+        ? html`
+            <div class="update-note" role="status">
+              ${justUpdated.notes
+                ? html`
+                    <button type="button" class="update-note-link" onClick=${onOpenWhatIsNew}>
+                      <span>Updated to ${justUpdated.version}</span>
+                      <span aria-hidden="true">·</span>
+                      <span class="update-note-action">What is new</span>
+                    </button>
+                  `
+                : html`<span class="update-note-text">Updated to ${justUpdated.version}</span>`}
+              <button
+                type="button"
+                class="update-note-dismiss"
+                aria-label="Dismiss update notice"
+                onClick=${onDismissUpdateNotice}
+              >
+                ×
+              </button>
+            </div>
+          `
+        : null}
       ${syncBanner
         ? html`
             <${Notice}
@@ -164,7 +239,6 @@ export function MachinesView({
                           machine=${m}
                           selected=${wide && m.name === selectedName}
                           canWake=${false}
-                          onWake=${onWakeMachine}
                         />
                       `,
                     )}
@@ -184,7 +258,7 @@ export function MachinesView({
                           selected=${wide && m.name === selectedName}
                           canWake=${canWake}
                           wakePending=${Boolean(wakePendingSet?.has(m.name))}
-                          onWake=${onWakeMachine}
+                          onEnsureAwake=${onEnsureAwake}
                         />
                       `,
                     )}
@@ -212,11 +286,14 @@ export function MachinesView({
                   tools=${tools}
                   allowedSet=${allowedSet}
                   settings=${settings}
+                  deviceNoun=${deviceNoun}
+                  thumbCache=${thumbCache}
                   wakePending=${Boolean(wakePendingSet?.has(selectedMachine.name))}
-                  onWakeMachine=${onWakeMachine}
+                  onEnsureAwake=${onEnsureAwake}
                   onWakeSent=${onWakeSent}
                   onRequestConfirm=${onRequestConfirm}
                   onRefreshFleet=${onRefresh}
+                  onUpdateMachineSys=${onUpdateMachineSys}
                   commandRuns=${commandRuns}
                   onCommandRunsChange=${onCommandRunsChange}
                 />
@@ -239,11 +316,14 @@ export function MachinesView({
         tools=${tools}
         allowedSet=${allowedSet}
         settings=${settings}
+        deviceNoun=${deviceNoun}
+        thumbCache=${thumbCache}
         wakePending=${Boolean(wakePendingSet?.has(selectedMachine.name))}
-        onWakeMachine=${onWakeMachine}
+        onEnsureAwake=${onEnsureAwake}
         onWakeSent=${onWakeSent}
         onRequestConfirm=${onRequestConfirm}
         onRefreshFleet=${onRefresh}
+        onUpdateMachineSys=${onUpdateMachineSys}
         commandRuns=${commandRuns}
         onCommandRunsChange=${onCommandRunsChange}
       />

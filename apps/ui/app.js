@@ -16,7 +16,17 @@ import {
   refreshFleetProgressive,
   serializeFleetCache,
 } from './lib/fleet.js';
-import { formatRelativeTime } from './lib/format.js';
+import {
+  filesFallbackBackRoute,
+  folderDisplayName,
+  parentFilePath,
+  selectAllEntries,
+  selectionSummary,
+  toggleSelection,
+} from './lib/files.js';
+import { readSortPreference, writeSortPreference } from './lib/files-store.js';
+import { formatBytes, formatRelativeTime } from './lib/format.js';
+import { createThumbCache } from './lib/thumb-cache.js';
 import {
   classifyHorizontalSwipe,
   classifyPullRefresh,
@@ -32,17 +42,23 @@ import {
   ROOT_SECTIONS,
   routeHref,
 } from './lib/route.js';
-import { describePowerConfirm } from './lib/schema.js';
 import {
   applySettingsToRoot,
   detectDeviceNoun,
   readSettings,
   writeSettings,
 } from './lib/settings.js';
+import {
+  PERIODIC_CHECK_INTERVAL_MS,
+  isSafeForAutoInstall,
+  shouldCheckOnResume,
+} from './lib/updates.js';
+import { createWakeController, setDefaultWakeController } from './lib/wake.js';
 import { createLink } from './link/index.js';
 import { ActionsView } from './views/actions.js';
 import { ActivityView } from './views/activity.js';
-import { Notice, Sheet } from './views/common.js';
+import { Notice, Sheet, WakeSheet } from './views/common.js';
+import { FilesDock, FilesView } from './views/files.js';
 import { CommandComposer } from './views/machine.js';
 import { MachinesView } from './views/machines.js';
 import { SettingsView } from './views/settings.js';
@@ -73,6 +89,22 @@ function safeLocalStorage() {
 }
 
 const WAKE_TTL_MS = 120_000;
+const PASSIVE_REFRESH_TOOLS = new Set([
+  'fleet.list',
+  'fleet.ping',
+  'sys.info',
+  'sys.procs',
+  'power.status',
+  'job.list',
+  'meta.whoami',
+  'meta.version',
+  'fs.list',
+  'fs.stat',
+  'fs.read',
+  'fs.search',
+  'fav.list',
+  'sync.list',
+]);
 
 function ConfirmSheet({ request, technical, onClose }) {
   const [dryResult, setDryResult] = useState(null);
@@ -220,14 +252,42 @@ function ConfirmSheet({ request, technical, onClose }) {
 }
 
 function App() {
-  const link = useMemo(() => createLink(), []);
+  const rawLink = useMemo(() => createLink(), []);
+  const activeCallsRef = useRef(0);
+  const link = useMemo(() => {
+    if (typeof rawLink.call !== 'function') return rawLink;
+    return {
+      ...rawLink,
+      async call(tool, args, options) {
+        const isInteractive = Boolean(options?.onEvent) || !PASSIVE_REFRESH_TOOLS.has(tool);
+        if (isInteractive) activeCallsRef.current += 1;
+        try {
+          return await rawLink.call(tool, args, options);
+        } finally {
+          if (isInteractive) activeCallsRef.current = Math.max(0, activeCallsRef.current - 1);
+        }
+      },
+    };
+  }, [rawLink]);
   const sessionCache = useMemo(() => createSessionCache(), []);
   const persistentCache = useMemo(() => createPersistentCache(), []);
+  const thumbCache = useMemo(() => createThumbCache({ maxEntries: 180, storage: null }), []);
   const shellRef = useRef(null);
   const mainRef = useRef(null);
   const refreshAbortRef = useRef(null);
   const refreshInFlightRef = useRef(false);
   const swipeRef = useRef(null);
+  const scrollByFolderRef = useRef(new Map());
+  const filesHistoryDepthRef = useRef(0);
+  const filesSheetHistoryRef = useRef(false);
+  const filesSelectHistoryRef = useRef(false);
+  const lastHashRef = useRef(window.location.hash);
+  const filesBulkHandlersRef = useRef({});
+  const toastTimerRef = useRef(null);
+  const toastSeqRef = useRef(0);
+  const toastRef = useRef(null);
+  const deviceTransfersRef = useRef([]);
+  const prevTransferStatesRef = useRef(null);
 
   const [settings, setSettings] = useState(() => {
     const loaded = readSettings(safeLocalStorage());
@@ -258,9 +318,43 @@ function App() {
   });
   const [pairingOpen, setPairingOpen] = useState(false);
   const [pairNotice, setPairNotice] = useState(null);
+  const [updateState, setUpdateState] = useState(null);
+  const [whatIsNewOpen, setWhatIsNewOpen] = useState(false);
+  const [startupUpdating, setStartupUpdating] = useState(false);
   const [wakeSentAt, setWakeSentAt] = useState({});
+  const [wakeUiState, setWakeUiState] = useState({ sheet: null, wakingMachines: new Set() });
+  const [toast, setToast] = useState(null);
+  const [deviceTransfers, setDeviceTransfers] = useState([]);
+  const [filesSortPref, setFilesSortPref] = useState(() => readSortPreference(safeLocalStorage()));
+  const [filesShowHidden, setFilesShowHidden] = useState(false);
+  const [filesSelecting, setFilesSelecting] = useState(false);
+  const [filesSelectedPaths, setFilesSelectedPaths] = useState(() => new Set());
+  const [filesSheet, setFilesSheet] = useState(null);
+  const [filesViewModeOverride, setFilesViewModeOverride] = useState(null);
+  const [filesResolvedViewMode, setFilesResolvedViewMode] = useState('list');
+  const [filesMeta, setFilesMeta] = useState({ caps: null, resolvedPath: '~', entries: [], syncFolders: [] });
+  const [filesSearchSummary, setFilesSearchSummary] = useState({ count: 0, machineCount: 0, searching: false });
   const sheetHistoryRef = useRef(false);
   const learnInFlightRef = useRef(false);
+  const updateCheckInFlightRef = useRef(false);
+  const userInteractedRef = useRef(false);
+  const startupAutoInstallRanRef = useRef(false);
+  const updateStateRef = useRef(updateState);
+  updateStateRef.current = updateState;
+  const confirmRequestRef = useRef(confirmRequest);
+  confirmRequestRef.current = confirmRequest;
+  const whatIsNewOpenRef = useRef(whatIsNewOpen);
+  whatIsNewOpenRef.current = whatIsNewOpen;
+  const commandDraftRef = useRef(commandDraft);
+  commandDraftRef.current = commandDraft;
+  const pairingOpenRef = useRef(pairingOpen);
+  pairingOpenRef.current = pairingOpen;
+  const filesSheetRef = useRef(filesSheet);
+  filesSheetRef.current = filesSheet;
+  const activeTransfersCountRef = useRef(0);
+  activeTransfersCountRef.current = deviceTransfers.filter(
+    (t) => t.state === 'running' || t.state === 'queued',
+  ).length;
 
   const nodeInfo = linkState?.nodes?.[0] || null;
   const nodeInfoRef = useRef(nodeInfo);
@@ -276,6 +370,9 @@ function App() {
     () => (nodeInfo?.whoami?.tools ? new Set(nodeInfo.whoami.tools) : null),
     [nodeInfo],
   );
+  const allowedSetRef = useRef(allowedSet);
+  allowedSetRef.current = allowedSet;
+  const wakeControllerRef = useRef(null);
 
   const deviceNoun = useMemo(
     () => detectDeviceNoun(link.kind, typeof navigator !== 'undefined' ? navigator.userAgent : '', viewportWidth),
@@ -297,15 +394,261 @@ function App() {
     }
   }, [settings, deviceNoun]);
 
+  const routeRef = useRef(route);
+  routeRef.current = route;
+  toastRef.current = toast;
+  deviceTransfersRef.current = deviceTransfers;
+
+  const isTerminalTransferState = (state) => state === 'done' || state === 'failed' || state === 'cancelled';
+
+  const allTrackedTransfersTerminal = (ids, list) => {
+    if (!Array.isArray(ids) || ids.length === 0) return false;
+    const byId = new Map((list || []).map((t) => [t.id, t.state]));
+    return ids.every((id) => isTerminalTransferState(byId.get(id)));
+  };
+
+  const formatTransferFailureToast = (failedList) => {
+    if (!Array.isArray(failedList) || failedList.length === 0) return '';
+    if (failedList.length === 1) {
+      const item = failedList[0];
+      const verb = item.direction === 'upload' ? 'Upload' : 'Download';
+      const name = item.name || 'file';
+      const detail = item.error?.message ? ` ${item.error.message}` : '';
+      return `${verb} of ${name} failed.${detail}`;
+    }
+    return `${failedList.length} transfers failed.`;
+  };
+
+  const clearToast = useCallback(() => {
+    if (toastTimerRef.current) {
+      clearTimeout(toastTimerRef.current);
+      toastTimerRef.current = null;
+    }
+    toastRef.current = null;
+    setToast(null);
+  }, []);
+
+  useEffect(() => () => {
+    if (toastTimerRef.current) {
+      clearTimeout(toastTimerRef.current);
+      toastTimerRef.current = null;
+    }
+  }, []);
+
+  const showToast = useCallback(
+    (message, opts = {}) => {
+      if (!message) return;
+      const actionHref = opts.actionHref || null;
+      const suppressOnActivity =
+        opts.suppressOnActivity !== undefined
+          ? Boolean(opts.suppressOnActivity)
+          : actionHref === '#/activity';
+      if (suppressOnActivity && routeRef.current?.section === 'activity') {
+        return;
+      }
+      const transferIds = Array.isArray(opts.transferIds) ? opts.transferIds.filter(Boolean) : [];
+      if (transferIds.length > 0 && allTrackedTransfersTerminal(transferIds, deviceTransfersRef.current)) {
+        return;
+      }
+      const transferJobs = Array.isArray(opts.transferJobs)
+        ? opts.transferJobs.filter((j) => j && j.id)
+        : [];
+      if (toastTimerRef.current) {
+        clearTimeout(toastTimerRef.current);
+        toastTimerRef.current = null;
+      }
+      const seq = ++toastSeqRef.current;
+      const tracksTransfer =
+        transferIds.length > 0 ||
+        transferJobs.length > 0 ||
+        Boolean(opts.transferIdsPromise) ||
+        Boolean(opts.transferJobsPromise);
+      const nextToast = {
+        seq,
+        message,
+        actionLabel: opts.actionLabel || null,
+        actionHref,
+        tone: opts.tone || null,
+        suppressOnActivity,
+        transferIds,
+        transferJobs,
+      };
+      toastRef.current = nextToast;
+      setToast(nextToast);
+      const ttlMs = tracksTransfer ? 8000 : opts.tone === 'error' ? 6000 : 4500;
+      toastTimerRef.current = window.setTimeout(() => {
+        toastTimerRef.current = null;
+        if (toastRef.current?.seq === seq) {
+          toastRef.current = null;
+          setToast(null);
+        }
+      }, ttlMs);
+
+      if (opts.transferIdsPromise && typeof opts.transferIdsPromise.then === 'function') {
+        opts.transferIdsPromise
+          .then((ids) => {
+            const clean = Array.isArray(ids) ? ids.filter(Boolean) : [];
+            if (clean.length === 0 || toastRef.current?.seq !== seq) return;
+            if (allTrackedTransfersTerminal(clean, deviceTransfersRef.current)) {
+              clearToast();
+              return;
+            }
+            const updated = { ...toastRef.current, transferIds: clean };
+            toastRef.current = updated;
+            setToast(updated);
+          })
+          .catch(() => {});
+      }
+
+      if (opts.transferJobsPromise && typeof opts.transferJobsPromise.then === 'function') {
+        opts.transferJobsPromise
+          .then((jobs) => {
+            const clean = Array.isArray(jobs) ? jobs.filter((j) => j && j.id) : [];
+            if (clean.length === 0 || toastRef.current?.seq !== seq) return;
+            const updated = { ...toastRef.current, transferJobs: clean };
+            toastRef.current = updated;
+            setToast(updated);
+          })
+          .catch(() => {});
+      }
+    },
+    [clearToast],
+  );
+
   useEffect(() => {
-    if (mainRef.current) mainRef.current.scrollTop = 0;
+    if (
+      route.section === 'activity' &&
+      (toastRef.current?.suppressOnActivity || toastRef.current?.actionHref === '#/activity')
+    ) {
+      clearToast();
+    }
+  }, [route.section, clearToast]);
+
+  // Keep device transfer queue in sync when the link supports it.
+  useEffect(() => {
+    prevTransferStatesRef.current = null;
+    if (!linkState?.ready || typeof link.transfers !== 'function') {
+      deviceTransfersRef.current = [];
+      setDeviceTransfers([]);
+      return undefined;
+    }
+    let alive = true;
+    const applyTransfers = (list) => {
+      if (!alive || !Array.isArray(list)) return;
+      const prevStates = prevTransferStatesRef.current;
+      const nextStates = new Map(list.map((t) => [t.id, t.state]));
+      const newlyFailed = [];
+      if (prevStates !== null) {
+        for (const item of list) {
+          if (item.state === 'failed' && prevStates.get(item.id) !== 'failed') {
+            newlyFailed.push(item);
+          }
+        }
+      }
+      prevTransferStatesRef.current = nextStates;
+      deviceTransfersRef.current = list;
+      setDeviceTransfers(list);
+
+      const currentToast = toastRef.current;
+      if (
+        currentToast?.transferIds?.length > 0 &&
+        allTrackedTransfersTerminal(currentToast.transferIds, list)
+      ) {
+        clearToast();
+      }
+
+      if (newlyFailed.length > 0) {
+        const onActivity = routeRef.current?.section === 'activity';
+        showToast(formatTransferFailureToast(newlyFailed), {
+          tone: 'error',
+          suppressOnActivity: false,
+          ...(onActivity ? {} : { actionLabel: 'Activity', actionHref: '#/activity' }),
+        });
+      }
+    };
+    link
+      .transfers()
+      .then(applyTransfers)
+      .catch(() => {});
+    const unsub =
+      typeof link.onTransferEvent === 'function'
+        ? link.onTransferEvent(applyTransfers)
+        : null;
+    return () => {
+      alive = false;
+      if (typeof unsub === 'function') unsub();
+    };
+  }, [link, linkState?.ready, clearToast, showToast]);
+
+  const trackedTransferJobs = toast?.transferJobs;
+  const trackedTransferToastSeq = toast?.seq;
+  useEffect(() => {
+    if (!trackedTransferJobs || trackedTransferJobs.length === 0 || !linkState?.ready) {
+      return undefined;
+    }
+    let alive = true;
+    let timer = null;
+    const checkJobs = async () => {
+      if (!alive || toastRef.current?.seq !== trackedTransferToastSeq) return;
+      const statuses = await Promise.all(
+        trackedTransferJobs.map((job) =>
+          link
+            .call('job.status', { id: job.id }, { on: job.machine || nodeInfoRef.current?.node })
+            .then((st) => ({ job, status: st }))
+            .catch(() => ({ job, status: null })),
+        ),
+      );
+      if (!alive || toastRef.current?.seq !== trackedTransferToastSeq) return;
+      const isTerminalJob = (s) => s === 'succeeded' || s === 'failed' || s === 'cancelled';
+      if (statuses.every((entry) => entry.status && isTerminalJob(entry.status.state))) {
+        clearToast();
+        const failed = statuses.filter((entry) => entry.status?.state === 'failed');
+        if (failed.length > 0) {
+          const onActivity = routeRef.current?.section === 'activity';
+          const first = failed[0].job;
+          const msg =
+            failed.length === 1
+              ? `${first.move ? 'Move' : 'Copy'} of ${first.label || 'item'} to ${first.destMachine || 'machine'} failed.`
+              : `${failed.length} transfers failed.`;
+          showToast(msg, {
+            tone: 'error',
+            suppressOnActivity: false,
+            ...(onActivity ? {} : { actionLabel: 'Activity', actionHref: '#/activity' }),
+          });
+        }
+        return;
+      }
+      timer = window.setTimeout(checkJobs, 700);
+    };
+    timer = window.setTimeout(checkJobs, 700);
+    return () => {
+      alive = false;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [trackedTransferJobs, trackedTransferToastSeq, link, linkState?.ready, clearToast, showToast]);
+
+  useEffect(() => {
+    if (mainRef.current && route.section !== 'files') mainRef.current.scrollTop = 0;
   }, [route.section]);
 
   useEffect(() => {
-    if (!wide && mainRef.current && route.tab !== 'command') {
+    if (!wide && mainRef.current && route.tab !== 'command' && route.section !== 'files') {
       mainRef.current.scrollTop = 0;
     }
-  }, [wide, route.machine, route.tab, route.tool, route.action, route.jobId, route.page, route.sub]);
+  }, [wide, route.section, route.machine, route.tab, route.tool, route.action, route.jobId, route.page, route.sub]);
+
+  // Restore saved folder scroll position when arriving at a Files folder (e.g. via Back).
+  useEffect(() => {
+    if (route.section !== 'files' || route.view !== 'folder' || route.viewer) return;
+    const key = `${route.machine || ''}\0${route.path || '~'}`;
+    const saved = scrollByFolderRef.current.get(key);
+    if (mainRef.current) {
+      const target = typeof saved === 'number' ? saved : 0;
+      window.requestAnimationFrame(() => {
+        if (mainRef.current) mainRef.current.scrollTop = target;
+      });
+    }
+  }, [route.section, route.view, route.machine, route.path, route.viewer, filesMeta.entries.length]);
 
   useEffect(() => {
     const el = shellRef.current;
@@ -321,20 +664,49 @@ function App() {
 
   useEffect(() => {
     function syncRoute() {
+      lastHashRef.current = window.location.hash;
+      const prevRoute = routeRef.current;
+      if (wakeControllerRef.current) {
+        wakeControllerRef.current.leaveScreen();
+      }
+      if (prevRoute?.section === 'files' && prevRoute.view === 'folder' && !prevRoute.viewer && mainRef.current) {
+        scrollByFolderRef.current.set(`${prevRoute.machine || ''}\0${prevRoute.path || '~'}`, mainRef.current.scrollTop);
+      }
       const next = parseRoute(window.location.hash);
+      if (prevRoute?.section === 'files' && (next.section !== 'files' || next.machine !== prevRoute.machine || next.path !== prevRoute.path)) {
+        setFilesViewModeOverride(null);
+      }
       setRoute((prev) => {
-        if (mainRef.current && (prev.section !== next.section || !wideRef.current)) {
+        if (mainRef.current && next.section !== 'files' && (prev.section !== next.section || !wideRef.current)) {
           mainRef.current.scrollTop = 0;
         }
         return next;
       });
     }
     function onPopState() {
-      if (sheetHistoryRef.current) {
+      const st = window.history.state;
+      if (sheetHistoryRef.current && !st?.legionSheet) {
         sheetHistoryRef.current = false;
         setConfirmRequest(null);
+        return;
       }
-      syncRoute();
+      if (filesSheetHistoryRef.current && !st?.legionFilesSheet) {
+        filesSheetHistoryRef.current = false;
+        setFilesSheet(null);
+        return;
+      }
+      if (filesSelectHistoryRef.current && !st?.legionFilesSelect) {
+        filesSelectHistoryRef.current = false;
+        setFilesSelecting(false);
+        setFilesSelectedPaths(new Set());
+        return;
+      }
+      if (window.location.hash !== lastHashRef.current) {
+        if (filesHistoryDepthRef.current > 0) {
+          filesHistoryDepthRef.current -= 1;
+        }
+        syncRoute();
+      }
     }
     window.addEventListener('hashchange', syncRoute);
     window.addEventListener('popstate', onPopState);
@@ -393,6 +765,81 @@ function App() {
         learnInFlightRef.current = false;
       });
   }, [link, mergeBackendState]);
+
+  const checkUpdatesQuietly = useCallback(async () => {
+    if (typeof link.checkUpdates !== 'function' || updateCheckInFlightRef.current) return;
+    updateCheckInFlightRef.current = true;
+    try {
+      const next = await link.checkUpdates();
+      if (next) setUpdateState(next);
+    } catch {
+      // A check that finds no machine reachable stays quiet.
+    } finally {
+      updateCheckInFlightRef.current = false;
+    }
+  }, [link]);
+
+  const handleCheckUpdates = useCallback(async () => {
+    if (typeof link.checkUpdates !== 'function') return null;
+    updateCheckInFlightRef.current = true;
+    try {
+      const next = await link.checkUpdates();
+      if (next) setUpdateState(next);
+      return next;
+    } finally {
+      updateCheckInFlightRef.current = false;
+    }
+  }, [link]);
+
+  const handleInstallUpdate = useCallback(async () => {
+    if (typeof link.installUpdate !== 'function') return null;
+    if (
+      commandDraftRef.current.running ||
+      activeCallsRef.current > 0 ||
+      activeTransfersCountRef.current > 0
+    ) {
+      if (!sheetHistoryRef.current) {
+        window.history.pushState({ legionSheet: true }, '');
+        sheetHistoryRef.current = true;
+      }
+      setConfirmRequest({
+        title: 'Update and restart now?',
+        summary:
+          'Something is still running in Legion. Installing the update will restart the app and interrupt it.',
+        confirmLabel: 'Update now',
+        danger: false,
+        async onConfirm() {
+          const next = await link.installUpdate();
+          if (next) setUpdateState(next);
+        },
+      });
+      return null;
+    }
+    const next = await link.installUpdate();
+    if (next) setUpdateState(next);
+    return next;
+  }, [link]);
+
+  const handleSetAutoUpdate = useCallback(
+    async (enabled) => {
+      if (typeof link.setAutoUpdate !== 'function') return null;
+      const next = await link.setAutoUpdate(enabled);
+      if (next) setUpdateState(next);
+      return next;
+    },
+    [link],
+  );
+
+  const handleDismissUpdateNotice = useCallback(async () => {
+    setWhatIsNewOpen(false);
+    if (typeof link.dismissUpdateNotice !== 'function') return;
+    try {
+      const next = await link.dismissUpdateNotice();
+      if (next) setUpdateState(next);
+    } catch {
+      // Ignore dismiss failure; next load will re-read state.
+    }
+  }, [link]);
 
   const refreshFleet = useCallback(
     async (activeNodeInfo, options = {}) => {
@@ -506,9 +953,115 @@ function App() {
 
       refreshFleet(primary, { initialSnapshot: cachedSnap });
       triggerLearnInBackground();
+      if (!startupAutoInstallRanRef.current && updateStateRef.current?.phase !== 'ready') {
+        checkUpdatesQuietly();
+      }
     },
-    [link, sessionCache, persistentCache, refreshFleet, triggerLearnInBackground],
+    [link, sessionCache, persistentCache, refreshFleet, triggerLearnInBackground, checkUpdatesQuietly],
   );
+
+  // Subscribe to native updater state and apply ready updates on startup before user interaction.
+  useEffect(() => {
+    const markInteracted = () => {
+      userInteractedRef.current = true;
+    };
+    window.addEventListener('pointerdown', markInteracted, { passive: true, once: true });
+    window.addEventListener('keydown', markInteracted, { passive: true, once: true });
+    window.addEventListener('touchstart', markInteracted, { passive: true, once: true });
+
+    if (typeof link.watchUpdates !== 'function' && typeof link.updateState !== 'function') {
+      return () => {
+        window.removeEventListener('pointerdown', markInteracted);
+        window.removeEventListener('keydown', markInteracted);
+        window.removeEventListener('touchstart', markInteracted);
+      };
+    }
+
+    let alive = true;
+    const maybeRunStartupInstall = (st) => {
+      if (
+        !alive ||
+        !st ||
+        startupAutoInstallRanRef.current ||
+        typeof link.maybeAutoInstall !== 'function'
+      ) {
+        return;
+      }
+      if (
+        !isSafeForAutoInstall({
+          updateState: st,
+          trigger: 'startup',
+          userInteracted: userInteractedRef.current,
+          hasOpenSheet: Boolean(
+            confirmRequestRef.current || whatIsNewOpenRef.current || filesSheetRef.current,
+          ),
+          hasCommandDraft: Boolean(commandDraftRef.current.cmd?.trim()),
+          isRunningCommand: Boolean(commandDraftRef.current.running),
+          activeCalls: activeCallsRef.current + activeTransfersCountRef.current,
+          isPairingOpen: Boolean(pairingOpenRef.current),
+        })
+      ) {
+        return;
+      }
+      startupAutoInstallRanRef.current = true;
+      const isMock = Boolean(link.mockFlags);
+      if (!isMock) setStartupUpdating(true);
+      link
+        .maybeAutoInstall('startup')
+        .then((res) => {
+          if (alive && (!res || res.phase !== 'installing')) {
+            setStartupUpdating(false);
+            if (res?.phase === 'checking') {
+              startupAutoInstallRanRef.current = false;
+            }
+          }
+        })
+        .catch(() => {
+          if (alive) setStartupUpdating(false);
+        });
+    };
+
+    const unwatch =
+      typeof link.watchUpdates === 'function'
+        ? link.watchUpdates((st) => {
+            if (!alive || !st) return;
+            setUpdateState(st);
+            maybeRunStartupInstall(st);
+          })
+        : () => {};
+    if (typeof link.updateState === 'function') {
+      link
+        .updateState()
+        .then((st) => {
+          if (!alive || !st) return;
+          setUpdateState(st);
+          maybeRunStartupInstall(st);
+        })
+        .catch(() => {});
+    }
+    return () => {
+      alive = false;
+      unwatch();
+      window.removeEventListener('pointerdown', markInteracted);
+      window.removeEventListener('keydown', markInteracted);
+      window.removeEventListener('touchstart', markInteracted);
+    };
+  }, [link]);
+
+  // Trigger periodic (6h) update checks while the app is open and visible.
+  useEffect(() => {
+    if (!linkState?.ready || typeof link.checkUpdates !== 'function') return;
+
+    const periodicTimer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        checkUpdatesQuietly();
+      }
+    }, PERIODIC_CHECK_INTERVAL_MS);
+
+    return () => {
+      window.clearInterval(periodicTimer);
+    };
+  }, [link, linkState?.ready, checkUpdatesQuietly]);
 
   useEffect(() => {
     let alive = true;
@@ -551,6 +1104,22 @@ function App() {
     const onVisibilityChange = async () => {
       if (document.visibilityState === 'hidden') {
         wasHidden = true;
+        if (
+          typeof link.maybeAutoInstall === 'function' &&
+          isSafeForAutoInstall({
+            updateState: updateStateRef.current,
+            trigger: 'background',
+            hasOpenSheet: Boolean(
+              confirmRequestRef.current || whatIsNewOpenRef.current || filesSheetRef.current,
+            ),
+            hasCommandDraft: Boolean(commandDraftRef.current.cmd?.trim()),
+            isRunningCommand: Boolean(commandDraftRef.current.running),
+            activeCalls: activeCallsRef.current + activeTransfersCountRef.current,
+            isPairingOpen: Boolean(pairingOpenRef.current),
+          })
+        ) {
+          link.maybeAutoInstall('background').catch(() => {});
+        }
         return;
       }
       if (document.visibilityState !== 'visible') return;
@@ -566,6 +1135,9 @@ function App() {
       } else {
         wasHidden = false;
         refreshFleet(nodeInfo, { background: true });
+      }
+      if (shouldCheckOnResume(updateStateRef.current?.last_checked_at)) {
+        checkUpdatesQuietly();
       }
     };
 
@@ -682,35 +1254,279 @@ function App() {
     for (const [name, ts] of Object.entries(wakeSentAt)) {
       if (now - ts < WAKE_TTL_MS) out.add(name);
     }
+    if (wakeUiState?.wakingMachines) {
+      for (const name of wakeUiState.wakingMachines) out.add(name);
+    }
     return out;
-  }, [wakeSentAt]);
+  }, [wakeSentAt, wakeUiState]);
 
-  const onWakeMachine = useCallback(
-    (machine) => {
-      const args = { machine: machine.name };
-      const copy = describePowerConfirm('power.wake', machine.name, args);
-      const wakeRunner =
-        (snapshotRef.current?.machines || []).find((m) => m.reachable)?.name || nodeInfo?.node;
-      openConfirm({
-        title: copy.title,
-        summary: copy.summary,
-        targetName: machine.name,
-        args,
-        tool: 'power.wake',
-        effect: 'power',
-        confirmLabel: copy.confirmLabel,
-        canDryRun: true,
-        async onDryRun() {
-          return link.call('power.wake', { machine: machine.name, dry_run: true }, { on: wakeRunner });
-        },
-        async onConfirm() {
-          await link.call('power.wake', { machine: machine.name }, { on: wakeRunner });
-          markWakeSent(machine.name);
-          refreshFleet(nodeInfo, { forceOffline: true });
-        },
+  const handleUpdateMachineSys = useCallback((machineName, sys) => {
+    if (!machineName || !sys) return;
+    setSnapshot((prev) => {
+      if (!prev || !Array.isArray(prev.machines)) return prev;
+      let changed = false;
+      const nextMachines = prev.machines.map((m) => {
+        if (m.name !== machineName) return m;
+        changed = true;
+        return {
+          ...m,
+          reachable: true,
+          status: 'answering',
+          asking: false,
+          sys,
+        };
       });
+      return changed ? { ...prev, machines: nextMachines } : prev;
+    });
+  }, []);
+
+  // Shared "Wake it and continue" controller (one wake and one sheet per machine).
+  const wakeController = useMemo(() => {
+    const customClock =
+      typeof window !== 'undefined' && window.__LEGION_TEST_WAKE_CLOCK__
+        ? window.__LEGION_TEST_WAKE_CLOCK__
+        : undefined;
+    const ctrl = createWakeController({
+      link,
+      clock: customClock,
+      getMachines: () => snapshotRef.current?.machines || [],
+      getLocalNode: () => nodeInfoRef.current?.node || null,
+      getAllowedSet: () => allowedSetRef.current,
+      onWakeSent(machineName) {
+        markWakeSent(machineName);
+      },
+      onWakeTimeout(machineName) {
+        setWakeSentAt((prev) => {
+          if (!prev[machineName]) return prev;
+          const next = { ...prev };
+          delete next[machineName];
+          return next;
+        });
+      },
+      async onMachineAwake(machineName) {
+        setSnapshot((prev) => {
+          if (!prev || !Array.isArray(prev.machines)) return prev;
+          return {
+            ...prev,
+            machines: prev.machines.map((m) =>
+              m.name === machineName
+                ? { ...m, reachable: true, status: 'answering', asking: false, error: null, reason: null }
+                : m,
+            ),
+          };
+        });
+        await refreshFleet(nodeInfoRef.current, { forceOffline: true });
+      },
+      onBackgroundComplete({ machine, kind }) {
+        const noun = kind === 'transfer' ? 'Transfer' : kind === 'command' ? 'Command' : 'Action';
+        showToast(`${noun} started on ${machine}.`, {
+          actionLabel: 'Activity',
+          actionHref: '#/activity',
+        });
+      },
+    });
+    return ctrl;
+  }, [link, markWakeSent, refreshFleet, showToast]);
+
+  wakeControllerRef.current = wakeController;
+
+  useEffect(() => {
+    setDefaultWakeController(wakeController);
+    setWakeUiState(wakeController.getState());
+    const unsub = wakeController.subscribe((st) => setWakeUiState(st));
+    return () => {
+      unsub();
+      wakeController.dispose();
+      setDefaultWakeController(null);
+    };
+  }, [wakeController]);
+
+  const ensureAwakeMachine = useCallback(
+    (machine, options) => wakeController.ensureAwake(machine, options),
+    [wakeController],
+  );
+
+  const filesActions = useMemo(
+    () => ({
+      pushHref(href) {
+        const pushDirect = (targetHref) => {
+          const cur = routeRef.current;
+          if (cur?.section === 'files' && cur.view === 'folder' && !cur.viewer && mainRef.current) {
+            scrollByFolderRef.current.set(`${cur.machine || ''}\0${cur.path || '~'}`, mainRef.current.scrollTop);
+          }
+          if (targetHref && targetHref !== window.location.hash) {
+            filesHistoryDepthRef.current += 1;
+            window.location.hash = targetHref;
+          }
+        };
+        if (href) {
+          const parsed = parseRoute(href);
+          if (parsed.section === 'files' && parsed.machine) {
+            const targetMachine = (snapshotRef.current?.machines || []).find(
+              (m) => m.name === parsed.machine,
+            );
+            const canWake = allowedSetRef.current ? allowedSetRef.current.has('power.wake') : false;
+            if (targetMachine && !targetMachine.reachable && targetMachine.canWake && canWake) {
+              wakeControllerRef.current?.ensureAwake(targetMachine, {
+                kind: 'files',
+                label: 'open its files',
+                onContinue: () => pushDirect(href),
+              });
+              return;
+            }
+          }
+        }
+        pushDirect(href);
+      },
+      closeViewer() {
+        if (filesHistoryDepthRef.current > 0) {
+          window.history.back();
+        } else {
+          const cur = routeRef.current;
+          window.location.hash = routeHref({ ...cur, viewer: null });
+        }
+      },
+      openSheet(nextSheet) {
+        if (!filesSheetHistoryRef.current) {
+          window.history.pushState({ legionFilesSheet: true }, '');
+          filesSheetHistoryRef.current = true;
+        }
+        setFilesSheet(nextSheet);
+      },
+      closeSheet() {
+        setFilesSheet(null);
+        if (filesSheetHistoryRef.current) {
+          filesSheetHistoryRef.current = false;
+          window.history.back();
+        }
+      },
+      startSelect(initialPath) {
+        if (filesSheetHistoryRef.current) {
+          setFilesSheet(null);
+          filesSheetHistoryRef.current = false;
+          if (!filesSelectHistoryRef.current) {
+            window.history.replaceState({ legionFilesSelect: true }, '');
+            filesSelectHistoryRef.current = true;
+          } else {
+            window.history.back();
+          }
+        } else if (!filesSelectHistoryRef.current) {
+          window.history.pushState({ legionFilesSelect: true }, '');
+          filesSelectHistoryRef.current = true;
+        }
+        setFilesSelecting(true);
+        setFilesSelectedPaths(initialPath ? new Set([initialPath]) : new Set());
+      },
+      endSelect() {
+        setFilesSelecting(false);
+        setFilesSelectedPaths(new Set());
+        if (filesSelectHistoryRef.current) {
+          filesSelectHistoryRef.current = false;
+          window.history.back();
+        }
+      },
+      finishBulkAction() {
+        setFilesSheet(null);
+        setFilesSelecting(false);
+        setFilesSelectedPaths(new Set());
+        let pops = 0;
+        if (filesSheetHistoryRef.current) {
+          filesSheetHistoryRef.current = false;
+          pops += 1;
+        }
+        if (filesSelectHistoryRef.current) {
+          filesSelectHistoryRef.current = false;
+          pops += 1;
+        }
+        if (pops > 0) {
+          window.history.go(-pops);
+        }
+      },
+      toggleSelect(path) {
+        setFilesSelectedPaths((prev) => toggleSelection(prev, path));
+      },
+      toggleSelectAll(entries) {
+        setFilesSelectedPaths((prev) => {
+          if (prev.size >= (entries || []).length && prev.size > 0) return new Set();
+          return selectAllEntries(entries);
+        });
+      },
+      setSortPref(pref) {
+        writeSortPreference(safeLocalStorage(), pref);
+        setFilesSortPref(pref);
+      },
+      setShowHidden(val) {
+        setFilesShowHidden(Boolean(val));
+      },
+      setViewModeOverride(mode) {
+        setFilesViewModeOverride(mode);
+      },
+      setResolvedViewMode(mode) {
+        setFilesResolvedViewMode(mode);
+      },
+      setMeta(meta) {
+        setFilesMeta((prev) => ({ ...prev, ...meta }));
+      },
+      setSearchSummary(summary) {
+        setFilesSearchSummary(summary);
+      },
+      registerHandlers(handlers) {
+        filesBulkHandlersRef.current = handlers || {};
+      },
+      bulkSend(machine, items) {
+        filesBulkHandlersRef.current.onBulkSend?.(machine, items);
+      },
+      bulkDownload(machine, items) {
+        filesBulkHandlersRef.current.onBulkDownload?.(machine, items);
+      },
+      bulkStar(machine, items) {
+        filesBulkHandlersRef.current.onBulkStar?.(machine, items);
+      },
+      bulkDelete(machine, items) {
+        filesBulkHandlersRef.current.onBulkDelete?.(machine, items);
+      },
+    }),
+    [],
+  );
+
+  const handleOpenDeviceTransfer = useCallback(
+    async (transfer) => {
+      if (!transfer) return;
+      if (typeof link.openTransfer === 'function') {
+        try {
+          const res = await link.openTransfer(transfer.id);
+          if (res?.viewer?.machine && res?.viewer?.path) {
+            const dir = parentFilePath(res.viewer.path) || '~';
+            filesActions.pushHref(
+              routeHref({
+                section: 'files',
+                view: 'folder',
+                machine: res.viewer.machine,
+                path: dir,
+                viewer: { machine: res.viewer.machine, path: res.viewer.path },
+              }),
+            );
+          }
+          return;
+        } catch (err) {
+          showToast(err?.message || 'Could not open this download.');
+          return;
+        }
+      }
+      if (transfer.machine && transfer.path) {
+        const dir = parentFilePath(transfer.path) || '~';
+        filesActions.pushHref(
+          routeHref({
+            section: 'files',
+            view: 'folder',
+            machine: transfer.machine,
+            path: dir,
+            viewer: { machine: transfer.machine, path: transfer.path },
+          }),
+        );
+      }
     },
-    [link, openConfirm, markWakeSent, refreshFleet, nodeInfo],
+    [link, filesActions, showToast],
   );
 
   const machines = snapshot?.machines || [];
@@ -718,22 +1534,61 @@ function App() {
     ? machines.find((m) => m.name === route.machine) || null
     : null;
 
+  const isFilesRoot = route.section === 'files' && route.view === 'home' && !route.viewer;
+  const isFilesFolder = route.section === 'files' && route.view === 'folder';
+  const isFilesSearch = route.section === 'files' && route.view === 'search';
+
   const isRootPlace =
     (route.section === 'machines' && !route.machine) ||
+    isFilesRoot ||
     (route.section === 'activity' && !route.jobId) ||
     (route.section === 'actions' && !route.action && !route.allTools);
 
   const inMachinePhone = !wide && route.section === 'machines' && Boolean(route.machine);
   const isPhoneCommand =
-    inMachinePhone && route.tab === 'command' && Boolean(selectedMachine?.reachable);
+    inMachinePhone &&
+    route.tab === 'command' &&
+    Boolean(selectedMachine?.reachable || (selectedMachine?.canWake && allowedSet?.has('power.wake')));
   const isActionsRoot =
     route.section === 'actions' && !route.action && !route.allTools;
-  const hasDock = isActionsRoot || isPhoneCommand;
+  const hasFilesDock =
+    route.section === 'files' &&
+    (filesSelecting || (!wide && (isFilesRoot || isFilesFolder || isFilesSearch)) || (wide && isFilesSearch));
+  const hasDock = isActionsRoot || isPhoneCommand || hasFilesDock;
 
-  // Hide bottom bar on phone for Settings and single-item detail pages so Settings feels like a real page.
-  const showBottomNav = wide || isRootPlace || inMachinePhone;
+  // Hide bottom bar on phone for Settings, single-item detail pages, and Files selection mode.
+  const showBottomNav =
+    wide ||
+    isRootPlace ||
+    inMachinePhone ||
+    (route.section === 'files' && !filesSelecting);
 
   function goBack() {
+    if (route.section === 'files') {
+      if (filesSheet) {
+        filesActions.closeSheet();
+        return;
+      }
+      if (filesSelecting) {
+        filesActions.endSelect();
+        return;
+      }
+      if (filesHistoryDepthRef.current > 0) {
+        window.history.back();
+        return;
+      }
+      const step = filesFallbackBackRoute(route, { hasSheet: Boolean(filesSheet), selecting: filesSelecting });
+      if (step?.action === 'navigate' && step.href) {
+        window.location.hash = step.href;
+        return;
+      }
+      if (window.history.length > 1) {
+        window.history.back();
+      } else {
+        window.location.hash = '#/machines';
+      }
+      return;
+    }
     if (route.section === 'machines' && route.machine) {
       if (route.jobId) {
         window.location.hash = routeHref({ section: 'machines', machine: route.machine, tab: 'activity' });
@@ -888,6 +1743,125 @@ function App() {
   }
 
   function renderHeader() {
+    // Files headers: selection mode, folder, search, sync, favourites, recent, and root.
+    if (route.section === 'files') {
+      if (filesSelecting) {
+        const sum = selectionSummary(filesMeta.entries, filesSelectedPaths);
+        const allPicked = filesMeta.entries.length > 0 && sum.count >= filesMeta.entries.length;
+        return html`
+          <header class="top sub">
+            <button
+              type="button"
+              class="btn icon back"
+              aria-label="Stop selecting"
+              onClick=${() => filesActions.endSelect()}
+            >
+              <${Icon} name="back" />
+            </button>
+            <h1>
+              ${`${sum.count} selected`}
+              ${sum.allSizesKnown ? html`<small>${formatBytes(sum.totalBytes)}</small>` : null}
+            </h1>
+            <button
+              type="button"
+              class="btn small quiet"
+              onClick=${() => filesActions.toggleSelectAll(filesMeta.entries)}
+            >
+              ${allPicked ? 'Deselect all' : 'Select all'}
+            </button>
+          </header>
+        `;
+      }
+      if (!wide && route.view === 'folder') {
+        const title = folderDisplayName(filesMeta.resolvedPath || route.path, {
+          technical: Boolean(settings.technical),
+        });
+        return html`
+          <header class="top sub">
+            <button type="button" class="btn icon back" aria-label="Back" onClick=${goBack}>
+              <${Icon} name="back" />
+            </button>
+            <h1>${title}</h1>
+          </header>
+        `;
+      }
+      if (!wide && route.view === 'search') {
+        const sub = filesSearchSummary.searching
+          ? 'Searching…'
+          : route.machine
+            ? `${filesSearchSummary.count} found in ${folderDisplayName(route.path)}`
+            : filesSearchSummary.machineCount > 0
+              ? `${filesSearchSummary.count} found on ${filesSearchSummary.machineCount} ${filesSearchSummary.machineCount === 1 ? 'machine' : 'machines'}`
+              : 'Search across your machines';
+        return html`
+          <header class="top sub">
+            <button type="button" class="btn icon back" aria-label="Back" onClick=${goBack}>
+              <${Icon} name="back" />
+            </button>
+            <h1>Search<small>${sub}</small></h1>
+          </header>
+        `;
+      }
+      if (!wide && route.view === 'sync') {
+        const sf = (filesMeta.syncFolders || []).find((f) => f.id === route.syncId);
+        const memberCount = sf?.members?.length || 0;
+        return html`
+          <header class="top sub">
+            <button type="button" class="btn icon back" aria-label="Back" onClick=${goBack}>
+              <${Icon} name="back" />
+            </button>
+            <h1>
+              ${sf?.name || 'Synced folder'}
+              ${memberCount > 0 ? html`<small>Kept in sync on ${memberCount} machines</small>` : null}
+            </h1>
+          </header>
+        `;
+      }
+      if (!wide && route.view === 'favourites') {
+        return html`
+          <header class="top sub">
+            <button type="button" class="btn icon back" aria-label="Back" onClick=${goBack}>
+              <${Icon} name="back" />
+            </button>
+            <h1>Favourites</h1>
+          </header>
+        `;
+      }
+      if (!wide && route.view === 'recent') {
+        return html`
+          <header class="top sub">
+            <button type="button" class="btn icon back" aria-label="Back" onClick=${goBack}>
+              <${Icon} name="back" />
+            </button>
+            <h1>Recent<small>Opened on this ${deviceNoun}</small></h1>
+          </header>
+        `;
+      }
+
+      const onlineCount = machines.filter((m) => m.reachable).length;
+      const filesSub =
+        onlineCount === 0
+          ? 'No machines are on'
+          : onlineCount === 1
+            ? '1 machine is on'
+            : `${onlineCount} machines are on`;
+      return html`
+        <header class="top">
+          <h1>
+            Files
+            ${machines.length > 0 ? html`<small>${filesSub}</small>` : null}
+          </h1>
+          ${!wide
+            ? html`
+                <a class="btn icon" href="#/settings" aria-label="Settings">
+                  <${Icon} name="gear" />
+                </a>
+              `
+            : null}
+        </header>
+      `;
+    }
+
     // Phone inside a machine.
     if (inMachinePhone && route.machine) {
       const m = selectedMachine;
@@ -1005,12 +1979,17 @@ function App() {
       : null;
 
     if (route.section === 'activity') {
-      const runningCount = (snapshot?.runningJobs || []).length;
+      const activeDeviceCount = deviceTransfers.filter(
+        (t) => t.state === 'running' || t.state === 'queued',
+      ).length;
+      const runningCount = (snapshot?.runningJobs || []).length + activeDeviceCount;
       return html`
         <header class="top">
           <h1>
             Activity
-            ${runningCount > 0 ? html`<small>${runningCount} running now</small>` : null}
+            ${runningCount > 0
+              ? html`<small>${runningCount} ${runningCount === 1 ? 'thing' : 'things'} running</small>`
+              : null}
           </h1>
           ${gearBtn}
         </header>
@@ -1041,6 +2020,24 @@ function App() {
   }
 
   function renderDock() {
+    if (hasFilesDock) {
+      return html`
+        <${FilesDock}
+          route=${route}
+          filesState=${{
+            caps: filesMeta.caps,
+            selecting: filesSelecting,
+            selectedPaths: filesSelectedPaths,
+            entries: filesMeta.entries,
+            resolvedPath: filesMeta.resolvedPath,
+            sortPref: filesSortPref,
+            resolvedViewMode: filesResolvedViewMode,
+          }}
+          filesActions=${filesActions}
+          onNavigateHref=${filesActions.pushHref}
+        />
+      `;
+    }
     if (isActionsRoot) {
       return html`
         <div class="dock">
@@ -1075,6 +2072,7 @@ function App() {
                 jobId: id,
               });
             }}
+            onEnsureAwake=${ensureAwakeMachine}
           />
         </div>
       `;
@@ -1118,7 +2116,7 @@ function App() {
       `;
     }
 
-    // Root 3 places (plus Settings at the foot of the wide rail).
+    // Root 4 places (plus Settings at the foot of the wide rail).
     return html`
       <nav class="nav" aria-label="Main">
         <a
@@ -1126,6 +2124,12 @@ function App() {
           aria-current=${route.section === 'machines' ? 'page' : undefined}
         >
           <${Icon} name="machines" />Machines
+        </a>
+        <a
+          href="#/files"
+          aria-current=${route.section === 'files' ? 'page' : undefined}
+        >
+          <${Icon} name="files" />Files
         </a>
         <a
           href="#/activity"
@@ -1154,6 +2158,11 @@ function App() {
     `;
   }
 
+  const hideToastOnRoute =
+    route.section === 'activity' &&
+    Boolean(toast?.suppressOnActivity || toast?.actionHref === '#/activity');
+  const visibleToast = hideToastOnRoute ? null : toast;
+
   const appClasses = [
     'app',
     !showBottomNav ? 'standalone' : '',
@@ -1165,7 +2174,9 @@ function App() {
   return html`
     <div ref=${shellRef} class="shell">
       <${IconSprite} />
-      ${booting
+      ${startupUpdating
+        ? html`<div class="startup-update" role="status" aria-live="polite">Updating…</div>`
+        : booting
         ? html`
             <div class="app standalone">
               <header class="top"><h1>Machines</h1></header>
@@ -1191,6 +2202,35 @@ function App() {
           : html`
               <div class=${appClasses}>
                 ${renderHeader()}
+                ${visibleToast
+                  ? html`
+                      <div
+                        class=${visibleToast.tone === 'error' ? 'toast-banner error' : 'toast-banner'}
+                        role=${visibleToast.tone === 'error' ? 'alert' : 'status'}
+                      >
+                        <span>${visibleToast.message}</span>
+                        ${visibleToast.actionLabel && visibleToast.actionHref
+                          ? html`
+                              <a
+                                class="btn small primary"
+                                href=${visibleToast.actionHref}
+                                onClick=${clearToast}
+                              >
+                                ${visibleToast.actionLabel}
+                              </a>
+                            `
+                          : null}
+                        <button
+                          type="button"
+                          class="btn small quiet"
+                          aria-label="Dismiss"
+                          onClick=${clearToast}
+                        >
+                          OK
+                        </button>
+                      </div>
+                    `
+                  : null}
                 <main
                   ref=${mainRef}
                   class=${isPhoneCommand ? 'main command-stream' : 'main'}
@@ -1217,6 +2257,9 @@ function App() {
                           error=${fleetError}
                           pairNotice=${pairNotice?.screen === 'machines' ? pairNotice.summary : null}
                           onDismissPairNotice=${() => setPairNotice(null)}
+                          updateState=${updateState}
+                          onOpenWhatIsNew=${() => setWhatIsNewOpen(true)}
+                          onDismissUpdateNotice=${handleDismissUpdateNotice}
                           loading=${refreshing}
                           wide=${wide}
                           route=${route}
@@ -1225,31 +2268,67 @@ function App() {
                           tools=${tools}
                           allowedSet=${allowedSet}
                           settings=${settings}
+                          deviceNoun=${deviceNoun}
+                          thumbCache=${thumbCache}
                           wakePendingSet=${wakePendingSet}
-                          onWakeMachine=${onWakeMachine}
+                          onEnsureAwake=${ensureAwakeMachine}
                           onWakeSent=${markWakeSent}
                           onRequestConfirm=${openConfirm}
                           onRefresh=${() => {
                             refreshFleet(nodeInfo, { forceOffline: true });
                             triggerLearnInBackground();
                           }}
+                          onUpdateMachineSys=${handleUpdateMachineSys}
                           commandRuns=${{ byMachine: commandRunsByMachine, draft: commandDraft }}
                           onCommandRunsChange=${commandRunsApi}
                         />
                       `
-                    : route.section === 'activity'
+                    : route.section === 'files'
                       ? html`
-                          <${ActivityView}
+                          <${FilesView}
                             route=${route}
+                            wide=${wide}
                             snapshot=${snapshot}
                             link=${link}
                             nodeInfo=${nodeInfo}
+                            tools=${tools}
                             allowedSet=${allowedSet}
                             settings=${settings}
-                            wide=${wide}
-                            onRefreshFleet=${() => refreshFleet(nodeInfo)}
+                            deviceNoun=${deviceNoun}
+                            thumbCache=${thumbCache}
+                            filesState=${{
+                              sortPref: filesSortPref,
+                              showHidden: filesShowHidden,
+                              selecting: filesSelecting,
+                              selectedPaths: filesSelectedPaths,
+                              sheet: filesSheet,
+                              viewModeOverride: filesViewModeOverride,
+                              resolvedViewMode: filesResolvedViewMode,
+                            }}
+                            filesActions=${filesActions}
+                            wakePendingSet=${wakePendingSet}
+                            onRefreshFleet=${(opts) => refreshFleet(nodeInfo, opts)}
+                            onEnsureAwake=${ensureAwakeMachine}
+                            onRequestConfirm=${openConfirm}
+                            onToast=${showToast}
                           />
                         `
+                      : route.section === 'activity'
+                        ? html`
+                            <${ActivityView}
+                              route=${route}
+                              snapshot=${snapshot}
+                              link=${link}
+                              nodeInfo=${nodeInfo}
+                              allowedSet=${allowedSet}
+                              settings=${settings}
+                              wide=${wide}
+                              deviceNoun=${deviceNoun}
+                              deviceTransfers=${deviceTransfers}
+                              onOpenTransfer=${handleOpenDeviceTransfer}
+                              onRefreshFleet=${() => refreshFleet(nodeInfo)}
+                            />
+                          `
                       : route.section === 'actions'
                         ? html`
                             <${ActionsView}
@@ -1263,6 +2342,7 @@ function App() {
                               wide=${wide}
                               query=${actionsQuery}
                               onWakeSent=${markWakeSent}
+                              onEnsureAwake=${ensureAwakeMachine}
                               onRequestConfirm=${openConfirm}
                               onRefreshFleet=${() => refreshFleet(nodeInfo)}
                             />
@@ -1281,6 +2361,11 @@ function App() {
                               settings=${settings}
                               pairNotice=${pairNotice?.screen === 'connections' ? pairNotice.summary : null}
                               onDismissPairNotice=${() => setPairNotice(null)}
+                              updateState=${updateState}
+                              onCheckUpdates=${handleCheckUpdates}
+                              onInstallUpdate=${handleInstallUpdate}
+                              onSetAutoUpdate=${handleSetAutoUpdate}
+                              onDismissUpdateNotice=${handleDismissUpdateNotice}
                               onUpdateSettings=${updateSettings}
                               onRequestConfirm=${openConfirm}
                               onAcceptIdentityChange=${handleAcceptIdentityChange}
@@ -1331,12 +2416,51 @@ function App() {
                 ${renderNav()}
               </div>
             `}
+      ${whatIsNewOpen && updateState?.just_updated
+        ? html`
+            <${Sheet}
+              title=${`What is new in ${updateState.just_updated.version}`}
+              onClose=${() => setWhatIsNewOpen(false)}
+            >
+              <p>${updateState.just_updated.notes}</p>
+              ${settings.technical
+                ? html`
+                    <div class="list spaced">
+                      <dl class="kv">
+                        <dt>channel</dt>
+                        <dd>${updateState.just_updated.channel}</dd>
+                        <dt>build</dt>
+                        <dd>${updateState.just_updated.build}</dd>
+                        <dt>sequence</dt>
+                        <dd>${updateState.just_updated.sequence}</dd>
+                      </dl>
+                    </div>
+                  `
+                : null}
+              <div class="actions">
+                <button type="button" class="btn primary full" onClick=${handleDismissUpdateNotice}>
+                  Done
+                </button>
+              </div>
+            <//>
+          `
+        : null}
       ${confirmRequest
         ? html`
             <${ConfirmSheet}
               request=${confirmRequest}
               technical=${Boolean(settings.technical)}
               onClose=${closeConfirm}
+            />
+          `
+        : null}
+      ${wakeUiState?.sheet
+        ? html`
+            <${WakeSheet}
+              sheet=${wakeUiState.sheet}
+              onConfirm=${() => wakeController.confirmWake(wakeUiState.sheet.machineName)}
+              onRetry=${() => wakeController.retry(wakeUiState.sheet.machineName)}
+              onDismiss=${() => wakeController.dismiss(wakeUiState.sheet.machineName)}
             />
           `
         : null}
