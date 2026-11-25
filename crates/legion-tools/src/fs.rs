@@ -13,7 +13,13 @@ mod thumb;
 mod thumb_cache;
 mod thumb_limit;
 mod thumb_probe;
+mod thumb_worker;
 mod write;
+
+pub use thumb_worker::{
+    THUMB_WORKER_MODE, enable_thumb_worker_self, set_thumb_decode_timeout_for_test,
+    try_thumb_worker_cli,
+};
 
 use std::cmp::Ordering;
 use std::fs::{self, FileType, Metadata};

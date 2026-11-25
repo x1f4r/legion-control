@@ -69,17 +69,22 @@ use legion_core::proto::{Effect, ErrorBody, ErrorCode};
 use legion_core::{Access, CancellationToken, Ctx, Registry, ToolError};
 use legion_os::OsError;
 use legion_os::file_id::{self, FileId};
+use legion_os::mem_limit::effective_memory_bytes;
 use legion_os::run::{RunOptions, run};
 use legion_os::shell::CommandSpec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sysinfo::{MemoryRefreshKind, RefreshKind, System};
+use serde_json::json;
 use tokio::task::JoinSet;
 
-use super::thumb_cache::{CachedThumb, ThumbCache, cache_key, temp_dir_in_cache};
+use super::thumb_cache::{CachedThumb, ThumbCache, bad_cache_key, cache_key, temp_dir_in_cache};
 use super::thumb_limit::{AcquireError, FairPool, compute_image_in_flight_budget};
 use super::thumb_probe::{
-    ImageProfile, MAX_IMAGE_DECODE_BYTES, image_limits, probe_image_profile, too_large_error,
+    ImageProfile, MAX_IMAGE_DECODE_BYTES, image_limits, is_mpeg_ts_file, peek_image_file,
+    probe_image_profile, too_large_error,
+};
+use super::thumb_worker::{
+    WorkerOutcome, effective_decode_timeout, run_thumb_worker, worker_enabled,
 };
 use super::{cancelled_error, check_fs_path, check_regular_file, map_io_error, platform};
 
@@ -99,25 +104,47 @@ const JPEG_QUALITY: u8 = 82;
 const FFMPEG_TIMEOUT: Duration = Duration::from_secs(15);
 const FFMPEG_KILL_GRACE: Duration = Duration::from_secs(1);
 const FFMPEG_CAPTURE_LIMIT: usize = 32 * 1024;
+/// Maximum single video frame pixel count admitted by `ffmpeg` (64 MP; blocks 16k×16k bombs).
+const FFMPEG_MAX_PIXELS: &str = "67108864";
+/// Maximum single `av_malloc` allocation in `ffmpeg` (128 MiB).
+const FFMPEG_MAX_ALLOC: &str = "134217728";
+/// Virtual address space headroom added to `ffmpeg`'s RSS cap for Linux `RLIMIT_AS` so system
+/// shared libraries load cleanly while rogue frame allocations still hit the limit.
+const FFMPEG_RLIMIT_AS_HEADROOM: u64 = 512 * 1024 * 1024;
 
 /// Strictly allow only local file I/O in `ffmpeg` — blocks `http`, `https`, `concat`, `crypto`,
 /// `data`, `pipe`, `subfile`, and all network/virtual protocols.
 const FFMPEG_PROTOCOL_WHITELIST: &str = "file";
-/// Strictly allow only container video demuxers in `ffmpeg` — blocks `dash`, `hls`, `concat`,
-/// `m3u8`, and any playlist or external-reference manifest demuxer.
-const FFMPEG_FORMAT_WHITELIST: &str =
-    "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,asf,flv,mpeg,mpegts,ogg,rm,mpegvideo";
+/// Whitelist when opening MOV/MP4 containers, always paired with `-enable_drefs 0` and
+/// `-use_absolute_path 0` so external data references cannot open other files.
+const FFMPEG_MOV_FORMAT_WHITELIST: &str = "mov,mp4,m4a,3gp,3g2,mj2";
+/// Whitelist for non-MOV containers; excludes the MOV demuxer so a renamed MOV file with external
+/// `dref` entries cannot bypass the pinned MOV options.
+const FFMPEG_OTHER_FORMAT_WHITELIST: &str =
+    "matroska,webm,avi,asf,flv,mpeg,mpegts,ogg,rm,mpegvideo";
+
+/// Whether a video container uses the MOV/MP4 demuxer family (which accepts `-enable_drefs 0` and
+/// `-use_absolute_path 0`) or another container format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VideoContainer {
+    MovFamily,
+    Other,
+}
 
 static IMAGE_POOL: OnceLock<Arc<FairPool>> = OnceLock::new();
 static VIDEO_POOL: OnceLock<Arc<FairPool>> = OnceLock::new();
 
 fn machine_in_flight_image_budget() -> u64 {
-    let total_ram = System::new_with_specifics(
-        RefreshKind::nothing().with_memory(MemoryRefreshKind::nothing().with_ram()),
+    let effective_ram = effective_memory_bytes();
+    compute_image_in_flight_budget(
+        effective_ram,
+        MAX_IMAGE_DECODE_BYTES,
+        MAX_IN_FLIGHT_IMAGE_BYTES,
     )
-    .map(|sys| sys.total_memory())
-    .unwrap_or(0);
-    compute_image_in_flight_budget(total_ram, MAX_IMAGE_DECODE_BYTES, MAX_IN_FLIGHT_IMAGE_BYTES)
+}
+
+fn video_worker_memory_limit() -> u64 {
+    (machine_in_flight_image_budget() / 2).clamp(192 * 1024 * 1024, MAX_IMAGE_DECODE_BYTES)
 }
 
 fn image_pool() -> Arc<FairPool> {
@@ -137,7 +164,7 @@ pub(super) fn register(registry: &mut Registry) {
     registry.add_fn(
         "fs.thumb",
         Effect::Read,
-        "Generate thumbnails for 1 to 32 image or video paths on this node (64 MiB source cap, 256 MiB estimated decode memory per image with EXIF/MPF preview fallback for larger JPEGs, in-flight budget capped at min(512 MiB, RAM/8)), returning per-path base64 JPEG (or PNG when transparent) thumbnails or per-path errors in input order, cached in a 256 MiB LRU store in the state directory.",
+        "Generate thumbnails for 1 to 32 image or video paths on this node (64 MiB source cap, 256 MiB estimated decode memory per image with EXIF/MPF preview fallback for larger JPEGs, out-of-process memory-bounded workers, in-flight budget capped at min(512 MiB, effective RAM/8)), returning per-path base64 JPEG (or PNG when transparent) thumbnails or per-path errors in input order, cached in a 256 MiB LRU store in the state directory.",
         thumb,
     );
 }
@@ -287,7 +314,7 @@ async fn thumb(ctx: &Ctx, args: ThumbArgs) -> Result<ThumbResult, ToolError> {
     }
 
     let cache_dir = ctx.paths().thumb_cache_dir();
-    let cache = ThumbCache::new(cache_dir.clone());
+    let cache = ThumbCache::for_dir(cache_dir.clone());
     let grant = ctx.grant().clone();
     let principal = ctx.principal().to_owned();
     let cancel = ctx.cancel_token().clone();
@@ -428,7 +455,23 @@ async fn thumb_one(
     };
 
     let media = classify_path(&resolved);
-    match media.category {
+    let mut category = media.category;
+    if category == Category::Text
+        && resolved
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("ts"))
+    {
+        let resolved_sniff = resolved.clone();
+        let is_video_ts = tokio::task::spawn_blocking(move || is_mpeg_ts_file(&resolved_sniff))
+            .await
+            .unwrap_or(false);
+        if is_video_ts {
+            category = Category::Video;
+        }
+    }
+
+    match category {
         Category::Image => {
             thumb_image(principal, cache, raw_path, resolved, size, fit, cancel).await
         }
@@ -464,7 +507,7 @@ async fn thumb_one(
                     format!(
                         "{} ({}) cannot be thumbnailed.",
                         resolved.display(),
-                        media.category
+                        category
                     ),
                 )
                 .with_hint("fs.thumb supports raster images (JPEG, PNG, GIF, WebP, BMP) and videos (when ffmpeg is on PATH)."),
@@ -473,16 +516,19 @@ async fn thumb_one(
     }
 }
 
-/// Prepared image file opened once, verified against TOCTOU swaps, and header-probed (or resolved
-/// to a validated embedded EXIF/MPF preview) before requesting byte-budget capacity from the fair
-/// image pool.
+/// Prepared image file opened once, verified against TOCTOU swaps, checked against positive and
+/// negative cache entries, and header-peeked (`<= 128 KiB`) BEFORE requesting byte-budget capacity
+/// or reading the full source file.
 enum ImagePrep {
     CacheHit(CachedThumb),
-    Decode {
+    CachedBad(ErrorBody),
+    Ready {
         key: String,
-        bytes: Vec<u8>,
-        profile: ImageProfile,
-        override_orientation: Option<Orientation>,
+        bad_key: String,
+        open_stamp: FileStamp,
+        file: File,
+        reserve_bytes: u64,
+        worker_mem_limit: u64,
     },
 }
 
@@ -504,29 +550,35 @@ async fn thumb_image(
     .map_err(|err| {
         ErrorBody::new(
             ErrorCode::Internal,
-            format!("fs.thumb image read stopped unexpectedly: {err}."),
+            format!("fs.thumb image open stopped unexpectedly: {err}."),
         )
     })?;
 
-    let (key, bytes, profile, override_orientation) = match prep {
+    let (key, bad_key, open_stamp, file, reserve_bytes, worker_mem_limit) = match prep {
         Ok(ImagePrep::CacheHit(hit)) => return Ok(ThumbItem::from_cached(raw_path, hit)),
-        Ok(ImagePrep::Decode {
+        Ok(ImagePrep::CachedBad(err)) => return Ok(ThumbItem::from_error(raw_path, err)),
+        Ok(ImagePrep::Ready {
             key,
-            bytes,
-            profile,
-            override_orientation,
-        }) => (key, bytes, profile, override_orientation),
+            bad_key,
+            open_stamp,
+            file,
+            reserve_bytes,
+            worker_mem_limit,
+        }) => (
+            key,
+            bad_key,
+            open_stamp,
+            file,
+            reserve_bytes,
+            worker_mem_limit,
+        ),
         Err(err) => return Ok(ThumbItem::from_error(raw_path, err)),
     };
 
-    // Acquire estimated decode bytes from the fair image pool (bounded wait, cancellable).
+    // Reserve estimated decode + source bytes from the fair image pool BEFORE reading the full
+    // file or launching a decode worker.
     let permit = match image_pool()
-        .acquire(
-            principal,
-            profile.estimated_peak_bytes,
-            IMAGE_WAIT_TIMEOUT,
-            &cancel,
-        )
+        .acquire(principal, reserve_bytes, IMAGE_WAIT_TIMEOUT, &cancel)
         .await
     {
         Ok(permit) => permit,
@@ -546,16 +598,89 @@ async fn thumb_image(
         }
     };
 
-    // Decode off async threads with a hard wall-clock time limit. The permit lives inside the
-    // blocking closure so its byte budget stays reserved until decoding finishes or unwinds.
+    let decode_timeout = effective_decode_timeout(IMAGE_DECODE_TIMEOUT);
+
+    if worker_enabled() {
+        let handle_check = match file.try_clone() {
+            Ok(cloned) => cloned,
+            Err(err) => {
+                drop(permit);
+                return Ok(ThumbItem::from_error(
+                    raw_path,
+                    map_io_error("read", &resolved, err),
+                ));
+            }
+        };
+        let worker_res = run_thumb_worker(
+            &resolved,
+            file,
+            size,
+            fit,
+            open_stamp.size,
+            MAX_SOURCE_BYTES,
+            worker_mem_limit,
+            decode_timeout,
+            cancel.clone(),
+        )
+        .await;
+        drop(permit);
+
+        let worker_outcome = match worker_res {
+            Ok(outcome) => outcome,
+            Err(err) if err.code == ErrorCode::Cancelled => return Err(err),
+            Err(err) => return Ok(ThumbItem::from_error(raw_path, err)),
+        };
+
+        return match worker_outcome {
+            WorkerOutcome::Ok(thumb) => {
+                let resolved_check = resolved.clone();
+                let stamp_ok = tokio::task::spawn_blocking(move || {
+                    verify_post_read_stamp(&resolved_check, &handle_check, open_stamp)
+                })
+                .await
+                .map_err(|err| {
+                    ErrorBody::new(
+                        ErrorCode::Internal,
+                        format!("fs.thumb post-read check stopped unexpectedly: {err}."),
+                    )
+                })?;
+                if let Err(err) = stamp_ok {
+                    return Ok(ThumbItem::from_error(raw_path, err));
+                }
+                let cache_put = cache.clone();
+                let thumb_put = thumb.clone();
+                let _ = tokio::task::spawn_blocking(move || cache_put.put(&key, &thumb_put)).await;
+                Ok(ThumbItem::from_cached(raw_path, thumb))
+            }
+            WorkerOutcome::Rejected(err) => Ok(ThumbItem::from_error(raw_path, err)),
+            WorkerOutcome::KilledForMemory { error, .. } | WorkerOutcome::Crashed(error) => {
+                let resolved_check = resolved.clone();
+                let cache_bad = cache.clone();
+                let err_bad = error.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if verify_post_read_stamp(&resolved_check, &handle_check, open_stamp).is_ok() {
+                        cache_bad.put_bad(&bad_key, &err_bad);
+                    }
+                })
+                .await;
+                Ok(ThumbItem::from_error(raw_path, error))
+            }
+        };
+    }
+
+    // In-process fallback (used only in standard unit/integration test binaries that do not
+    // dispatch `__thumb-worker`). Full file bytes are still read only AFTER acquiring `permit`.
     let abort_flag = Arc::new(AtomicBool::new(false));
     let abort_worker = Arc::clone(&abort_flag);
     let resolved_decode = resolved.clone();
     let mut handle = tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        let bytes = read_open_file_verified(&resolved_decode, &file, open_stamp)?;
+        let (decode_bytes, profile, override_orientation) =
+            select_decode_source(&resolved_decode, bytes)?;
         decode_and_render_image_checked(
             &resolved_decode,
-            bytes,
+            decode_bytes,
             profile,
             override_orientation,
             size,
@@ -564,7 +689,7 @@ async fn thumb_image(
         )
     });
 
-    let sleep = tokio::time::sleep(IMAGE_DECODE_TIMEOUT);
+    let sleep = tokio::time::sleep(decode_timeout);
     tokio::pin!(sleep);
 
     let outcome = tokio::select! {
@@ -584,7 +709,11 @@ async fn thumb_image(
             abort_flag.store(true, Ordering::Release);
             Err(ErrorBody::new(
                 ErrorCode::Timeout,
-                format!("Decoding a thumbnail for {} exceeded the 10-second time limit.", resolved.display()),
+                format!(
+                    "Decoding a thumbnail for {} exceeded the {}-second time limit.",
+                    resolved.display(),
+                    decode_timeout.as_secs().max(1)
+                ),
             )
             .with_hint("The image may be malformed or too expensive to decode quickly."))
         }
@@ -630,8 +759,29 @@ async fn thumb_video(
             size,
             fit,
         );
+        let bad_key = bad_cache_key(&resolved_stat, stamp.size, stamp.mtime_nanos, stamp.file_id);
         let hit = cache_get.get(&key);
-        Ok::<(FileStamp, String, Option<CachedThumb>), ToolError>((stamp, key, hit))
+        let bad = if hit.is_none() {
+            cache_get.get_bad(&bad_key)
+        } else {
+            None
+        };
+        let container = if hit.is_none() && bad.is_none() {
+            sniff_video_container(&resolved_stat)
+        } else {
+            VideoContainer::Other
+        };
+        Ok::<
+            (
+                FileStamp,
+                String,
+                String,
+                VideoContainer,
+                Option<CachedThumb>,
+                Option<ErrorBody>,
+            ),
+            ToolError,
+        >((stamp, key, bad_key, container, hit, bad))
     })
     .await
     .map_err(|err| {
@@ -641,12 +791,15 @@ async fn thumb_video(
         )
     })?;
 
-    let (stamp, key, hit) = match pre {
+    let (stamp, key, bad_key, container, hit, bad) = match pre {
         Ok(v) => v,
         Err(err) => return Ok(ThumbItem::from_error(raw_path, err)),
     };
     if let Some(hit) = hit {
         return Ok(ThumbItem::from_cached(raw_path, hit));
+    }
+    if let Some(bad) = bad {
+        return Ok(ThumbItem::from_error(raw_path, bad));
     }
 
     let permit = match video_pool()
@@ -672,8 +825,16 @@ async fn thumb_video(
         }
     };
 
-    let outcome =
-        extract_video_poster(&resolved, stamp, cache_dir, size, fit, cancel.clone()).await;
+    let outcome = extract_video_poster(
+        &resolved,
+        stamp,
+        container,
+        cache_dir,
+        size,
+        fit,
+        cancel.clone(),
+    )
+    .await;
     drop(permit);
 
     match outcome {
@@ -684,13 +845,27 @@ async fn thumb_video(
             Ok(ThumbItem::from_cached(raw_path, thumb))
         }
         Err(err) if err.code == ErrorCode::Cancelled => Err(err),
-        Err(err) => Ok(ThumbItem::from_error(raw_path, err)),
+        Err(err) => {
+            let killed_for_memory = err
+                .details
+                .as_ref()
+                .and_then(|d| d.get("killed_for_memory"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if killed_for_memory {
+                let cache_bad = cache.clone();
+                let err_bad = err.clone();
+                let _ = tokio::task::spawn_blocking(move || cache_bad.put_bad(&bad_key, &err_bad))
+                    .await;
+            }
+            Ok(ThumbItem::from_error(raw_path, err))
+        }
     }
 }
 
 /// Selects either the full image (when its estimated decode peak fits the 256 MiB cap) or the best
 /// validated embedded MPF/EXIF JPEG preview (with the main image's EXIF orientation).
-fn select_decode_source(
+pub(crate) fn select_decode_source(
     path: &Path,
     bytes: Vec<u8>,
 ) -> Result<(Vec<u8>, ImageProfile, Option<Orientation>), ErrorBody> {
@@ -720,10 +895,10 @@ fn select_decode_source(
     Err(too_large_error(path, &profile))
 }
 
-/// Opens an image file once, checks its metadata and identity on the open handle, checks the
-/// lock-free cache, reads bytes from that same open handle on miss, and probes the image format,
-/// subtype, and estimated decode memory (falling back to a validated EXIF/MPF preview when over
-/// cap) before acquiring decode capacity.
+/// Opens an image file once, verifies its metadata and identity on the open handle, checks the
+/// lock-free positive and negative caches, and peeks ONLY the header prefix (`<= 128 KiB`) before
+/// rewinding to byte 0 so full source bytes are never read into the parent process prior to
+/// reserving pool capacity.
 fn prepare_image_open_once<F>(
     path: &Path,
     cache: &ThumbCache,
@@ -743,7 +918,7 @@ where
 
     between_stat_and_open();
 
-    let file = File::open(path).map_err(|err| map_io_error("read", path, err))?;
+    let mut file = File::open(path).map_err(|err| map_io_error("read", path, err))?;
     let open_meta = file
         .metadata()
         .map_err(|err| map_io_error("read", path, err))?;
@@ -793,11 +968,76 @@ where
     if let Some(hit) = cache.get(&key) {
         return Ok(ImagePrep::CacheHit(hit));
     }
+    let bad_key = bad_cache_key(
+        path,
+        open_stamp.size,
+        open_stamp.mtime_nanos,
+        open_stamp.file_id,
+    );
+    if let Some(bad) = cache.get_bad(&bad_key) {
+        return Ok(ImagePrep::CachedBad(bad));
+    }
 
+    let peek = peek_image_file(path, &mut file, open_stamp.size)?;
+    if !peek.profile.fits_cap() && !peek.may_have_embedded_preview {
+        return Err(too_large_error(path, &peek.profile));
+    }
+
+    let (reserve_bytes, worker_mem_limit) = if peek.profile.fits_cap() {
+        let reserve = peek.profile.estimated_peak_bytes;
+        let limit = reserve
+            .saturating_add(48 * 1024 * 1024)
+            .clamp(64 * 1024 * 1024, MAX_IMAGE_DECODE_BYTES);
+        (reserve, limit)
+    } else {
+        // Over-cap JPEG with EXIF/MPF marker: reserve source + preview headroom and cap the
+        // worker tightly so it can only decode an embedded preview, never the full over-cap frame.
+        let reserve = open_stamp
+            .size
+            .saturating_add(48 * 1024 * 1024)
+            .min(MAX_IMAGE_DECODE_BYTES);
+        let limit = reserve
+            .saturating_add(32 * 1024 * 1024)
+            .clamp(64 * 1024 * 1024, MAX_IMAGE_DECODE_BYTES);
+        (reserve, limit)
+    };
+
+    Ok(ImagePrep::Ready {
+        key,
+        bad_key,
+        open_stamp,
+        file,
+        reserve_bytes,
+        worker_mem_limit,
+    })
+}
+
+fn verify_post_read_stamp(
+    path: &Path,
+    file: &File,
+    open_stamp: FileStamp,
+) -> Result<(), ErrorBody> {
+    let after_handle_meta = file
+        .metadata()
+        .map_err(|err| map_io_error("read", path, err))?;
+    if FileStamp::from_open_file(file, &after_handle_meta) != open_stamp {
+        return Err(changed_while_reading(path));
+    }
+    let after_path_meta = fs::metadata(path).map_err(|err| map_io_error("stat", path, err))?;
+    if FileStamp::from_path(path, &after_path_meta) != open_stamp {
+        return Err(changed_while_reading(path));
+    }
+    Ok(())
+}
+
+fn read_open_file_verified(
+    path: &Path,
+    file: &File,
+    open_stamp: FileStamp,
+) -> Result<Vec<u8>, ErrorBody> {
     let capacity = usize::try_from(open_stamp.size.min(MAX_SOURCE_BYTES)).unwrap_or(0);
     let mut bytes = Vec::with_capacity(capacity);
-    (&file)
-        .take(MAX_SOURCE_BYTES + 1)
+    file.take(MAX_SOURCE_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|err| map_io_error("read", path, err))?;
 
@@ -814,24 +1054,8 @@ where
     if bytes.len() as u64 != open_stamp.size {
         return Err(changed_while_reading(path));
     }
-    let after_handle_meta = file
-        .metadata()
-        .map_err(|err| map_io_error("read", path, err))?;
-    if FileStamp::from_open_file(&file, &after_handle_meta) != open_stamp {
-        return Err(changed_while_reading(path));
-    }
-    let after_path_meta = fs::metadata(path).map_err(|err| map_io_error("stat", path, err))?;
-    if FileStamp::from_path(path, &after_path_meta) != open_stamp {
-        return Err(changed_while_reading(path));
-    }
-
-    let (decode_bytes, profile, override_orientation) = select_decode_source(path, bytes)?;
-    Ok(ImagePrep::Decode {
-        key,
-        bytes: decode_bytes,
-        profile,
-        override_orientation,
-    })
+    verify_post_read_stamp(path, file, open_stamp)?;
+    Ok(bytes)
 }
 
 fn changed_while_reading(path: &Path) -> ErrorBody {
@@ -848,7 +1072,7 @@ fn changed_while_reading(path: &Path) -> ErrorBody {
 /// Decodes a header-verified raster image inside hard limits, downscales before applying EXIF
 /// orientation (avoiding a second full-resolution allocation on rotated portrait photos), and
 /// encodes JPEG (or PNG when transparent).
-fn decode_and_render_image_checked(
+pub(crate) fn decode_and_render_image_checked(
     path: &Path,
     bytes: Vec<u8>,
     profile: ImageProfile,
@@ -879,7 +1103,7 @@ fn decode_and_render_image_checked(
     })?;
 
     let (w, h) = decoder.dimensions();
-    if w != profile.width || h != profile.height {
+    if w == 0 || h == 0 || w > profile.width || h > profile.height {
         return Err(ErrorBody::new(
             ErrorCode::Failed,
             format!(
@@ -1044,8 +1268,40 @@ fn encode_thumbnail(img: &DynamicImage) -> Result<CachedThumb, ErrorBody> {
     })
 }
 
+/// Sniffs whether a regular video file belongs to the MOV/MP4 demuxer family (by extension or
+/// leading ISO BMFF box header) so `ffmpeg` always pins `-enable_drefs 0 -use_absolute_path 0` for
+/// MOV/MP4 inputs and excludes the MOV demuxer entirely for all other formats.
+fn sniff_video_container(path: &Path) -> VideoContainer {
+    if let Some(ext) = path.extension().and_then(|e| e.to_str())
+        && matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "mov" | "mp4" | "m4v" | "m4a" | "3gp" | "3g2" | "mj2"
+        )
+    {
+        return VideoContainer::MovFamily;
+    }
+    if let Ok(file) = File::open(path) {
+        let mut header = [0u8; 12];
+        let n = file.take(12).read(&mut header).unwrap_or(0);
+        if n >= 8
+            && matches!(
+                &header[4..8],
+                b"ftyp" | b"moov" | b"mdat" | b"free" | b"skip" | b"wide" | b"pnot"
+            )
+        {
+            return VideoContainer::MovFamily;
+        }
+    }
+    VideoContainer::Other
+}
+
 /// Builds the locked-down `ffmpeg` argument list for single-frame video poster extraction.
-fn build_ffmpeg_args(input_arg: &str, frame_arg: &str, seek: Option<&str>) -> Vec<String> {
+fn build_ffmpeg_args(
+    input_arg: &str,
+    frame_arg: &str,
+    seek: Option<&str>,
+    container: VideoContainer,
+) -> Vec<String> {
     let mut args = vec![
         "-hide_banner".to_owned(),
         "-loglevel".to_owned(),
@@ -1054,11 +1310,31 @@ fn build_ffmpeg_args(input_arg: &str, frame_arg: &str, seek: Option<&str>) -> Ve
         "-y".to_owned(),
         "-threads".to_owned(),
         "1".to_owned(),
+        "-max_pixels".to_owned(),
+        FFMPEG_MAX_PIXELS.to_owned(),
+        "-max_alloc".to_owned(),
+        FFMPEG_MAX_ALLOC.to_owned(),
         "-protocol_whitelist".to_owned(),
         FFMPEG_PROTOCOL_WHITELIST.to_owned(),
-        "-format_whitelist".to_owned(),
-        FFMPEG_FORMAT_WHITELIST.to_owned(),
     ];
+    match container {
+        VideoContainer::MovFamily => {
+            args.extend([
+                "-format_whitelist".to_owned(),
+                FFMPEG_MOV_FORMAT_WHITELIST.to_owned(),
+                "-enable_drefs".to_owned(),
+                "0".to_owned(),
+                "-use_absolute_path".to_owned(),
+                "0".to_owned(),
+            ]);
+        }
+        VideoContainer::Other => {
+            args.extend([
+                "-format_whitelist".to_owned(),
+                FFMPEG_OTHER_FORMAT_WHITELIST.to_owned(),
+            ]);
+        }
+    }
     if let Some(ss) = seek {
         args.push("-ss".to_owned());
         args.push(ss.to_owned());
@@ -1069,6 +1345,10 @@ fn build_ffmpeg_args(input_arg: &str, frame_arg: &str, seek: Option<&str>) -> Ve
         "-map".to_owned(),
         "0:v:0".to_owned(),
         "-frames:v".to_owned(),
+        "1".to_owned(),
+        "-threads".to_owned(),
+        "1".to_owned(),
+        "-filter_threads".to_owned(),
         "1".to_owned(),
         "-an".to_owned(),
         "-sn".to_owned(),
@@ -1087,6 +1367,7 @@ fn build_ffmpeg_args(input_arg: &str, frame_arg: &str, seek: Option<&str>) -> Ve
 async fn extract_video_poster(
     resolved: &Path,
     expected_stamp: FileStamp,
+    container: VideoContainer,
     cache_dir: &Path,
     target_size: u32,
     fit: ThumbFit,
@@ -1105,8 +1386,16 @@ async fn extract_video_poster(
     let frame_arg = frame_path.to_string_lossy().into_owned();
     let input_arg = platform::ffmpeg_input_arg(resolved);
 
-    let seek_outcome =
-        run_ffmpeg_extract(&input_arg, &frame_arg, Some("1"), deadline, cancel.clone()).await?;
+    let seek_outcome = run_ffmpeg_extract(
+        resolved,
+        &input_arg,
+        &frame_arg,
+        Some("1"),
+        container,
+        deadline,
+        cancel.clone(),
+    )
+    .await?;
 
     let frame_ready = fs::metadata(&frame_path)
         .map(|m| m.is_file() && m.len() > 0)
@@ -1124,11 +1413,19 @@ async fn extract_video_poster(
                         first_line(detail)
                     ),
                 )
-                .with_hint("The file may be corrupted, a playlist/manifest (blocked for safety), or use a codec this node's ffmpeg cannot decode."));
+                .with_hint("The file may be corrupted, exceed pixel/memory limits, reference external data (blocked for safety), or use a codec this node's ffmpeg cannot decode."));
             }
         }
-        let fallback_outcome =
-            run_ffmpeg_extract(&input_arg, &frame_arg, None, deadline, cancel.clone()).await?;
+        let fallback_outcome = run_ffmpeg_extract(
+            resolved,
+            &input_arg,
+            &frame_arg,
+            None,
+            container,
+            deadline,
+            cancel.clone(),
+        )
+        .await?;
         let fallback_ready = fs::metadata(&frame_path)
             .map(|m| m.is_file() && m.len() > 0)
             .unwrap_or(false);
@@ -1196,9 +1493,11 @@ async fn extract_video_poster(
 }
 
 async fn run_ffmpeg_extract(
+    resolved: &Path,
     input_arg: &str,
     frame_arg: &str,
     seek: Option<&str>,
+    container: VideoContainer,
     deadline: Instant,
     cancel: CancellationToken,
 ) -> Result<legion_os::run::RunOutput, ErrorBody> {
@@ -1211,11 +1510,14 @@ async fn run_ffmpeg_extract(
         .with_hint("The video may be very slow to seek or on slow storage."));
     }
 
-    let args = build_ffmpeg_args(input_arg, frame_arg, seek);
+    let args = build_ffmpeg_args(input_arg, frame_arg, seek, container);
+    let mem_limit = video_worker_memory_limit();
     let options = RunOptions::new(CommandSpec::Argv {
         program: "ffmpeg".into(),
         args: args.into_iter().map(Into::into).collect(),
     })
+    .memory_limit(mem_limit)
+    .rlimit_as_headroom(FFMPEG_RLIMIT_AS_HEADROOM)
     .timeout(remaining)
     .kill_grace(FFMPEG_KILL_GRACE)
     .capture_limit(FFMPEG_CAPTURE_LIMIT)
@@ -1237,6 +1539,23 @@ async fn run_ffmpeg_extract(
 
     if output.cancelled {
         return Err(cancelled_error("fs.thumb"));
+    }
+    if output.killed_for_memory {
+        let limit_mib = mem_limit / (1024 * 1024);
+        return Err(ErrorBody::new(
+            ErrorCode::Failed,
+            format!(
+                "Extracting a video poster for {} exceeded the {limit_mib} MiB memory limit and ffmpeg was stopped.",
+                resolved.display()
+            ),
+        )
+        .with_hint("The video frame requires too much memory to decode as a thumbnail.")
+        .with_details(json!({
+            "reason": "too_large",
+            "killed_for_memory": true,
+            "limit_bytes": mem_limit,
+            "peak_rss_bytes": output.peak_rss_bytes,
+        })));
     }
     if output.timed_out {
         return Err(ErrorBody::new(
@@ -1340,29 +1659,67 @@ mod tests {
     }
 
     #[test]
-    fn ffmpeg_args_enforce_protocol_format_whitelists_single_thread_and_video_only_map() {
-        let args = build_ffmpeg_args("file:/clip.mp4", "/tmp/out.png", Some("1"));
-        let idx = |flag: &str| args.iter().position(|a| a == flag);
-        let input_pos = idx("-i").expect("-i missing");
-        let proto_pos = idx("-protocol_whitelist").expect("-protocol_whitelist missing");
-        let fmt_pos = idx("-format_whitelist").expect("-format_whitelist missing");
-        let threads_pos = idx("-threads").expect("-threads missing");
+    fn ffmpeg_args_enforce_whitelists_pixel_alloc_caps_and_mov_dref_pinning() {
+        let mov_args = build_ffmpeg_args(
+            "file:/clip.mp4",
+            "/tmp/out.png",
+            Some("1"),
+            VideoContainer::MovFamily,
+        );
+        let idx = |list: &[String], flag: &str| list.iter().position(|a| a == flag);
+        let input_pos = idx(&mov_args, "-i").expect("-i missing");
+        let proto_pos = idx(&mov_args, "-protocol_whitelist").expect("-protocol_whitelist missing");
+        let fmt_pos = idx(&mov_args, "-format_whitelist").expect("-format_whitelist missing");
+        let threads_pos = idx(&mov_args, "-threads").expect("-threads missing");
+        let max_px_pos = idx(&mov_args, "-max_pixels").expect("-max_pixels missing");
+        let max_alloc_pos = idx(&mov_args, "-max_alloc").expect("-max_alloc missing");
+        let drefs_pos = idx(&mov_args, "-enable_drefs").expect("-enable_drefs missing");
+        let abs_pos = idx(&mov_args, "-use_absolute_path").expect("-use_absolute_path missing");
         assert!(proto_pos < input_pos, "-protocol_whitelist must precede -i");
         assert!(fmt_pos < input_pos, "-format_whitelist must precede -i");
         assert!(threads_pos < input_pos, "-threads must precede -i");
-        assert_eq!(args[proto_pos + 1], "file");
-        assert_eq!(args[threads_pos + 1], "1");
-        assert!(args.contains(&"-nostdin".to_owned()));
-        assert!(args.contains(&"-an".to_owned()));
-        assert!(args.contains(&"-sn".to_owned()));
-        assert!(args.contains(&"-dn".to_owned()));
-        let map_pos = idx("-map").expect("-map missing");
-        assert_eq!(args[map_pos + 1], "0:v:0");
-        let formats: Vec<&str> = args[fmt_pos + 1].split(',').collect();
+        assert!(max_px_pos < input_pos, "-max_pixels must precede -i");
+        assert!(max_alloc_pos < input_pos, "-max_alloc must precede -i");
+        assert!(drefs_pos < input_pos, "-enable_drefs must precede -i");
+        assert!(abs_pos < input_pos, "-use_absolute_path must precede -i");
+        assert_eq!(mov_args[proto_pos + 1], "file");
+        assert_eq!(mov_args[threads_pos + 1], "1");
+        assert_eq!(mov_args[max_px_pos + 1], FFMPEG_MAX_PIXELS);
+        assert_eq!(mov_args[max_alloc_pos + 1], FFMPEG_MAX_ALLOC);
+        assert_eq!(mov_args[drefs_pos + 1], "0");
+        assert_eq!(mov_args[abs_pos + 1], "0");
+        assert!(mov_args.contains(&"-nostdin".to_owned()));
+        assert!(mov_args.contains(&"-an".to_owned()));
+        assert!(mov_args.contains(&"-sn".to_owned()));
+        assert!(mov_args.contains(&"-dn".to_owned()));
+        let map_pos = idx(&mov_args, "-map").expect("-map missing");
+        assert_eq!(mov_args[map_pos + 1], "0:v:0");
+        let mov_formats: Vec<&str> = mov_args[fmt_pos + 1].split(',').collect();
         for forbidden in ["dash", "hls", "concat", "m3u8", "http", "https"] {
             assert!(
-                !formats.contains(&forbidden),
+                !mov_formats.contains(&forbidden),
                 "forbidden format {forbidden}"
+            );
+        }
+
+        // Non-MOV containers must NOT pass MOV-private options and MUST exclude the MOV demuxer.
+        let mkv_args = build_ffmpeg_args(
+            "file:/clip.mkv",
+            "/tmp/out.png",
+            Some("1"),
+            VideoContainer::Other,
+        );
+        let mkv_in = idx(&mkv_args, "-i").expect("-i missing");
+        let mkv_fmt = idx(&mkv_args, "-format_whitelist").expect("-format_whitelist missing");
+        assert!(idx(&mkv_args, "-max_pixels").unwrap() < mkv_in);
+        assert!(idx(&mkv_args, "-max_alloc").unwrap() < mkv_in);
+        assert!(idx(&mkv_args, "-enable_drefs").is_none());
+        assert!(idx(&mkv_args, "-use_absolute_path").is_none());
+        let mkv_formats: Vec<&str> = mkv_args[mkv_fmt + 1].split(',').collect();
+        for forbidden in ["mov", "mp4", "dash", "hls", "concat", "m3u8"] {
+            assert!(
+                !mkv_formats.contains(&forbidden),
+                "non-MOV whitelist must exclude {forbidden}"
             );
         }
     }
