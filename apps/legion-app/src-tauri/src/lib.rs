@@ -5,6 +5,8 @@ pub mod commands;
 pub mod content;
 pub mod link_backend;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod transfers;
 pub mod updater;
 
