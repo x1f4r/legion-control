@@ -2843,7 +2843,9 @@ async fn find_large_directory_cuts_off_within_budget() {
                 "path": f.p(&big),
                 "name": "does_not_match_any_file",
                 "ignore": false,
-                "budget_ms": 40,
+                // The smallest budget there is: no machine walks this directory in a millisecond,
+                // so the cut-off does not depend on how fast the runner happens to be.
+                "budget_ms": 1,
             }),
         )
         .await
@@ -2857,7 +2859,7 @@ async fn find_large_directory_cuts_off_within_budget() {
     assert_eq!(res["reason"], json!("time"));
     assert!(
         elapsed < Duration::from_secs(2),
-        "fs.find took {elapsed:?} for a 40ms budget"
+        "fs.find took {elapsed:?} for a 1ms budget"
     );
 }
 
