@@ -1044,6 +1044,8 @@ function App() {
       capsStore.renameMachine(PENDING_LOCAL_MACHINE_NAME, realName);
       folderChanges.renameMachine(LOCAL_PIPE_CONNECTION, realName);
       folderChanges.renameMachine(PENDING_LOCAL_MACHINE_NAME, realName);
+      thumbCache.renameMachine(LOCAL_PIPE_CONNECTION, realName);
+      thumbCache.renameMachine(PENDING_LOCAL_MACHINE_NAME, realName);
 
       const cur = routeRef.current;
       if (cur) {
@@ -1079,7 +1081,7 @@ function App() {
         }
       }
     },
-    [capsStore, folderChanges],
+    [capsStore, folderChanges, thumbCache],
   );
 
   const handleLocalNodeResolved = useCallback(

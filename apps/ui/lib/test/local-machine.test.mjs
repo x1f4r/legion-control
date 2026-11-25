@@ -3,12 +3,14 @@ import test from 'node:test';
 
 import { formatMachineStatusPhrase } from '../activity.js';
 import { createCapabilitiesStore } from '../capabilities.js';
+import { createThumbQueue } from '../files.js';
 import { createFolderChangesStore } from '../folder-changes.js';
 import {
   migrateLocalFavouritesOnNode,
   migrateLocalMachineStorage,
   normalizeFavouritesMachine,
 } from '../local-machine.js';
+import { createThumbCache, thumbCacheKey } from '../thumb-cache.js';
 
 function memoryStorage(initial = {}) {
   const map = new Map(Object.entries(initial));
@@ -199,4 +201,74 @@ test('formatMachineStatusPhrase prefixes This computer for desktop local machine
     formatMachineStatusPhrase({ name: 'tower', isLocalComputer: false, reachable: true, busy: false, runningJobs: 0 }),
     'Idle',
   );
+});
+
+test('createThumbQueue finds migrated local and pending thumbnails under the resolved node name without calling fs.thumb', () => {
+  // 1. Persisted legacy "local" thumbnail migrated in Web Storage is hit directly by createThumbQueue.
+  const storage = memoryStorage({
+    [`legion.thumb.v1.${thumbCacheKey('local', '/home/me/photo.jpg', '2026-01-01T00:00:00Z', 128)}`]: JSON.stringify({
+      url: 'data:image/jpeg;base64,TE9DQUw=',
+    }),
+  });
+  migrateLocalMachineStorage('studio', { localStorage: storage });
+
+  const storageCache = createThumbCache({ maxEntries: 32, storage });
+  let rpcCalls = 0;
+  const timers = [];
+  const q1 = createThumbQueue({
+    machine: 'studio',
+    link: {
+      async call() {
+        rpcCalls += 1;
+        return { results: [] };
+      },
+    },
+    thumbCache: storageCache,
+    schedule: (fn) => {
+      timers.push(fn);
+      return timers.length;
+    },
+    cancel: () => {},
+  });
+  q1.enqueue({ path: '/home/me/photo.jpg', mtime: '2026-01-01T00:00:00Z' });
+  assert.equal(timers.length, 0, 'migrated storage thumbnail must be a cache hit without scheduling fs.thumb');
+  assert.equal(rpcCalls, 0);
+  assert.equal(
+    storageCache.get(thumbCacheKey('studio', '/home/me/photo.jpg', '2026-01-01T00:00:00Z', 128))?.url,
+    'data:image/jpeg;base64,TE9DQUw=',
+  );
+  q1.dispose();
+
+  // 2. In-memory thumbnails cached under "This computer" before the node resolved move onto the node name.
+  const memCache = createThumbCache({ maxEntries: 32, storage: null });
+  memCache.set(thumbCacheKey('This computer', '/home/me/clip.mp4', 'm2', 128), {
+    url: 'data:image/png;base64,TUVN',
+  });
+  assert.equal(memCache.renameMachine('This computer', 'studio'), true);
+  assert.equal(memCache.get(thumbCacheKey('This computer', '/home/me/clip.mp4', 'm2', 128)), null);
+
+  const timers2 = [];
+  const q2 = createThumbQueue({
+    machine: 'studio',
+    link: {
+      async call() {
+        rpcCalls += 1;
+        return { results: [] };
+      },
+    },
+    thumbCache: memCache,
+    schedule: (fn) => {
+      timers2.push(fn);
+      return timers2.length;
+    },
+    cancel: () => {},
+  });
+  q2.enqueue({ path: '/home/me/clip.mp4', mtime: 'm2' });
+  assert.equal(timers2.length, 0, 'renamed in-memory thumbnail must be a cache hit without scheduling fs.thumb');
+  assert.equal(rpcCalls, 0);
+  assert.equal(
+    memCache.get(thumbCacheKey('studio', '/home/me/clip.mp4', 'm2', 128))?.url,
+    'data:image/png;base64,TUVN',
+  );
+  q2.dispose();
 });
