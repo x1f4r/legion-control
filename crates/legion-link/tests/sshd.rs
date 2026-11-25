@@ -392,6 +392,87 @@ async fn real_sshd_session_and_security_checks() {
         let still_alive = link.hello(&env.node).await.unwrap();
         assert_eq!(still_alive["node"], json!(env.node));
 
+        // Unread large stream (> 4 MiB, exceeding russh's 2 MiB window and channel buffer) must
+        // never stall RPC calls or other streams on the same SSH connection; resuming it later
+        // yields the exact bytes.
+        assert!(
+            expected.len() >= 4 * 1024 * 1024,
+            "sample file should be >= 4 MiB to exercise SSH backpressure"
+        );
+        let mut paused = link
+            .open_content(&env.node, sample_file, 0, None)
+            .await
+            .unwrap();
+        assert_eq!(paused.size(), expected.len() as u64);
+        assert_eq!(paused.length(), expected.len() as u64);
+        // Leave `paused` completely unread while the remote pushes its first window.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let quick_hello = tokio::time::timeout(Duration::from_secs(3), link.hello(&env.node))
+            .await
+            .expect("hello stalled behind unread content stream")
+            .unwrap();
+        assert_eq!(quick_hello["node"], json!(env.node));
+
+        let quick_info = tokio::time::timeout(
+            Duration::from_secs(3),
+            link.call(&env.node, "sys.info", json!({}), None, |_| {}),
+        )
+        .await
+        .expect("sys.info stalled behind unread content stream")
+        .unwrap();
+        assert!(quick_info.get("os").is_some());
+
+        // A second stream on the exact same SSH connection flows freely while the first is paused.
+        let mut second = tokio::time::timeout(
+            Duration::from_secs(3),
+            link.open_content(&env.node, sample_file, 2 * 1024 * 1024, Some(512 * 1024)),
+        )
+        .await
+        .expect("second stream open stalled behind unread content stream")
+        .unwrap();
+        let mut second_buf = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), second.read_to_end(&mut second_buf))
+            .await
+            .expect("second stream read stalled behind unread content stream")
+            .unwrap();
+        assert_eq!(
+            second_buf,
+            &expected[2 * 1024 * 1024..2 * 1024 * 1024 + 512 * 1024]
+        );
+
+        // Resuming the unread first stream delivers every byte accurately across chunks.
+        let mut paused_buf = Vec::with_capacity(expected.len());
+        tokio::time::timeout(Duration::from_secs(15), paused.read_to_end(&mut paused_buf))
+            .await
+            .expect("resumed stream timed out")
+            .unwrap();
+        assert_eq!(paused_buf, expected);
+
+        // Opening 12 concurrent streams (exceeding sshd's default MaxSessions of 10) queues
+        // cleanly without discarding the healthy SSH connection.
+        let mut concurrent = tokio::task::JoinSet::new();
+        for i in 0..12usize {
+            let link_clone = link.clone();
+            let node_name = env.node.clone();
+            let path = sample_file.clone();
+            let off = (i * 65_536) as u64;
+            let len = 32_768u64;
+            concurrent.spawn(async move {
+                let mut s = link_clone
+                    .open_content(&node_name, &path, off, Some(len))
+                    .await
+                    .unwrap();
+                let mut out = Vec::new();
+                s.read_to_end(&mut out).await.unwrap();
+                (off as usize, out)
+            });
+        }
+        while let Some(res) = concurrent.join_next().await {
+            let (off, bytes) = res.unwrap();
+            assert_eq!(bytes, &expected[off..off + 32_768]);
+        }
+
         // Error cases: offset past EOF and unknown machine.
         let bad_off = link
             .open_content(&env.node, sample_file, expected.len() as u64 + 1, Some(10))

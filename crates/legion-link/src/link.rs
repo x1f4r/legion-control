@@ -2169,30 +2169,35 @@ impl Link {
 
         let live = self.get_or_open(machine, cancel.clone()).await?;
         let flight = live.acquire_flight();
-        let (raw, live, flight) = match self.open_stream_on(&live, machine, cancel.clone()).await {
-            Ok(raw) => (raw, live, flight),
-            Err(StreamOpenError::DeadSession(_)) => {
-                // The cached session died before any stream bytes were sent; reopen once.
-                drop(flight);
-                self.invalidate_if_same(machine, &live.session);
-                let fresh = self.get_or_open(machine, cancel.clone()).await?;
-                let flight2 = fresh.acquire_flight();
-                let raw = self
-                    .open_stream_on(&fresh, machine, cancel.clone())
-                    .await
-                    .map_err(|err| match err {
-                        StreamOpenError::DeadSession(body) | StreamOpenError::Failed(body) => {
-                            self.invalidate_if_same(machine, &fresh.session);
-                            body.with_machine(machine)
-                        }
-                    })?;
-                (raw, fresh, flight2)
-            }
-            Err(StreamOpenError::Failed(body)) => return Err(body.with_machine(machine)),
-        };
+        let (raw, opener, live, flight) =
+            match self.open_stream_on(&live, machine, cancel.clone()).await {
+                Ok((raw, opener)) => (raw, opener, live, flight),
+                Err(StreamOpenError::DeadSession(_)) => {
+                    // The cached session died before any stream bytes were sent; reopen once.
+                    drop(flight);
+                    self.invalidate_if_same(machine, &live.session);
+                    let fresh = self.get_or_open(machine, cancel.clone()).await?;
+                    let flight2 = fresh.acquire_flight();
+                    let (raw, opener) = self
+                        .open_stream_on(&fresh, machine, cancel.clone())
+                        .await
+                        .map_err(|err| match err {
+                            StreamOpenError::DeadSession(body) | StreamOpenError::Failed(body) => {
+                                self.invalidate_if_same(machine, &fresh.session);
+                                body.with_machine(machine)
+                            }
+                            StreamOpenError::ChannelRefused(body) => body.with_machine(machine),
+                        })?;
+                    (raw, opener, fresh, flight2)
+                }
+                Err(StreamOpenError::ChannelRefused(body) | StreamOpenError::Failed(body)) => {
+                    return Err(body.with_machine(machine));
+                }
+            };
 
         let mut stream = handshake_get(
             raw,
+            Some(opener),
             machine,
             path,
             offset,
@@ -2211,7 +2216,13 @@ impl Link {
         live: &LiveSession,
         machine: &str,
         cancel: CancellationToken,
-    ) -> Result<crate::content::RawStream, StreamOpenError> {
+    ) -> Result<
+        (
+            crate::content::RawStream,
+            Arc<dyn crate::content::StreamOpener>,
+        ),
+        StreamOpenError,
+    > {
         let Some(opener) = live.session.stream_opener() else {
             return Err(StreamOpenError::Failed(
                 ErrorBody::new(
@@ -2222,7 +2233,8 @@ impl Link {
                 .with_machine(machine),
             ));
         };
-        opener.open_stream(cancel).await
+        let raw = opener.open_stream(cancel).await?;
+        Ok((raw, opener))
     }
 
     /// Calls `tool` on `node` with JSON `arguments` and optional `on` (passed through untouched to

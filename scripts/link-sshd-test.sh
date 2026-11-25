@@ -216,7 +216,8 @@ echo "1) Running legion-link sshd integration test..."
 SAMPLE_FILE="$WORK/sample-content.bin"
 node -e '
 const fs = require("node:fs");
-const buf = Buffer.alloc(256 * 1024);
+// 5 MiB (> russh 2 MiB window and 100-packet mpsc) so unread-stream non-blocking is proven.
+const buf = Buffer.alloc(5 * 1024 * 1024);
 for (let i = 0; i < buf.length; i++) buf[i] = (i * 31 + 7) & 0xff;
 fs.writeFileSync(process.argv[1], buf);
 ' "$SAMPLE_FILE"
