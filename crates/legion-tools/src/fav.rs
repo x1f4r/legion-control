@@ -194,6 +194,10 @@ pub struct FavoriteTombstone {
     pub removed_at: String,
     /// Node that recorded the removal.
     pub removed_on: String,
+    /// Last-known field registers (`base`, `label`, `pinned`) carried with this removal so merging
+    /// a removal with concurrent field edits across any order stays strictly associative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<FavoriteRecord>,
 }
 
 impl Document for FavoritesFile {
@@ -225,28 +229,7 @@ impl Document for FavoritesFile {
                     "favourite id {id:?} appears in both [entries] and [removed]"
                 ));
             }
-            validate_machine_name(&entry.machine)
-                .map_err(|reason| format!("entry {id:?}: machine {:?}: {reason}", entry.machine))?;
-            validate_path(&entry.path).map_err(|reason| format!("entry {id:?}: path: {reason}"))?;
-            if let Some(ref label) = entry.label {
-                validate_label(label).map_err(|reason| format!("entry {id:?}: label: {reason}"))?;
-            }
-            Principal::try_from(entry.added_by.clone())
-                .map_err(|reason| format!("entry {id:?}: added_by: {reason}"))?;
-            validate_utc_timestamp(&entry.added_at)
-                .map_err(|reason| format!("entry {id:?}: added_at: {reason}"))?;
-            validate_utc_timestamp(&entry.updated_at)
-                .map_err(|reason| format!("entry {id:?}: updated_at: {reason}"))?;
-            validate_node_stamp(&entry.updated_on)
-                .map_err(|reason| format!("entry {id:?}: updated_on: {reason}"))?;
-            validate_utc_timestamp(&entry.label_updated_at)
-                .map_err(|reason| format!("entry {id:?}: label_updated_at: {reason}"))?;
-            validate_node_stamp(&entry.label_updated_on)
-                .map_err(|reason| format!("entry {id:?}: label_updated_on: {reason}"))?;
-            validate_utc_timestamp(&entry.pinned_updated_at)
-                .map_err(|reason| format!("entry {id:?}: pinned_updated_at: {reason}"))?;
-            validate_node_stamp(&entry.pinned_updated_on)
-                .map_err(|reason| format!("entry {id:?}: pinned_updated_on: {reason}"))?;
+            validate_record(id, entry)?;
         }
         for (id, tomb) in &self.removed {
             validate_id(id)?;
@@ -254,9 +237,61 @@ impl Document for FavoritesFile {
                 .map_err(|reason| format!("removed {id:?}: removed_at: {reason}"))?;
             validate_node_stamp(&tomb.removed_on)
                 .map_err(|reason| format!("removed {id:?}: removed_on: {reason}"))?;
+            if let Some(ref entry) = tomb.entry {
+                validate_record(id, entry)?;
+            }
         }
         Ok(())
     }
+}
+
+fn validate_record(id: &str, entry: &FavoriteRecord) -> Result<(), String> {
+    validate_machine_name(&entry.machine)
+        .map_err(|reason| format!("entry {id:?}: machine {:?}: {reason}", entry.machine))?;
+    validate_stored_path(&entry.path).map_err(|reason| format!("entry {id:?}: path: {reason}"))?;
+    if let Some(ref label) = entry.label {
+        validate_label(label).map_err(|reason| format!("entry {id:?}: label: {reason}"))?;
+    }
+    Principal::try_from(entry.added_by.clone())
+        .map_err(|reason| format!("entry {id:?}: added_by: {reason}"))?;
+    validate_utc_timestamp(&entry.added_at)
+        .map_err(|reason| format!("entry {id:?}: added_at: {reason}"))?;
+    validate_utc_timestamp(&entry.updated_at)
+        .map_err(|reason| format!("entry {id:?}: updated_at: {reason}"))?;
+    validate_node_stamp(&entry.updated_on)
+        .map_err(|reason| format!("entry {id:?}: updated_on: {reason}"))?;
+    validate_utc_timestamp(&entry.label_updated_at)
+        .map_err(|reason| format!("entry {id:?}: label_updated_at: {reason}"))?;
+    validate_node_stamp(&entry.label_updated_on)
+        .map_err(|reason| format!("entry {id:?}: label_updated_on: {reason}"))?;
+    validate_utc_timestamp(&entry.pinned_updated_at)
+        .map_err(|reason| format!("entry {id:?}: pinned_updated_at: {reason}"))?;
+    validate_node_stamp(&entry.pinned_updated_on)
+        .map_err(|reason| format!("entry {id:?}: pinned_updated_on: {reason}"))?;
+    Ok(())
+}
+
+fn record_to_toml_table(rec: &FavoriteRecord) -> Table {
+    let mut t = Table::new();
+    t["machine"] = value(rec.machine.as_str());
+    t["path"] = value(rec.path.as_str());
+    t["kind"] = value(match rec.kind {
+        FavoriteKind::File => "file",
+        FavoriteKind::Dir => "dir",
+    });
+    if let Some(ref label) = rec.label {
+        t["label"] = value(label.as_str());
+    }
+    t["pinned"] = value(rec.pinned);
+    t["added_at"] = value(rec.added_at.as_str());
+    t["added_by"] = value(rec.added_by.as_str());
+    t["updated_at"] = value(rec.updated_at.as_str());
+    t["updated_on"] = value(rec.updated_on.as_str());
+    t["label_updated_at"] = value(rec.label_updated_at.as_str());
+    t["label_updated_on"] = value(rec.label_updated_on.as_str());
+    t["pinned_updated_at"] = value(rec.pinned_updated_at.as_str());
+    t["pinned_updated_on"] = value(rec.pinned_updated_on.as_str());
+    t
 }
 
 impl FavoritesFile {
@@ -268,26 +303,7 @@ impl FavoritesFile {
             let mut entries_table = Table::new();
             entries_table.set_implicit(true);
             for (id, rec) in &self.entries {
-                let mut t = Table::new();
-                t["machine"] = value(rec.machine.as_str());
-                t["path"] = value(rec.path.as_str());
-                t["kind"] = value(match rec.kind {
-                    FavoriteKind::File => "file",
-                    FavoriteKind::Dir => "dir",
-                });
-                if let Some(ref label) = rec.label {
-                    t["label"] = value(label.as_str());
-                }
-                t["pinned"] = value(rec.pinned);
-                t["added_at"] = value(rec.added_at.as_str());
-                t["added_by"] = value(rec.added_by.as_str());
-                t["updated_at"] = value(rec.updated_at.as_str());
-                t["updated_on"] = value(rec.updated_on.as_str());
-                t["label_updated_at"] = value(rec.label_updated_at.as_str());
-                t["label_updated_on"] = value(rec.label_updated_on.as_str());
-                t["pinned_updated_at"] = value(rec.pinned_updated_at.as_str());
-                t["pinned_updated_on"] = value(rec.pinned_updated_on.as_str());
-                entries_table.insert(id, Item::Table(t));
+                entries_table.insert(id, Item::Table(record_to_toml_table(rec)));
             }
             doc.insert("entries", Item::Table(entries_table));
         }
@@ -298,6 +314,9 @@ impl FavoritesFile {
                 let mut t = Table::new();
                 t["removed_at"] = value(tomb.removed_at.as_str());
                 t["removed_on"] = value(tomb.removed_on.as_str());
+                if let Some(ref rec) = tomb.entry {
+                    t.insert("entry", Item::Table(record_to_toml_table(rec)));
+                }
                 removed_table.insert(id, Item::Table(t));
             }
             doc.insert("removed", Item::Table(removed_table));
@@ -325,36 +344,25 @@ pub fn parse_favorites_bytes(path: &Path, bytes: &[u8]) -> Result<FavoritesFile,
     parse::<FavoritesFile>(path, bytes)
 }
 
-/// Maximum number of merged entries + tombstones retained by [`merge_favorites`] before trimming
-/// by one total order `(stamp, is_removed, id)`.
-pub const MAX_MERGED_FAVORITES: usize = 8192;
-
-/// Merges two `favorites.toml` documents using a join-semilattice bounded by keeping the newest
-/// [`MAX_MERGED_FAVORITES`] items (live entries and tombstones together) in one total order
-/// `(stamp, is_removed, id)`.
+/// Merges two `favorites.toml` documents as a pure join-semilattice of independent
+/// last-writer-wins registers with zero trimming during merge.
 ///
-/// - For the same `id`, a tombstone wins when `(removed_at, removed_on) >= (updated_at,
-///   updated_on)` (which holds for every removal produced by `fav.remove` and all equal-stamp
-///   ties); two tombstones keep the newer `(removed_at, removed_on)`.
-/// - Live entries with the same `id` merge field by field (`label` and `pinned` independently) by
-///   comparing `(timestamp, updated_on, value)` so ties break deterministically.
-/// - Keeping the newest `N` of the unified merged set guarantees a removed favourite cannot
-///   resurrect when tombstones exceed the bound (any `N` items newer than the tombstone are also
-///   newer than the older live entry).
+/// Each favourite `id` is a tuple of independent LWW registers compared by one total order
+/// `(timestamp_nanos, timestamp_rfc3339, writing_node)`:
+/// - **existence** (`present` vs `removed`, breaking exact stamp ties in favour of `removed`): a
+///   removal whose stamp is newer than every edit wins, while an edit whose stamp is newer than a
+///   removal wins like any other write;
+/// - **base** (`added_at`, `added_by`, `machine`, `path`, `kind`);
+/// - **label** (`label_updated_at`, `label_updated_on`, `label`);
+/// - **pinned** (`pinned_updated_at`, `pinned_updated_on`, `pinned`).
+///
+/// Merging takes the per-register maximum across all four registers (preserving last-known field
+/// registers on tombstones so concurrent edits and removals commute and associate regardless of
+/// merge order). Commutativity, associativity, and idempotence hold by construction for all
+/// inputs. Limits are never enforced by trimming inside merge: creation tools enforce entry caps,
+/// [`prune_expired_tombstones`] drops removals older than 90 days relative to the document's own
+/// newest stamp, and oversized received documents are refused whole.
 pub fn merge_favorites(a: &FavoritesFile, b: &FavoritesFile) -> FavoritesFile {
-    let mut out = merge_favorites_with_limit(a, b, MAX_MERGED_FAVORITES);
-    enforce_byte_limit(&mut out, MAX_FAVORITES_BYTES);
-    out
-}
-
-/// Pure bounded merge retaining at most `max_items` combined entries and tombstones by the single
-/// total order `(stamp, is_removed, id)`. Exposed so property tests can exercise the exact bound
-/// with small `max_items` across many ids.
-pub fn merge_favorites_with_limit(
-    a: &FavoritesFile,
-    b: &FavoritesFile,
-    max_items: usize,
-) -> FavoritesFile {
     let mut all_ids = std::collections::BTreeSet::new();
     for id in a
         .entries
@@ -373,147 +381,88 @@ pub fn merge_favorites_with_limit(
     };
 
     for id in all_ids {
-        let tomb = match (a.removed.get(id), b.removed.get(id)) {
-            (Some(ta), Some(tb)) => Some(merge_tombstone(ta, tb)),
-            (Some(ta), None) => Some(ta.clone()),
-            (None, Some(tb)) => Some(tb.clone()),
-            (None, None) => None,
+        let state_a = register_state(a, id);
+        let state_b = register_state(b, id);
+        let merged = match (state_a, state_b) {
+            (Some(sa), Some(sb)) => merge_register_state(sa, sb),
+            (Some(sa), None) => sa,
+            (None, Some(sb)) => sb,
+            (None, None) => continue,
         };
-        let live = match (a.entries.get(id), b.entries.get(id)) {
-            (Some(ea), Some(eb)) => Some(merge_record(ea, eb)),
-            (Some(ea), None) => Some(ea.clone()),
-            (None, Some(eb)) => Some(eb.clone()),
-            (None, None) => None,
-        };
-        match (tomb, live) {
-            (Some(t), _) => {
-                // Removals always dominate live entries for the same id; `fav.remove` stamps
-                // `removed_at` strictly past `updated_at` so a unified top-N trim never evicts a
-                // tombstone while keeping the older live entry it removed.
-                out.removed.insert(id.to_owned(), t);
-            }
-            (None, Some(l)) => {
-                out.entries.insert(id.to_owned(), l);
-            }
-            (None, None) => {}
+        if merged.is_removed {
+            let entry = merged.fields.map(|mut rec| {
+                // Normalize `updated_at`/`updated_on` on a tombstone's preserved field record to
+                // the tombstone's own stamp so repeated merges are strictly canonical and
+                // idempotent.
+                rec.updated_at = merged.existence_at.clone();
+                rec.updated_on = merged.existence_on.clone();
+                rec
+            });
+            out.removed.insert(
+                id.to_owned(),
+                FavoriteTombstone {
+                    removed_at: merged.existence_at,
+                    removed_on: merged.existence_on,
+                    entry,
+                },
+            );
+        } else if let Some(mut rec) = merged.fields {
+            rec.updated_at = merged.existence_at;
+            rec.updated_on = merged.existence_on;
+            out.entries.insert(id.to_owned(), rec);
         }
     }
 
-    trim_to_newest(&mut out, max_items);
     out
 }
 
-/// Keeps only the newest `max_items` combined entries and tombstones in `file`, ordered by one
-/// total order: `(stamp_nanos, stamp_at, is_removed, stamp_on, id)`.
-///
-/// Placing `is_removed` before `stamp_on` ensures that when a removal and a live edit carry the
-/// exact same timestamp on different nodes, the removal's rank is strictly higher than the live
-/// entry's rank so the join is monotonic with respect to the truncation order.
-fn trim_to_newest(file: &mut FavoritesFile, max_items: usize) {
-    let total = file.entries.len() + file.removed.len();
-    if total <= max_items {
-        return;
-    }
-    let mut ranked: Vec<(i128, String, bool, String, String)> = Vec::with_capacity(total);
-    for (id, rec) in &file.entries {
-        let (nanos, _, _) = stamp_key(&rec.updated_at, &rec.updated_on);
-        ranked.push((
-            nanos,
-            rec.updated_at.clone(),
-            false,
-            rec.updated_on.clone(),
-            id.clone(),
-        ));
-    }
-    for (id, tomb) in &file.removed {
-        let (nanos, _, _) = stamp_key(&tomb.removed_at, &tomb.removed_on);
-        ranked.push((
-            nanos,
-            tomb.removed_at.clone(),
-            true,
-            tomb.removed_on.clone(),
-            id.clone(),
-        ));
-    }
-    ranked.sort();
-    let excess = total - max_items;
-    for (_, _, is_removed, _, id) in ranked.into_iter().take(excess) {
-        if is_removed {
-            file.removed.remove(&id);
-        } else {
-            file.entries.remove(&id);
-        }
+#[derive(Clone, Debug)]
+struct RegisterState {
+    existence_at: String,
+    existence_on: String,
+    is_removed: bool,
+    fields: Option<FavoriteRecord>,
+}
+
+fn register_state(file: &FavoritesFile, id: &str) -> Option<RegisterState> {
+    if let Some(rec) = file.entries.get(id) {
+        Some(RegisterState {
+            existence_at: rec.updated_at.clone(),
+            existence_on: rec.updated_on.clone(),
+            is_removed: false,
+            fields: Some(rec.clone()),
+        })
+    } else {
+        file.removed.get(id).map(|tomb| RegisterState {
+            existence_at: tomb.removed_at.clone(),
+            existence_on: tomb.removed_on.clone(),
+            is_removed: true,
+            fields: tomb.entry.clone(),
+        })
     }
 }
 
-/// Deterministically enforces hard document limits ([`MAX_MERGED_FAVORITES`],
-/// [`MAX_RECEIVED_LIVE_FAVORITES`], [`MAX_RECEIVED_TOMBSTONES`], and [`MAX_FAVORITES_BYTES`])
-/// solely from the merged content using the single total order `(stamp, is_removed, node, id)`.
-pub fn enforce_merged_bounds(file: &mut FavoritesFile) {
-    trim_to_newest(file, MAX_MERGED_FAVORITES);
-    enforce_byte_limit(file, MAX_FAVORITES_BYTES);
+fn existence_key(s: &RegisterState) -> ((i128, &str, &str), bool) {
+    (stamp_key(&s.existence_at, &s.existence_on), s.is_removed)
 }
 
-fn enforce_byte_limit(file: &mut FavoritesFile, max_bytes: usize) {
-    if file.entries.len() > MAX_RECEIVED_LIVE_FAVORITES {
-        let mut entry_order: Vec<(i128, String, String, String)> = file
-            .entries
-            .iter()
-            .map(|(id, rec)| {
-                let (nanos, _, _) = stamp_key(&rec.updated_at, &rec.updated_on);
-                (
-                    nanos,
-                    rec.updated_at.clone(),
-                    rec.updated_on.clone(),
-                    id.clone(),
-                )
-            })
-            .collect();
-        entry_order.sort();
-        let excess = file.entries.len() - MAX_RECEIVED_LIVE_FAVORITES;
-        for (_, _, _, id) in entry_order.into_iter().take(excess) {
-            file.entries.remove(&id);
-        }
-    }
-    if file.to_toml_string().len() <= max_bytes {
-        return;
-    }
-    // Trim oldest items by the same total order until the serialized TOML fits within `max_bytes`.
-    let total = file.entries.len() + file.removed.len();
-    let mut ranked: Vec<(i128, String, bool, String, String)> = Vec::with_capacity(total);
-    for (id, rec) in &file.entries {
-        let (nanos, _, _) = stamp_key(&rec.updated_at, &rec.updated_on);
-        ranked.push((
-            nanos,
-            rec.updated_at.clone(),
-            false,
-            rec.updated_on.clone(),
-            id.clone(),
-        ));
-    }
-    for (id, tomb) in &file.removed {
-        let (nanos, _, _) = stamp_key(&tomb.removed_at, &tomb.removed_on);
-        ranked.push((
-            nanos,
-            tomb.removed_at.clone(),
-            true,
-            tomb.removed_on.clone(),
-            id.clone(),
-        ));
-    }
-    ranked.sort();
-    let mut idx = 0usize;
-    while idx < ranked.len() && file.to_toml_string().len() > max_bytes {
-        let over = file.to_toml_string().len() - max_bytes;
-        let step = (over / 100).max(1).min(ranked.len() - idx);
-        for (_, _, is_removed, _, id) in &ranked[idx..idx + step] {
-            if *is_removed {
-                file.removed.remove(id);
-            } else {
-                file.entries.remove(id);
-            }
-        }
-        idx += step;
+fn merge_register_state(a: RegisterState, b: RegisterState) -> RegisterState {
+    let fields = match (&a.fields, &b.fields) {
+        (Some(fa), Some(fb)) => Some(merge_record_fields(fa, fb)),
+        (Some(fa), None) => Some(fa.clone()),
+        (None, Some(fb)) => Some(fb.clone()),
+        (None, None) => None,
+    };
+    let (existence_at, existence_on, is_removed) = if existence_key(&a) >= existence_key(&b) {
+        (a.existence_at, a.existence_on, a.is_removed)
+    } else {
+        (b.existence_at, b.existence_on, b.is_removed)
+    };
+    RegisterState {
+        existence_at,
+        existence_on,
+        is_removed,
+        fields,
     }
 }
 
@@ -561,7 +510,13 @@ pub fn sanitize_received_favorites(
     }
 
     for (id, tomb) in &incoming.removed {
-        if is_future(&tomb.removed_at) {
+        let future_entry = tomb.entry.as_ref().is_some_and(|e| {
+            is_future(&e.added_at)
+                || is_future(&e.updated_at)
+                || is_future(&e.label_updated_at)
+                || is_future(&e.pinned_updated_at)
+        });
+        if is_future(&tomb.removed_at) || future_entry {
             if warnings.len() < MAX_INDIVIDUAL_FUTURE_WARNINGS {
                 warnings.push(format!(
                     "Skipped favourite removal tombstone {id}: timestamp is more than 24 hours in the future."
@@ -591,16 +546,9 @@ fn stamp_key<'a>(at: &'a str, on: &'a str) -> (i128, &'a str, &'a str) {
     (nanos, at, on)
 }
 
-fn merge_tombstone(a: &FavoriteTombstone, b: &FavoriteTombstone) -> FavoriteTombstone {
-    if stamp_key(&a.removed_at, &a.removed_on) >= stamp_key(&b.removed_at, &b.removed_on) {
-        a.clone()
-    } else {
-        b.clone()
-    }
-}
-
-fn merge_record(a: &FavoriteRecord, b: &FavoriteRecord) -> FavoriteRecord {
-    // Base immutable-ish fields tie-break deterministically so the join is a total order.
+fn merge_record_fields(a: &FavoriteRecord, b: &FavoriteRecord) -> FavoriteRecord {
+    // Each field register has a single total order so the join is commutative, associative, and
+    // idempotent.
     fn base_key(r: &FavoriteRecord) -> ((i128, &str, &str), &str, &str, FavoriteKind) {
         (
             stamp_key(&r.added_at, &r.added_by),
@@ -625,13 +573,6 @@ fn merge_record(a: &FavoriteRecord, b: &FavoriteRecord) -> FavoriteRecord {
     let label_src = if label_key(a) >= label_key(b) { a } else { b };
     let pinned_src = if pinned_key(a) >= pinned_key(b) { a } else { b };
 
-    let (updated_at, updated_on) =
-        if stamp_key(&a.updated_at, &a.updated_on) >= stamp_key(&b.updated_at, &b.updated_on) {
-            (a.updated_at.as_str(), a.updated_on.as_str())
-        } else {
-            (b.updated_at.as_str(), b.updated_on.as_str())
-        };
-
     FavoriteRecord {
         machine: base.machine.clone(),
         path: base.path.clone(),
@@ -640,8 +581,8 @@ fn merge_record(a: &FavoriteRecord, b: &FavoriteRecord) -> FavoriteRecord {
         pinned: pinned_src.pinned,
         added_at: base.added_at.clone(),
         added_by: base.added_by.clone(),
-        updated_at: updated_at.to_owned(),
-        updated_on: updated_on.to_owned(),
+        updated_at: base.updated_at.clone(),
+        updated_on: base.updated_on.clone(),
         label_updated_at: label_src.label_updated_at.clone(),
         label_updated_on: label_src.label_updated_on.clone(),
         pinned_updated_at: pinned_src.pinned_updated_at.clone(),
@@ -649,13 +590,45 @@ fn merge_record(a: &FavoriteRecord, b: &FavoriteRecord) -> FavoriteRecord {
     }
 }
 
-/// Removes tombstones whose `removed_at` is strictly older than `TOMBSTONE_RETENTION_DAYS` (90
-/// days) relative to `now`. Returns how many tombstones were pruned.
-pub fn prune_expired_tombstones(file: &mut FavoritesFile, now: Timestamp) -> usize {
+/// Returns the newest timestamp in `file` (in nanoseconds since the Unix epoch), across every live
+/// entry and removal tombstone. Used by [`prune_expired_tombstones`] so every node drops expired
+/// removals by the exact same document-relative clock rather than its own wall clock.
+pub fn newest_document_stamp_nanos(file: &FavoritesFile) -> Option<i128> {
+    let mut newest: Option<i128> = None;
+    let mut consider = |ts: &str| {
+        if let Ok(parsed) = ts.parse::<Timestamp>() {
+            let nanos = parsed.as_nanosecond();
+            newest = Some(newest.map_or(nanos, |cur| cur.max(nanos)));
+        }
+    };
+    for rec in file.entries.values() {
+        consider(&rec.added_at);
+        consider(&rec.updated_at);
+        consider(&rec.label_updated_at);
+        consider(&rec.pinned_updated_at);
+    }
+    for tomb in file.removed.values() {
+        consider(&tomb.removed_at);
+        if let Some(ref rec) = tomb.entry {
+            consider(&rec.added_at);
+            consider(&rec.updated_at);
+            consider(&rec.label_updated_at);
+            consider(&rec.pinned_updated_at);
+        }
+    }
+    newest
+}
+
+/// Removes tombstones whose `removed_at` is strictly older than [`TOMBSTONE_RETENTION_DAYS`] (90
+/// days) compared with the newest stamp in `file` (not the local wall clock), so every node
+/// holding the same merged document drops the exact same expired tombstones. Returns how many
+/// tombstones were pruned.
+pub fn prune_expired_tombstones(file: &mut FavoritesFile) -> usize {
+    let Some(newest_nanos) = newest_document_stamp_nanos(file) else {
+        return 0;
+    };
     let retention_secs = TOMBSTONE_RETENTION_DAYS * 24 * 60 * 60;
-    let cutoff_nanos = now
-        .as_nanosecond()
-        .saturating_sub(i128::from(retention_secs) * 1_000_000_000);
+    let cutoff_nanos = newest_nanos.saturating_sub(i128::from(retention_secs) * 1_000_000_000);
     let before = file.removed.len();
     file.removed.retain(|_, tomb| {
         tomb.removed_at
@@ -706,8 +679,7 @@ where
     let now = Timestamp::now();
     let (sanitized_incoming, warnings) = sanitize_received_favorites(incoming, now);
     let mut merged = merge_favorites(&local, &sanitized_incoming);
-    prune_expired_tombstones(&mut merged, now.max(build_time_floor()));
-    enforce_merged_bounds(&mut merged);
+    prune_expired_tombstones(&mut merged);
     merged.validate().map_err(|reason| {
         ErrorBody::new(
             ErrorCode::InvalidArgs,
@@ -850,6 +822,10 @@ pub struct FavoriteView {
     /// Whether the path currently exists on disk, reported cheaply when `machine` is this node.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exists: Option<bool>,
+    /// Optional human-readable note (for example when an existing entry's stored path is not valid
+    /// on the operating system currently running this node).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// Maps a file path's extension (case-insensitive) to its category per `docs/legion/files.md`.
@@ -893,6 +869,7 @@ fn view_of(
     record: &FavoriteRecord,
     here: &str,
     local_checked: Option<&Path>,
+    note: Option<String>,
 ) -> FavoriteView {
     let exists = if record.machine == here {
         local_checked.map(|p| std::fs::metadata(p).is_ok())
@@ -910,6 +887,7 @@ fn view_of(
         added_at: record.added_at.clone(),
         added_by: record.added_by.clone(),
         exists,
+        note,
     }
 }
 
@@ -1000,22 +978,82 @@ fn fleet_machine_os(paths: &Paths, machine: &str) -> Option<TargetOs> {
     None
 }
 
-/// Checks whether a favourite entry is visible to `ctx.grant()`, returning the checked local path
-/// when `record.machine == ctx.node_name()`.
-fn check_visibility(ctx: &Ctx, record: &FavoriteRecord) -> Option<Option<PathBuf>> {
-    if record.machine == ctx.node_name() {
-        let checked = ctx.grant().check_path(&record.path, Access::Read).ok()?;
-        Some(Some(checked))
-    } else if let Some(roots) = ctx.grant().roots() {
-        let peer_os = fleet_machine_os(ctx.paths(), &record.machine);
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EntryVisibility {
+    local_checked: Option<PathBuf>,
+    note: Option<String>,
+}
+
+/// Checks whether a favourite entry is visible to `ctx.grant()`, returning its checked local path
+/// and any note when `record.machine == ctx.node_name()`.
+///
+/// An entry that already exists in `favorites.toml` is NEVER hidden or dropped merely because its
+/// stored path is not valid for the node's current OS (for example a Unix `/srv/...` path read on
+/// Windows or a dual-boot machine booted into its other OS): unconfined callers always see and can
+/// remove it with a note, and path-confined callers see it when it syntactically matches their
+/// configured `paths`.
+fn check_visibility(ctx: &Ctx, record: &FavoriteRecord) -> Option<EntryVisibility> {
+    check_visibility_for_os(
+        ctx.paths(),
+        ctx.node_name(),
+        ctx.grant(),
+        record,
+        TargetOs::HOST,
+    )
+}
+
+fn check_visibility_for_os(
+    paths: &Paths,
+    node_name: &str,
+    grant: &legion_core::Grant,
+    record: &FavoriteRecord,
+    host_os: TargetOs,
+) -> Option<EntryVisibility> {
+    let invalid_os_note = "Path is not valid on this operating system.".to_owned();
+    if record.machine == node_name {
+        let valid_for_host = validate_path_for_os(&record.path, Some(host_os)).is_ok();
+        if valid_for_host
+            && host_os == TargetOs::HOST
+            && let Ok(checked) = grant.check_path(&record.path, Access::Read)
+        {
+            return Some(EntryVisibility {
+                local_checked: Some(checked),
+                note: None,
+            });
+        }
+        if let Some(roots) = grant.roots() {
+            let root_strs: Vec<&str> = roots.iter().map(|r| r.as_str()).collect();
+            let os_hint = valid_for_host.then_some(host_os);
+            if remote_path_within_roots(&record.path, &root_strs, os_hint) {
+                Some(EntryVisibility {
+                    local_checked: None,
+                    note: (!valid_for_host).then_some(invalid_os_note),
+                })
+            } else {
+                None
+            }
+        } else {
+            Some(EntryVisibility {
+                local_checked: None,
+                note: (!valid_for_host).then_some(invalid_os_note),
+            })
+        }
+    } else if let Some(roots) = grant.roots() {
+        let peer_os = fleet_machine_os(paths, &record.machine);
         let root_strs: Vec<&str> = roots.iter().map(|r| r.as_str()).collect();
         if remote_path_within_roots(&record.path, &root_strs, peer_os) {
-            Some(None)
+            Some(EntryVisibility {
+                local_checked: None,
+                note: None,
+            })
         } else {
             None
         }
     } else {
-        Some(None)
+        Some(EntryVisibility {
+            local_checked: None,
+            note: None,
+        })
     }
 }
 
@@ -1061,10 +1099,16 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
         {
             continue;
         }
-        let Some(local_checked) = check_visibility(ctx, record) else {
+        let Some(vis) = check_visibility(ctx, record) else {
             continue;
         };
-        entries.push(view_of(id, record, here, local_checked.as_deref()));
+        entries.push(view_of(
+            id,
+            record,
+            here,
+            vis.local_checked.as_deref(),
+            vis.note,
+        ));
     }
     // Pinned first, then newest added first, then id for deterministic ordering.
     entries.sort_by(|a, b| {
@@ -1206,7 +1250,7 @@ async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddResult, ToolError> {
         };
         let now = Timestamp::now();
         let floor = build_time_floor();
-        prune_expired_tombstones(&mut file, now.max(floor));
+        prune_expired_tombstones(&mut file);
 
         // Idempotent add: if `(machine, path)` is already live, update label/pinned stamps in place.
         let existing_id = file
@@ -1264,7 +1308,6 @@ async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddResult, ToolError> {
             (id, record, false)
         };
 
-        enforce_merged_bounds(&mut file);
         file.validate().map_err(|reason| {
             ErrorBody::new(
                 ErrorCode::InvalidArgs,
@@ -1290,7 +1333,7 @@ async fn add(ctx: &Ctx, args: AddArgs) -> Result<AddResult, ToolError> {
     .await;
 
     Ok(AddResult {
-        entry: view_of(&id, &record, &here, local_checked.as_deref()),
+        entry: view_of(&id, &record, &here, local_checked.as_deref(), None),
         existing,
         fleet,
     })
@@ -1353,7 +1396,7 @@ async fn set(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
     let Some(preview) = existing_file.entries.get(&args.id) else {
         return Err(not_found_fav(&args.id));
     };
-    let Some(local_checked) = check_visibility(ctx, preview) else {
+    let Some(vis) = check_visibility(ctx, preview) else {
         return Err(not_found_fav(&args.id));
     };
 
@@ -1374,7 +1417,7 @@ async fn set(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
         };
         let now = Timestamp::now();
         let floor = build_time_floor();
-        prune_expired_tombstones(&mut file, now.max(floor));
+        prune_expired_tombstones(&mut file);
 
         let rec = file
             .entries
@@ -1394,8 +1437,6 @@ async fn set(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
         rec.updated_at = stamp;
         rec.updated_on = node_name;
         let out = rec.clone();
-
-        enforce_merged_bounds(&mut file);
 
         file.validate().map_err(|reason| {
             ErrorBody::new(
@@ -1422,7 +1463,13 @@ async fn set(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
     .await;
 
     Ok(SetResult {
-        entry: view_of(&args.id, &updated, &here, local_checked.as_deref()),
+        entry: view_of(
+            &args.id,
+            &updated,
+            &here,
+            vis.local_checked.as_deref(),
+            vis.note,
+        ),
         fleet,
     })
 }
@@ -1476,19 +1523,24 @@ async fn remove(ctx: &Ctx, args: RemoveArgs) -> Result<RemoveResult, ToolError> 
         };
         let now = Timestamp::now();
         let floor = build_time_floor();
-        prune_expired_tombstones(&mut file, now.max(floor));
+        prune_expired_tombstones(&mut file);
 
-        if let Some(prev) = file.entries.remove(&id) {
+        if let Some(mut prev) = file.entries.remove(&id) {
             let stamp = format_timestamp(effective_stamp(now, Some(&prev.updated_at), floor));
+            prev.updated_at = stamp.clone();
+            prev.updated_on = node_name.clone();
             file.removed.insert(
                 id,
                 FavoriteTombstone {
                     removed_at: stamp,
                     removed_on: node_name,
+                    entry: Some(prev),
                 },
             );
-            enforce_merged_bounds(&mut file);
             let canonical = file.to_toml_string();
+            if canonical.len() > MAX_FAVORITES_BYTES {
+                return Err(favorites_size_limit_error(canonical.len()));
+            }
             write_backup_if_present(&paths, bytes_before.as_deref())?;
             write_favorites_atomically(&target, &canonical)?;
             Ok(true)
@@ -1889,13 +1941,39 @@ fn is_tilde_path(path: &str, windows_sep: bool) -> bool {
     path == "~" || path.starts_with("~/") || (windows_sep && path.starts_with("~\\"))
 }
 
+fn is_windows_device_or_verbatim_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 4
+        && (bytes[0] == b'\\' || bytes[0] == b'/')
+        && (bytes[1] == b'\\' || bytes[1] == b'/')
+        && (bytes[2] == b'?' || bytes[2] == b'.')
+        && (bytes[3] == b'\\' || bytes[3] == b'/')
+}
+
+fn has_windows_trailing_dot_or_space(path: &str) -> bool {
+    let rest = if is_windows_drive_path(path) {
+        &path[3..]
+    } else if let Some(unc) = path.strip_prefix("\\\\") {
+        unc
+    } else if let Some(tilde) = path.strip_prefix("~\\").or_else(|| path.strip_prefix("~/")) {
+        tilde
+    } else {
+        path
+    };
+    rest.split(['\\', '/'])
+        .filter(|s| !s.is_empty() && *s != ".")
+        .any(|seg| seg.ends_with('.') || seg.ends_with(' '))
+}
+
 /// Validates a favourite path according to the operating system of the machine it belongs to.
 ///
 /// - `Some(TargetOs::Unix)`: accepts `/…`, `~`, `~/…`.
 /// - `Some(TargetOs::Windows)`: accepts `~`, `~/…`, `~\…`, drive-letter paths (`C:\…`, `C:/…`),
 ///   and UNC paths (`\\server\share\…`), rejecting Unix-only `/…` paths and Windows path hazards.
-/// - `None` (remote OS unknown): accepts every absolute form Legion understands (`/…`, `~`, `~/…`,
-///   `~\…`, drive-letter paths, UNC paths).
+/// - `None` (remote OS unknown): accepts absolute forms Legion understands (`/…`, `~`, `~/…`,
+///   `~\…`, drive-letter paths, UNC paths) and also refuses Windows hazards (device/verbatim paths
+///   `\\?\` / `\\.\`, reserved device names, ADS stream syntax, trailing dots/spaces on Windows
+///   paths).
 ///
 /// Always refuses empty strings, over-long paths, control characters, relative paths, and `..`
 /// segments.
@@ -1908,6 +1986,9 @@ pub fn validate_path_for_os(path: &str, os: Option<TargetOs>) -> Result<(), Stri
     }
     if path.chars().any(char::is_control) {
         return Err("path must not contain control characters".to_owned());
+    }
+    if os != Some(TargetOs::Unix) && is_windows_device_or_verbatim_path(path) {
+        return Err("path must not use a Windows device or verbatim prefix".to_owned());
     }
     let valid_root = match os {
         Some(TargetOs::Unix) => path.starts_with('/') || is_tilde_path(path, false),
@@ -1933,20 +2014,54 @@ pub fn validate_path_for_os(path: &str, os: Option<TargetOs>) -> Result<(), Stri
     if path.split(['/', '\\']).any(|seg| seg == "..") {
         return Err("path must not contain `..` segments".to_owned());
     }
-    if os == Some(TargetOs::Windows) {
+    if os != Some(TargetOs::Unix) {
         crate::fs::validate_windows_path(path).map_err(|err| err.message)?;
+        let windows_shaped = os == Some(TargetOs::Windows)
+            || is_windows_drive_path(path)
+            || is_windows_unc_path(path)
+            || path.starts_with("~\\");
+        if windows_shaped && has_windows_trailing_dot_or_space(path) {
+            return Err("Windows path segments must not end with a dot or space".to_owned());
+        }
     }
     Ok(())
 }
 
-fn validate_path(path: &str) -> Result<(), String> {
-    validate_path_for_os(path, None)
+/// Validates a path already stored in `favorites.toml`.
+///
+/// Only enforces fundamental structural safety (non-empty, length, no control characters, no `..`)
+/// so an existing entry is never silently rejected or hidden merely because its path belongs to a
+/// different OS or violates a creation-time hazard check; the user can always list it and remove
+/// it by id.
+fn validate_stored_path(path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("path must not be empty".to_owned());
+    }
+    if path.len() > MAX_PATH_BYTES {
+        return Err(format!("path exceeds the {MAX_PATH_BYTES} byte limit"));
+    }
+    if path.chars().any(char::is_control) {
+        return Err("path must not contain control characters".to_owned());
+    }
+    let has_root = path.starts_with('/')
+        || is_windows_drive_path(path)
+        || is_windows_unc_path(path)
+        || is_tilde_path(path, true);
+    if !has_root {
+        return Err("path must be absolute or start with ~".to_owned());
+    }
+    if path.split(['/', '\\']).any(|seg| seg == "..") {
+        return Err("path must not contain `..` segments".to_owned());
+    }
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum ParsedRemotePath {
     Unix(Vec<String>),
-    Tilde(Vec<String>),
+    TildeRoot,
+    TildeUnix(Vec<String>),
+    TildeWindows(Vec<String>),
     WindowsDrive(char, Vec<String>),
     WindowsUnc(String, String, Vec<String>),
 }
@@ -1969,15 +2084,39 @@ fn parse_remote_path(path: &str, os: Option<TargetOs>) -> Option<ParsedRemotePat
             })
             .collect()
     };
-    let fold_win = os == Some(TargetOs::Windows);
     if path == "~" {
-        return Some(ParsedRemotePath::Tilde(Vec::new()));
+        return Some(match os {
+            Some(TargetOs::Windows) => ParsedRemotePath::TildeWindows(Vec::new()),
+            Some(TargetOs::Unix) => ParsedRemotePath::TildeUnix(Vec::new()),
+            None => ParsedRemotePath::TildeRoot,
+        });
     }
-    if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
-        return Some(ParsedRemotePath::Tilde(normalize_segs(
-            rest,
-            os != Some(TargetOs::Unix),
-            fold_win,
+    if let Some(rest) = path.strip_prefix("~/") {
+        if os == Some(TargetOs::Windows) {
+            return Some(ParsedRemotePath::TildeWindows(normalize_segs(
+                rest, true, true,
+            )));
+        }
+        if os == Some(TargetOs::Unix) {
+            return Some(ParsedRemotePath::TildeUnix(normalize_segs(
+                rest, false, false,
+            )));
+        }
+        // When OS is unknown, a `~/…` path containing backslashes is ambiguous between Windows
+        // separators and literal Unix characters, so treat it separately from pure `~/…`.
+        if rest.contains('\\') {
+            return Some(ParsedRemotePath::TildeWindows(normalize_segs(
+                rest, true, false,
+            )));
+        }
+        return Some(ParsedRemotePath::TildeUnix(normalize_segs(
+            rest, false, false,
+        )));
+    }
+    if let Some(rest) = path.strip_prefix("~\\") {
+        let fold = os == Some(TargetOs::Windows);
+        return Some(ParsedRemotePath::TildeWindows(normalize_segs(
+            rest, true, fold,
         )));
     }
     if is_windows_unc_path(path) {
@@ -2001,8 +2140,8 @@ fn parse_remote_path(path: &str, os: Option<TargetOs>) -> Option<ParsedRemotePat
 
 /// Cross-platform syntactic containment check for a remote favourite path against the caller's
 /// `paths` roots. Fails closed (`false`) whenever the path or root cannot be judged on the same
-/// path shape (for example a Windows path against Linux roots, or a remote `~` path against
-/// concrete roots).
+/// path shape (for example a Windows path against Linux roots, `~\projects\x` against `~/projects`
+/// when the peer's OS is unknown, or a remote `~` path against concrete roots).
 pub fn remote_path_within_roots(path: &str, roots: &[&str], os: Option<TargetOs>) -> bool {
     let Some(target) = parse_remote_path(path, os) else {
         return false;
@@ -2013,7 +2152,12 @@ pub fn remote_path_within_roots(path: &str, roots: &[&str], os: Option<TargetOs>
         };
         match (&target, &parsed_root) {
             (ParsedRemotePath::Unix(t), ParsedRemotePath::Unix(r))
-            | (ParsedRemotePath::Tilde(t), ParsedRemotePath::Tilde(r)) => t.starts_with(r),
+            | (ParsedRemotePath::TildeUnix(t), ParsedRemotePath::TildeUnix(r))
+            | (ParsedRemotePath::TildeWindows(t), ParsedRemotePath::TildeWindows(r)) => {
+                t.starts_with(r)
+            }
+            (ParsedRemotePath::TildeUnix(_), ParsedRemotePath::TildeRoot)
+            | (ParsedRemotePath::TildeRoot, ParsedRemotePath::TildeRoot) => true,
             (ParsedRemotePath::WindowsDrive(td, t), ParsedRemotePath::WindowsDrive(rd, r)) => {
                 td == rd && t.starts_with(r)
             }
@@ -2113,11 +2257,37 @@ mod tests {
             match rng.gen_range(4) {
                 0 => {} // absent
                 1 => {
+                    let removed_at = random_ts(rng);
+                    let removed_on = NODES[rng.gen_range(NODES.len())].to_owned();
+                    let entry = if rng.gen_bool() {
+                        Some(FavoriteRecord {
+                            machine: NODES[rng.gen_range(NODES.len())].to_owned(),
+                            path: format!("/srv/media/{id}.mp4"),
+                            kind: if rng.gen_bool() {
+                                FavoriteKind::File
+                            } else {
+                                FavoriteKind::Dir
+                            },
+                            label: LABELS[rng.gen_range(LABELS.len())].map(str::to_owned),
+                            pinned: rng.gen_bool(),
+                            added_at: random_ts(rng),
+                            added_by: "owner".to_owned(),
+                            updated_at: removed_at.clone(),
+                            updated_on: removed_on.clone(),
+                            label_updated_at: random_ts(rng),
+                            label_updated_on: NODES[rng.gen_range(NODES.len())].to_owned(),
+                            pinned_updated_at: random_ts(rng),
+                            pinned_updated_on: NODES[rng.gen_range(NODES.len())].to_owned(),
+                        })
+                    } else {
+                        None
+                    };
                     file.removed.insert(
                         id.to_owned(),
                         FavoriteTombstone {
-                            removed_at: random_ts(rng),
-                            removed_on: NODES[rng.gen_range(NODES.len())].to_owned(),
+                            removed_at,
+                            removed_on,
+                            entry,
                         },
                     );
                 }
@@ -2239,14 +2409,19 @@ mod tests {
 
     #[test]
     fn tombstones_expire_after_90_days() {
-        let now: Timestamp = "2026-11-25T00:00:00.000Z".parse().unwrap();
+        let newest: Timestamp = "2026-11-25T00:00:00.000Z".parse().unwrap();
         let mut file = FavoritesFile::default();
-        // 89 days old: kept
-        let kept_ts = now
+        // Live anchor entry sets the document's newest stamp to `newest` (independent of wall clock).
+        file.entries.insert(
+            "anchor".to_owned(),
+            sample_record("anchor", &format_timestamp(newest), "tower"),
+        );
+        // 89 days older than newest: kept
+        let kept_ts = newest
             .checked_sub(jiff::SignedDuration::from_hours(89 * 24))
             .unwrap();
-        // 90 days + 1 second old: expired
-        let expired_ts = now
+        // 90 days + 1 second older than newest: expired
+        let expired_ts = newest
             .checked_sub(jiff::SignedDuration::from_secs(90 * 24 * 3600 + 1))
             .unwrap();
         file.removed.insert(
@@ -2254,6 +2429,7 @@ mod tests {
             FavoriteTombstone {
                 removed_at: format_timestamp(kept_ts),
                 removed_on: "tower".to_owned(),
+                entry: None,
             },
         );
         file.removed.insert(
@@ -2261,13 +2437,16 @@ mod tests {
             FavoriteTombstone {
                 removed_at: format_timestamp(expired_ts),
                 removed_on: "tower".to_owned(),
+                entry: None,
             },
         );
 
-        let pruned = prune_expired_tombstones(&mut file, now);
+        let pruned = prune_expired_tombstones(&mut file);
         assert_eq!(pruned, 1);
         assert!(file.removed.contains_key("recent"));
         assert!(!file.removed.contains_key("old"));
+        // Idempotent when called again.
+        assert_eq!(prune_expired_tombstones(&mut file), 0);
     }
 
     #[test]
@@ -2499,6 +2678,7 @@ paths = [{:?}]
                 FavoriteTombstone {
                     removed_at: "2026-11-02T00:00:00.000Z".to_owned(),
                     removed_on: "tower".to_owned(),
+                    entry: None,
                 },
             );
             b.removed.insert(
@@ -2506,6 +2686,7 @@ paths = [{:?}]
                 FavoriteTombstone {
                     removed_at: "2026-11-02T00:00:01.000Z".to_owned(),
                     removed_on: "pi".to_owned(),
+                    entry: None,
                 },
             );
         }
@@ -2528,177 +2709,267 @@ paths = [{:?}]
     }
 
     #[test]
-    fn hard_size_bound_keeps_newest_by_single_total_order_and_never_resurrects_removed() {
-        let mut a = FavoritesFile::default();
-        let mut b = FavoritesFile::default();
-
-        // 50 newer live entries that must survive over older tombstones.
-        for i in 0..50 {
-            a.entries.insert(
-                format!("live-{i:04}"),
-                sample_record(&format!("live-{i:04}"), "2026-11-25T00:00:00.000Z", "tower"),
-            );
+    fn oversized_received_document_is_refused_whole_and_never_trimmed() {
+        let mut huge = FavoritesFile::default();
+        // Build enough live entries to exceed `MAX_FAVORITES_BYTES` (1 MiB) cleanly.
+        let long_label = "x".repeat(MAX_LABEL_CHARS);
+        for i in 0..2_600 {
+            let mut rec =
+                sample_record(&format!("big-{i:05}"), "2026-11-25T00:00:00.000Z", "tower");
+            rec.path = format!("/srv/archive/project-{i:05}/{}", "segment/".repeat(25));
+            rec.label = Some(long_label.clone());
+            huge.entries.insert(format!("big-{i:05}"), rec);
         }
-        // 15,000 tombstones across `a` and `b`, exceeding MAX_MERGED_FAVORITES (8192).
-        for i in 0..7_500 {
-            let secs = 1_793_500_000_i64 + i as i64;
-            let ts_a = format_timestamp(Timestamp::from_second(secs).unwrap());
-            let ts_b = format_timestamp(Timestamp::from_second(secs + 10_000).unwrap());
-            a.removed.insert(
-                format!("ta-{i:05}"),
-                FavoriteTombstone {
-                    removed_at: ts_a,
-                    removed_on: "tower".to_owned(),
-                },
-            );
-            b.removed.insert(
-                format!("tb-{i:05}"),
-                FavoriteTombstone {
-                    removed_at: ts_b,
-                    removed_on: "pi".to_owned(),
-                },
-            );
-        }
-
-        let ab = merge_favorites(&a, &b);
-        let ba = merge_favorites(&b, &a);
-        assert_eq!(ab, ba, "bounded merge must be strictly commutative");
-        assert_eq!(
-            merge_favorites(&ab, &ab),
-            ab,
-            "bounded merge must be idempotent"
+        let encoded = huge.to_toml_string();
+        assert!(
+            encoded.len() > MAX_FAVORITES_BYTES,
+            "test fixture must exceed MAX_FAVORITES_BYTES (got {})",
+            encoded.len()
         );
-        assert!(ab.to_toml_string().len() <= MAX_FAVORITES_BYTES);
-        assert_eq!(ab.entries.len() + ab.removed.len(), MAX_MERGED_FAVORITES);
-        assert_eq!(ab.entries.len(), 50);
-        // The newest tombstones (`tb-*`) must be retained over the oldest (`ta-00000`).
-        assert!(!ab.removed.contains_key("ta-00000"));
-        assert!(ab.removed.contains_key("tb-07499"));
+        let err = parse_favorites_bytes(Path::new("favorites.toml"), encoded.as_bytes())
+            .expect_err("oversized received document must be refused whole");
+        assert_eq!(err.code, ErrorCode::InvalidArgs, "{err:?}");
+        assert!(
+            err.message.contains("byte limit"),
+            "error must report the size limit visibly: {err:?}"
+        );
     }
 
     #[test]
-    fn merge_with_small_bound_is_commutative_associative_and_never_resurrects_removed() {
-        const BOUND: usize = 6;
-        const ID_COUNT: usize = 24;
-        const STAMPS: &[&str] = &[
-            "2026-11-01T00:00:01.000Z",
-            "2026-11-01T00:00:02.000Z",
-            "2026-11-01T00:00:03.000Z",
-            "2026-11-01T00:00:04.000Z",
-            "2026-11-01T00:00:05.000Z",
-            "2026-11-01T00:00:06.000Z",
-            "2026-11-01T00:00:07.000Z",
-            "2026-11-01T00:00:08.000Z",
+    fn lww_register_interleavings_satisfy_semilattice_laws_removal_and_age_rule() {
+        // Property test simulating 4 nodes performing random interleavings of add, edit label,
+        // edit pin, remove, and merge across 1,000 random trials (plus the exact concurrent
+        // remove-at-t=10 vs edit-at-t=20 scenario that previously broke associativity).
+        const NODES: [&str; 4] = ["tower", "pi", "nas", "laptop"];
+        const IDS: [&str; 12] = [
+            "f00", "f01", "f02", "f03", "f04", "f05", "f06", "f07", "f08", "f09", "f10", "f11",
         ];
-        const NODES: &[&str] = &["tower", "pi", "nas"];
+        const LABELS: [Option<&str>; 4] = [None, Some("Alpha"), Some("Beta"), Some("Gamma")];
+        let base_ts: Timestamp = "2026-06-01T00:00:00.000Z".parse().unwrap();
 
-        // Per-id causal stamps: a removal of `id` always carries a stamp >= its live entry's
-        // stamp (matching `fav.remove`, which advances `removed_at` past `prev.updated_at`).
-        let mut rng = Rng(0x1234_5678_9abc_def0);
-        let mut hit_bound = 0usize;
-        for case in 0..400 {
-            let live_stamps: Vec<usize> =
-                (0..ID_COUNT).map(|_| rng.gen_range(STAMPS.len())).collect();
-            let make_doc = |rng: &mut Rng| -> FavoritesFile {
-                let mut file = FavoritesFile::default();
-                for (idx, &live_idx) in live_stamps.iter().enumerate() {
-                    let id = format!("f{idx:02}");
-                    match rng.gen_range(5) {
-                        0..=2 => {}
-                        3 => {
-                            let rem_idx = live_idx + rng.gen_range(STAMPS.len() - live_idx);
-                            let ts = STAMPS[rem_idx].to_owned();
-                            let node = NODES[rng.gen_range(NODES.len())].to_owned();
-                            file.removed.insert(
-                                id,
-                                FavoriteTombstone {
-                                    removed_at: ts,
-                                    removed_on: node,
-                                },
-                            );
-                        }
-                        _ => {
-                            let ts = STAMPS[live_idx];
-                            let node = NODES[rng.gen_range(NODES.len())];
-                            file.entries
-                                .insert(id.clone(), sample_record(&id, ts, node));
-                        }
-                    }
-                }
-                trim_to_newest(&mut file, BOUND);
-                file
-            };
-            let a = make_doc(&mut rng);
-            let b = make_doc(&mut rng);
-            let c = make_doc(&mut rng);
-            let union_size = a
-                .entries
-                .keys()
-                .chain(a.removed.keys())
-                .chain(b.entries.keys())
-                .chain(b.removed.keys())
-                .chain(c.entries.keys())
-                .chain(c.removed.keys())
-                .collect::<std::collections::BTreeSet<_>>()
-                .len();
-            if union_size > BOUND {
-                hit_bound += 1;
-            }
-
-            let ab = merge_favorites_with_limit(&a, &b, BOUND);
-            let ba = merge_favorites_with_limit(&b, &a, BOUND);
-            assert_eq!(ab, ba, "bounded commutativity failed on case {case}");
-
-            let ab_c = merge_favorites_with_limit(&ab, &c, BOUND);
-            let bc = merge_favorites_with_limit(&b, &c, BOUND);
-            let a_bc = merge_favorites_with_limit(&a, &bc, BOUND);
-            assert_eq!(ab_c, a_bc, "bounded associativity failed on case {case}");
-
-            assert_eq!(
-                merge_favorites_with_limit(&a, &a, BOUND),
-                a,
-                "bounded idempotence failed on case {case}"
-            );
-            assert!(ab_c.entries.len() + ab_c.removed.len() <= BOUND);
-        }
-        assert!(
-            hit_bound >= 200,
-            "property test must regularly exceed the bound (only hit {hit_bound}/400)"
-        );
-
-        // Explicit resurrection regression: `a` has old live `victim` (T=1), `b` removes `victim`
-        // (T=2), and `c` has `BOUND` newer tombstones (T=3..T=2+BOUND). Regardless of merge order,
-        // `victim` MUST NOT come back as a live entry.
-        let mut a = FavoritesFile::default();
-        a.entries.insert(
-            "victim".to_owned(),
-            sample_record("victim", "2026-11-01T00:00:01.000Z", "tower"),
-        );
-        let mut b = FavoritesFile::default();
-        b.removed.insert(
-            "victim".to_owned(),
-            FavoriteTombstone {
-                removed_at: "2026-11-01T00:00:02.000Z".to_owned(),
-                removed_on: "pi".to_owned(),
-            },
-        );
-        let mut c = FavoritesFile::default();
-        for i in 0..BOUND {
-            c.removed.insert(
-                format!("newer-{i:02}"),
+        // 1. Concrete regression: node A edits X at t=20 without seeing node B's removal at t=10,
+        //    merged with node C holding unrelated entries. Both merge orders must match identically
+        //    and keep X live (since t=20 > t=10).
+        let a_live = {
+            let mut f = FavoritesFile::default();
+            let mut rec = sample_record("X", "2026-11-01T00:00:20.000Z", "tower");
+            rec.label = Some("Edited".to_owned());
+            rec.label_updated_at = "2026-11-01T00:00:20.000Z".to_owned();
+            rec.pinned = true;
+            rec.pinned_updated_at = "2026-11-01T00:00:15.000Z".to_owned();
+            f.entries.insert("X".to_owned(), rec);
+            f
+        };
+        let b_removed = {
+            let mut f = FavoritesFile::default();
+            f.removed.insert(
+                "X".to_owned(),
                 FavoriteTombstone {
-                    removed_at: format!("2026-11-01T00:00:{:02}.000Z", 10 + i),
-                    removed_on: "nas".to_owned(),
+                    removed_at: "2026-11-01T00:00:10.000Z".to_owned(),
+                    removed_on: "pi".to_owned(),
+                    entry: None,
                 },
             );
-        }
-        let left =
-            merge_favorites_with_limit(&merge_favorites_with_limit(&a, &b, BOUND), &c, BOUND);
-        let right =
-            merge_favorites_with_limit(&a, &merge_favorites_with_limit(&b, &c, BOUND), BOUND);
+            f
+        };
+        let c_other = {
+            let mut f = FavoritesFile::default();
+            f.entries.insert(
+                "Y".to_owned(),
+                sample_record("Y", "2026-11-01T00:00:15.000Z", "nas"),
+            );
+            f
+        };
+        let left = merge_favorites(&merge_favorites(&a_live, &b_removed), &c_other);
+        let right = merge_favorites(&a_live, &merge_favorites(&b_removed, &c_other));
         assert_eq!(left, right);
-        assert!(!left.entries.contains_key("victim"));
-        assert!(!right.entries.contains_key("victim"));
+        assert!(left.entries.contains_key("X"));
+        assert!(!left.removed.contains_key("X"));
+        assert_eq!(left.entries["X"].label.as_deref(), Some("Edited"));
+        assert!(left.entries["X"].pinned);
+
+        // 2. Concrete associative check when A has an older live edit with a newer pinned flag
+        //    (t_exist=5, t_pin=15), B removes at t=10, and C edits at t=20 (t_pin=1).
+        let a_old = {
+            let mut f = FavoritesFile::default();
+            let mut rec = sample_record("X", "2026-11-01T00:00:05.000Z", "tower");
+            rec.pinned = true;
+            rec.pinned_updated_at = "2026-11-01T00:00:15.000Z".to_owned();
+            rec.pinned_updated_on = "tower".to_owned();
+            f.entries.insert("X".to_owned(), rec);
+            f
+        };
+        let c_new = {
+            let mut f = FavoritesFile::default();
+            let mut rec = sample_record("X", "2026-11-01T00:00:20.000Z", "nas");
+            rec.pinned = false;
+            rec.pinned_updated_at = "2026-11-01T00:00:01.000Z".to_owned();
+            rec.pinned_updated_on = "nas".to_owned();
+            f.entries.insert("X".to_owned(), rec);
+            f
+        };
+        let assoc_l = merge_favorites(&merge_favorites(&a_old, &b_removed), &c_new);
+        let assoc_r = merge_favorites(&a_old, &merge_favorites(&b_removed, &c_new));
+        assert_eq!(assoc_l, assoc_r);
+        assert!(assoc_l.entries["X"].pinned);
+
+        // 3. Random multi-node interleavings of add, edit label, edit pin, remove, and merge
+        //    spanning > 120 days so the 90-day document-relative age rule is also exercised.
+        let mut rng = Rng(0x1234_5678_9abc_def0);
+        let mut age_pruned_total = 0usize;
+        for trial in 0..1_000 {
+            let mut docs = [
+                FavoritesFile::default(),
+                FavoritesFile::default(),
+                FavoritesFile::default(),
+                FavoritesFile::default(),
+            ];
+            let mut max_edit_nanos: HashMap<&str, i128> = HashMap::new();
+            let mut max_remove_nanos: HashMap<&str, i128> = HashMap::new();
+
+            // Each trial runs 24 operations across 4 nodes with timestamps spanning 0..140 days.
+            let mut sec_cursor = 0i64;
+            for _step in 0..24 {
+                let node_idx = rng.gen_range(NODES.len());
+                let node = NODES[node_idx];
+                let id = IDS[rng.gen_range(IDS.len())];
+                sec_cursor += i64::try_from(rng.gen_range(14)).unwrap() * 86_400
+                    + 1
+                    + i64::try_from(rng.gen_range(60)).unwrap();
+                let ts = base_ts
+                    .checked_add(jiff::SignedDuration::from_secs(sec_cursor))
+                    .unwrap();
+                let ts_str = format_timestamp(ts);
+                let ts_nanos = ts.as_nanosecond();
+
+                match rng.gen_range(5) {
+                    0 => {
+                        // add
+                        let rec = sample_record(id, &ts_str, node);
+                        docs[node_idx].removed.remove(id);
+                        docs[node_idx].entries.insert(id.to_owned(), rec);
+                        max_edit_nanos
+                            .entry(id)
+                            .and_modify(|m| *m = (*m).max(ts_nanos))
+                            .or_insert(ts_nanos);
+                    }
+                    1 => {
+                        // edit label
+                        if let Some(rec) = docs[node_idx].entries.get_mut(id) {
+                            let prev = rec.updated_at.parse::<Timestamp>().unwrap().as_nanosecond();
+                            if ts_nanos > prev {
+                                rec.label = LABELS[rng.gen_range(LABELS.len())].map(str::to_owned);
+                                rec.label_updated_at = ts_str.clone();
+                                rec.label_updated_on = node.to_owned();
+                                rec.updated_at = ts_str;
+                                rec.updated_on = node.to_owned();
+                                max_edit_nanos
+                                    .entry(id)
+                                    .and_modify(|m| *m = (*m).max(ts_nanos))
+                                    .or_insert(ts_nanos);
+                            }
+                        }
+                    }
+                    2 => {
+                        // edit pinned
+                        if let Some(rec) = docs[node_idx].entries.get_mut(id) {
+                            let prev = rec.updated_at.parse::<Timestamp>().unwrap().as_nanosecond();
+                            if ts_nanos > prev {
+                                rec.pinned = rng.gen_bool();
+                                rec.pinned_updated_at = ts_str.clone();
+                                rec.pinned_updated_on = node.to_owned();
+                                rec.updated_at = ts_str;
+                                rec.updated_on = node.to_owned();
+                                max_edit_nanos
+                                    .entry(id)
+                                    .and_modify(|m| *m = (*m).max(ts_nanos))
+                                    .or_insert(ts_nanos);
+                            }
+                        }
+                    }
+                    3 => {
+                        // remove
+                        let prev_entry = docs[node_idx].entries.remove(id).map(|mut r| {
+                            r.updated_at = ts_str.clone();
+                            r.updated_on = node.to_owned();
+                            r
+                        });
+                        docs[node_idx].removed.insert(
+                            id.to_owned(),
+                            FavoriteTombstone {
+                                removed_at: ts_str,
+                                removed_on: node.to_owned(),
+                                entry: prev_entry,
+                            },
+                        );
+                        max_remove_nanos
+                            .entry(id)
+                            .and_modify(|m| *m = (*m).max(ts_nanos))
+                            .or_insert(ts_nanos);
+                    }
+                    _ => {
+                        // pairwise sync between two nodes
+                        let peer = rng.gen_range(NODES.len());
+                        let m = merge_favorites(&docs[node_idx], &docs[peer]);
+                        docs[node_idx] = m.clone();
+                        docs[peer] = m;
+                    }
+                }
+            }
+
+            // Check commutativity, associativity, and idempotence on `(docs[0], docs[1], docs[2])`.
+            let (a, b, c) = (&docs[0], &docs[1], &docs[2]);
+            let ab = merge_favorites(a, b);
+            let ba = merge_favorites(b, a);
+            assert_eq!(ab, ba, "commutativity failed on trial {trial}");
+
+            let ab_c = merge_favorites(&ab, c);
+            let bc = merge_favorites(b, c);
+            let a_bc = merge_favorites(a, &bc);
+            assert_eq!(ab_c, a_bc, "associativity failed on trial {trial}");
+            assert_eq!(
+                merge_favorites(&ab_c, &ab_c),
+                ab_c,
+                "idempotence failed on trial {trial}"
+            );
+
+            // Merge all 4 nodes in two completely different orders -> must converge identically.
+            let all_fwd = merge_favorites(&ab_c, &docs[3]);
+            let all_rev = merge_favorites(
+                &merge_favorites(&docs[3], &docs[2]),
+                &merge_favorites(&docs[1], &docs[0]),
+            );
+            assert_eq!(
+                all_fwd, all_rev,
+                "4-node convergence failed on trial {trial}"
+            );
+
+            // Law: any removal strictly newer than every edit of that id is NEVER undone.
+            for (id, &rem_nanos) in &max_remove_nanos {
+                let newest_edit = max_edit_nanos.get(id).copied().unwrap_or(i128::MIN);
+                if rem_nanos > newest_edit {
+                    assert!(
+                        !all_fwd.entries.contains_key(*id) && all_fwd.removed.contains_key(*id),
+                        "removal newer than every edit was undone for {id} on trial {trial}"
+                    );
+                }
+            }
+
+            // Age pruning: identical on two nodes regardless of wall clock because it compares
+            // against the document's own newest stamp.
+            let mut p1 = all_fwd.clone();
+            let mut p2 = all_rev.clone();
+            let n1 = prune_expired_tombstones(&mut p1);
+            let n2 = prune_expired_tombstones(&mut p2);
+            assert_eq!(n1, n2);
+            assert_eq!(p1, p2);
+            assert_eq!(prune_expired_tombstones(&mut p1), 0);
+            age_pruned_total += n1;
+        }
+        assert!(
+            age_pruned_total > 100,
+            "property test must exercise 90-day document-relative tombstone expiry (pruned {age_pruned_total})"
+        );
     }
 
     #[test]
@@ -2719,8 +2990,9 @@ paths = [{:?}]
         assert!(validate_path_for_os("/srv/films", Some(TargetOs::Windows)).is_err());
         assert!(validate_path_for_os(r"C:\Users\me\file:stream", Some(TargetOs::Windows)).is_err());
 
-        // Unknown remote OS: accepts every absolute form Legion understands, refuses relative,
-        // `..`, control chars, and over-long paths.
+        // Unknown remote OS: accepts absolute forms Legion understands, refuses relative,
+        // `..`, control chars, over-long paths, AND Windows hazards (device/verbatim paths,
+        // reserved device names, ADS stream syntax, trailing dots/spaces on Windows paths).
         assert!(validate_path_for_os("/srv/films", None).is_ok());
         assert!(validate_path_for_os("~/films", None).is_ok());
         assert!(validate_path_for_os(r"C:\Users\me\Videos", None).is_ok());
@@ -2730,6 +3002,13 @@ paths = [{:?}]
         assert!(validate_path_for_os("/srv/../etc/passwd", None).is_err());
         assert!(validate_path_for_os("/srv/bad\nline", None).is_err());
         assert!(validate_path_for_os(&format!("/{}", "a".repeat(MAX_PATH_BYTES)), None).is_err());
+        assert!(validate_path_for_os(r"\\?\C:\Users\me\x", None).is_err());
+        assert!(validate_path_for_os(r"\\.\COM1", None).is_err());
+        assert!(validate_path_for_os(r"C:\con\x", None).is_err());
+        assert!(validate_path_for_os(r"C:\a\b.", None).is_err());
+        assert!(validate_path_for_os(r"C:\a:stream", None).is_err());
+        assert!(validate_path_for_os("/srv/NUL/x", None).is_err());
+        assert!(validate_path_for_os("/srv/file:stream", None).is_err());
 
         // Cross-platform `fav.list` root filtering: matches matching path shapes and fails closed
         // whenever a path cannot be judged against the caller's roots.
@@ -2752,6 +3031,27 @@ paths = [{:?}]
             r"\\NAS\Media\2026\clip.mp4",
             &[r"\\nas\media"],
             Some(TargetOs::Windows)
+        ));
+        // When OS is unknown, `~\projects\x` must NOT be treated as inside `~/projects`.
+        assert!(!remote_path_within_roots(
+            r"~\projects\x",
+            &["~/projects"],
+            None
+        ));
+        assert!(!remote_path_within_roots(
+            r"~\projects\x",
+            &["~/projects"],
+            Some(TargetOs::Unix)
+        ));
+        assert!(remote_path_within_roots(
+            r"~\projects\x",
+            &["~/projects"],
+            Some(TargetOs::Windows)
+        ));
+        assert!(remote_path_within_roots(
+            "~/projects/x",
+            &["~/projects"],
+            None
         ));
         // Mismatched OS or remote `~` against concrete root MUST fail closed (hidden).
         assert!(!remote_path_within_roots(
@@ -2880,6 +3180,7 @@ target = "unknown_peer"
             FavoriteTombstone {
                 removed_at: valid_ts.to_owned(),
                 removed_on: "pi".to_owned(),
+                entry: None,
             },
         );
         incoming.removed.insert(
@@ -2887,6 +3188,7 @@ target = "unknown_peer"
             FavoriteTombstone {
                 removed_at: future_ts.to_owned(),
                 removed_on: "pi".to_owned(),
+                entry: None,
             },
         );
 
@@ -2943,6 +3245,7 @@ target = "unknown_peer"
                 FavoriteTombstone {
                     removed_at: now_str.clone(),
                     removed_on: "tower".to_owned(),
+                    entry: None,
                 },
             );
         }
@@ -3079,5 +3382,101 @@ target = "unknown_peer"
         );
         assert!(pushes >= 1, "at least one push must have occurred");
         assert_eq!(load_favorites(&paths).unwrap().entries.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn existing_entry_with_other_os_path_is_listed_with_note_and_removable_by_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::under(tmp.path().join("home"));
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::write(paths.config_file("node.toml"), "name = \"tower\"\n").unwrap();
+
+        let now_str = format_timestamp(Timestamp::now().max(build_time_floor()));
+        let mut unix_rec = sample_record("unix-entry", &now_str, "tower");
+        unix_rec.path = "/srv/media/holiday.mp4".to_owned();
+        let mut win_rec = sample_record("win-entry", &now_str, "tower");
+        win_rec.path = r"C:\Users\me\Videos\holiday.mp4".to_owned();
+
+        // 1. Inject BOTH `TargetOs::Unix` and `TargetOs::Windows` directly into
+        //    `check_visibility_for_os` so this test exercises the exact Windows failure on every OS.
+        let mut reg = Registry::new();
+        register(&mut reg);
+        let node = Node::new(paths.clone(), reg);
+        let check_spec = legion_core::proto::ToolSpec {
+            name: "fav.list".to_owned(),
+            description: String::new(),
+            effect: Effect::Read,
+            input_schema: legion_core::input_schema::<Value>(),
+        };
+        let policy = legion_core::policy::Policy::default();
+        let grant = policy.authorize("owner", &check_spec, &paths).unwrap();
+
+        // On Windows, the seeded Unix `/srv/media/...` entry must STILL be visible with a note.
+        let win_sees_unix =
+            check_visibility_for_os(&paths, "tower", &grant, &unix_rec, TargetOs::Windows)
+                .expect("Windows node must not hide existing Unix-path entry");
+        assert!(win_sees_unix.local_checked.is_none());
+        assert!(
+            win_sees_unix
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("not valid")),
+            "{win_sees_unix:?}"
+        );
+        // On Unix, the seeded Windows `C:\...` entry must STILL be visible with a note.
+        let unix_sees_win =
+            check_visibility_for_os(&paths, "tower", &grant, &win_rec, TargetOs::Unix)
+                .expect("Unix node must not hide existing Windows-path entry");
+        assert!(unix_sees_win.local_checked.is_none());
+        assert!(
+            unix_sees_win
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("not valid")),
+            "{unix_sees_win:?}"
+        );
+
+        // 2. End-to-end: seed BOTH entries on disk and verify `fav.list` lists the other-OS entry
+        //    with a note and `fav.remove` deletes it cleanly by id.
+        let mut seed = FavoritesFile::default();
+        seed.entries.insert("unix-entry".to_owned(), unix_rec);
+        seed.entries.insert("win-entry".to_owned(), win_rec);
+        std::fs::write(
+            paths.config_file(FavoritesFile::FILE),
+            seed.to_toml_string(),
+        )
+        .unwrap();
+
+        let listed = node
+            .call(Call::new(Door::Cli, "fav.list", json!({})))
+            .await
+            .unwrap();
+        let entries = listed["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "{listed}");
+        let other_id = if cfg!(windows) {
+            "unix-entry"
+        } else {
+            "win-entry"
+        };
+        let other_view = entries.iter().find(|e| e["id"] == other_id).unwrap();
+        assert!(
+            other_view["note"]
+                .as_str()
+                .is_some_and(|n| n.contains("not valid")),
+            "expected invalid-OS note on {other_id}: {other_view}"
+        );
+
+        let removed = node
+            .call(Call::new(
+                Door::Cli,
+                "fav.remove",
+                json!({ "id": other_id }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(removed["removed"], json!(true));
+        let after = load_favorites(&paths).unwrap();
+        assert!(!after.entries.contains_key(other_id));
+        assert!(after.removed.contains_key(other_id));
     }
 }

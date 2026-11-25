@@ -39,9 +39,8 @@ use legion_tools::device::sessions::{
 };
 use legion_tools::ext::def::parse_toml as parse_extension_toml;
 use legion_tools::fav::{
-    FavoritesFile, MAX_FAVORITES_BYTES, apply_favorites_merge_blocking, build_time_floor,
-    enforce_merged_bounds, favorites_size_limit_error, merge_favorites, parse_favorites_bytes,
-    prune_expired_tombstones, sanitize_received_favorites,
+    FavoritesFile, MAX_FAVORITES_BYTES, apply_favorites_merge_blocking, favorites_size_limit_error,
+    merge_favorites, parse_favorites_bytes, prune_expired_tombstones, sanitize_received_favorites,
 };
 use legion_tools::proj::ProjectsFile;
 use legion_xfer::hash::{Hash, hash_bytes};
@@ -2333,8 +2332,17 @@ async fn sync_favorites_document(
     let now = Timestamp::now();
     let (sanitized_remote, mut sync_warnings) = sanitize_received_favorites(&remote_favs, now);
     let mut merged = merge_favorites(&local_favs, &sanitized_remote);
-    prune_expired_tombstones(&mut merged, now.max(build_time_floor()));
-    enforce_merged_bounds(&mut merged);
+    prune_expired_tombstones(&mut merged);
+    if let Err(reason) = legion_core::Document::validate(&merged) {
+        return error_outcome(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!("Merged favorites.toml is invalid: {reason}."),
+        ));
+    }
+    let merged_len = merged.to_toml_string().len();
+    if merged_len > MAX_FAVORITES_BYTES {
+        return error_outcome(favorites_size_limit_error(merged_len));
+    }
 
     if direction == SyncDirection::Status {
         let (status, detail) = if local_favs == remote_favs && local.exists == remote.exists {
