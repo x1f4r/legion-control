@@ -268,9 +268,10 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
     await page.locator('.viewer-top button[aria-label="Close"]').click();
     await page.locator('.viewer').waitFor({ state: 'hidden' });
 
-    // 9. Royalty-free Opus Ogg audio playback loads cleanly.
+    // 9. Royalty-free Opus Ogg audio playback loads cleanly in the music player.
     await page.locator('.list a.row', { hasText: 'Voice note.ogg' }).click();
-    await page.locator('.viewer audio').waitFor();
+    await page.locator('.viewer .music-screen').waitFor();
+    await page.locator('.viewer audio').waitFor({ state: 'attached' });
     await page.waitForFunction(
       () => {
         const a = document.querySelector('.viewer audio');

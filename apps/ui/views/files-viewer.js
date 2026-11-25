@@ -13,7 +13,7 @@ import {
 } from '../lib/files.js';
 import { readTextWrapPreference, writeTextWrapPreference } from '../lib/files-store.js';
 import { formatBytes, formatRelativeTime } from '../lib/format.js';
-import { extractThumbMap, formatSpeed, PLAYBACK_SPEEDS } from '../lib/player.js';
+import { formatSpeed, PLAYBACK_SPEEDS } from '../lib/player.js';
 import { CopyButton, Notice, Sheet } from './common.js';
 import { MusicPlayer, VideoPlayer } from './player.js';
 
@@ -259,7 +259,7 @@ export function FilesViewer({
         runCall('fs.thumb', { paths: [path], size: 512, fit: 'contain' }, { signal: ctrl.signal })
           .then((res) => {
             if (ctrl.signal.aborted) return;
-            const t = extractThumbMap(res)[path];
+            const t = res?.thumbnails?.[path];
             if (t?.content && t?.mime) {
               setMediaUrl(`data:${t.mime};base64,${t.content}`);
             } else {

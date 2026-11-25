@@ -489,12 +489,19 @@ export function VideoPlayer({
     link?.keepScreenOn?.(Boolean(ctrl.playing));
   }, [link, ctrl.playing]);
 
+  const portraitImmersiveRef = useRef(false);
+
   // On mobile native apps, hiding the overlay in portrait hides system bars too ("one state").
   useEffect(() => {
-    if (!mobileNative || isFullscreen) return;
+    if (!mobileNative || isFullscreen) {
+      portraitImmersiveRef.current = false;
+      return;
+    }
     if (!ctrl.visible) {
+      portraitImmersiveRef.current = true;
       link?.immersive?.(true, { orientation: 'none', element: viewerRef?.current, video: videoRef.current });
-    } else {
+    } else if (portraitImmersiveRef.current) {
+      portraitImmersiveRef.current = false;
       link?.immersive?.(false, { element: viewerRef?.current, video: videoRef.current });
     }
   }, [mobileNative, isFullscreen, ctrl.visible, link, viewerRef]);
@@ -529,8 +536,10 @@ export function VideoPlayer({
     async ({ fromPopState = false } = {}) => {
       const hadPushed = pushedFsHistoryRef.current;
       pushedFsHistoryRef.current = false;
+      portraitImmersiveRef.current = false;
       setIsFullscreen(false);
       setFullscreenSource(null);
+      controller.notifyActivity({ show: true });
       if (typeof link?.immersive === 'function') {
         await link.immersive(false, { element: viewerRef?.current, video: videoRef.current });
       }
@@ -543,7 +552,7 @@ export function VideoPlayer({
         }
       }
     },
-    [link, viewerRef],
+    [controller, link, viewerRef],
   );
 
   // Sync platform-initiated full-screen exits (browser Esc, macOS window button, iOS webkitendfullscreen).
@@ -1251,7 +1260,10 @@ export function MusicPlayer({
 
   const display = useMemo(() => formatMusicDisplay(tags, name), [tags, name]);
 
-  // Apply playbackRate changes (set via More sheet) to `<audio>`.
+  // Apply playbackRate changes (set via More sheet) to `<audio>` immediately and on effect flush.
+  if (audioRef.current && audioRef.current.playbackRate !== playbackRate) {
+    audioRef.current.playbackRate = playbackRate;
+  }
   useEffect(() => {
     const a = audioRef.current;
     if (a) a.playbackRate = playbackRate;

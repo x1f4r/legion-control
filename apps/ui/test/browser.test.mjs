@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
 import './files-browser.mjs';
 import './machine-browser.mjs';
+import './player-browser.mjs';
 
 const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(TEST_DIR, '..', '..', '..');
@@ -1604,13 +1605,16 @@ test('real Files tab opens pictures and plays/seeks video on local and remote no
     });
     await page.getByText('3 are on').waitFor({ timeout: 15_000 });
 
+    const fileEntry = (name) =>
+      page.locator(`a.row:has-text("${name}"), a.cell[aria-label="${name}"]`);
+
     async function openMachineMedia(machine) {
       await page.locator('nav.nav a', { hasText: 'Files' }).click();
       await page.locator('header.top h1', { hasText: 'Files' }).waitFor();
       await page.locator('.list a.row', { hasText: machine }).first().click();
-      await page.locator('a.row, a.cell', { hasText: 'media' }).waitFor({ timeout: 10_000 });
-      await page.locator('a.row, a.cell', { hasText: 'media' }).click();
-      await page.locator('a.row, a.cell', { hasText: 'icon.png' }).waitFor({ timeout: 10_000 });
+      await fileEntry('media').waitFor({ timeout: 10_000 });
+      await fileEntry('media').click();
+      await fileEntry('icon.png').waitFor({ timeout: 10_000 });
     }
 
     async function verifyPictureAndVideo(machine) {
@@ -1618,7 +1622,7 @@ test('real Files tab opens pictures and plays/seeks video on local and remote no
       await openMachineMedia(machine);
 
       // Picture opens through real /v1/content and decodes cleanly.
-      await page.locator('a.row, a.cell', { hasText: 'icon.png' }).click();
+      await fileEntry('icon.png').click();
       const img = page.locator('.viewer img.viewer-img');
       await img.waitFor({ timeout: 10_000 });
       await page.waitForFunction(
@@ -1641,7 +1645,7 @@ test('real Files tab opens pictures and plays/seeks video on local and remote no
       await page.locator('.viewer').waitFor({ state: 'hidden' });
 
       // Video opens through real /v1/content, decodes VP8 WebM, and seeks cleanly with 206 ranges.
-      await page.locator('a.row, a.cell', { hasText: 'sample.webm' }).click();
+      await fileEntry('sample.webm').click();
       const video = page.locator('.viewer video.viewer-video');
       await video.waitFor({ timeout: 10_000 });
       const videoCheck = await video.evaluate(async (el) => {
@@ -1703,7 +1707,7 @@ test('real Files tab opens pictures and plays/seeks video on local and remote no
     // 2. Older node (legacy): graceful fallback on first unsupported response, remembered for the
     //    rest of the session so the second file does not retry POST /v1/content.
     await openMachineMedia('legacy');
-    await page.locator('a.row, a.cell', { hasText: 'icon.png' }).click();
+    await fileEntry('icon.png').click();
     await page.locator('.viewer .said', { hasText: "Can't show this picture here" }).waitFor({ timeout: 10_000 });
     await page.locator('.viewer .said', { hasText: "doesn't serve picture previews yet" }).waitFor();
     assert.equal(await page.locator('.viewer img.viewer-img').count(), 0);
@@ -1712,7 +1716,7 @@ test('real Files tab opens pictures and plays/seeks video on local and remote no
     await page.locator('.viewer-top button[aria-label="Close"]').click();
     await page.locator('.viewer').waitFor({ state: 'hidden' });
 
-    await page.locator('a.row, a.cell', { hasText: 'sample.webm' }).click();
+    await fileEntry('sample.webm').click();
     await page.locator('.viewer .said', { hasText: "Video playback isn't available from legacy yet" }).waitFor({ timeout: 10_000 });
     assert.equal(await page.locator('.viewer video.viewer-video').count(), 0);
     assert.equal(
@@ -1725,7 +1729,7 @@ test('real Files tab opens pictures and plays/seeks video on local and remote no
 
     // 3. Supported remote machine still opens pictures after legacy was remembered unsupported.
     await openMachineMedia('pi');
-    await page.locator('a.row, a.cell', { hasText: 'icon.png' }).click();
+    await fileEntry('icon.png').click();
     await page.waitForFunction(
       () => {
         const el = document.querySelector('.viewer img.viewer-img');

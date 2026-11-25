@@ -463,8 +463,6 @@ export function createVideoController({
     state = {
       ...state,
       loading: true,
-      visible: true,
-      cursorHidden: false,
     };
     clearHideTimer();
     startStallCountdown();
