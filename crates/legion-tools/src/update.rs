@@ -583,6 +583,9 @@ pub fn random_hex(byte_len: usize) -> Result<String, ErrorBody> {
 /// Called once at process startup so a previous `meta.update` that renamed a running executable
 /// aside leaves no stale binaries in the install directory.
 pub fn cleanup_old_binary() {
+    // Keep the compiled-in sequence marker in release binaries so packaging tools can verify it
+    // without executing the binary.
+    let _ = std::hint::black_box(legion_update::compiled_sequence_marker());
     if let Ok(exe) = legion_core::current_exe() {
         cleanup_old_binaries_next_to(&exe);
     }

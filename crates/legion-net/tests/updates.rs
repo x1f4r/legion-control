@@ -53,6 +53,10 @@ fn main() -> ExitCode {
             "pull_from_peer_refuses_tampered_artifact_and_stores_nothing",
             pull_from_peer_refuses_tampered_artifact_and_stores_nothing,
         ),
+        (
+            "pull_from_peer_refuses_wrong_offset_oversized_and_short_reads",
+            pull_from_peer_refuses_wrong_offset_oversized_and_short_reads,
+        ),
     ];
 
     let mut failed = Vec::new();
@@ -98,6 +102,9 @@ fn run_peer_helper(args: &[String]) -> ExitCode {
         Some(decode_hex32(&args[2]))
     };
     let corrupt_read = args.iter().any(|a| a == "corrupt");
+    let wrong_offset = args.iter().any(|a| a == "wrong-offset");
+    let short_read = args.iter().any(|a| a == "short-read");
+    let oversized_chunk = args.iter().any(|a| a == "oversized-chunk");
     let anchors = TrustAnchors::with_keys(rel_pub, prev_pub);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -165,21 +172,37 @@ fn run_peer_helper(args: &[String]) -> ExitCode {
                         call.hops = parsed.hops;
                         match node.call(call).await {
                             Ok(mut val) => {
-                                if corrupt_read
-                                    && parsed.tool == "update.read"
+                                if parsed.tool == "update.read"
                                     && val.get("name").and_then(Value::as_str) == Some("Legion.apk")
                                 {
-                                    // Flip payload bytes to simulate a malicious/corrupted peer.
                                     use base64::Engine as _;
-                                    let mut raw = base64::engine::general_purpose::STANDARD
-                                        .decode(val["content"].as_str().unwrap())
-                                        .unwrap();
-                                    if let Some(first) = raw.first_mut() {
-                                        *first ^= 0xFF;
+                                    if corrupt_read {
+                                        let mut raw = base64::engine::general_purpose::STANDARD
+                                            .decode(val["content"].as_str().unwrap())
+                                            .unwrap();
+                                        if let Some(first) = raw.first_mut() {
+                                            *first ^= 0xFF;
+                                        }
+                                        val["content"] = json!(
+                                            base64::engine::general_purpose::STANDARD.encode(&raw)
+                                        );
+                                    } else if wrong_offset {
+                                        val["offset"] = json!(7u64);
+                                    } else if short_read {
+                                        let raw = b"short";
+                                        val["content"] = json!(
+                                            base64::engine::general_purpose::STANDARD.encode(raw)
+                                        );
+                                        val["length"] = json!(raw.len() as u64);
+                                        val["eof"] = json!(true);
+                                    } else if oversized_chunk {
+                                        let raw = vec![0x41u8; 64];
+                                        val["content"] = json!(
+                                            base64::engine::general_purpose::STANDARD.encode(&raw)
+                                        );
+                                        val["length"] = json!(raw.len() as u64);
+                                        val["eof"] = json!(true);
                                     }
-                                    val["content"] = json!(
-                                        base64::engine::general_purpose::STANDARD.encode(&raw)
-                                    );
                                 }
                                 Response::ok(Some(id), val)
                             }
@@ -257,6 +280,7 @@ fn write_signed_set(
             "os": os,
             "arch": arch,
             "kind": kind,
+            "size": bytes.len(),
         }));
     }
     let manifest_bytes = serde_json::to_vec_pretty(&json!({
@@ -563,5 +587,98 @@ fn pull_from_peer_refuses_tampered_artifact_and_stores_nothing() {
         assert!(staging_leftovers.is_empty(), "{staging_leftovers:?}");
 
         fleet.close().await;
+    });
+}
+
+fn pull_from_peer_refuses_wrong_offset_oversized_and_short_reads() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let dir = tempdir().unwrap();
+        let exe = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let (_rel_sign, rel_pub) = keypair(0x51);
+        let (prev_sign, prev_pub) = keypair(0x52);
+        let rel_hex = encode_hex(&rel_pub);
+        let prev_hex = encode_hex(&prev_pub);
+
+        for (mode, expected_substr) in [
+            ("wrong-offset", "unexpected offset"),
+            ("short-read", "ended at"),
+            ("oversized-chunk", "exceeding requested"),
+        ] {
+            let rogue_root = dir.path().join(format!("rogue-{mode}"));
+            let receiver_root = dir.path().join(format!("receiver-{mode}"));
+            let rogue_cmd = toml_cmd(&[
+                exe.clone(),
+                HELPER_FLAG.to_owned(),
+                rogue_root.to_string_lossy().into_owned(),
+                rel_hex.clone(),
+                prev_hex.clone(),
+                mode.to_owned(),
+            ]);
+            let fleet_toml = format!("[machines.rogue]\ncommand = {rogue_cmd}\n");
+            init_node_dir(&rogue_root, "rogue", "");
+            init_node_dir(&receiver_root, "receiver", &fleet_toml);
+
+            let rogue_stored =
+                update_set_dir(&Paths::under(&rogue_root), Channel::Preview, 202611250310);
+            write_signed_set(
+                &rogue_stored,
+                Channel::Preview,
+                "0.3.1",
+                202611250310,
+                &[(
+                    "Legion.apk",
+                    Program::App,
+                    Os::Android,
+                    Arch::Universal,
+                    InstallKind::Apk,
+                    b"good-apk-bytes",
+                )],
+                &prev_sign,
+            );
+
+            let anchors = TrustAnchors::with_keys(rel_pub, Some(prev_pub));
+            let paths = Paths::under(&receiver_root);
+            let fleet = Fleet::new(&paths);
+            let mut reg = Registry::new();
+            legion_tools::register_all(&mut reg);
+            register_with_anchors(&mut reg, fleet.clone(), anchors);
+            let receiver = Node::new(paths.clone(), reg);
+
+            let err = receiver
+                .call(Call::new(
+                    Door::Cli,
+                    "update.publish",
+                    json!({
+                        "from_peer": "rogue",
+                        "channel": "preview",
+                        "sequence": 202611250310u64,
+                        "timeout_s": Duration::from_secs(30).as_secs_f64(),
+                    }),
+                ))
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Failed, "mode={mode}: {err:?}");
+            assert!(
+                err.message.contains(expected_substr),
+                "mode={mode}: expected {expected_substr:?} in {:?}",
+                err.message
+            );
+            assert!(!update_set_dir(&paths, Channel::Preview, 202611250310).exists());
+            let leftovers: Vec<_> = fs::read_dir(paths.state_dir().join("updates"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with(".staging-"))
+                .collect();
+            assert!(leftovers.is_empty(), "mode={mode}: {leftovers:?}");
+            fleet.close().await;
+        }
     });
 }

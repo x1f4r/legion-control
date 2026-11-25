@@ -16,7 +16,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -55,7 +55,14 @@ const PULL_CHUNK_BYTES: u64 = 512 * 1024;
 
 /// Upper bound on any single artifact pulled from a peer (512 MiB) so a rogue peer cannot exhaust
 /// disk space.
-const MAX_PULL_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_PULL_ARTIFACT_BYTES: u64 = legion_update::MAX_ARTIFACT_BYTES;
+
+/// Maximum `update.read` chunk calls accepted for a small metadata file.
+const MAX_SMALL_FILE_CHUNKS: usize = 32;
+
+/// Minimum assumed bytes per chunk when capping total chunk count for an artifact pull so a rogue
+/// peer sending 1-byte chunks cannot stall the pull indefinitely.
+const MIN_EXPECTED_CHUNK_BYTES: u64 = 4096;
 
 /// Default per-peer timeout in seconds during `update.publish` propagation.
 const DEFAULT_PUBLISH_TIMEOUT_S: f64 = 60.0;
@@ -180,6 +187,65 @@ pub fn update_set_dir(paths: &Paths, channel: Channel, sequence: u64) -> PathBuf
     updates_root(paths)
         .join(channel.as_str())
         .join(sequence.to_string())
+}
+
+/// Removes leaked `.staging-*` directories and orphaned `.staging-*.lock` files left behind by
+/// crashed `update.publish` runs without disturbing any active concurrent staging directory.
+///
+/// Does nothing if `<state_dir>/updates` does not exist yet.
+pub fn cleanup_stale_staging(paths: &Paths) {
+    cleanup_stale_staging_in(&updates_root(paths));
+}
+
+fn cleanup_stale_staging_in(root: &Path) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    let mut dirs = Vec::new();
+    let mut lock_files = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(text) = name.to_str() else { continue };
+        if !text.starts_with(".staging-") {
+            continue;
+        }
+        if text.ends_with(".lock") {
+            lock_files.push(entry.path());
+        } else {
+            dirs.push((text.to_owned(), entry.path()));
+        }
+    }
+
+    for (name, dir_path) in dirs {
+        let lock_path = root.join(format!("{name}.lock"));
+        match FileLock::try_acquire(&lock_path, LockMode::Exclusive) {
+            Ok(lock) => {
+                let _ = fs::remove_dir_all(&dir_path);
+                drop(lock);
+                let _ = fs::remove_file(&lock_path);
+            }
+            Err(_) => {
+                // Active staging holds the lock (or lock path is inaccessible); leave undisturbed.
+            }
+        }
+    }
+
+    for lock_path in lock_files {
+        let Some(lock_name) = lock_path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(dir_name) = lock_name.strip_suffix(".lock") else {
+            continue;
+        };
+        let dir_path = root.join(dir_name);
+        if dir_path.exists() {
+            continue;
+        }
+        if let Ok(lock) = FileLock::try_acquire(&lock_path, LockMode::Exclusive) {
+            drop(lock);
+            let _ = fs::remove_file(&lock_path);
+        }
+    }
 }
 
 // ── update.list ─────────────────────────────────────────────────────────────────────────────
@@ -920,6 +986,8 @@ async fn pull_set_from_peer(
     anchors: &TrustAnchors,
     timeout: Duration,
 ) -> Result<StoreOutcome, ErrorBody> {
+    let deadline = Instant::now() + timeout;
+
     // 1. Fetch SHA256SUMS and SHA256SUMS.sig first and verify signature BEFORE downloading any
     //    artifacts so an untrusted or preview set on a release-only node is refused immediately.
     let sums_bytes = read_small_from_peer(
@@ -930,7 +998,7 @@ async fn pull_set_from_peer(
         sequence,
         CHECKSUMS_FILENAME,
         MAX_SUMS_BYTES,
-        timeout,
+        deadline,
     )
     .await?;
     let sig_bytes = read_small_from_peer(
@@ -941,7 +1009,7 @@ async fn pull_set_from_peer(
         sequence,
         SIGNATURE_FILENAME,
         MAX_SIG_BYTES,
-        timeout,
+        deadline,
     )
     .await?;
     let sig_text = String::from_utf8(sig_bytes).map_err(|err| {
@@ -961,7 +1029,7 @@ async fn pull_set_from_peer(
         sequence,
         MANIFEST_FILENAME,
         MAX_MANIFEST_BYTES,
-        timeout,
+        deadline,
     )
     .await?;
     let meta = verify_set_metadata(&sums_bytes, &sig_text, &manifest_bytes, anchors)?;
@@ -1005,8 +1073,9 @@ async fn pull_set_from_peer(
         });
     }
 
-    // 4. Create a temporary staging directory under `<state_dir>/updates/` and stream every file
-    //    listed in SHA256SUMS into it with bounded memory and incremental SHA-256 verification.
+    // 4. Create a locked temporary staging directory under `<state_dir>/updates/` and stream every
+    //    file listed in SHA256SUMS into it with bounded memory, exact size enforcement, and
+    //    incremental SHA-256 verification.
     let root = updates_root(ctx.paths());
     fs::create_dir_all(&root).map_err(|err| {
         ErrorBody::new(
@@ -1014,41 +1083,40 @@ async fn pull_set_from_peer(
             format!("Could not create update store {}: {err}.", root.display()),
         )
     })?;
-    let staging = root.join(format!(".staging-{}", random_hex(8)?));
-    fs::create_dir(&staging).map_err(|err| {
-        ErrorBody::new(
-            ErrorCode::Failed,
-            format!(
-                "Could not create staging directory {}: {err}.",
-                staging.display()
-            ),
-        )
-    })?;
-    let mut guard = DirCleanup::new(staging.clone());
+    cleanup_stale_staging_in(&root);
+    let mut staging = StagingDir::create(&root)?;
 
-    fs::write(staging.join(CHECKSUMS_FILENAME), &sums_bytes).map_err(|err| {
+    fs::write(staging.path().join(CHECKSUMS_FILENAME), &sums_bytes).map_err(|err| {
         ErrorBody::new(
             ErrorCode::Failed,
             format!("Could not write staged {CHECKSUMS_FILENAME}: {err}."),
         )
     })?;
-    fs::write(staging.join(SIGNATURE_FILENAME), sig_text.as_bytes()).map_err(|err| {
+    fs::write(staging.path().join(SIGNATURE_FILENAME), sig_text.as_bytes()).map_err(|err| {
         ErrorBody::new(
             ErrorCode::Failed,
             format!("Could not write staged {SIGNATURE_FILENAME}: {err}."),
         )
     })?;
-    fs::write(staging.join(MANIFEST_FILENAME), &manifest_bytes).map_err(|err| {
+    fs::write(staging.path().join(MANIFEST_FILENAME), &manifest_bytes).map_err(|err| {
         ErrorBody::new(
             ErrorCode::Failed,
             format!("Could not write staged {MANIFEST_FILENAME}: {err}."),
         )
     })?;
 
+    let artifact_sizes: BTreeMap<&str, u64> = meta
+        .manifest
+        .artifacts
+        .iter()
+        .map(|a| (a.name.as_str(), a.size))
+        .collect();
+
     for (name, expected_hash) in meta.sums.iter() {
         if name == MANIFEST_FILENAME {
             continue;
         }
+        let expected_size = artifact_sizes.get(name).copied();
         download_file_from_peer(
             fleet,
             ctx,
@@ -1057,15 +1125,16 @@ async fn pull_set_from_peer(
             sequence,
             name,
             expected_hash,
-            &staging.join(name),
-            timeout,
+            expected_size,
+            &staging.path().join(name),
+            deadline,
         )
         .await?;
     }
 
     // 5. Re-verify the complete staged directory and atomically commit under lock.
     let paths_commit = ctx.paths().clone();
-    let staging_commit = staging.clone();
+    let staging_commit = staging.path().to_path_buf();
     let anchors_commit = *anchors;
     let outcome = tokio::task::spawn_blocking(move || {
         commit_staged_set(&paths_commit, &staging_commit, &anchors_commit)
@@ -1078,9 +1147,21 @@ async fn pull_set_from_peer(
         )
     })??;
     if !outcome.already_present {
-        guard.disarm();
+        staging.disarm();
     }
     Ok(outcome)
+}
+
+fn remaining_before(deadline: Instant, peer: &str, action: &str) -> Result<Duration, ErrorBody> {
+    let now = Instant::now();
+    if now >= deadline {
+        return Err(ErrorBody::new(
+            ErrorCode::Timeout,
+            format!("Timed out {action} from {peer}."),
+        )
+        .with_machine(peer));
+    }
+    Ok(deadline.saturating_duration_since(now))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1092,20 +1173,23 @@ async fn read_small_from_peer(
     sequence: u64,
     name: &str,
     max_bytes: usize,
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<Vec<u8>, ErrorBody> {
     let mut out = Vec::new();
     let mut offset = 0u64;
+    let mut chunks = 0usize;
     loop {
+        let remaining = remaining_before(deadline, peer, &format!("reading {name}"))?;
+        let req_len = PULL_CHUNK_BYTES.min((max_bytes as u64).saturating_sub(offset));
         let req = json!({
             "channel": channel,
             "sequence": sequence,
             "name": name,
             "offset": offset,
-            "length": PULL_CHUNK_BYTES.min(max_bytes as u64),
+            "length": req_len,
         });
         let val = tokio::time::timeout(
-            timeout,
+            remaining,
             fleet.call_remote_as_node(ctx, peer, "update.read", req, EventSink::discard()),
         )
         .await
@@ -1122,6 +1206,21 @@ async fn read_small_from_peer(
                 format!("Peer {peer} returned a malformed update.read reply for {name}: {err}."),
             )
         })?;
+        if reply.offset != offset {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Peer {peer} returned unexpected offset {} (expected {offset}) for {name}.",
+                    reply.offset
+                ),
+            ));
+        }
+        if reply.size > max_bytes as u64 {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("{name} from {peer} exceeds the {max_bytes}-byte limit."),
+            ));
+        }
         let chunk = BASE64.decode(reply.content.as_bytes()).map_err(|err| {
             ErrorBody::new(
                 ErrorCode::Failed,
@@ -1134,6 +1233,12 @@ async fn read_small_from_peer(
                 format!("Peer {peer} returned inconsistent byte length for {name}."),
             ));
         }
+        if chunk.len() as u64 > req_len {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("Peer {peer} returned more bytes than requested for {name}."),
+            ));
+        }
         if out.len().saturating_add(chunk.len()) > max_bytes {
             return Err(ErrorBody::new(
                 ErrorCode::Failed,
@@ -1142,13 +1247,29 @@ async fn read_small_from_peer(
         }
         out.extend_from_slice(&chunk);
         offset = offset.saturating_add(chunk.len() as u64);
+        chunks += 1;
         if reply.eof {
+            if offset != reply.size {
+                return Err(ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "Peer {peer} ended {name} early at {offset} bytes (claimed {}).",
+                        reply.size
+                    ),
+                ));
+            }
             break;
         }
         if chunk.is_empty() {
             return Err(ErrorBody::new(
                 ErrorCode::Failed,
                 format!("Peer {peer} stopped making progress while sending {name}."),
+            ));
+        }
+        if chunks >= MAX_SMALL_FILE_CHUNKS {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("Peer {peer} sent too many small chunks for {name}."),
             ));
         }
     }
@@ -1164,9 +1285,21 @@ async fn download_file_from_peer(
     sequence: u64,
     name: &str,
     expected_sha256: &str,
+    expected_size: Option<u64>,
     dest: &Path,
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<(), ErrorBody> {
+    let max_bytes = expected_size.unwrap_or(MAX_PULL_ARTIFACT_BYTES);
+    if max_bytes == 0 || max_bytes > MAX_PULL_ARTIFACT_BYTES {
+        return Err(ErrorBody::new(
+            ErrorCode::Failed,
+            format!("Artifact {name} declares invalid size {max_bytes}."),
+        ));
+    }
+    let max_chunks = (max_bytes / MIN_EXPECTED_CHUNK_BYTES)
+        .saturating_add(64)
+        .min(usize::MAX as u64) as usize;
+
     let mut file = File::create(dest).map_err(|err| {
         ErrorBody::new(
             ErrorCode::Failed,
@@ -1178,16 +1311,21 @@ async fn download_file_from_peer(
     })?;
     let mut hasher = Sha256::new();
     let mut offset = 0u64;
+    let mut chunks = 0usize;
+    let mut claimed_size: Option<u64> = expected_size;
     loop {
+        let remaining = remaining_before(deadline, peer, &format!("downloading {name}"))?;
+        let remaining_bytes = max_bytes.saturating_sub(offset);
+        let req_len = PULL_CHUNK_BYTES.min(remaining_bytes);
         let req = json!({
             "channel": channel,
             "sequence": sequence,
             "name": name,
             "offset": offset,
-            "length": PULL_CHUNK_BYTES,
+            "length": req_len,
         });
         let val = tokio::time::timeout(
-            timeout,
+            remaining,
             fleet.call_remote_as_node(ctx, peer, "update.read", req, EventSink::discard()),
         )
         .await
@@ -1204,6 +1342,44 @@ async fn download_file_from_peer(
                 format!("Peer {peer} returned a malformed update.read reply for {name}: {err}."),
             )
         })?;
+        if reply.offset != offset {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Peer {peer} returned unexpected offset {} (expected {offset}) for {name}.",
+                    reply.offset
+                ),
+            ));
+        }
+        if let Some(exp) = expected_size
+            && reply.size != exp
+        {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Peer {peer} reported size {} for {name}, which does not match signed size {exp}.",
+                    reply.size
+                ),
+            ));
+        }
+        if reply.size > MAX_PULL_ARTIFACT_BYTES {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Artifact {name} from {peer} exceeds the {MAX_PULL_ARTIFACT_BYTES}-byte download limit."
+                ),
+            ));
+        }
+        if let Some(prev) = claimed_size {
+            if reply.size != prev {
+                return Err(ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!("Peer {peer} changed reported size of {name} mid-download."),
+                ));
+            }
+        } else {
+            claimed_size = Some(reply.size);
+        }
         let chunk = BASE64.decode(reply.content.as_bytes()).map_err(|err| {
             ErrorBody::new(
                 ErrorCode::Failed,
@@ -1216,12 +1392,21 @@ async fn download_file_from_peer(
                 format!("Peer {peer} returned inconsistent byte length for {name}."),
             ));
         }
-        offset = offset.saturating_add(chunk.len() as u64);
-        if offset > MAX_PULL_ARTIFACT_BYTES {
+        if chunk.len() as u64 > req_len {
             return Err(ErrorBody::new(
                 ErrorCode::Failed,
                 format!(
-                    "Artifact {name} from {peer} exceeds the {MAX_PULL_ARTIFACT_BYTES}-byte download limit."
+                    "Peer {peer} returned {} bytes for {name}, exceeding requested {req_len} bytes.",
+                    chunk.len()
+                ),
+            ));
+        }
+        offset = offset.saturating_add(chunk.len() as u64);
+        if offset > max_bytes {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Artifact {name} from {peer} exceeded its signed byte limit ({max_bytes})."
                 ),
             ));
         }
@@ -1234,13 +1419,29 @@ async fn download_file_from_peer(
             })?;
             hasher.update(&chunk);
         }
-        if reply.eof {
+        chunks += 1;
+        if reply.eof || (expected_size.is_some() && offset == max_bytes) {
+            let final_expected = expected_size.unwrap_or(reply.size);
+            if offset != final_expected {
+                return Err(ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!(
+                        "Artifact {name} from {peer} ended at {offset} bytes (expected {final_expected})."
+                    ),
+                ));
+            }
             break;
         }
         if chunk.is_empty() {
             return Err(ErrorBody::new(
                 ErrorCode::Failed,
                 format!("Peer {peer} stopped making progress while sending {name}."),
+            ));
+        }
+        if chunks >= max_chunks {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!("Peer {peer} sent too many tiny chunks while downloading {name}."),
             ));
         }
     }
@@ -1445,34 +1646,25 @@ fn store_verified_set_from_dir(
             format!("Could not create update store {}: {err}.", root.display()),
         )
     })?;
+    cleanup_stale_staging_in(&root);
 
-    let staging = root.join(format!(".staging-{}", random_hex(8)?));
-    fs::create_dir(&staging).map_err(|err| {
-        ErrorBody::new(
-            ErrorCode::Failed,
-            format!(
-                "Could not create staging directory {}: {err}.",
-                staging.display()
-            ),
-        )
-    })?;
-    let mut guard = DirCleanup::new(staging.clone());
+    let mut staging = StagingDir::create(&root)?;
 
     copy_regular_file(
         &src_dir.join(CHECKSUMS_FILENAME),
-        &staging.join(CHECKSUMS_FILENAME),
+        &staging.path().join(CHECKSUMS_FILENAME),
     )?;
     copy_regular_file(
         &src_dir.join(SIGNATURE_FILENAME),
-        &staging.join(SIGNATURE_FILENAME),
+        &staging.path().join(SIGNATURE_FILENAME),
     )?;
     for (name, _) in verified.sums.iter() {
-        copy_regular_file(&src_dir.join(name), &staging.join(name))?;
+        copy_regular_file(&src_dir.join(name), &staging.path().join(name))?;
     }
 
-    let outcome = commit_staged_set(paths, &staging, anchors)?;
+    let outcome = commit_staged_set(paths, staging.path(), anchors)?;
     if !outcome.already_present {
-        guard.disarm();
+        staging.disarm();
     }
     Ok(outcome)
 }
@@ -1719,15 +1911,52 @@ fn format_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Removes a temporary staging directory on drop unless disarmed after atomic commit.
-struct DirCleanup {
+/// Locked temporary staging directory removed on drop unless disarmed after atomic commit.
+///
+/// The sidecar `.staging-<id>.lock` file is acquired *before* creating the directory and held until
+/// drop so concurrent [`cleanup_stale_staging`] sweeps never delete an active staging directory.
+struct StagingDir {
     path: PathBuf,
+    lock_path: PathBuf,
+    _lock: Option<FileLock>,
     armed: bool,
 }
 
-impl DirCleanup {
-    fn new(path: PathBuf) -> Self {
-        Self { path, armed: true }
+impl StagingDir {
+    fn create(root: &Path) -> Result<Self, ErrorBody> {
+        let name = format!(".staging-{}", random_hex(8)?);
+        let lock_path = root.join(format!("{name}.lock"));
+        let lock = FileLock::try_acquire(&lock_path, LockMode::Exclusive).map_err(|err| {
+            ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Could not lock staging directory {}: {err}.",
+                    lock_path.display()
+                ),
+            )
+        })?;
+        let path = root.join(&name);
+        if let Err(err) = fs::create_dir(&path) {
+            drop(lock);
+            let _ = fs::remove_file(&lock_path);
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Could not create staging directory {}: {err}.",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(Self {
+            path,
+            lock_path,
+            _lock: Some(lock),
+            armed: true,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
     }
 
     fn disarm(&mut self) {
@@ -1735,11 +1964,13 @@ impl DirCleanup {
     }
 }
 
-impl Drop for DirCleanup {
+impl Drop for StagingDir {
     fn drop(&mut self) {
         if self.armed {
             let _ = fs::remove_dir_all(&self.path);
         }
+        self._lock.take();
+        let _ = fs::remove_file(&self.lock_path);
     }
 }
 
@@ -1798,6 +2029,7 @@ pub(crate) fn write_test_set(
             "os": os,
             "arch": arch,
             "kind": kind,
+            "size": bytes.len(),
         }));
     }
     let manifest_bytes = serde_json::to_vec_pretty(&json!({
@@ -2170,5 +2402,48 @@ paths = ["~/projects/**"]
         assert_eq!(c_err.code, ErrorCode::Denied);
         assert!(!update_set_dir(node_c.paths(), Channel::Preview, 202611250200).exists());
         let _ = Arc::new(node_a);
+    }
+
+    #[test]
+    fn cleanup_stale_staging_removes_leaked_dirs_and_preserves_active_locked_staging() {
+        let dir = tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let root = updates_root(&paths);
+        fs::create_dir_all(&root).unwrap();
+
+        // Leaked staging directory with an unlocked sidecar lock file + a legacy leaked dir with no lock.
+        let leaked_a = root.join(".staging-deadbeef");
+        let leaked_a_lock = root.join(".staging-deadbeef.lock");
+        fs::create_dir(&leaked_a).unwrap();
+        fs::write(leaked_a.join("partial.apk"), b"partial").unwrap();
+        fs::write(&leaked_a_lock, b"").unwrap();
+
+        let leaked_b = root.join(".staging-cafebabe");
+        fs::create_dir(&leaked_b).unwrap();
+
+        let orphan_lock = root.join(".staging-orphan.lock");
+        fs::write(&orphan_lock, b"").unwrap();
+
+        // Active locked staging directory must NOT be touched.
+        let active = StagingDir::create(&root).unwrap();
+        fs::write(active.path().join("live.apk"), b"live").unwrap();
+
+        cleanup_stale_staging(&paths);
+
+        assert!(!leaked_a.exists(), "leaked locked dir should be removed");
+        assert!(
+            !leaked_a_lock.exists(),
+            "leaked lock file should be removed"
+        );
+        assert!(!leaked_b.exists(), "legacy leaked dir should be removed");
+        assert!(!orphan_lock.exists(), "orphan lock file should be removed");
+        assert!(
+            active.path().join("live.apk").is_file(),
+            "active locked staging directory must be preserved"
+        );
+
+        let active_path = active.path().to_path_buf();
+        drop(active);
+        assert!(!active_path.exists());
     }
 }

@@ -133,6 +133,7 @@ async fn run(command: Command) -> ExitCode {
     };
     let (node, router) = match paths_result {
         Ok(paths) => {
+            legion_net::updates::cleanup_stale_staging(&paths);
             let fleet = Fleet::new(&paths);
             let mut registry = legion_tools::registry();
             legion_net::register(&mut registry, fleet.clone());
