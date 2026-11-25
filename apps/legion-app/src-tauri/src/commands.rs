@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+#[cfg(target_os = "android")]
+use tauri::Manager;
 use tauri::State;
 use tauri::ipc::Channel;
 
@@ -15,6 +17,9 @@ use crate::backend::{
     AppError, AppState, Backend, CallId, CallRequest, CancelResult, ErrorCode, LearnResult,
     RepairResult, UnpairResult,
 };
+#[cfg(target_os = "android")]
+use crate::updater::android::AndroidUpdaterHandle;
+use crate::updater::{SharedUpdater, UpdateState};
 
 /// Log line emitted when the web interface finishes its first paint.
 pub const INTERFACE_READY_MARKER: &str = "legion-app: interface ready";
@@ -240,12 +245,13 @@ pub fn device_name() -> String {
 /// `LEGION_APP_READY_FILE` is set, also writes the marker line to that path so automated smoke
 /// checks can assert startup without guessing a sleep duration.
 #[tauri::command]
-pub fn ready() -> Result<(), AppError> {
+pub fn ready(updater: State<'_, SharedUpdater>) -> Result<(), AppError> {
     if !READY_LOGGED.swap(true, Ordering::SeqCst) {
         println!("{INTERFACE_READY_MARKER}");
         let _ = std::io::stdout().flush();
         #[cfg(target_os = "android")]
         log::info!(target: "legion-app", "{INTERFACE_READY_MARKER}");
+        updater.0.on_app_ready();
     }
 
     if let Some(path) = std::env::var_os(READY_FILE_ENV).filter(|val| !val.is_empty()) {
@@ -253,6 +259,169 @@ pub fn ready() -> Result<(), AppError> {
     }
 
     Ok(())
+}
+
+/// Returns the current app update state without making network calls.
+#[tauri::command]
+pub async fn update_state(
+    app: tauri::AppHandle,
+    updater: State<'_, SharedUpdater>,
+) -> Result<UpdateState, AppError> {
+    #[cfg(target_os = "android")]
+    {
+        let android_updater = app.state::<AndroidUpdaterHandle>();
+        if let Ok(caps) = crate::updater::android::capabilities(&android_updater).await {
+            return Ok(updater.0.set_android_capabilities(caps));
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    let _ = app;
+    Ok(updater.0.snapshot())
+}
+
+/// Subscribes `on_state` to live updater state changes (and immediately sends the current state).
+#[tauri::command]
+pub fn update_watch(
+    updater: State<'_, SharedUpdater>,
+    on_state: Channel<UpdateState>,
+) -> Result<(), AppError> {
+    updater.0.watch(on_state);
+    Ok(())
+}
+
+/// Checks every reachable paired machine for a newer verified app update.
+#[tauri::command]
+pub async fn update_check(
+    app: tauri::AppHandle,
+    backend: State<'_, SharedBackend>,
+    updater: State<'_, SharedUpdater>,
+) -> Result<UpdateState, AppError> {
+    #[cfg(target_os = "android")]
+    let is_metered = {
+        let android_updater = app.state::<AndroidUpdaterHandle>();
+        if let Ok(caps) = crate::updater::android::capabilities(&android_updater).await {
+            let metered = caps.is_metered;
+            updater.0.set_android_capabilities(caps);
+            metered
+        } else {
+            false
+        }
+    };
+    #[cfg(not(target_os = "android"))]
+    let is_metered = {
+        let _ = app;
+        false
+    };
+    updater
+        .0
+        .check_with_backend(backend.0.as_ref(), false, is_metered)
+        .await
+}
+
+/// Downloads (if needed), re-verifies, and installs the available app update.
+#[tauri::command]
+pub async fn update_install(
+    app: tauri::AppHandle,
+    backend: State<'_, SharedBackend>,
+    updater: State<'_, SharedUpdater>,
+) -> Result<UpdateState, AppError> {
+    #[cfg(target_os = "android")]
+    {
+        let android_updater = app.state::<AndroidUpdaterHandle>();
+        updater
+            .0
+            .install_android(backend.0.as_ref(), &android_updater, false, false)
+            .await
+    }
+    #[cfg(target_os = "ios")]
+    {
+        let _ = (app, backend, updater);
+        Err(AppError::new(
+            ErrorCode::Unsupported,
+            "Updates on iOS are delivered through TestFlight or the App Store.",
+        ))
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let (st, should_exit) = updater.0.install_desktop(backend.0.as_ref(), false).await?;
+        if should_exit {
+            let handle = app.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                handle.exit(0);
+            });
+        }
+        Ok(st)
+    }
+}
+
+/// Enables or disables automatic updates (download when seen, install on start or leaving the app).
+#[tauri::command]
+pub fn update_set_auto(
+    updater: State<'_, SharedUpdater>,
+    enabled: bool,
+) -> Result<UpdateState, AppError> {
+    updater.0.set_auto_update(enabled)
+}
+
+/// Dismisses the one-time "Updated to …" or rollback notice.
+#[tauri::command]
+pub fn update_dismiss_notice(updater: State<'_, SharedUpdater>) -> Result<UpdateState, AppError> {
+    updater.0.dismiss_notice()
+}
+
+/// Installs an already-downloaded verified update at one of the two non-interrupting moments
+/// (`trigger`: `"startup"` before user interaction, or `"background"` when leaving the app).
+/// Never interrupts the user with an unexpected prompt or brings a backgrounded app forward.
+#[tauri::command]
+pub async fn update_maybe_auto_install(
+    app: tauri::AppHandle,
+    backend: State<'_, SharedBackend>,
+    updater: State<'_, SharedUpdater>,
+    trigger: Option<String>,
+) -> Result<UpdateState, AppError> {
+    let current = updater.0.snapshot();
+    let ready_or_checking_downloaded = current.phase == "ready"
+        || (current.phase == "checking"
+            && current.available.as_ref().is_some_and(|a| a.downloaded));
+    if !current.auto_update || !ready_or_checking_downloaded || !current.can_self_install {
+        return Ok(current);
+    }
+    let trigger_kind = trigger.as_deref().unwrap_or("startup");
+    if !matches!(trigger_kind, "startup" | "background") {
+        return Ok(current);
+    }
+    #[cfg(target_os = "android")]
+    {
+        let background = trigger_kind == "background";
+        let android_updater = app.state::<AndroidUpdaterHandle>();
+        updater
+            .0
+            .install_android(backend.0.as_ref(), &android_updater, true, background)
+            .await
+    }
+    #[cfg(target_os = "ios")]
+    {
+        let _ = (app, backend);
+        Ok(current)
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        // On desktop, window-close installs run via `WindowEvent::CloseRequested`; the frontend
+        // auto-install trigger applies only at startup before user interaction.
+        if trigger_kind != "startup" {
+            return Ok(current);
+        }
+        let (st, should_exit) = updater.0.install_desktop(backend.0.as_ref(), true).await?;
+        if should_exit {
+            let handle = app.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                handle.exit(0);
+            });
+        }
+        Ok(st)
+    }
 }
 
 fn write_ready_marker(path: &Path) -> Result<(), AppError> {

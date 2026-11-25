@@ -1186,17 +1186,20 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "ed25519-dalek",
+ "getrandom 0.4.3",
  "jiff",
  "legion-core",
  "legion-link",
  "legion-os",
  "legion-proto",
  "legion-tools",
+ "legion-update",
  "legion-xfer",
  "same-file",
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -1264,6 +1267,7 @@ dependencies = [
  "legion-core",
  "legion-os",
  "legion-proto",
+ "legion-update",
  "legion-xfer",
  "nix",
  "regex",
@@ -1276,6 +1280,21 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml_edit",
+]
+
+[[package]]
+name = "legion-update"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "ed25519-dalek",
+ "jiff",
+ "legion-proto",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

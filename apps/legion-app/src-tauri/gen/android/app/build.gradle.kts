@@ -1,4 +1,7 @@
+import java.time.ZoneOffset
+import java.time.ZonedDateTime
 import java.util.Properties
+import org.gradle.api.GradleException
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
@@ -14,6 +17,48 @@ val tauriProperties = Properties().apply {
     }
 }
 
+// Mirrors `legion_update::android_version_code` and `scripts/make-update-set.mjs` so Android's own
+// downgrade check always agrees with Legion's update sequence.
+fun androidVersionCodeFromSequence(raw: String): Int {
+    val seq = raw.trim().toLongOrNull()
+        ?: throw GradleException("LEGION_BUILD_SEQUENCE='$raw' is not a positive integer.")
+    if (seq <= 0L) {
+        throw GradleException("LEGION_BUILD_SEQUENCE='$raw' must be greater than 0.")
+    }
+    if (seq <= 20_000_000L) {
+        return seq.toInt()
+    }
+    if (seq in 202001010000L..299912312359L) {
+        val minute = (seq % 100L).toInt()
+        val hour = ((seq / 100L) % 100L).toInt()
+        val day = ((seq / 10_000L) % 100L).toInt()
+        val month = ((seq / 1_000_000L) % 100L).toInt()
+        val year = (seq / 100_000_000L).toInt()
+        val dt = try {
+            ZonedDateTime.of(year, month, day, hour, minute, 0, 0, ZoneOffset.UTC)
+        } catch (e: Exception) {
+            throw GradleException(
+                "LEGION_BUILD_SEQUENCE='$raw' is not a valid UTC YYYYMMDDHHMM timestamp: ${e.message}"
+            )
+        }
+        val unixMinutes = dt.toEpochSecond() / 60L
+        if (unixMinutes <= 0L || unixMinutes > 2_100_000_000L) {
+            throw GradleException("LEGION_BUILD_SEQUENCE='$raw' overflows Android versionCode.")
+        }
+        return unixMinutes.toInt()
+    }
+    throw GradleException(
+        "LEGION_BUILD_SEQUENCE='$raw' cannot map to Android versionCode (pass UTC YYYYMMDDHHMM or 1..20000000)."
+    )
+}
+
+val buildSequenceEnv = System.getenv("LEGION_BUILD_SEQUENCE")?.trim()?.takeIf { it.isNotEmpty() }
+val resolvedVersionCode = if (buildSequenceEnv != null) {
+    androidVersionCodeFromSequence(buildSequenceEnv)
+} else {
+    tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
+}
+
 android {
     compileSdk = 37
     namespace = "com.x1f4r.legion"
@@ -22,7 +67,7 @@ android {
         applicationId = "com.x1f4r.legion"
         minSdk = 30
         targetSdk = 37
-        versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
+        versionCode = resolvedVersionCode
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
     }
     buildTypes {

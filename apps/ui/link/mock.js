@@ -1,16 +1,21 @@
 import { formatBusyReasonLines } from '../lib/format.js';
+import { createMockFilesState, FILES_EXTRA_TOOLS, OLD_FS_FIND_TOOL } from './mock-files.js';
 
 // Deterministic mock link (?mock) shaped like real Legion tool results.
 // Mode flags (comma-separated, e.g. ?mock=multi,tech):
-//   token   - unauthenticated HTTP token start screen
-//   pair    - unauthenticated app pairing start screen
-//   repair  - damaged state file recovery screen
-//   limited - observer role (no exec, write, power, destroy, admin)
-//   multi   - native app mode with two paired nodes (tower, pi)
-//   fleet   - native app mode with learned routes, unsynced peer, relay peer, identity change, and fleet device.invite schema
-//   enrol   - with fleet, auto-completes the next created invite so post-pairing delivery appears
-//   first   - adds a never-seen machine ("mini") that starts in asking state
-//   tech    - starts with Technical details turned on
+//   token     - unauthenticated HTTP token start screen
+//   pair      - unauthenticated app pairing start screen
+//   repair    - damaged state file recovery screen
+//   limited   - observer role (no exec, write, power, destroy, admin)
+//   multi     - native app mode with two paired nodes (tower, pi)
+//   fleet     - native app mode with learned routes, unsynced peer, relay peer, identity change, and fleet device.invite schema
+//   enrol     - with fleet, auto-completes the next created invite so post-pairing delivery appears
+//   first     - adds a never-seen machine ("mini") that starts in asking state
+//   tech      - starts with Technical details turned on
+//   old       - configures mock as an older node with none of the new Files tools or content URLs
+//   nosync    - hides sync.* tools so the Kept in sync section is omitted
+//   large     - adds a 5 000-entry folder (/home/me/Archive5000) for paging tests
+//   transfers - seeds live running machine & device transfers for Activity preview
 
 const isoAgo = (sec) => new Date(Date.now() - sec * 1000).toISOString();
 
@@ -477,6 +482,47 @@ const MOCK_TOOLS = [
       },
     },
   },
+  {
+    name: 'update.list',
+    effect: 'read',
+    description: 'List the signed update sets stored on this node (newest first).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        channel: { type: 'string', enum: ['stable', 'preview'], description: 'Filter by channel.' },
+      },
+    },
+  },
+  {
+    name: 'update.publish',
+    effect: 'admin',
+    description: 'Verify a signed update set, store it, and notify reachable fleet machines.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        from: { type: 'string', description: 'Local directory holding the signed update set.' },
+        from_peer: { type: 'string', description: 'Peer machine to pull a set from.' },
+        channel: { type: 'string', enum: ['stable', 'preview'], description: 'Channel when using from_peer.' },
+        sequence: { type: 'integer', minimum: 1, description: 'Sequence when using from_peer.' },
+      },
+    },
+  },
+  {
+    name: 'update.read',
+    effect: 'read',
+    description: 'Read up to 1 MiB of one listed file from a stored update set as base64.',
+    input_schema: {
+      type: 'object',
+      required: ['channel', 'sequence', 'name'],
+      properties: {
+        channel: { type: 'string', enum: ['stable', 'preview'] },
+        sequence: { type: 'integer', minimum: 1 },
+        name: { type: 'string' },
+        offset: { type: 'integer', minimum: 0 },
+        length: { type: 'integer', minimum: 0, maximum: 1048576 },
+      },
+    },
+  },
 ];
 
 export function createMockLink(mode = '') {
@@ -503,10 +549,28 @@ export function createMockLink(mode = '') {
   const isRepair = flags.has('repair');
   const isPair = flags.has('pair');
   const isToken = flags.has('token');
+  const isUpdate = flags.has('update');
+  const isUpdated = flags.has('updated');
+  const isUpdateDeb = flags.has('update-deb');
+  const isUpdateFailed = flags.has('update-failed');
+  const isUpdateMetered = flags.has('update-metered');
+  const isUpdateSeq0 = flags.has('update-seq0');
 
   let authed = !isToken && !isPair && !isRepair;
   let repaired = false;
-  const kind = isPair || isMulti || isRepair || isFleet ? 'app' : 'mock';
+  const kind =
+    isPair ||
+    isMulti ||
+    isRepair ||
+    isFleet ||
+    isUpdate ||
+    isUpdated ||
+    isUpdateDeb ||
+    isUpdateFailed ||
+    isUpdateMetered ||
+    isUpdateSeq0
+      ? 'app'
+      : 'mock';
   let jobCounter = 10;
   let inviteCounter = 1;
   let activeNode = 'tower';
@@ -517,9 +581,54 @@ export function createMockLink(mode = '') {
   let deviceListPollCount = 0;
   let fleetDevicesByMachine = null;
 
+  const isOldNode = flags.has('old') || flags.has('legacy');
+  const isNoSync = flags.has('nosync') || isOldNode;
+
+  const baseTools = MOCK_TOOLS.map((t) => {
+    if (!isOldNode && t.name === 'fs.list') {
+      return {
+        ...t,
+        input_schema: {
+          ...t.input_schema,
+          properties: {
+            ...t.input_schema.properties,
+            sort: { type: 'string', enum: ['name', 'modified', 'size'] },
+            order: { type: 'string', enum: ['asc', 'desc'] },
+            categories: { type: 'array', items: { type: 'string' } },
+            offset: { type: 'integer', default: 0, minimum: 0 },
+          },
+        },
+      };
+    }
+    if (!isOldNode && t.name === 'fs.transfer') {
+      return {
+        ...t,
+        input_schema: {
+          ...t.input_schema,
+          properties: {
+            ...t.input_schema.properties,
+            if_exists: { type: 'string', enum: ['fail', 'skip', 'replace', 'rename'] },
+            move: { type: 'boolean', default: false },
+            background: { type: 'boolean', default: false },
+          },
+        },
+      };
+    }
+    return t;
+  });
+
+  const extraFileTools = isOldNode
+    ? [
+        OLD_FS_FIND_TOOL,
+        ...FILES_EXTRA_TOOLS.filter((t) => ['fs.mkdir', 'fs.move', 'fs.stat', 'fs.hash'].includes(t.name)),
+      ]
+    : FILES_EXTRA_TOOLS.filter((t) => !(isNoSync && t.name.startsWith('sync.')));
+
+  const fullBaseTools = [...baseTools, ...extraFileTools];
+
   const mockToolsList = isFleet
     ? [
-        ...MOCK_TOOLS.map((t) =>
+        ...fullBaseTools.map((t) =>
           t.name === 'device.invite'
             ? {
                 ...t,
@@ -563,7 +672,7 @@ export function createMockLink(mode = '') {
             ]
           : []),
       ]
-    : MOCK_TOOLS;
+    : fullBaseTools;
 
   const role = isNone ? 'guest' : isLimited ? 'observer' : 'owner';
   const allowedTools = isNone
@@ -826,31 +935,13 @@ export function createMockLink(mode = '') {
     };
   }
 
-  const fsTree = {
-    '/home/me': [
-      { name: 'projects', path: '/home/me/projects', kind: 'dir', size: 4096, mtime: isoAgo(1200), mode: '0755' },
-      { name: 'docs', path: '/home/me/docs', kind: 'dir', size: 4096, mtime: isoAgo(86400), mode: '0755' },
-      { name: 'notes.txt', path: '/home/me/notes.txt', kind: 'file', size: 124, mtime: isoAgo(3600), mode: '0644' },
-    ],
-    '/home/me/projects': [
-      { name: 'legion', path: '/home/me/projects/legion', kind: 'dir', size: 4096, mtime: isoAgo(600), mode: '0755' },
-      { name: 'notes', path: '/home/me/projects/notes', kind: 'dir', size: 4096, mtime: isoAgo(5400), mode: '0755' },
-    ],
-    '/home/me/projects/legion': [
-      { name: 'README.md', path: '/home/me/projects/legion/README.md', kind: 'file', size: 312, mtime: isoAgo(900), mode: '0644' },
-      { name: 'Cargo.toml', path: '/home/me/projects/legion/Cargo.toml', kind: 'file', size: 184, mtime: isoAgo(900), mode: '0644' },
-    ],
-    '/home/me/docs': [
-      { name: 'hello.txt', path: '/home/me/docs/hello.txt', kind: 'file', size: 38, mtime: isoAgo(86400), mode: '0644' },
-    ],
-  };
-
-  const fsFiles = {
-    '/home/me/notes.txt': 'Tower runs Linux 7.2 with 32 cores and 60 GB RAM.\nPi stays online as the Wake-on-LAN helper for laptop.\n',
-    '/home/me/docs/hello.txt': 'Hello from Legion mock file preview.\n',
-    '/home/me/projects/legion/README.md': '# Legion\n\nOne interface, one protocol, three pipes.\n',
-    '/home/me/projects/legion/Cargo.toml': '[workspace]\nmembers = ["crates/*"]\n',
-  };
+  const filesState = createMockFilesState({
+    machines,
+    flags,
+    activeNodeRef: () => activeNode,
+    isAuthedRef: () => authed,
+    canReadRef: () => allowedTools.includes('fs.read'),
+  });
 
   function resolveOne(target, tool, args, onEvent) {
     const name = target || activeNode;
@@ -870,6 +961,11 @@ export function createMockLink(mode = '') {
         hint: 'Ask the machine owner to grant access in policy.toml.',
         machine: name,
       };
+    }
+
+    if (tool.startsWith('fs.') || tool.startsWith('fav.') || tool.startsWith('sync.')) {
+      const handled = filesState.handleTool(name, tool, args, onEvent);
+      if (handled !== undefined) return handled;
     }
 
     switch (tool) {
@@ -938,7 +1034,9 @@ export function createMockLink(mode = '') {
             : { machine: 'tower', reachable: true, node: 'tower', system: 'linux', version: '0.1.0', os: 'linux', arch: 'x86_64', latency_ms: 0 },
           { machine: 'pi', reachable: true, node: 'pi', system: 'linux', version: '0.1.0', os: 'linux', arch: 'aarch64', latency_ms: 4 },
           { machine: 'studio', reachable: true, node: 'studio', system: 'macos', version: '0.1.0', os: 'macos', arch: 'aarch64', latency_ms: 11 },
-          { machine: 'laptop', reachable: false, error: machines.laptop.error },
+          machines.laptop.reachable
+            ? { machine: 'laptop', reachable: true, node: 'laptop', system: 'linux', version: '0.1.0', os: 'linux', arch: 'x86_64', latency_ms: 8 }
+            : { machine: 'laptop', reachable: false, error: machines.laptop.error },
           { machine: 'nas', reachable: false, error: machines.nas.error },
         ];
         if (isFirst) {
@@ -1123,43 +1221,11 @@ export function createMockLink(mode = '') {
           duration_ms: 38,
         };
       }
-      case 'fs.list': {
-        const requested = (args?.path || '~').replace(/^~(?=\/|$)/, '/home/me').replace(/\/+$/, '') || '/home/me';
-        const entries = fsTree[requested];
-        if (!entries) {
-          throw { code: 'not_found', message: `${requested} does not exist.`, hint: null, machine: name };
-        }
-        return { path: requested, entries, truncated: false };
-      }
-      case 'fs.read': {
-        const requested = (args?.path || '').replace(/^~(?=\/|$)/, '/home/me');
-        const content = fsFiles[requested];
-        if (content === undefined) {
-          throw { code: 'not_found', message: `${requested} does not exist.`, hint: null, machine: name };
-        }
-        return {
-          path: requested,
-          size: content.length,
-          offset: 0,
-          length: content.length,
-          encoding: 'utf8',
-          content,
-          eof: true,
-        };
-      }
-      case 'fs.transfer':
-        return {
-          transferred: !args?.dry_run,
-          dry_run: Boolean(args?.dry_run) || undefined,
-          from: args?.from,
-          to: args?.to,
-          bytes: 124,
-        };
       case 'job.list': {
         if (isEmpty) return { jobs: [], truncated: false };
         const jobs = args?.state ? m.jobs.filter((j) => j.state === args.state) : m.jobs;
         return {
-          jobs: jobs.map(({ logs: _logs, ...rest }) => rest),
+          jobs: jobs.map(({ logs: _logs, _mockLive: _live, ...rest }) => rest),
           truncated: false,
         };
       }
@@ -1183,8 +1249,16 @@ export function createMockLink(mode = '') {
         if (!job) throw { code: 'not_found', message: `No job ${args?.id}.`, hint: null, machine: name };
         return {
           id: job.id,
+          kind: job.kind,
           name: job.name,
+          title: job.title,
           cmd: job.command,
+          from: job.from,
+          to: job.to,
+          move: job.move,
+          hash: job.hash,
+          error_summary: job.error_summary,
+          progress: job.progress ? { ...job.progress } : undefined,
           state: job.state,
           created: job.created,
           finished: job.finished,
@@ -1302,14 +1376,35 @@ export function createMockLink(mode = '') {
           detail: had ? 'Cancelled pending power action.' : 'Nothing is pending on this machine.',
         };
       }
-      case 'power.wake':
+      case 'power.wake': {
+        const wakeTarget = args?.machine || 'laptop';
+        if (!args?.dry_run && machines[wakeTarget] && !machines[wakeTarget].reachable) {
+          setTimeout(() => {
+            const targetMachine = machines[wakeTarget];
+            if (!targetMachine || targetMachine.reachable) return;
+            targetMachine.reachable = true;
+            targetMachine.error = null;
+            if (!targetMachine.sys) {
+              targetMachine.sys = {
+                node: wakeTarget,
+                os: { family: 'linux', name: 'Linux', arch: 'x86_64' },
+                uptime_s: 12,
+                load: [0.18, 0.14, 0.1],
+                memory: { total: 32 * 1024 ** 3, used: 6 * 1024 ** 3, available: 26 * 1024 ** 3 },
+                disks: [{ mount: '/', total: 1000 * 1024 ** 3, used: 420 * 1024 ** 3, available: 580 * 1024 ** 3 }],
+                gpus: [],
+              };
+            }
+          }, 450);
+        }
         return {
-          machine: args?.machine || 'laptop',
+          machine: wakeTarget,
           awake: false,
           sent_by: 'pi',
           dry_run: Boolean(args?.dry_run) || undefined,
           would_send: args?.dry_run ? ['255.255.255.255:9'] : undefined,
         };
+      }
       default:
         return { ok: true, tool, args: args || {}, node: name };
     }
@@ -1325,6 +1420,10 @@ export function createMockLink(mode = '') {
     const { on, onEvent } = options || {};
     if (typeof window !== 'undefined') {
       window.__LEGION_MOCK_LAST_CALL__ = { tool, args, on: on ?? null };
+      // Tests that must not depend on what the screen calls next read the recent calls instead.
+      const recent = window.__LEGION_MOCK_CALLS__ || (window.__LEGION_MOCK_CALLS__ = []);
+      recent.push({ tool, args, on: on ?? null });
+      if (recent.length > 200) recent.splice(0, recent.length - 200);
     }
     if (kind === 'app' && !on && !MOCK_ANY_NODE_TOOLS.has(tool)) {
       throw {
@@ -1689,7 +1788,179 @@ export function createMockLink(mode = '') {
     return 'legion-invite-1.mock.scanned';
   }
 
-  return {
+  const updateWatchers = new Set();
+  const mockDebSha256 = 'a'.repeat(64);
+  let mockUpdateState =
+    kind === 'app'
+      ? {
+          phase: isUpdateSeq0
+            ? 'unsupported'
+            : isUpdateDeb
+              ? 'manual'
+              : isUpdateFailed
+                ? 'error'
+                : isUpdateMetered
+                  ? 'available'
+                  : isUpdate
+                    ? 'ready'
+                    : 'up_to_date',
+          current: {
+            version: isUpdated ? '0.2.0' : '0.1.0',
+            build: isUpdated ? 'feedface1234' : 'abc123456789',
+            sequence: isUpdateSeq0 ? 0 : isUpdated ? 202611250205 : 202611250200,
+            os: isUpdateDeb ? 'linux' : 'android',
+            arch: isUpdateDeb ? 'x86_64' : 'aarch64',
+            install_kind: isUpdateDeb ? 'deb' : 'apk',
+            preview_enabled: true,
+            release_key_fingerprint: 'SHA256:MockReleaseKey11111111111111111111111111111',
+            preview_key_fingerprint: 'SHA256:MockPreviewKey22222222222222222222222222222',
+          },
+          sequence_floor: isUpdateSeq0 ? 0 : isUpdated ? 202611250205 : 202611250200,
+          auto_update: true,
+          can_self_install: !isUpdateDeb && !isUpdateSeq0,
+          unsupported_reason: isUpdateSeq0
+            ? 'This build has sequence 0, so self-updates are disabled.'
+            : null,
+          manual_command: isUpdateDeb
+            ? 'sudo apt-get install /home/me/.local/share/com.x1f4r.legion/updates/verified/legion-app_0.2.0_amd64.deb'
+            : null,
+          manual_sha256: isUpdateDeb ? mockDebSha256 : null,
+          available:
+            isUpdate || isUpdateDeb || isUpdateFailed || isUpdateMetered
+              ? {
+                  channel: 'preview',
+                  version: '0.2.0',
+                  build: 'feedface1234',
+                  sequence: 202611250205,
+                  published_at: isoAgo(180),
+                  notes: 'Automatic fleet updates and faster status refresh.',
+                  signer: 'preview',
+                  key_fingerprint: 'SHA256:MockPreviewKey22222222222222222222222222222',
+                  source_node: 'tower',
+                  artifact_name: isUpdateDeb ? 'legion-app_0.2.0_amd64.deb' : 'Legion-0.2.0.apk',
+                  artifact_sha256: isUpdateDeb ? mockDebSha256 : '0'.repeat(64),
+                  artifact_size: 18_000_000,
+                  downloaded: !isUpdateMetered,
+                }
+              : null,
+          progress: null,
+          metered_paused: isUpdateMetered,
+          last_checked_at: isoAgo(30),
+          checked_nodes: ['tower'],
+          just_updated: isUpdated
+            ? {
+                channel: 'preview',
+                version: '0.2.0',
+                build: 'feedface1234',
+                sequence: 202611250205,
+                notes: 'Automatic fleet updates and faster status refresh.',
+                updated_at: isoAgo(60),
+              }
+            : null,
+          rolled_back: null,
+          failed_update: isUpdateFailed
+            ? {
+                channel: 'preview',
+                version: '0.2.0',
+                sequence: 202611250205,
+                reason: 'Version 0.2.0 did not finish installing.',
+                failed_at: isoAgo(120),
+              }
+            : null,
+          android: isUpdateDeb
+            ? null
+            : {
+                canRequestPackageInstalls: true,
+                isSelfInstaller: true,
+                installerPackage: 'com.x1f4r.legion',
+                apiLevel: 35,
+                supportsSilentSelfUpdate: true,
+                isMetered: isUpdateMetered,
+              },
+          last_error: isUpdateFailed ? 'Version 0.2.0 did not finish installing.' : null,
+          last_error_detail: isUpdateFailed ? 'INSTALL_FAILED_VERIFICATION_FAILURE' : null,
+        }
+      : null;
+
+  function emitMockUpdateState() {
+    if (!mockUpdateState) return;
+    const copy = structuredClone(mockUpdateState);
+    for (const fn of updateWatchers) {
+      try {
+        fn(copy);
+      } catch {
+        // Ignore callback failure.
+      }
+    }
+  }
+
+  async function updateState() {
+    return mockUpdateState ? structuredClone(mockUpdateState) : null;
+  }
+
+  function watchUpdates(onState) {
+    if (!mockUpdateState || typeof onState !== 'function') return () => {};
+    updateWatchers.add(onState);
+    onState(structuredClone(mockUpdateState));
+    return () => updateWatchers.delete(onState);
+  }
+
+  async function checkUpdates() {
+    if (!mockUpdateState) return null;
+    mockUpdateState.last_checked_at = new Date().toISOString();
+    emitMockUpdateState();
+    return structuredClone(mockUpdateState);
+  }
+
+  async function installUpdate() {
+    if (!mockUpdateState) return null;
+    if (mockUpdateState.available && mockUpdateState.can_self_install) {
+      const next = mockUpdateState.available;
+      mockUpdateState = {
+        ...mockUpdateState,
+        phase: 'up_to_date',
+        current: {
+          ...mockUpdateState.current,
+          version: next.version,
+          build: next.build,
+          sequence: next.sequence,
+        },
+        sequence_floor: next.sequence,
+        available: null,
+        just_updated: {
+          channel: next.channel,
+          version: next.version,
+          build: next.build,
+          sequence: next.sequence,
+          notes: next.notes,
+          updated_at: new Date().toISOString(),
+        },
+      };
+      emitMockUpdateState();
+    }
+    return structuredClone(mockUpdateState);
+  }
+
+  async function setAutoUpdate(enabled) {
+    if (!mockUpdateState) return null;
+    mockUpdateState.auto_update = Boolean(enabled);
+    emitMockUpdateState();
+    return structuredClone(mockUpdateState);
+  }
+
+  async function dismissUpdateNotice() {
+    if (!mockUpdateState) return null;
+    mockUpdateState.just_updated = null;
+    mockUpdateState.rolled_back = null;
+    emitMockUpdateState();
+    return structuredClone(mockUpdateState);
+  }
+
+  async function maybeAutoInstall(_trigger = 'startup') {
+    return updateState();
+  }
+
+  const baseApi = {
     kind,
     mockFlags: flags,
     state,
@@ -1707,5 +1978,20 @@ export function createMockLink(mode = '') {
     repairStore,
     scanInvite,
     initialFleetCache,
+    ...filesState.optionalLinkMethods,
   };
+
+  if (kind === 'app') {
+    return {
+      ...baseApi,
+      updateState,
+      watchUpdates,
+      checkUpdates,
+      installUpdate,
+      setAutoUpdate,
+      dismissUpdateNotice,
+      maybeAutoInstall,
+    };
+  }
+  return baseApi;
 }
