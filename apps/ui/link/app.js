@@ -114,13 +114,13 @@ export function createAppLink() {
   const iosPlatform = isIosPlatform();
   const unsupportedContentMachines = new Set();
   const contentSupportListeners = new Set();
+  let hasLocalPipe = false;
+  let localPipeNode = null;
   const appResumeListeners = new Set();
   let nativeResumeUnlistens = null;
   let nativeResumeReady = null;
   let nativeResumeToken = null;
   let sawNativeSuspend = false;
-  let hasLocalPipe = false;
-  let localPipeNode = null;
 
   function notifyAppResume(source) {
     for (const listener of appResumeListeners) {
@@ -514,16 +514,16 @@ export function createAppLink() {
       const refreshed = [];
       for (const [name, entry] of Object.entries(result.results || {})) {
         if (entry && typeof entry === 'object' && entry.ok && !entry.error) {
-          refreshed.push(name);
-          if (typeof entry.ok.node === 'string') refreshed.push(entry.ok.node);
+          refreshed.push(displayMachineFor(name));
+          if (typeof entry.ok.node === 'string') refreshed.push(displayMachineFor(entry.ok.node));
         }
       }
       if (refreshed.length > 0) clearContentUnsupported(refreshed);
       return;
     }
 
-    const onKey = machineKey(targetOn);
-    const nodeKey = machineKey(result.node);
+    const onKey = machineKey(displayMachineFor(targetOn));
+    const nodeKey = machineKey(displayMachineFor(result.node));
     const refreshed = [];
     if (onKey && onKey !== 'all') refreshed.push(onKey);
     if (nodeKey) refreshed.push(nodeKey);
@@ -539,7 +539,7 @@ export function createAppLink() {
   }
 
   function supportsContentFor(machine) {
-    const key = machineKey(machine);
+    const key = machineKey(displayMachineFor(machine));
     return !key || !unsupportedContentMachines.has(key);
   }
 
@@ -1128,9 +1128,9 @@ export function createAppLink() {
         payload.onEvent = channel;
       }
       const res = await invoke('call', payload);
-      const result = rewriteCallResult(tool, res, calledLocalPipe);
-      noteCapabilityContact(tool, displayMachineFor(on), result);
-      return result;
+      const rewritten = rewriteCallResult(tool, res, calledLocalPipe);
+      noteCapabilityContact(tool, displayMachineFor(on), rewritten);
+      return rewritten;
     } catch (err) {
       throw formatError(err);
     } finally {
@@ -1251,6 +1251,7 @@ export function createAppLink() {
         // Selected machine did not answer: keep it selected and mark it unreachable with its
         // last known role ("as of <when>"), never substituting another node's identity.
         const resolvedNodeName = primaryIsLocalPipe ? localDisplayName() : rawTargetNode;
+        selectedNode = machineKey(resolvedNodeName);
         const nodeNamePending = primaryIsLocalPipe && !localPipeNode;
         const cached = isRealMachineName(resolvedNodeName)
           ? readCachedNodeIdentity(resolvedNodeName)
@@ -1568,7 +1569,7 @@ export function createAppLink() {
         path: path || '',
         download: Boolean(download),
       });
-      clearContentUnsupported([machine || selectedNode]);
+      clearContentUnsupported([displayMachineFor(machine) || selectedNode]);
       if (signal?.aborted) {
         if (result?.url) {
           invoke('content_revoke', { url: String(result.url) }).catch(() => {});

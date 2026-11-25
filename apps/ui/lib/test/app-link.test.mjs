@@ -789,7 +789,6 @@ test('createAppLink does not mark relay or target unsupported on relay_too_old a
     }
   }
 });
-
 test('createAppLink onAppResume listens to native tauri://resumed and deduplicates focus fallback', async () => {
   const prevWindow = globalThis.window;
   const handlers = new Map();
@@ -1262,6 +1261,7 @@ test('createAppLink resolves local pipe to the node name, routes calls through l
   const prevWindow = globalThis.window;
   const calls = [];
   let transferChannel = null;
+  let ticketSeq = 0;
   globalThis.window = {
     __TAURI__: {
       core: {
@@ -1306,7 +1306,18 @@ test('createAppLink resolves local pipe to the node name, routes calls through l
             return Promise.resolve([{ name: 'fs.list', effect: 'read' }]);
           }
           if (command === 'content_url') {
-            return Promise.resolve({ url: 'http://127.0.0.1:42001/v1/content/tok/a.png', expires_in: 900 });
+            ticketSeq += 1;
+            const fileName = String(payload.path || 'file').split('/').pop();
+            return Promise.resolve({
+              url: `http://127.0.0.1:42001/v1/content/tok-${payload.machine}-${ticketSeq}/${fileName}`,
+              expires_in: 900,
+            });
+          }
+          if (command === 'content_status') {
+            return Promise.resolve({ request_count: 1, status: 200, stream_failed: false, ticket_live: true });
+          }
+          if (command === 'content_revoke') {
+            return Promise.resolve(true);
           }
           if (command === 'transfer_download' || command === 'transfer_upload' || command === 'transfer_open_externally') {
             return Promise.resolve({ id: 'tr-local' });
@@ -1363,18 +1374,38 @@ test('createAppLink resolves local pipe to the node name, routes calls through l
     // Outgoing calls addressed to the local computer's real node name use the local pipe.
     await link.call('fs.list', { path: '~' }, { on: 'studio' });
     await link.tools({ on: 'studio' });
-    await link.contentUrl({ machine: 'studio', path: '/home/me/a.png' });
+    const localPic = await link.contentUrl({ machine: 'studio', path: '/home/me/a.png' });
+    const localVid = await link.contentUrl({ machine: 'studio', path: '/home/me/clip.mp4' });
+    const remotePic = await link.contentUrl({ machine: 'tower', path: '/home/me/b.png' });
+    const remoteVid = await link.contentUrl({ machine: 'tower', path: '/home/me/clip.mp4' });
     await link.download({ machine: 'studio', path: '/home/me/a.png' });
     await link.upload({ machine: 'studio', dir: '/home/me' });
     await link.openExternally({ machine: 'studio', path: '/home/me/a.png' });
 
     assert.equal(calls.find((c) => c.command === 'call' && c.payload.tool === 'fs.list')?.payload?.on, 'local');
     assert.equal(calls.find((c) => c.command === 'tools')?.payload?.on, 'local');
-    assert.equal(calls.find((c) => c.command === 'content_url')?.payload?.machine, 'local');
+    const urlCalls = calls.filter((c) => c.command === 'content_url');
+    assert.deepEqual(
+      urlCalls.map((c) => [c.payload.machine, c.payload.path]),
+      [
+        ['local', '/home/me/a.png'],
+        ['local', '/home/me/clip.mp4'],
+        ['tower', '/home/me/b.png'],
+        ['tower', '/home/me/clip.mp4'],
+      ],
+    );
     assert.equal(calls.find((c) => c.command === 'transfer_download')?.payload?.machine, 'local');
     assert.equal(calls.find((c) => c.command === 'transfer_upload')?.payload?.machine, 'local');
     assert.equal(calls.find((c) => c.command === 'transfer_open_externally')?.payload?.machine, 'local');
 
+    // Content status and revocation work identically for local-pipe and remote-machine URLs.
+    for (const minted of [localPic, localVid, remotePic, remoteVid]) {
+      const status = await link.contentStatus(minted.url);
+      assert.equal(status.status, 200);
+      assert.equal(await link.revokeContentUrl(minted.url), true);
+    }
+    const revokedUrls = calls.filter((c) => c.command === 'content_revoke').map((c) => c.payload.url);
+    assert.deepEqual(revokedUrls, [localPic.url, localVid.url, remotePic.url, remoteVid.url]);
     // Remote machines still keep their own node name.
     await link.call('fs.list', { path: '~' }, { on: 'tower' });
     assert.equal(
@@ -1430,6 +1461,15 @@ test('createAppLink exposes This computer while local node name cannot be read y
           if (command === 'call' && payload.tool === 'meta.version') {
             return Promise.reject({ code: 'unreachable', message: 'Starting up.', machine: 'local' });
           }
+          if (command === 'content_url') {
+            return Promise.resolve({
+              url: 'http://127.0.0.1:42001/v1/content/tok-pending/pic.png',
+              expires_in: 900,
+            });
+          }
+          if (command === 'content_revoke') {
+            return Promise.resolve(true);
+          }
           return Promise.resolve({});
         },
         Channel: class FakeChannel {
@@ -1449,6 +1489,11 @@ test('createAppLink exposes This computer while local node name cannot be read y
     assert.equal(initial.nodes[0].isLocalComputer, true);
     assert.equal(initial.nodes[0].nodeNamePending, true);
     assert.equal(initial.nodes[0].unreachableError.machine, 'This computer');
+
+    // Minting and revoking content URLs for "This computer" before name resolution routes over local pipe.
+    const pendingUrl = await link.contentUrl({ machine: 'This computer', path: '/home/me/pic.png' });
+    assert.equal(calls.find((c) => c.command === 'content_url')?.payload?.machine, 'local');
+    assert.equal(await link.revokeContentUrl(pendingUrl.url), true);
 
     // Subsequent call addressed to "This computer" routes over the local pipe and settles the name.
     whoamiReady = true;
