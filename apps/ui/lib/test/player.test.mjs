@@ -7,6 +7,7 @@ import {
   clampVolume,
   classifyPlayerKey,
   computeResumePosition,
+  createFullscreenController,
   createResumeStore,
   createVideoController,
   DOUBLE_TAP_WINDOW_MS,
@@ -568,4 +569,94 @@ test('createBrowserImmersive requests fullscreen on viewer element, falls back t
   const res = await safariApi.immersive(true, { element: {}, video: webkitVideo, orientation: 'landscape' });
   assert.deepEqual(res, { active: true, mode: 'webkit-video' });
   assert.equal(webkitEntered, 1);
+});
+
+test('createFullscreenController owns state, history entry, and external platform exits as a single source of truth', async () => {
+  const stack = [{ state: null, hash: '#/files/tower/Videos?view=A.mp4' }];
+  let idx = 0;
+  let currentHash = stack[0].hash;
+  const fakeHistory = {
+    get state() {
+      return stack[idx].state;
+    },
+    replaceState(state, _title, url) {
+      stack[idx].state = state;
+      if (url) {
+        stack[idx].hash = url;
+        currentHash = url;
+      }
+    },
+    pushState(state, _title, url) {
+      stack.splice(idx + 1);
+      const nextHash = url || currentHash;
+      stack.push({ state, hash: nextHash });
+      idx += 1;
+      currentHash = nextHash;
+    },
+    back() {
+      if (idx > 0) {
+        idx -= 1;
+        currentHash = stack[idx].hash;
+        queueMicrotask(() => ctrl.handlePopState());
+      }
+    },
+  };
+
+  const calls = [];
+  let platformListener = null;
+  const fakeLink = {
+    async immersive(on, opts) {
+      calls.push({ on, orientation: opts?.orientation });
+      return { active: on, mode: 'android' };
+    },
+    onImmersiveChange(fn) {
+      platformListener = fn;
+      return () => {
+        platformListener = null;
+      };
+    },
+  };
+
+  const states = [];
+  const ctrl = createFullscreenController({
+    link: fakeLink,
+    history: fakeHistory,
+    getHash: () => currentHash,
+    onChange: (s) => states.push(s),
+  });
+
+  // Enter via button -> pushes history entry.
+  await ctrl.enter('button', { orientation: 'landscape' });
+  assert.equal(ctrl.getState().active, true);
+  assert.equal(ctrl.getState().source, 'button');
+  assert.equal(ctrl.getState().pushedHistory, true);
+  assert.equal(stack.length, 2);
+
+  // Switch sibling while in fullscreen -> updates hash on top entry.
+  fakeHistory.replaceState(fakeHistory.state, '', '#/files/tower/Videos?view=B.mp4');
+  ctrl.noteViewerHash('#/files/tower/Videos?view=B.mp4');
+
+  // Leave via action (like Rename/Delete) even though native platform sends NO change event:
+  // updates state to inactive immediately and pops history cleanly back to B.mp4 (not A.mp4!).
+  await ctrl.leave();
+  assert.equal(ctrl.getState().active, false);
+  assert.equal(ctrl.getState().source, null);
+  assert.equal(ctrl.getState().pushedHistory, false);
+  assert.equal(idx, 0);
+  assert.equal(currentHash, '#/files/tower/Videos?view=B.mp4');
+  assert.deepEqual(
+    calls.map((c) => c.on),
+    [true, false],
+  );
+
+  // Platform-initiated exit (e.g. browser Esc) clears state and pops history.
+  await ctrl.enter('button', { orientation: 'landscape' });
+  assert.equal(ctrl.getState().active, true);
+  assert.equal(idx, 1);
+  platformListener(false);
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(ctrl.getState().active, false);
+  assert.equal(idx, 0);
+
+  ctrl.dispose();
 });

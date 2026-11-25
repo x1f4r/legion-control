@@ -3,7 +3,7 @@
 // on content addresses, text (128 KiB + load more), extensionless text probing, and in-place
 // "Open in another app" staging with progress, cancel, and honest errors.
 
-import { html, useEffect, useRef, useState } from '../vendor/preact-htm.js';
+import { html, useEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
 import { Icon } from '../icons.js';
 import { plainErrorMessage } from '../lib/errors.js';
 import {
@@ -19,7 +19,7 @@ import {
 } from '../lib/files.js';
 import { readTextWrapPreference, writeTextWrapPreference } from '../lib/files-store.js';
 import { formatBytePair, formatBytes, formatRelativeTime } from '../lib/format.js';
-import { formatSpeed, PLAYBACK_SPEEDS } from '../lib/player.js';
+import { createFullscreenController, formatSpeed, PLAYBACK_SPEEDS } from '../lib/player.js';
 import { CopyButton, Notice, Sheet } from './common.js';
 import { MusicPlayer, VideoPlayer } from './player.js';
 
@@ -166,7 +166,12 @@ export function FilesViewer({
   const [chromeHidden, setChromeHidden] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
   const [musicPlaybackRate, setMusicPlaybackRate] = useState(1);
-  const [videoFullscreen, setVideoFullscreen] = useState(false);
+  const [fullscreenState, setFullscreenState] = useState({
+    active: false,
+    source: null,
+    pushedHistory: false,
+    inFlight: false,
+  });
   const [wrapLines, setWrapLines] = useState(() => readTextWrapPreference(safeStorage()));
   const [retryNonce, setRetryNonce] = useState(0);
   const [binaryTsVideo, setBinaryTsVideo] = useState(() => ({ key: fileKey, active: false }));
@@ -236,11 +241,23 @@ export function FilesViewer({
   const activeOpen = openState.key === fileKey ? openState : makeIdleOpenState(fileKey);
 
   const viewerRef = useRef(null);
-  const pictureImmersiveRef = useRef(false);
   const imgRef = useRef(null);
   const videoRef = useRef(null);
   const audioRef = useRef(null);
   const musicAutoPlayRef = useRef(null);
+  const fullscreenController = useMemo(
+    () =>
+      createFullscreenController({
+        link,
+        getElement: () => viewerRef.current,
+        getVideo: () => videoRef.current,
+        onChange: (next) => setFullscreenState(next),
+      }),
+    [link],
+  );
+  if (typeof window !== 'undefined' && window.location.hash) {
+    fullscreenController.noteViewerHash(window.location.hash);
+  }
   const abortRef = useRef(null);
   const noticeTimerRef = useRef(null);
   const activeFileKeyRef = useRef(fileKey);
@@ -357,16 +374,15 @@ export function FilesViewer({
     }
   }
 
-  function handleClose() {
+  async function handleClose() {
     if (abortRef.current) {
       abortRef.current.abort();
       abortRef.current = null;
     }
     stopMediaElements();
     revokeActiveMintedUrl();
-    if (pictureImmersiveRef.current) {
-      pictureImmersiveRef.current = false;
-      link?.immersive?.(false, { element: viewerRef.current });
+    if (fullscreenController.getState().active) {
+      await fullscreenController.leave();
     }
     link?.keepScreenOn?.(false);
     if (onClose) onClose();
@@ -375,36 +391,46 @@ export function FilesViewer({
   const effectiveChromeHidden =
     chromeHidden && activeOpen.status === 'idle' && !(viewerNotice && viewerNotice.key === fileKey);
 
-  // Picture viewer: hidden viewer bars and hidden system bars are one state.
+  // Register the single viewer-level fullscreen controller for history Back handling.
+  useEffect(() => {
+    if (typeof onRegisterPopState === 'function') {
+      return onRegisterPopState(() => fullscreenController.handlePopState());
+    }
+    const onPopState = () => {
+      fullscreenController.handlePopState();
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, [fullscreenController, onRegisterPopState]);
+
+  // Picture viewer: hidden viewer bars and hidden system bars are one state owned by the controller.
   useEffect(() => {
     if (category === 'image' && effectiveChromeHidden) {
-      pictureImmersiveRef.current = true;
-      link?.immersive?.(true, { orientation: 'none', element: viewerRef.current });
-    } else if (pictureImmersiveRef.current) {
-      pictureImmersiveRef.current = false;
-      link?.immersive?.(false, { element: viewerRef.current });
+      fullscreenController.enter('picture', { orientation: 'none' });
+    } else if (fullscreenController.getState().source === 'picture') {
+      fullscreenController.leave();
     }
-  }, [category, effectiveChromeHidden, link]);
+  }, [category, effectiveChromeHidden, fullscreenController]);
 
+  // If the platform leaves immersive while a picture is hiding its bars, restore the viewer bars.
   useEffect(() => {
-    if (category !== 'image' || typeof link?.onImmersiveChange !== 'function') return undefined;
-    return link.onImmersiveChange((active) => {
-      if (!active && pictureImmersiveRef.current) {
-        pictureImmersiveRef.current = false;
+    let prevSource = null;
+    if (fullscreenState.source === 'picture' && fullscreenState.active) {
+      prevSource = 'picture';
+    }
+    return () => {
+      if (prevSource === 'picture' && !fullscreenController.getState().active) {
         setChromeHidden(false);
       }
-    });
-  }, [category, link]);
+    };
+  }, [fullscreenState.active, fullscreenState.source, fullscreenController]);
 
   useEffect(() => {
     return () => {
-      if (pictureImmersiveRef.current) {
-        pictureImmersiveRef.current = false;
-        link?.immersive?.(false, { element: viewerRef.current });
-      }
+      fullscreenController.dispose();
       link?.keepScreenOn?.(false);
     };
-  }, [link]);
+  }, [fullscreenController, link]);
 
   function syncOpenStateFromTransfers(list) {
     if (!Array.isArray(list)) return;
@@ -2108,10 +2134,10 @@ export function FilesViewer({
   const expectedUrl = mediaUrl;
   const openBanner = renderOpenBanner();
 
-  function runOutsideFullscreen(fn) {
+  async function runOutsideFullscreen(fn) {
     setMoreOpen(false);
-    if (videoFullscreen) {
-      link?.immersive?.(false, { element: viewerRef.current });
+    if (fullscreenController.getState().active) {
+      await fullscreenController.leave();
     }
     if (fn) fn();
   }
@@ -2131,7 +2157,8 @@ export function FilesViewer({
               siblings=${siblings}
               link=${link}
               viewerRef=${viewerRef}
-              onRegisterPopState=${onRegisterPopState}
+              fullscreenController=${fullscreenController}
+              fullscreenState=${fullscreenState}
               moreOpen=${moreOpen}
               onOpenMore=${() => setMoreOpen(true)}
               onClose=${handleClose}
@@ -2143,7 +2170,6 @@ export function FilesViewer({
               onMediaError=${(el) => {
                 if (expectedUrl) handleMediaElementError('video', expectedKey, expectedUrl, el);
               }}
-              onFullscreenStateChange=${(active) => setVideoFullscreen(Boolean(active))}
             />
             ${openBanner ? html`<div class="player-open-banner-wrap">${openBanner}</div>` : null}
           `

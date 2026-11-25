@@ -610,6 +610,78 @@ test('Player: instance and full screen survive file changes (next, prev, song en
   }
 });
 
+test('Player: single full-screen owner keeps Rename and Delete from full screen in sync', async () => {
+  const server = await startStaticUiServer();
+  const browser = await chromium.launch({
+    executablePath: findBrowser(),
+    headless: true,
+    args: ['--no-sandbox', '--disable-gpu', '--autoplay-policy=no-user-gesture-required'],
+  });
+  const consoleErrors = [];
+  const pageErrors = [];
+
+  try {
+    const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
+    const page = await context.newPage();
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => pageErrors.push(String(err)));
+
+    // 1. Rename from full screen (mock mode sends no native change event):
+    // full screen exits, button immediately reverts to "Full screen", and ONE Back closes the viewer.
+    await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').click();
+    await page.locator('.viewer video.viewer-video[src]').waitFor();
+
+    await page.locator('.viewer button[aria-label="Full screen"]').click();
+    await page.locator('.viewer button[aria-label="Exit full screen"]').waitFor();
+
+    await page.locator('.viewer .player-top button[aria-label="More options"]').click();
+    await page.locator('.sheet button.row', { hasText: 'Rename' }).click();
+    await page.locator('.sheet h2', { hasText: 'Rename' }).waitFor({ timeout: 5000 });
+    await page.locator('.sheet button', { hasText: 'Cancel' }).click();
+    await page.locator('.sheet').waitFor({ state: 'hidden', timeout: 5000 });
+
+    // Player button must already say "Full screen" (NOT stale "Exit full screen").
+    await page.locator('.viewer button[aria-label="Full screen"]').waitFor({ timeout: 5000 });
+    assert.equal(await page.locator('.viewer button[aria-label="Exit full screen"]').count(), 0);
+
+    // A SINGLE Back must close the viewer (no leftover full-screen history entry!).
+    await page.evaluate(() => window.history.back());
+    await page.locator('.viewer').waitFor({ state: 'hidden', timeout: 5000 });
+
+    // 2. Delete from full screen: confirming Delete closes the viewer cleanly instead of staying open on the deleted file.
+    await page.locator('.grid a.cell[aria-label="Beach.mp4"]').click();
+    await page.locator('.viewer video.viewer-video[src]').waitFor();
+
+    await page.locator('.viewer button[aria-label="Full screen"]').click();
+    await page.locator('.viewer button[aria-label="Exit full screen"]').waitFor();
+
+    await page.locator('.viewer .player-top button[aria-label="More options"]').click();
+    await page.locator('.sheet button.row', { hasText: 'Delete' }).click();
+    await page.locator('.sheet h2', { hasText: 'Delete Beach.mp4?' }).waitFor({ timeout: 5000 });
+    await page.locator('.sheet button.btn.danger', { hasText: 'Delete' }).click();
+
+    await page.locator('.viewer').waitFor({ state: 'hidden', timeout: 5000 });
+    await page.locator('.sheet').waitFor({ state: 'hidden', timeout: 5000 });
+    await page.waitForFunction(
+      () => !document.querySelector('.grid a.cell[aria-label="Beach.mp4"]'),
+      null,
+      { timeout: 5000 },
+    );
+
+    assert.deepEqual(consoleErrors, [], `Console errors: ${consoleErrors.join('; ')}`);
+    assert.deepEqual(pageErrors, [], `Page errors: ${pageErrors.join('; ')}`);
+    await context.close();
+  } finally {
+    await browser.close();
+    await server.stop();
+  }
+});
+
 test('Player: music screen, tags, covers in listing, MediaSession, auto-advance, large library, and reduced motion', async () => {
   const server = await startStaticUiServer();
   const browser = await chromium.launch({

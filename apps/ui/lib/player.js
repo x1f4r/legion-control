@@ -794,3 +794,261 @@ export function clampVolume(v) {
   if (!Number.isFinite(v)) return 1;
   return Math.max(0, Math.min(1, Math.round(v * 100) / 100));
 }
+
+// ── Viewer-level full-screen controller (single owner of immersive state and history entry) ──
+
+/**
+ * Single owner of full-screen / immersive state for a mounted viewer.
+ *
+ * Holds active state, who entered it (`'button' | 'rotation' | 'picture' | 'bars'`), and the
+ * optional `{ legionFullscreen: true }` history entry. The player, picture viewer, and all sheets
+ * or actions (Rename, Delete, Send to, Open in another app) ask this controller; nothing else in
+ * the viewer calls `link.immersive`.
+ */
+export function createFullscreenController({
+  link = null,
+  history = typeof window !== 'undefined' ? window.history : null,
+  getHash = () => (typeof window !== 'undefined' ? window.location.hash : ''),
+  getElement = () => null,
+  getVideo = () => null,
+  onChange = () => {},
+} = {}) {
+  let state = {
+    active: false,
+    source: null,
+    pushedHistory: false,
+    inFlight: false,
+  };
+  let disposed = false;
+  let historyToken = 0;
+  let suppressNextPop = false;
+  let activeViewerHash = getHash() || '';
+  let pendingPopResolvers = [];
+  let pendingPopTimer = null;
+
+  function emit() {
+    if (disposed) return;
+    try {
+      onChange({ ...state });
+    } catch {
+      // Keep controller state intact if a listener throws.
+    }
+  }
+
+  function flushPopWaiters() {
+    if (pendingPopTimer !== null) {
+      clearTimeout(pendingPopTimer);
+      pendingPopTimer = null;
+    }
+    const waiters = pendingPopResolvers;
+    pendingPopResolvers = [];
+    for (const resolve of waiters) {
+      resolve();
+    }
+  }
+
+  function syncUnderlyingHash() {
+    if (!history || !activeViewerHash) return;
+    const currentHash = getHash() || '';
+    if (currentHash !== activeViewerHash) {
+      try {
+        history.replaceState(history.state, '', activeViewerHash);
+      } catch {
+        // Ignore restricted history APIs.
+      }
+    }
+  }
+
+  function popFullscreenHistory() {
+    if (!history || typeof history.back !== 'function') {
+      return Promise.resolve();
+    }
+    suppressNextPop = true;
+    return new Promise((resolve) => {
+      pendingPopResolvers.push(resolve);
+      if (pendingPopTimer !== null) clearTimeout(pendingPopTimer);
+      pendingPopTimer = setTimeout(() => {
+        suppressNextPop = false;
+        flushPopWaiters();
+      }, 120);
+      try {
+        history.back();
+      } catch {
+        suppressNextPop = false;
+        flushPopWaiters();
+      }
+    });
+  }
+
+  function noteViewerHash(hash) {
+    if (typeof hash === 'string' && hash) {
+      activeViewerHash = hash;
+    }
+  }
+
+  async function enter(source = 'button', { orientation = 'none' } = {}) {
+    if (disposed || typeof link?.immersive !== 'function') {
+      return { active: false, mode: 'none' };
+    }
+    if (state.inFlight) {
+      return { active: state.active, mode: 'in-flight' };
+    }
+    if (state.active && state.source === source && source !== 'button') {
+      return { active: true, mode: 'existing' };
+    }
+    state = { ...state, inFlight: true };
+    emit();
+
+    let res = null;
+    try {
+      res = await link.immersive(true, {
+        orientation,
+        element: getElement?.() || null,
+        video: getVideo?.() || null,
+      });
+    } catch {
+      res = { active: false, mode: 'none' };
+    }
+
+    if (disposed) {
+      if (res?.active !== false) {
+        link.immersive(false, { element: getElement?.() || null, video: getVideo?.() || null }).catch?.(() => {});
+      }
+      return { active: false, mode: 'disposed' };
+    }
+
+    if (res && res.active === false) {
+      state = { ...state, inFlight: false };
+      emit();
+      return { active: false, mode: res.mode || 'none' };
+    }
+
+    let pushedHistory = state.pushedHistory;
+    if (source === 'button' && !pushedHistory && res?.mode !== 'webkit-video' && history) {
+      try {
+        historyToken += 1;
+        const token = historyToken;
+        const baseState = history.state && typeof history.state === 'object' ? history.state : {};
+        history.replaceState({ ...baseState, legionViewerEntry: token }, '');
+        history.pushState({ legionFullscreen: true, legionFullscreenToken: token }, '');
+        pushedHistory = true;
+      } catch {
+        // Ignore restricted history APIs.
+      }
+    }
+
+    state = {
+      active: true,
+      source,
+      pushedHistory,
+      inFlight: false,
+    };
+    emit();
+    return { active: true, mode: res?.mode || 'none' };
+  }
+
+  async function leave({ fromPopState = false } = {}) {
+    const wasActive = state.active;
+    const hadPushed = state.pushedHistory;
+    state = {
+      active: false,
+      source: null,
+      pushedHistory: false,
+      inFlight: false,
+    };
+    emit();
+
+    if (wasActive && typeof link?.immersive === 'function') {
+      try {
+        await link.immersive(false, {
+          element: getElement?.() || null,
+          video: getVideo?.() || null,
+        });
+      } catch {
+        // Best-effort exit.
+      }
+    }
+
+    if (hadPushed && !fromPopState) {
+      await popFullscreenHistory();
+    }
+    return { active: false };
+  }
+
+  function syncFromPlatform(platformActive) {
+    if (disposed) return;
+    if (!platformActive && state.active) {
+      const hadPushed = state.pushedHistory;
+      state = {
+        active: false,
+        source: null,
+        pushedHistory: false,
+        inFlight: false,
+      };
+      emit();
+      if (hadPushed) {
+        popFullscreenHistory();
+      }
+    }
+  }
+
+  function handlePopState() {
+    const st = history?.state;
+    const landedOnViewerEntry = Boolean(
+      historyToken && st && typeof st === 'object' && st.legionViewerEntry === historyToken,
+    );
+    if (suppressNextPop) {
+      suppressNextPop = false;
+      if (landedOnViewerEntry) {
+        syncUnderlyingHash();
+      }
+      flushPopWaiters();
+      return landedOnViewerEntry;
+    }
+    if (state.pushedHistory && !st?.legionFullscreen && landedOnViewerEntry) {
+      syncUnderlyingHash();
+      leave({ fromPopState: true });
+      return true;
+    }
+    return false;
+  }
+
+  const unsubPlatform =
+    typeof link?.onImmersiveChange === 'function'
+      ? link.onImmersiveChange((active) => syncFromPlatform(active))
+      : () => {};
+
+  function getState() {
+    return { ...state };
+  }
+
+  function dispose() {
+    if (disposed) return;
+    disposed = true;
+    unsubPlatform();
+    flushPopWaiters();
+    const wasActive = state.active;
+    state = { active: false, source: null, pushedHistory: false, inFlight: false };
+    if (wasActive && typeof link?.immersive === 'function') {
+      try {
+        const res = link.immersive(false, {
+          element: getElement?.() || null,
+          video: getVideo?.() || null,
+        });
+        if (res && typeof res.catch === 'function') res.catch(() => {});
+      } catch {
+        // Best-effort cleanup on unmount.
+      }
+    }
+  }
+
+  return {
+    getState,
+    noteViewerHash,
+    enter,
+    leave,
+    syncFromPlatform,
+    handlePopState,
+    dispose,
+  };
+}

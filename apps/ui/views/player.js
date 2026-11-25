@@ -332,7 +332,8 @@ export function VideoPlayer({
   siblings = [],
   link,
   viewerRef,
-  onRegisterPopState = null,
+  fullscreenController = null,
+  fullscreenState = null,
   moreOpen = false,
   onOpenMore,
   onClose,
@@ -342,7 +343,6 @@ export function VideoPlayer({
   onMediaPlay,
   onMediaPause,
   onMediaError,
-  onFullscreenStateChange,
 }) {
   const videoRef = useRef(null);
   const bindVideoRef = useCallback(
@@ -389,19 +389,17 @@ export function VideoPlayer({
   const [volume, setVolume] = useState(1);
   const [muted, setMuted] = useState(false);
   const [speedOpen, setSpeedOpen] = useState(false);
-  const [isFullscreen, setIsFullscreen] = useState(false);
-  const [fullscreenSource, setFullscreenSource] = useState(null); // null | 'button' | 'rotation'
   const [canFs, setCanFs] = useState(() =>
     typeof link?.canImmersive === 'function' ? Boolean(link.canImmersive({ element: viewerRef?.current })) : false,
   );
 
-  const isFullscreenRef = useRef(false);
+  const fsState = fullscreenState || { active: false, source: null, pushedHistory: false, inFlight: false };
+  const isFullscreen = Boolean(fsState.active && (fsState.source === 'button' || fsState.source === 'rotation'));
+  const fullscreenSource = isFullscreen ? fsState.source : null;
+  const isFullscreenRef = useRef(isFullscreen);
   isFullscreenRef.current = isFullscreen;
-  const fullscreenSourceRef = useRef(null);
+  const fullscreenSourceRef = useRef(fullscreenSource);
   fullscreenSourceRef.current = fullscreenSource;
-  const pushedFsHistoryRef = useRef(false);
-  const fsHistoryTokenRef = useRef(0);
-  const suppressNextPopRef = useRef(false);
   const leavingFsUntilRef = useRef(0);
   const activeSeekSeqRef = useRef(0);
   const lastSavedAtRef = useRef(0);
@@ -423,10 +421,6 @@ export function VideoPlayer({
   const ctrlPlayingRef = useRef(ctrl.playing);
   ctrlPlayingRef.current = ctrl.playing;
   const wantPlayAfterSwapRef = useRef(false);
-  const activeViewerHashRef = useRef(typeof window !== 'undefined' ? window.location.hash : '');
-  if (typeof window !== 'undefined' && window.location.hash) {
-    activeViewerHashRef.current = window.location.hash;
-  }
 
   const commitSeekOnMedia = useCallback((targetTime, seq) => {
     activeSeekSeqRef.current = seq;
@@ -525,171 +519,57 @@ export function VideoPlayer({
     controller.setMenuOpen(Boolean(moreOpen || speedOpen));
   }, [moreOpen, speedOpen, controller]);
 
-  // Notify parent viewer about fullscreen state for styling / external sheet coordination.
-  useEffect(() => {
-    if (onFullscreenStateChange) onFullscreenStateChange(isFullscreen, fullscreenSource);
-  }, [isFullscreen, fullscreenSource, onFullscreenStateChange]);
-
   // Screen stays on while video plays (including across a file swap while playing); released on pause/end/close.
   const holdScreenOn = Boolean(ctrl.playing || (mediaLoading && wantPlayAfterSwapRef.current));
   useEffect(() => {
     link?.keepScreenOn?.(holdScreenOn);
   }, [link, holdScreenOn]);
 
-  const portraitImmersiveRef = useRef(false);
-
-  // On mobile native apps, hiding the overlay in portrait hides system bars too ("one state").
+  // On mobile native apps, hiding the overlay in portrait hides system bars too ("one state")
+  // through the viewer's single full-screen controller.
   useEffect(() => {
-    if (!mobileNative || isFullscreen) {
-      portraitImmersiveRef.current = false;
+    if (!mobileNative || isFullscreen || !fullscreenController) {
       return;
     }
     if (!ctrl.visible) {
-      portraitImmersiveRef.current = true;
-      link?.immersive?.(true, { orientation: 'none', element: viewerRef?.current, video: videoRef.current });
-    } else if (portraitImmersiveRef.current) {
-      portraitImmersiveRef.current = false;
-      link?.immersive?.(false, { element: viewerRef?.current, video: videoRef.current });
+      fullscreenController.enter('bars', { orientation: 'none' });
+    } else if (fullscreenController.getState().source === 'bars') {
+      fullscreenController.leave();
     }
-  }, [mobileNative, isFullscreen, ctrl.visible, link, viewerRef]);
+  }, [mobileNative, isFullscreen, ctrl.visible, fullscreenController]);
 
   const enterFullscreen = useCallback(
     async (source = 'button') => {
-      if (typeof link?.immersive !== 'function') return;
+      if (!fullscreenController) return;
       const v = videoRef.current;
       const orientation =
         source === 'button' ? preferredVideoOrientation(v?.videoWidth, v?.videoHeight) : 'none';
-      const res = await link.immersive(true, {
-        orientation,
-        element: viewerRef?.current,
-        video: v,
-      });
-      if (res && res.active === false) return;
-      setIsFullscreen(true);
-      setFullscreenSource(source);
-      if (source === 'button' && !pushedFsHistoryRef.current && res?.mode !== 'webkit-video') {
-        try {
-          const token = fsHistoryTokenRef.current + 1;
-          fsHistoryTokenRef.current = token;
-          const baseState =
-            window.history.state && typeof window.history.state === 'object' ? window.history.state : {};
-          window.history.replaceState({ ...baseState, legionViewerEntry: token }, '');
-          window.history.pushState({ legionFullscreen: true, legionFullscreenToken: token }, '');
-          pushedFsHistoryRef.current = true;
-        } catch {
-          // Ignore restricted history APIs.
-        }
-      }
+      await fullscreenController.enter(source, { orientation });
     },
-    [link, viewerRef],
+    [fullscreenController],
   );
 
-  const leaveFullscreen = useCallback(
-    async ({ fromPopState = false } = {}) => {
-      const hadPushed = pushedFsHistoryRef.current;
-      pushedFsHistoryRef.current = false;
-      portraitImmersiveRef.current = false;
-      const wasLandscapeNow = typeof window !== 'undefined' && window.innerWidth > window.innerHeight;
-      leavingFsUntilRef.current = wasLandscapeNow ? Date.now() + 900 : 0;
-      setIsFullscreen(false);
-      setFullscreenSource(null);
-      controller.notifyActivity({ show: true });
-      if (typeof link?.immersive === 'function') {
-        await link.immersive(false, { element: viewerRef?.current, video: videoRef.current });
-      }
-      if (hadPushed && !fromPopState) {
-        suppressNextPopRef.current = true;
-        try {
-          window.history.back();
-        } catch {
-          suppressNextPopRef.current = false;
-        }
-      }
-    },
-    [controller, link, viewerRef],
-  );
+  const leaveFullscreen = useCallback(async () => {
+    const wasLandscapeNow = typeof window !== 'undefined' && window.innerWidth > window.innerHeight;
+    leavingFsUntilRef.current = wasLandscapeNow ? Date.now() + 900 : 0;
+    controller.notifyActivity({ show: true });
+    if (fullscreenController) {
+      await fullscreenController.leave();
+    }
+  }, [controller, fullscreenController]);
 
-  // Sync platform-initiated full-screen exits (browser Esc, macOS window button, iOS webkitendfullscreen).
+  // Report iOS Safari `<video>` webkitendfullscreen back to the single controller.
   useEffect(() => {
-    const unsub =
-      typeof link?.onImmersiveChange === 'function'
-        ? link.onImmersiveChange((active) => {
-            if (!active && isFullscreenRef.current) {
-              const hadPushed = pushedFsHistoryRef.current;
-              pushedFsHistoryRef.current = false;
-              setIsFullscreen(false);
-              setFullscreenSource(null);
-              if (hadPushed) {
-                suppressNextPopRef.current = true;
-                try {
-                  window.history.back();
-                } catch {
-                  suppressNextPopRef.current = false;
-                }
-              }
-            }
-          })
-        : () => {};
     const v = videoRef.current;
-    const onWebkitEnd = () => {
-      if (isFullscreenRef.current) {
-        setIsFullscreen(false);
-        setFullscreenSource(null);
-      }
-    };
-    v?.addEventListener?.('webkitendfullscreen', onWebkitEnd);
-    return () => {
-      unsub();
-      v?.removeEventListener?.('webkitendfullscreen', onWebkitEnd);
-    };
-  }, [link, mediaUrl]);
-
-  // Android / browser Back gesture while button-entered full screen leaves full screen without
-  // closing the viewer or reverting to an earlier sibling file.
-  useEffect(() => {
-    function syncUnderlyingHash() {
-      const targetHash = activeViewerHashRef.current;
-      if (targetHash && typeof window !== 'undefined' && window.location.hash !== targetHash) {
-        try {
-          window.history.replaceState(window.history.state, '', targetHash);
-        } catch {
-          // Ignore restricted history APIs.
-        }
-      }
-    }
-    function handlePop() {
-      const st = window.history.state;
-      const landedOnViewerEntry = Boolean(
-        fsHistoryTokenRef.current && st && st.legionViewerEntry === fsHistoryTokenRef.current,
-      );
-      if (suppressNextPopRef.current) {
-        suppressNextPopRef.current = false;
-        if (landedOnViewerEntry) {
-          syncUnderlyingHash();
-          return true;
-        }
-        return false;
-      }
-      if (pushedFsHistoryRef.current && !st?.legionFullscreen && landedOnViewerEntry) {
-        syncUnderlyingHash();
-        leaveFullscreen({ fromPopState: true });
-        return true;
-      }
-      return false;
-    }
-    if (typeof onRegisterPopState === 'function') {
-      return onRegisterPopState(handlePop);
-    }
-    const onPopState = () => {
-      handlePop();
-    };
-    window.addEventListener('popstate', onPopState);
-    return () => window.removeEventListener('popstate', onPopState);
-  }, [leaveFullscreen, onRegisterPopState]);
+    if (!v || !fullscreenController) return undefined;
+    const onWebkitEnd = () => fullscreenController.syncFromPlatform(false);
+    v.addEventListener?.('webkitendfullscreen', onWebkitEnd);
+    return () => v.removeEventListener?.('webkitendfullscreen', onWebkitEnd);
+  }, [fullscreenController, mediaUrl]);
 
   // Turning a phone or tablet to landscape enters full screen; turning back leaves it if turning entered it.
   useEffect(() => {
-    if (!touchOrientationDevice || typeof link?.immersive !== 'function') return undefined;
+    if (!touchOrientationDevice || !fullscreenController) return undefined;
 
     let wasLandscape = false;
     const checkOrientation = (initial = false) => {
@@ -719,9 +599,9 @@ export function VideoPlayer({
       window.removeEventListener('orientationchange', onResize);
       window.screen?.orientation?.removeEventListener?.('change', onResize);
     };
-  }, [touchOrientationDevice, link, enterFullscreen, leaveFullscreen]);
+  }, [touchOrientationDevice, fullscreenController, enterFullscreen, leaveFullscreen]);
 
-  // Always release immersive, keep-screen-on, and save resume position on unmount.
+  // Always release keep-screen-on, save resume position, and clear `<video>` on unmount.
   useEffect(() => {
     return () => {
       const v = videoRef.current;
@@ -729,7 +609,6 @@ export function VideoPlayer({
         resumeStore.save(identityRef.current, v.currentTime, v.duration);
       }
       link?.keepScreenOn?.(false);
-      link?.immersive?.(false, { element: viewerRef?.current, video: v });
       if (v) {
         try {
           v.pause();
@@ -740,7 +619,7 @@ export function VideoPlayer({
         }
       }
     };
-  }, [link, resumeStore, viewerRef]);
+  }, [link, resumeStore]);
 
   const togglePlay = useCallback(() => {
     const v = videoRef.current;
