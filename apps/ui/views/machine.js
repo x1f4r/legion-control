@@ -271,8 +271,10 @@ function OverviewTab({
   link,
   allowedSet,
   technical,
+  wide,
   wakePending,
   onWake,
+  onEnsureAwake,
   onStopJob,
   onUpdateMachineSys,
 }) {
@@ -362,7 +364,17 @@ function OverviewTab({
         ${canWake
           ? html`
               <div class="actions">
-                <button type="button" class="btn primary" onClick=${() => onWake(machine)}>
+                <button
+                  type="button"
+                  class="btn primary"
+                  onClick=${() => {
+                    if (onEnsureAwake) {
+                      onEnsureAwake(machine, { kind: 'wake', immediate: true, forgettable: true });
+                    } else if (onWake) {
+                      onWake(machine);
+                    }
+                  }}
+                >
                   Wake ${machine.name}
                 </button>
               </div>
@@ -401,12 +413,21 @@ function OverviewTab({
     .join(' ')
     .replace(' ·', ' ·');
 
+  const hasAboutRows =
+    Boolean(systemLine) ||
+    busyReasonLines.length > 0 ||
+    (technical && (sys?.uptime_s != null || Boolean(machine.version) || Boolean(busySummary)));
+
   return html`
     <div>
-      <div class=${stale ? 'machine-state stale-values' : 'machine-state'}>
-        <span class=${activeBusy ? 'dot busy' : 'dot'} aria-hidden="true"></span>
-        <span>${stateLine}</span>
-      </div>
+      ${wide
+        ? html`
+            <div class=${stale ? 'machine-state stale-values' : 'machine-state'}>
+              <span class=${activeBusy ? 'dot busy' : 'dot'} aria-hidden="true"></span>
+              <span>${stateLine}</span>
+            </div>
+          `
+        : null}
 
       ${meters.length > 0
         ? html`
@@ -491,33 +512,46 @@ function OverviewTab({
           `
         : null}
 
-      <p class="label">About</p>
-      <div class="list">
-        <dl class=${technical ? 'kv' : 'kv plain'}>
-          <dt>${technical ? 'system' : 'System'}</dt>
-          <dd>${systemLine || 'Unknown'}</dd>
-          ${sys?.uptime_s != null
-            ? html`
-                <dt>${technical ? 'up' : 'On for'}</dt>
-                <dd>${formatFriendlyUptime(sys.uptime_s)}</dd>
-              `
-            : null}
-          ${technical && machine.version
-            ? html`
-                <dt>legion</dt>
-                <dd>${machine.version}</dd>
-              `
-            : null}
-          <dt>${technical ? 'busy' : 'Status'}</dt>
-          ${busyReasonLines.length > 0
-            ? html`
-                <dd class="allows-lines">
-                  ${busyReasonLines.map((line, i) => html`<span key=${i}>${line}</span>`)}
-                </dd>
-              `
-            : html`<dd>${busySummary}</dd>`}
-        </dl>
-      </div>
+      ${hasAboutRows
+        ? html`
+            <p class="label">About</p>
+            <div class="list">
+              <dl class=${technical ? 'kv' : 'kv plain'}>
+                ${systemLine
+                  ? html`
+                      <dt>${technical ? 'system' : 'System'}</dt>
+                      <dd>${systemLine}</dd>
+                    `
+                  : null}
+                ${technical && sys?.uptime_s != null
+                  ? html`
+                      <dt>up</dt>
+                      <dd>${formatFriendlyUptime(sys.uptime_s)}</dd>
+                    `
+                  : null}
+                ${technical && machine.version
+                  ? html`
+                      <dt>legion</dt>
+                      <dd>${machine.version}</dd>
+                    `
+                  : null}
+                ${busyReasonLines.length > 0
+                  ? html`
+                      <dt>${technical ? 'busy' : 'Busy'}</dt>
+                      <dd class="allows-lines">
+                        ${busyReasonLines.map((line, i) => html`<span key=${i}>${line}</span>`)}
+                      </dd>
+                    `
+                  : technical
+                    ? html`
+                        <dt>busy</dt>
+                        <dd>${busySummary}</dd>
+                      `
+                    : null}
+              </dl>
+            </div>
+          `
+        : null}
 
       ${selectedProgram
         ? html`
@@ -665,9 +699,10 @@ export function CommandComposer({
     if (!trimmed) return;
 
     if (!machine.reachable && onEnsureAwake) {
+      const shortCmd = trimmed.length > 48 ? `${trimmed.slice(0, 47)}…` : trimmed;
       const res = await onEnsureAwake(machine, {
         kind: 'command',
-        label: trimmed,
+        label: `run ${shortCmd}`,
         onContinue: ({ inBackground }) =>
           executeSubmitted(trimmed, inBackground && canJob ? true : asJob, jobName),
       });
@@ -1694,8 +1729,10 @@ export function MachineDetail({
               link=${link}
               allowedSet=${allowedSet}
               technical=${technical}
+              wide=${wide}
               wakePending=${wakePending}
               onWake=${onWakeMachine || (() => selectTab('power'))}
+              onEnsureAwake=${onEnsureAwake}
               onStopJob=${handleStopJob}
               onUpdateMachineSys=${onUpdateMachineSys}
             />

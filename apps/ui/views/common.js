@@ -319,15 +319,16 @@ export function Sheet({ title, onClose, children }) {
  */
 export function WakeSheet({ sheet, onConfirm, onRetry, onDismiss }) {
   if (!sheet) return null;
-  const { machineName, phase, elapsedS, error } = sheet;
+  const { machineName, phase, elapsedS, error, continueText } = sheet;
 
   if (phase === 'waking') {
     return html`
-      <${Sheet} title=${`${machineName} is waking up`} onClose=${onDismiss}>
-        <p class="wake-elapsed">Waking ${machineName}… ${formatElapsed(elapsedS || 0)}</p>
+      <${Sheet} title=${`Waking ${machineName}…`} onClose=${onDismiss}>
+        <p class="wake-elapsed">${formatElapsed(elapsedS || 0)}</p>
         <div class="actions">
-          <button type="button" class="btn full" onClick=${onDismiss}>Not now</button>
+          <button type="button" class="btn full" onClick=${onDismiss}>Stop waiting</button>
         </div>
+        <p class="wake-note">The wake signal has already been sent.</p>
       <//>
     `;
   }
@@ -335,9 +336,7 @@ export function WakeSheet({ sheet, onConfirm, onRetry, onDismiss }) {
   if (phase === 'timeout') {
     return html`
       <${Sheet} title=${`${machineName} did not answer`} onClose=${onDismiss}>
-        <p>
-          ${`${machineName} did not answer after 3 minutes. It may need longer to start, or waking it may not be working.`}
-        </p>
+        <p>It has been 3 minutes. It may need longer to start, or waking it may not be working.</p>
         <div class="actions">
           <button type="button" class="btn" onClick=${onDismiss}>Not now</button>
           <button type="button" class="btn primary full" onClick=${onRetry}>Try again</button>
@@ -360,6 +359,7 @@ export function WakeSheet({ sheet, onConfirm, onRetry, onDismiss }) {
 
   return html`
     <${Sheet} title=${`${machineName} is off.`} onClose=${onDismiss}>
+      ${continueText ? html`<p class="wake-then">${continueText}</p>` : null}
       <div class="actions">
         <button type="button" class="btn" onClick=${onDismiss}>Not now</button>
         <button type="button" class="btn primary full" onClick=${onConfirm}>

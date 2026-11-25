@@ -49,7 +49,7 @@ function OnlineMachineCard({ machine, selected, showMetrics }) {
               ${hasDisk
                 ? html`
                     <div class="stat">
-                      <span>Disk <b>${metrics.diskPct}%</b></span>
+                      <span>Storage <b>${metrics.diskPct}%</b></span>
                       <${Meter} value=${metrics.diskPct} />
                     </div>
                   `
@@ -78,6 +78,7 @@ function OfflineMachineRow({ machine, selected, canWake, wakePending, onWake, on
       e.preventDefault();
       onEnsureAwake(machine, {
         kind: 'screen',
+        label: `open ${machine.name}`,
         onContinue: () => {
           window.location.hash = href;
         },
@@ -100,7 +101,11 @@ function OfflineMachineRow({ machine, selected, canWake, wakePending, onWake, on
               onClick=${(e) => {
                 e.preventDefault();
                 e.stopPropagation();
-                if (onWake) onWake(machine);
+                if (onEnsureAwake) {
+                  onEnsureAwake(machine, { kind: 'wake', immediate: true, forgettable: true });
+                } else if (onWake) {
+                  onWake(machine);
+                }
               }}
             >
               Wake

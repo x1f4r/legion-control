@@ -8,7 +8,32 @@ export const WAKE_POLL_INTERVAL_MS = 3_000;
 export const WAKE_TIMEOUT_MS = 180_000;
 export const WAKE_ELAPSED_TICK_MS = 1_000;
 
-const FORGETTABLE_KINDS = new Set(['screen', 'files']);
+const FORGETTABLE_KINDS = new Set(['screen', 'files', 'wake']);
+
+/**
+ * Formats the plain "Then: ..." line for the wake prompt sheet from the first waiter.
+ */
+export function formatWakeContinueLine(waiter, machineName) {
+  if (!waiter || waiter.kind === 'wake') return null;
+  const rawLabel = typeof waiter.label === 'string' ? waiter.label.trim() : '';
+  if (rawLabel) {
+    if (/^then:/i.test(rawLabel)) return rawLabel;
+    return `Then: ${rawLabel}`;
+  }
+  switch (waiter.kind) {
+    case 'files':
+      return 'Then: open its files';
+    case 'transfer':
+      return `Then: transfer files with ${machineName}`;
+    case 'command':
+      return `Then: run command on ${machineName}`;
+    case 'action':
+      return `Then: run action on ${machineName}`;
+    case 'screen':
+    default:
+      return `Then: open ${machineName}`;
+  }
+}
 
 function defaultClock() {
   return {
@@ -46,6 +71,8 @@ export function createWakeController({
   getMachines = () => [],
   getLocalNode = () => null,
   getAllowedSet = () => null,
+  onWakeSent = null,
+  onWakeTimeout = null,
   onMachineAwake = null,
   onBackgroundComplete = null,
   clock = defaultClock(),
@@ -200,6 +227,13 @@ export function createWakeController({
     entry.elapsedS = Math.floor(timeoutMs / 1000);
     entry.visible = true;
     activeSheetMachine = entry.machineName;
+    if (typeof onWakeTimeout === 'function') {
+      try {
+        onWakeTimeout(entry.machineName);
+      } catch {
+        // Ignore callback errors.
+      }
+    }
     emit();
   }
 
@@ -219,6 +253,13 @@ export function createWakeController({
         { machine: entry.machineName },
         { on: pickWakeRunner(entry.machineName) },
       );
+      if (typeof onWakeSent === 'function') {
+        try {
+          onWakeSent(entry.machineName);
+        } catch {
+          // Ignore callback errors.
+        }
+      }
     } catch (err) {
       if (entry.finished) return;
       stopTimers(entry);
@@ -290,7 +331,11 @@ export function createWakeController({
         existing.waiters.push(waiter);
         existing.visible = true;
         activeSheetMachine = machine.name;
-        emit();
+        if (options.immediate && existing.phase !== 'waking') {
+          startWaking(existing);
+        } else {
+          emit();
+        }
         return;
       }
 
@@ -309,7 +354,11 @@ export function createWakeController({
       };
       entries.set(machine.name, entry);
       activeSheetMachine = machine.name;
-      emit();
+      if (options.immediate) {
+        startWaking(entry);
+      } else {
+        emit();
+      }
     });
   }
 
@@ -413,6 +462,7 @@ export function createWakeController({
     for (const entry of entries.values()) {
       if (entry.phase === 'waking') wakingMachines.add(entry.machineName);
     }
+    const primaryWaiter = active?.waiters?.find((w) => !w.forgotten && !w.done) || active?.waiters?.[0] || null;
     return {
       sheet: active && active.visible
         ? {
@@ -420,6 +470,7 @@ export function createWakeController({
             phase: active.phase,
             elapsedS: active.elapsedS,
             error: active.error,
+            continueText: formatWakeContinueLine(primaryWaiter, active.machineName),
             waiterCount: active.waiters.length,
             hasBackgroundWork: active.waiters.some((w) => !w.forgettable),
           }

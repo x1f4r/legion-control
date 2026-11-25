@@ -116,6 +116,9 @@ test('Machine Overview: no empty meters on minimal machine, Stop then Force stop
       await page.getByText('Nothing much is running.').waitFor({ timeout: 10_000 });
       assert.equal(await page.locator('.gauge').count(), 0, 'Minimal machine must render zero empty meters');
       assert.equal(await page.locator('p.label', { hasText: 'Health' }).count(), 0, 'Health heading omitted when no meters exist');
+      assert.equal(await page.locator('.machine-state').count(), 0, 'Phone already shows state in header subtitle');
+      assert.equal(await page.locator('dt', { hasText: 'On for' }).count(), 0, 'About must not repeat On for');
+      assert.equal(await page.locator('dt', { hasText: 'Status' }).count(), 0, 'About must not repeat Status');
       await captureShot(page, 'phone-minimal-overview');
       await ctx.close();
     }
@@ -136,6 +139,7 @@ test('Machine Overview: no empty meters on minimal machine, Stop then Force stop
       await page.getByText('9.1 GB of graphics memory').waitFor();
       await page.getByText('Temperature').waitFor();
       await page.getByText('Storage').waitFor();
+      assert.equal(await page.locator('.machine-state').count(), 0, 'Phone must not duplicate state under header');
 
       const overviewText = await page.locator('main.main').innerText();
       assert.equal(PLAIN_JARGON_RE.test(overviewText), false, `Plain mode leaked jargon: ${overviewText}`);
@@ -196,6 +200,7 @@ test('Machine Overview: no empty meters on minimal machine, Stop then Force stop
       await page.getByText('Running hot').waitFor({ timeout: 10_000 });
       await page.getByText('Battery low').waitFor();
       await page.getByText('Storage almost full').waitFor();
+      await page.locator('a.machine', { hasText: 'tower' }).getByText('Storage').waitFor();
       await captureShot(page, 'phone-machines-amber');
       await ctx.close();
 
@@ -210,6 +215,7 @@ test('Machine Overview: no empty meters on minimal machine, Stop then Force stop
 
       await deskPage.goto(`${server.url}/?mock=amber#/machines/tower`, { waitUntil: 'domcontentloaded' });
       await deskPage.getByText('Running hot').waitFor({ timeout: 10_000 });
+      await deskPage.locator('.machine-state', { hasText: 'On for 11 hours · Busy' }).waitFor();
       await deskPage.getByText('62% of the processor').waitFor();
       await captureShot(deskPage, 'desktop-overview-busy');
 
@@ -303,13 +309,17 @@ test('Machine Overview: no empty meters on minimal machine, Stop then Force stop
 
       const sheet = page.locator('.sheet');
       await sheet.waitFor();
-      await sheet.getByText('laptop is off.').waitFor();
+      await sheet.getByRole('heading', { name: 'laptop is off.' }).waitFor();
+      await sheet.getByText('Then: open laptop').waitFor();
       await captureShot(page, 'phone-wake-prompt');
 
       await sheet.getByRole('button', { name: 'Wake it and continue' }).click();
-      await sheet.getByText(/Waking laptop… 0:00/).waitFor();
+      await sheet.getByRole('heading', { name: 'Waking laptop…' }).waitFor();
+      await sheet.locator('.wake-elapsed', { hasText: '0:00' }).waitFor();
+      await sheet.getByRole('button', { name: 'Stop waiting' }).waitFor();
+      await sheet.getByText('The wake signal has already been sent.').waitFor();
       await page.evaluate(() => window.__LEGION_TEST_WAKE_CLOCK__.advance(3000));
-      await sheet.getByText(/Waking laptop… 0:03/).waitFor();
+      await sheet.locator('.wake-elapsed', { hasText: '0:03' }).waitFor();
       await captureShot(page, 'phone-wake-waking');
 
       // Second 3s tick -> laptop answers -> sheet closes and navigates to laptop Overview!
@@ -317,16 +327,17 @@ test('Machine Overview: no empty meters on minimal machine, Stop then Force stop
       await sheet.waitFor({ state: 'hidden', timeout: 5_000 });
       await page.locator('header.top h1', { hasText: 'laptop' }).waitFor({ timeout: 5_000 });
 
-      // 4b. Wake never answers -> 3-minute timeout shows exact sentence and Try again.
+      // 4b. Wake never answers -> 3-minute timeout shows non-redundant body and Try again.
       await page.goto(`${server.url}/?mock=wake-never#/machines`, { waitUntil: 'domcontentloaded' });
       await page.locator('.machine.off a.machine-link', { hasText: 'laptop' }).click();
       await sheet.waitFor();
       await sheet.getByRole('button', { name: 'Wake it and continue' }).click();
-      await sheet.getByText(/Waking laptop…/).waitFor();
+      await sheet.getByRole('heading', { name: 'Waking laptop…' }).waitFor();
 
       await page.evaluate(() => window.__LEGION_TEST_WAKE_CLOCK__.advance(180_000));
+      await sheet.getByRole('heading', { name: 'laptop did not answer' }).waitFor({ timeout: 5_000 });
       await sheet
-        .getByText('laptop did not answer after 3 minutes. It may need longer to start, or waking it may not be working.')
+        .getByText('It has been 3 minutes. It may need longer to start, or waking it may not be working.')
         .waitFor({ timeout: 5_000 });
       await sheet.getByRole('button', { name: 'Try again' }).waitFor();
       await captureShot(page, 'phone-wake-timeout');
@@ -338,7 +349,7 @@ test('Machine Overview: no empty meters on minimal machine, Stop then Force stop
       await page.locator('.machine.off a.machine-link', { hasText: 'laptop' }).click();
       await sheet.waitFor();
       await sheet.getByRole('button', { name: 'Wake it and continue' }).click();
-      await sheet.getByText(/Waking laptop…/).waitFor();
+      await sheet.getByRole('heading', { name: 'Waking laptop…' }).waitFor();
 
       // Navigate away to Activity while waiting -> screen navigation is forgotten.
       await page.evaluate(() => { window.location.hash = '#/activity'; });
@@ -347,6 +358,15 @@ test('Machine Overview: no empty meters on minimal machine, Stop then Force stop
       await page.evaluate(() => window.__LEGION_TEST_WAKE_CLOCK__.advance(9_000));
       // Still on Activity (did NOT jump to laptop)!
       await page.locator('header.top h1', { hasText: 'Activity' }).waitFor();
+
+      // 4d. Explicit Wake button on Machines list enters waking state directly.
+      await page.goto(`${server.url}/?mock=wake-ticks=3#/machines`, { waitUntil: 'domcontentloaded' });
+      await page.locator('.machine.off', { hasText: 'laptop' }).getByRole('button', { name: 'Wake' }).click();
+      await sheet.waitFor();
+      await sheet.getByRole('heading', { name: 'Waking laptop…' }).waitFor();
+      await sheet.getByRole('button', { name: 'Stop waiting' }).click();
+      await sheet.waitFor({ state: 'hidden' });
+      await page.locator('.machine.off', { hasText: 'laptop' }).getByText('Wake sent · waiting for it to answer').waitFor();
 
       await ctx.close();
     }

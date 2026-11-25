@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { createWakeController, WAKE_POLL_INTERVAL_MS, WAKE_TIMEOUT_MS } from '../wake.js';
+import {
+  createWakeController,
+  formatWakeContinueLine,
+  WAKE_POLL_INTERVAL_MS,
+  WAKE_TIMEOUT_MS,
+} from '../wake.js';
 
 function createFakeClock(startMs = 1_000_000) {
   let nowMs = startMs;
@@ -194,4 +199,55 @@ test('leaving screen forgets opening a screen or files, but keeps transfers and 
   assert.deepEqual(transferResult, { awake: true, woke: true });
   assert.equal(screenOpened, 0);
   assert.equal(transferStarted, 1);
+});
+
+test('immediate wake starts directly in waking state, fires onWakeSent, and formats continue lines', async () => {
+  const clock = createFakeClock();
+  const calls = [];
+  const sent = [];
+  let laptopReachable = false;
+
+  const link = {
+    async call(tool, args) {
+      calls.push({ tool, args });
+      if (tool === 'power.wake') return { machine: args.machine, awake: false, sent_by: 'pi' };
+      if (tool === 'fleet.ping') return { results: [{ machine: 'laptop', reachable: laptopReachable }] };
+      return { ok: true };
+    },
+  };
+
+  const controller = createWakeController({
+    link,
+    clock,
+    getMachines: () => [
+      { name: 'pi', reachable: true, canWake: false },
+      { name: 'laptop', reachable: laptopReachable, canWake: true },
+    ],
+    getLocalNode: () => 'pi',
+    getAllowedSet: () => new Set(['power.wake', 'fleet.ping']),
+    onWakeSent: (name) => sent.push(name),
+  });
+
+  assert.equal(formatWakeContinueLine({ kind: 'screen', label: 'open laptop' }, 'laptop'), 'Then: open laptop');
+  assert.equal(formatWakeContinueLine({ kind: 'files' }, 'laptop'), 'Then: open its files');
+  assert.equal(
+    formatWakeContinueLine({ kind: 'transfer', label: 'send holiday.mp4 to laptop' }, 'laptop'),
+    'Then: send holiday.mp4 to laptop',
+  );
+  assert.equal(
+    formatWakeContinueLine({ kind: 'action', label: 'run Update packages' }, 'laptop'),
+    'Then: run Update packages',
+  );
+  assert.equal(formatWakeContinueLine({ kind: 'wake' }, 'laptop'), null);
+
+  const p = controller.ensureAwake('laptop', { kind: 'wake', immediate: true, forgettable: true });
+  await Promise.resolve();
+  assert.equal(controller.getState().sheet.phase, 'waking');
+  assert.equal(calls.filter((c) => c.tool === 'power.wake').length, 1);
+  assert.deepEqual(sent, ['laptop']);
+
+  controller.dismiss('laptop');
+  assert.equal(controller.getState().sheet, null);
+  const res = await p;
+  assert.deepEqual(res, { awake: false, forgotten: true });
 });

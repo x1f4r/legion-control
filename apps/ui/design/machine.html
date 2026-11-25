@@ -37,7 +37,6 @@
     <h1>tower<small>Busy · on for 11 hours</small></h1>
   </header>
   <main class="main">
-    <div class="machine-state"><span class="dot busy"></span><span>On for 11 hours · Busy</span></div>
     <p class="label">Health</p>
     <div class="list">
       <div class="gauge"><header><span>Processor</span><span>71%</span></header><span class="meter" style="--v:71"><i></i></span></div>
@@ -78,7 +77,6 @@
     <h1>studio<small>Idle · on for 3 days</small></h1>
   </header>
   <main class="main">
-    <div class="machine-state"><span class="dot"></span><span>On for 3 days · Idle</span></div>
     <p class="label">Health</p>
     <div class="list">
       <div class="gauge"><header><span>Processor</span><span>12%</span></header><span class="meter" style="--v:12"><i></i></span></div>
@@ -96,8 +94,6 @@
     <div class="list">
       <dl class="kv plain">
         <dt>System</dt><dd>macOS 15.4</dd>
-        <dt>On for</dt><dd>3 days</dd>
-        <dt>Status</dt><dd>Idle</dd>
       </dl>
     </div>
   </main>
@@ -120,7 +116,6 @@
     <h1>tower<small>Busy · on for 11 hours</small></h1>
   </header>
   <main class="main">
-    <div class="machine-state"><span class="dot busy"></span><span>On for 11 hours · Busy</span></div>
     <p class="label">Using it now</p>
     <div class="list">
       <button class="row"><span class="body"><span class="title">rustc<span class="proc-count">× 12</span></span><span class="sub">62% of the processor</span></span><span class="chev">›</span></button>
@@ -156,9 +151,7 @@
     <span class="dot busy"></span>
     <h1>tower<small>Busy · on for 11 hours</small></h1>
   </header>
-  <main class="main">
-    <div class="machine-state"><span class="dot busy"></span><span>On for 11 hours · Busy</span></div>
-  </main>
+  <main class="main"></main>
   <div class="scrim">
     <div class="sheet" role="dialog" aria-modal="true">
       <h2>python3</h2>
@@ -194,8 +187,6 @@
     <h1>pi<small>Idle · on for 41 days</small></h1>
   </header>
   <main class="main">
-    <div class="machine-state"><span class="dot"></span><span>On for 41 days · Idle</span></div>
-
     <p class="label">Using it now</p>
     <div class="list">
       <div class="row off"><span class="body"><span class="sub">Nothing much is running.</span></span></div>
@@ -205,8 +196,6 @@
     <div class="list">
       <dl class="kv plain">
         <dt>System</dt><dd>Linux 13</dd>
-        <dt>On for</dt><dd>41 days</dd>
-        <dt>Status</dt><dd>Idle</dd>
       </dl>
     </div>
   </main>
@@ -236,6 +225,7 @@
   <div class="scrim">
     <div class="sheet" role="dialog" aria-modal="true">
       <h2>laptop is off.</h2>
+      <p class="wake-then">Then: open laptop</p>
       <div class="actions">
         <button class="btn">Not now</button>
         <button class="btn primary full">Wake it and continue</button>
@@ -261,11 +251,12 @@
   </main>
   <div class="scrim">
     <div class="sheet" role="dialog" aria-modal="true">
-      <h2>laptop is waking up</h2>
-      <p class="wake-elapsed">Waking laptop… 0:24</p>
+      <h2>Waking laptop…</h2>
+      <p class="wake-elapsed">0:24</p>
       <div class="actions">
-        <button class="btn full">Not now</button>
+        <button class="btn full">Stop waiting</button>
       </div>
+      <p class="wake-note">The wake signal has already been sent.</p>
     </div>
   </div>
 </div></div></div>
@@ -288,7 +279,7 @@
   <div class="scrim">
     <div class="sheet" role="dialog" aria-modal="true">
       <h2>laptop did not answer</h2>
-      <p>laptop did not answer after 3 minutes. It may need longer to start, or waking it may not be working.</p>
+      <p>It has been 3 minutes. It may need longer to start, or waking it may not be working.</p>
       <div class="actions">
         <button class="btn">Not now</button>
         <button class="btn primary full">Try again</button>

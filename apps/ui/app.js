@@ -1094,6 +1094,17 @@ function App() {
       getMachines: () => snapshotRef.current?.machines || [],
       getLocalNode: () => nodeInfoRef.current?.node || null,
       getAllowedSet: () => allowedSetRef.current,
+      onWakeSent(machineName) {
+        markWakeSent(machineName);
+      },
+      onWakeTimeout(machineName) {
+        setWakeSentAt((prev) => {
+          if (!prev[machineName]) return prev;
+          const next = { ...prev };
+          delete next[machineName];
+          return next;
+        });
+      },
       async onMachineAwake(machineName) {
         setSnapshot((prev) => {
           if (!prev || !Array.isArray(prev.machines)) return prev;
@@ -1117,7 +1128,7 @@ function App() {
       },
     });
     return ctrl;
-  }, [link, refreshFleet, showToast]);
+  }, [link, markWakeSent, refreshFleet, showToast]);
 
   wakeControllerRef.current = wakeController;
 
@@ -1188,6 +1199,7 @@ function App() {
             if (targetMachine && !targetMachine.reachable && targetMachine.canWake && canWake) {
               wakeControllerRef.current?.ensureAwake(targetMachine, {
                 kind: 'files',
+                label: 'open its files',
                 onContinue: () => pushDirect(href),
               });
               return;

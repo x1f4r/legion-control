@@ -1021,6 +1021,19 @@ button.row:active {
 
 .wake-elapsed {
   font-variant-numeric: tabular-nums;
+  font-size: 16px;
+  color: var(--dim);
+}
+
+.wake-then {
+  color: var(--dim);
+}
+
+.wake-note {
+  margin: 10px 0 0 !important;
+  font-size: var(--text-small);
+  color: var(--dim);
+  text-align: center;
 }
 
 /* ── Tiles (Actions) ────────────────────────────────────────────────────────────────────────── */

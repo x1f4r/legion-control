@@ -101,8 +101,15 @@ function ActionDetail({
                             class="row off"
                             onClick=${() => {
                               if (onEnsureAwake) {
+                                const continueLabel =
+                                  action.machineTab === 'files'
+                                    ? 'open its files'
+                                    : action.machineTab === 'command'
+                                      ? `open Command on ${m.name}`
+                                      : `open ${action.title.toLowerCase()} on ${m.name}`;
                                 onEnsureAwake(m, {
                                   kind: wakeKind,
+                                  label: continueLabel,
                                   onContinue: () => {
                                     window.location.hash = destHref;
                                   },
@@ -150,8 +157,9 @@ function ActionDetail({
                       onClick=${() => {
                         if (onEnsureAwake) {
                           onEnsureAwake(m, {
-                            kind: 'action',
-                            label: `Wake ${m.name}`,
+                            kind: 'wake',
+                            immediate: true,
+                            forgettable: true,
                             onContinue: () => {
                               setResultMsg(`${m.name} is on.`);
                               if (onRefreshFleet) onRefreshFleet();
@@ -270,6 +278,7 @@ function ActionDetail({
                               if (onEnsureAwake) {
                                 onEnsureAwake(m, {
                                   kind: 'action',
+                                  label: `run ${action.title}`,
                                   onContinue: () => setPickedMachine(m.name),
                                 });
                               } else {
