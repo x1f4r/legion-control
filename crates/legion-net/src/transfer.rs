@@ -1341,7 +1341,6 @@ impl Transfer<'_> {
             Some(file_name(&from.path).to_owned()),
             false,
         );
-        meter.emit(true);
         let relayed = relay(
             &mut source,
             &mut dest,
@@ -1552,7 +1551,6 @@ impl Transfer<'_> {
             None,
             true,
         );
-        meter.emit(true);
         // A destination that does not exist yet is made even when there is nothing to put in it,
         // so an empty tree arrives as an empty directory.
         let mut rounds = if args.move_source {
