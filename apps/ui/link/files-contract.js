@@ -19,7 +19,7 @@
  * @property {string} url - Ticketed content address for `<img>`, `<video>`, `<audio>`, or download.
  * @property {number | null} [expires_in] - Ticket lifetime in seconds.
  *
- * @typedef {'queued' | 'running' | 'paused' | 'done' | 'failed' | 'cancelled'} DeviceTransferState
+ * @typedef {'queued' | 'running' | 'paused' | 'cancelling' | 'done' | 'failed' | 'cancelled'} DeviceTransferState
  *
  * @typedef {Object} DeviceTransfer
  * @property {string} id - Stable transfer identifier.
@@ -76,6 +76,7 @@ export const DEVICE_TRANSFER_STATES = Object.freeze([
   'queued',
   'running',
   'paused',
+  'cancelling',
   'done',
   'failed',
   'cancelled',

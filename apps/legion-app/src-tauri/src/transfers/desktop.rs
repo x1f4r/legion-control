@@ -202,7 +202,7 @@ impl TransferPlatform for DesktopTransferPlatform {
                             format!("Could not show {} in Finder: {err}.", path.display()),
                         )
                     })?;
-                return Ok(());
+                Ok(())
             }
             #[cfg(target_os = "windows")]
             {
@@ -215,7 +215,7 @@ impl TransferPlatform for DesktopTransferPlatform {
                             format!("Could not show {} in Explorer: {err}.", path.display()),
                         )
                     })?;
-                return Ok(());
+                Ok(())
             }
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             {

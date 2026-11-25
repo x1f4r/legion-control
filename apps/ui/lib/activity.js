@@ -589,6 +589,9 @@ export function formatDeviceTransferTitle(transfer, technical = false) {
   if (transfer.state === 'done') {
     return isUp ? `Uploaded ${name}` : `Downloaded ${name}`;
   }
+  if (transfer.state === 'cancelling') {
+    return `Cancelling ${name}`;
+  }
   if (transfer.state === 'queued') {
     return isUp ? `Waiting to upload ${name}` : `Waiting to download ${name}`;
   }
@@ -602,6 +605,14 @@ export function formatDeviceTransferSubtitle(transfer, { deviceNoun = 'phone', t
   if (!transfer) return '';
   const isUp = transfer.direction === 'upload';
   const destLabel = isUp ? `From this ${deviceNoun} to ${transfer.machine}` : `To this ${deviceNoun}`;
+
+  if (transfer.state === 'cancelling') {
+    const msg =
+      typeof transfer.error === 'string'
+        ? transfer.error
+        : transfer.error?.message || 'Removing partial files…';
+    return msg;
+  }
 
   if (transfer.state === 'running' || transfer.state === 'paused' || transfer.state === 'queued') {
     const parts = [transfer.state === 'paused' ? 'Paused' : destLabel];
@@ -659,6 +670,12 @@ export function friendlyDeviceTransferState(transfer, technical = false) {
   }
   if (st === 'queued') return { label: 'Queued', cls: 'running' };
   if (st === 'paused') return { label: 'Paused', cls: '' };
+  if (st === 'cancelling') {
+    return {
+      label: technical ? 'cancelling' : 'Cancelling',
+      cls: transfer?.error ? 'failed' : '',
+    };
+  }
   if (st === 'done') return { label: technical ? 'done' : 'Finished', cls: 'done' };
   if (st === 'failed') return { label: technical ? 'failed' : 'Stopped', cls: 'failed' };
   if (st === 'cancelled') return { label: technical ? 'cancelled' : 'Stopped', cls: '' };

@@ -411,7 +411,11 @@ object TransferBridge {
       if (!TransferPathPolicy.isDeletableSavedDownloadUri(uri.authority, context.packageName)) {
         throw SecurityException("Refusing to delete content URI from disallowed authority.")
       }
-      val rows = runCatching { context.contentResolver.delete(uri, null, null) }.getOrDefault(0)
+      val rows = try {
+        context.contentResolver.delete(uri, null, null)
+      } catch (_: java.io.FileNotFoundException) {
+        0
+      }
       if (rows > 0) {
         deleted = true
       }
@@ -419,14 +423,23 @@ object TransferBridge {
         val seg = uri.lastPathSegment?.substringAfterLast('/')
         if (!seg.isNullOrBlank()) {
           val cacheDir = File(context.cacheDir, "open-externally")
-          if (runCatching { TransferPathPolicy.deleteContainedCacheFile(cacheDir, File(cacheDir, seg)) }.getOrDefault(false)) {
+          val target = File(cacheDir, seg)
+          val existedBefore = target.exists()
+          if (TransferPathPolicy.deleteContainedCacheFile(cacheDir, target)) {
             deleted = true
+          } else if (existedBefore && target.exists()) {
+            throw java.io.IOException("Could not delete cached file ${target.name}.")
           }
         }
       }
     } else {
       val cacheDir = File(context.cacheDir, "open-externally")
-      deleted = TransferPathPolicy.deleteContainedCacheFile(cacheDir, File(uriOrPath))
+      val target = File(uriOrPath)
+      val existedBefore = target.exists()
+      deleted = TransferPathPolicy.deleteContainedCacheFile(cacheDir, target)
+      if (!deleted && existedBefore && target.exists()) {
+        throw java.io.IOException("Could not delete cached file ${target.name}.")
+      }
     }
 
     return JSONObject().put("ok", true).put("deleted", deleted)
