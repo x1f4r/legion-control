@@ -3,9 +3,9 @@
 //!
 //! Interrupted two-step renames record their intent under `<state_dir>/xfer/renames/<key>.json`
 //! (with a sibling `<key>.lock` flock) and use a **visible** intermediate name
-//! (`legion-renaming-*`) so nothing is hidden if the process dies mid-rename. Both `fs.list` and
-//! stream transfer operations call [`recover_pending_renames`] to complete or reverse any
-//! interrupted rename and clean up its intent and lock files.
+//! (`legion-renaming-*`) so nothing is hidden if the process dies mid-rename. Stream transfer
+//! write operations call [`recover_pending_renames`] to complete or reverse any interrupted rename
+//! and clean up its intent and lock files; read operations never mutate disk.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;

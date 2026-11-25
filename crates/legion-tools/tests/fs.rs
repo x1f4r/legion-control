@@ -201,7 +201,7 @@ async fn list_orders_directories_first_handles_depth_hidden_and_truncation() {
 }
 
 #[tokio::test]
-async fn list_recovers_interrupted_two_step_rename_and_cleans_up_intent_and_lock() {
+async fn list_leaves_interrupted_two_step_rename_untouched_until_recovery_runs() {
     let f = Fixture::new();
     let state_dir = f.dir.path().join("state");
     let temp_name = legion_xfer::visible_rename_temp_name(std::ffi::OsStr::new("Draft.txt"), 77, 1);
@@ -223,6 +223,7 @@ async fn list_recovers_interrupted_two_step_rename_and_cleans_up_intent_and_lock
     std::fs::write(&lock_path, b"").unwrap();
     std::fs::write(&orphan_lock, b"").unwrap();
 
+    // `fs.list` is strictly a read and must never mutate files or sweep state.
     let listed = f
         .call("fs.list", json!({"path": "~/projects"}))
         .await
@@ -233,7 +234,31 @@ async fn list_recovers_interrupted_two_step_rename_and_cleans_up_intent_and_lock
         .iter()
         .map(|e| e["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["draft.txt"]);
+    assert_eq!(names, [temp_name.as_str()]);
+    assert!(!f.work.join("draft.txt").exists());
+    assert!(intent_path.exists(), "fs.list must not remove intent json");
+    assert!(lock_path.exists(), "fs.list must not remove intent lock");
+    assert!(
+        orphan_lock.exists(),
+        "fs.list must not sweep orphaned rename locks"
+    );
+
+    // Explicit write-path recovery completes the rename and cleans up the intent and locks.
+    legion_xfer::recover_pending_renames(
+        &state_dir,
+        Some(legion_xfer::RenameRecoveryScope::ExactDir(&f.work)),
+    );
+    let listed_after = f
+        .call("fs.list", json!({"path": "~/projects"}))
+        .await
+        .unwrap();
+    let names_after: Vec<&str> = listed_after["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names_after, ["draft.txt"]);
     assert_eq!(
         std::fs::read_to_string(f.work.join("draft.txt")).unwrap(),
         "recovered body"
@@ -370,8 +395,8 @@ role = "home_reader_role"
     assert!(!f.work.join("plan.txt").exists());
     assert!(proj_intent_path.exists());
 
-    // Finally, when the owner (who HAS `fs.write` in `~/projects`) lists `~/projects`, ONLY the
-    // pending rename in `~/projects` is recovered; the one in `~` STILL remains untouched.
+    // Even when the owner (who HAS `fs.write` in `~/projects`) lists `~/projects`, reads never
+    // mutate disk: both pending renames stay untouched until a write operation runs in that folder.
     let listed_owner = f
         .call("fs.list", json!({"path": "~/projects"}))
         .await
@@ -382,9 +407,13 @@ role = "home_reader_role"
         .iter()
         .map(|e| e["name"].as_str().unwrap())
         .collect();
-    assert!(owner_names.contains(&"plan.txt"), "{owner_names:?}");
-    assert!(!f.work.join(&proj_temp).exists());
-    assert!(!proj_intent_path.exists());
+    assert!(
+        owner_names.contains(&proj_temp.as_str()),
+        "owner fs.list must not mutate disk: {owner_names:?}"
+    );
+    assert!(f.work.join(&proj_temp).exists());
+    assert!(!f.work.join("plan.txt").exists());
+    assert!(proj_intent_path.exists());
     assert!(
         f.home.join(&home_temp).exists(),
         "listing ~/projects must still leave pending rename in ancestor ~ untouched"

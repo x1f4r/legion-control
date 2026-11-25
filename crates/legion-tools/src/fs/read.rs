@@ -154,22 +154,6 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
     }
     let root = check_fs_path(ctx.grant(), &args.path, Access::Read)?;
     let own_dirs = OwnDirFilter::for_ctx(ctx);
-    let state_dir = ctx.paths().state_dir().to_path_buf();
-    let write_grant = ctx
-        .node()
-        .config()
-        .get::<legion_core::Policy>()
-        .ok()
-        .and_then(|policy| {
-            policy
-                .authorize_name(
-                    ctx.principal(),
-                    "fs.write",
-                    Some(Effect::Write),
-                    ctx.paths(),
-                )
-                .ok()
-        });
     let max_depth = args.depth;
     let include_hidden = args.hidden;
     let limit = usize::try_from(args.limit).unwrap_or(usize::MAX);
@@ -186,32 +170,6 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
                 format!("{} is not a directory.", root.display()),
             )
             .with_hint("Use fs.stat or fs.read for a file, or pass its parent directory."));
-        }
-        // Only recover pending two-step renames in the exact listed directory, and ONLY when the
-        // caller is authorized for `fs.write` covering that directory and its target entries.
-        if let Some(ref wg) = write_grant
-            && wg.check_path(&root, Access::Write).is_ok()
-            && super::check_not_protected_tree(wg, &root).is_ok()
-        {
-            legion_xfer::recover_pending_renames_checked(
-                &state_dir,
-                Some(legion_xfer::RenameRecoveryScope::ExactDir(&root)),
-                |parent, intent| {
-                    wg.check_path(parent, Access::Write).is_ok()
-                        && super::check_not_protected_tree(wg, parent).is_ok()
-                        && [
-                            intent.from_name.as_str(),
-                            intent.temp_name.as_str(),
-                            intent.to_name.as_str(),
-                        ]
-                        .iter()
-                        .all(|name| {
-                            let entry = parent.join(name);
-                            wg.check_path(&entry, Access::Write).is_ok()
-                                && super::check_not_protected_tree(wg, &entry).is_ok()
-                        })
-                },
-            );
         }
         let root_device = platform::device_id(&root, &meta);
         let root_str = path_to_string(&root);
