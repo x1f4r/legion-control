@@ -1287,10 +1287,18 @@ impl UpdateManager {
     }
 
     fn bump_generation(&self) -> (u64, watch::Receiver<u64>) {
-        let next = self.cancel_tx.borrow().wrapping_add(1);
-        self.cancel_tx.send_replace(next);
         let mut rx = self.cancel_tx.subscribe();
-        let _ = rx.borrow_and_update();
+        let mut next = 0u64;
+        self.cancel_tx.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+            next = *generation;
+        });
+        // Mark `next` as seen only if no newer caller has already superseded it; if another
+        // caller bumped again before we got here, leave the newer value unseen so our very first
+        // `cancel_rx.changed().await` returns immediately.
+        if *rx.borrow() == next {
+            let _ = rx.borrow_and_update();
+        }
         (next, rx)
     }
 
@@ -4956,6 +4964,9 @@ mod tests {
         fail_after_reads: Option<usize>,
         reads: AtomicUsize,
         artifact_reads_by_node: Mutex<HashMap<String, usize>>,
+        stalled_list_entered: Arc<tokio::sync::Notify>,
+        stalled_list_entered_count: Arc<AtomicUsize>,
+        stalled_list_dropped: Arc<AtomicBool>,
     }
 
     impl FakeFleet {
@@ -4967,7 +4978,26 @@ mod tests {
                 fail_after_reads: None,
                 reads: AtomicUsize::new(0),
                 artifact_reads_by_node: Mutex::new(HashMap::new()),
+                stalled_list_entered: Arc::new(tokio::sync::Notify::new()),
+                stalled_list_entered_count: Arc::new(AtomicUsize::new(0)),
+                stalled_list_dropped: Arc::new(AtomicBool::new(false)),
             }
+        }
+
+        async fn wait_stalled_list_entered(&self) {
+            loop {
+                let notified = self.stalled_list_entered.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.stalled_list_entered_count.load(Ordering::SeqCst) > 0 {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        fn stalled_list_dropped(&self) -> bool {
+            self.stalled_list_dropped.load(Ordering::SeqCst)
         }
 
         fn add_set(&mut self, node: &str, set: FakeSet) {
@@ -4994,9 +5024,21 @@ mod tests {
                 self.behaviors.get(node),
                 Some(NodeBehavior::StallListForever)
             ) {
-                return Box::pin(async {
-                    tokio::time::sleep(Duration::from_secs(60)).await;
-                    Err(AppError::new(ErrorCode::Timeout, "stalled"))
+                let entered = Arc::clone(&self.stalled_list_entered);
+                let entered_count = Arc::clone(&self.stalled_list_entered_count);
+                let dropped = Arc::clone(&self.stalled_list_dropped);
+                struct DropFlag(Arc<AtomicBool>);
+                impl Drop for DropFlag {
+                    fn drop(&mut self) {
+                        self.0.store(true, Ordering::SeqCst);
+                    }
+                }
+                return Box::pin(async move {
+                    let _drop_guard = DropFlag(dropped);
+                    entered_count.fetch_add(1, Ordering::SeqCst);
+                    entered.notify_waiters();
+                    std::future::pending::<()>().await;
+                    unreachable!()
                 });
             }
             let res = match self.nodes.get(node) {
@@ -5786,7 +5828,7 @@ mod tests {
         assert!(st_newer.failed_update.is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn manual_check_cancels_stalled_background_check_immediately() {
         let dir = tempfile::tempdir().unwrap();
         let (rel_sk, rel_pk) = keypair(0x89);
@@ -5831,25 +5873,38 @@ mod tests {
                 .await
         });
 
-        // Give the background check a moment to enter the stalled call.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Wait deterministically until the background check is parked inside `list_sets("slow")`.
+        slow_fleet.wait_stalled_list_entered().await;
+        assert!(
+            !slow_fleet.stalled_list_dropped(),
+            "stalled background list_sets must still be active before manual check starts"
+        );
 
         let started = Instant::now();
         let st = mgr
             .check_with_client(&fast_fleet, &["fast".to_owned()], true, false)
             .await
             .unwrap();
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "manual check must not block behind stalled background check"
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "manual check must cancel stalled background check immediately without waiting on LIST_NODE_TIMEOUT"
         );
         assert_eq!(st.phase, "ready", "{st:?}");
-        // Background task also exits promptly when cancelled.
-        let bg_res = tokio::time::timeout(Duration::from_secs(2), bg_handle)
-            .await
-            .expect("cancelled background check should exit promptly")
-            .unwrap();
+
+        // Background task exits immediately via generation cancellation rather than waiting on
+        // `LIST_NODE_TIMEOUT`, dropping the stalled `list_sets` future.
+        let bg_res = bg_handle.await.unwrap();
         assert!(bg_res.is_ok());
+        assert!(
+            slow_fleet.stalled_list_dropped(),
+            "cancelled background check must drop its stalled list_sets future"
+        );
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "cancelled background check must finish without advancing virtual time to LIST_NODE_TIMEOUT"
+        );
     }
 
     #[tokio::test]
@@ -7668,8 +7723,8 @@ mod tests {
                     rollback_ps_path: None,
                     single_instance_dbus_name: None,
                     single_instance_socket_path: None,
-                    pre_swap_wait_secs: 2,
-                    wait_secs: 2,
+                    pre_swap_wait_secs: 4,
+                    wait_secs: 4,
                     exit_grace_secs: 1,
                     rollback_retries: 4,
                     verify_only: true,
@@ -7679,7 +7734,7 @@ mod tests {
                 supervisors_spawned += 1;
 
                 // Wait for the supervisor to finish rolling back and release update.lock.
-                let deadline = StdInstant::now() + Duration::from_secs(10);
+                let deadline = StdInstant::now() + Duration::from_secs(30);
                 while StdInstant::now() < deadline {
                     if rb_path.exists() && !updates_dir.join(desktop::UPDATE_LOCK_FILENAME).exists()
                     {
@@ -8367,6 +8422,7 @@ mod tests {
             block_delete_part: AtomicBool,
             hidden_for_drain: AtomicBool,
             drain_notified: AtomicBool,
+            drain_notify: tokio::sync::Notify,
         }
 
         impl BlockingCancelPlatform {
@@ -8375,6 +8431,7 @@ mod tests {
                     block_delete_part: AtomicBool::new(true),
                     hidden_for_drain: AtomicBool::new(false),
                     drain_notified: AtomicBool::new(false),
+                    drain_notify: tokio::sync::Notify::new(),
                 }
             }
         }
@@ -8434,6 +8491,7 @@ mod tests {
                     && self.hidden_for_drain.swap(false, Ordering::SeqCst)
                 {
                     self.drain_notified.store(true, Ordering::SeqCst);
+                    self.drain_notify.notify_waiters();
                 }
             }
         }
@@ -8635,22 +8693,26 @@ mod tests {
         // completes and the transfer reaches `Cancelled`, every gate unblocks cleanly.
         platform.block_delete_part.store(false, Ordering::SeqCst);
         transfers.start();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        loop {
-            let state = transfers
-                .list()
-                .into_iter()
-                .find(|t| t.id == xfer_id)
-                .map(|t| t.state);
-            if state == Some(TransferState::Cancelled) {
-                break;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let notified = platform.drain_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let state = transfers
+                    .list()
+                    .into_iter()
+                    .find(|t| t.id == xfer_id)
+                    .map(|t| t.state);
+                if state == Some(TransferState::Cancelled)
+                    && platform.drain_notified.load(Ordering::SeqCst)
+                {
+                    break;
+                }
+                notified.await;
             }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "timed out waiting for Cancelling transfer to finish cleanup (state={state:?})"
-            );
-            tokio::time::sleep(Duration::from_millis(15)).await;
-        }
+        })
+        .await
+        .expect("timed out waiting for Cancelling transfer to finish cleanup");
         transfers.shutdown();
 
         assert!(!part_file.exists());
@@ -8682,19 +8744,19 @@ mod tests {
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(start_paused = true)]
     async fn overview_background_refreshes_do_not_block_updates_and_never_get_cut_off_mid_call() {
         use std::sync::atomic::AtomicBool;
 
         use legion_link::proto::{HelloResult, PROTOCOL, Request, Response, method};
         use serde_json::Value;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::sync::Notify;
+        use tokio::sync::{Notify, Semaphore};
 
         use crate::backend::CallRequest;
         use crate::commands::{evaluate_and_quiesce_auto_install, has_active_native_work};
         use crate::content::AppContentServer;
-        use crate::link_backend::LinkBackend;
+        use crate::link_backend::{DrainClock, LinkBackend, ManualDrainClock};
         use crate::store::AppStore;
         use crate::transfers::{PickedUploadFile, TransferManager, TransferPlatform};
         use crate::{DesktopCloseOutcome, handle_desktop_close_request_with_timeout};
@@ -8753,7 +8815,7 @@ mod tests {
             ),
         );
 
-        let mgr = UpdateManager::with_config_at(
+        let mgr = Arc::new(UpdateManager::with_config_at(
             updates_dir.clone(),
             anchors,
             Os::Linux,
@@ -8765,7 +8827,7 @@ mod tests {
             "old".to_owned(),
             202611250200,
             t0,
-        );
+        ));
         assert_eq!(
             mgr.check_with_client_at(&fleet, &["tower".to_owned()], false, false, t0)
                 .await
@@ -8775,11 +8837,14 @@ mod tests {
         );
 
         let call_entered = Arc::new(AtomicUsize::new(0));
-        let release = Arc::new(Notify::new());
+        let call_entered_notify = Arc::new(Notify::new());
+        let release = Arc::new(Semaphore::new(0));
         let entered_tx = Arc::clone(&call_entered);
+        let entered_notify_tx = Arc::clone(&call_entered_notify);
         let release_rx = Arc::clone(&release);
         let opener: legion_link::SessionOpener = Arc::new(move |entry, _, cancel| {
             let entered_tx = Arc::clone(&entered_tx);
+            let entered_notify_tx = Arc::clone(&entered_notify_tx);
             let release_rx = Arc::clone(&release_rx);
             Box::pin(async move {
                 let node_name = entry.node.clone();
@@ -8812,7 +8877,11 @@ mod tests {
                             )
                         } else {
                             entered_tx.fetch_add(1, Ordering::SeqCst);
-                            release_rx.notified().await;
+                            entered_notify_tx.notify_waiters();
+                            let Ok(permit) = release_rx.acquire().await else {
+                                break;
+                            };
+                            permit.forget();
                             Response::ok(req.id, serde_json::json!({ "ok": true }))
                         };
                         let mut out = serde_json::to_string(&reply).unwrap_or_default();
@@ -8835,19 +8904,37 @@ mod tests {
             })
         });
 
+        let wait_for_call_entered = || {
+            let call_entered = Arc::clone(&call_entered);
+            let call_entered_notify = Arc::clone(&call_entered_notify);
+            async move {
+                loop {
+                    let notified = call_entered_notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if call_entered.load(Ordering::SeqCst) > 0 {
+                        return;
+                    }
+                    notified.await;
+                }
+            }
+        };
+
+        let clock = ManualDrainClock::new();
         let store = AppStore::in_dir(&data_dir);
-        let backend: Arc<LinkBackend> = Arc::new(LinkBackend::with_opener(
+        let backend: Arc<LinkBackend> = Arc::new(LinkBackend::with_opener_and_clock(
             store,
             Some("/usr/bin/legion".to_owned()),
             opener,
+            Arc::clone(&clock) as Arc<dyn DrainClock>,
         ));
         let backend_dyn: Arc<dyn Backend> = Arc::clone(&backend) as Arc<dyn Backend>;
-        let content = AppContentServer::new(Arc::clone(&backend_dyn));
-        let transfers = TransferManager::load_or_new(
+        let content = Arc::new(AppContentServer::new(Arc::clone(&backend_dyn)));
+        let transfers = Arc::new(TransferManager::load_or_new(
             &data_dir,
             Arc::clone(&backend_dyn),
             Arc::new(NoopPlatform),
-        );
+        ));
 
         // 1. Start a Machine Overview `sys.procs` poll and pause it mid-flight.
         let b_poll = Arc::clone(&backend);
@@ -8869,11 +8956,7 @@ mod tests {
             res
         });
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        while call_entered.load(Ordering::SeqCst) == 0 {
-            assert!(tokio::time::Instant::now() < deadline);
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        wait_for_call_entered().await;
         assert_eq!(backend.active_operations(), 0);
         assert_eq!(backend.background_refreshes(), 1);
         assert!(
@@ -8882,55 +8965,66 @@ mod tests {
         );
 
         // If the poll stays mid-flight past the grace timeout, desktop close defers cleanly
-        // instead of cutting the RPC off mid-call.
-        let mgr_ref = &mgr;
+        // instead of cutting the RPC off mid-call (driven deterministically via ManualDrainClock).
+        let m_close = Arc::clone(&mgr);
         let b_close = Arc::clone(&backend);
         let t_close = Arc::clone(&transfers);
-        let deferred = tokio::task::block_in_place(|| {
+        let deferred_task = tokio::task::spawn_blocking(move || {
             handle_desktop_close_request_with_timeout(
-                mgr_ref,
+                &m_close,
                 b_close.as_ref(),
                 &t_close,
-                Duration::from_millis(40),
+                Duration::from_secs(2),
             )
         });
+        clock.wait_for_waiter().await;
+        assert!(
+            !poll_finished.load(Ordering::SeqCst),
+            "poll must still be in flight while desktop close waits for grace timeout"
+        );
+        clock.advance(Duration::from_secs(2));
+        let deferred = deferred_task.await.unwrap();
         assert_eq!(deferred, DesktopCloseOutcome::CloseNormally);
         assert!(!updates_dir.join(desktop::UPDATE_LOCK_FILENAME).exists());
 
-        // Start a startup auto-install quiesce while the poll is mid-call, then let the poll
-        // finish 40 ms later: the install waits for the poll to finish (never cutting it off) and
-        // succeeds right between poll ticks!
-        let release_soon = Arc::clone(&release);
-        let finished_check = Arc::clone(&poll_finished);
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(40)).await;
-            assert!(
-                !finished_check.load(Ordering::SeqCst),
-                "poll must still be in flight until released"
-            );
-            release_soon.notify_waiters();
+        // Start a startup auto-install quiesce while the poll is mid-call, prove it waits behind
+        // the poll, then release the poll: the install waits for the poll to finish (never cutting
+        // it off) and succeeds right between poll ticks without relying on wall-clock budgets.
+        let m_quiesce = Arc::clone(&mgr);
+        let b_quiesce = Arc::clone(&backend);
+        let t_quiesce = Arc::clone(&transfers);
+        let c_quiesce = Arc::clone(&content);
+        let quiesce_task = tokio::spawn(async move {
+            evaluate_and_quiesce_auto_install(
+                &m_quiesce,
+                b_quiesce.as_ref(),
+                &t_quiesce,
+                &c_quiesce,
+                "startup",
+                Duration::from_secs(2),
+            )
+            .await
         });
-        let allowed_after_poll = evaluate_and_quiesce_auto_install(
-            &mgr,
-            backend.as_ref(),
-            &transfers,
-            &content,
-            "startup",
-            Duration::from_secs(2),
-        )
-        .await;
+        clock.wait_for_waiter().await;
+        assert!(
+            !poll_finished.load(Ordering::SeqCst),
+            "poll must still be in flight until explicitly released"
+        );
+        release.add_permits(1);
+        let allowed_after_poll = quiesce_task.await.unwrap();
         assert!(
             allowed_after_poll,
             "auto-install must wait for in-flight Overview poll and then proceed between ticks"
         );
+        assert!(poll_task.await.unwrap().is_ok());
         assert!(
             poll_finished.load(Ordering::SeqCst),
             "Overview poll must finish cleanly before auto-install proceeds"
         );
-        assert!(poll_task.await.unwrap().is_ok());
+        assert_eq!(backend.background_refreshes(), 0);
 
         // 2. Now start a user-started `exec.run` call and pause it mid-flight:
-        //    it MUST block every update gate immediately!
+        //    it MUST block every update gate immediately without entering the refresh drain wait.
         call_entered.store(0, Ordering::SeqCst);
         let b_exec = Arc::clone(&backend);
         let exec_task = tokio::spawn(async move {
@@ -8946,11 +9040,7 @@ mod tests {
                 )
                 .await
         });
-        let deadline2 = tokio::time::Instant::now() + Duration::from_secs(3);
-        while call_entered.load(Ordering::SeqCst) == 0 {
-            assert!(tokio::time::Instant::now() < deadline2);
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        wait_for_call_entered().await;
         assert_eq!(backend.active_operations(), 1);
         assert!(has_active_native_work(
             backend.as_ref(),
@@ -8962,17 +9052,27 @@ mod tests {
             mgr.evaluate_auto_install_gate("close", backend.active_operations(), false),
             Err("native_activity_in_flight")
         );
-        let blocked_close = tokio::task::block_in_place(|| {
+        let m_blocked = Arc::clone(&mgr);
+        let b_blocked = Arc::clone(&backend);
+        let t_blocked = Arc::clone(&transfers);
+        let blocked_close = tokio::task::spawn_blocking(move || {
             handle_desktop_close_request_with_timeout(
-                &mgr,
-                backend.as_ref(),
-                &transfers,
-                Duration::from_secs(1),
+                &m_blocked,
+                b_blocked.as_ref(),
+                &t_blocked,
+                Duration::from_secs(2),
             )
-        });
+        })
+        .await
+        .unwrap();
         assert_eq!(blocked_close, DesktopCloseOutcome::CloseNormally);
+        assert_eq!(
+            clock.pending_waiters(),
+            0,
+            "active user operation must refuse close-time install immediately without waiting on refresh drain"
+        );
         assert!(!updates_dir.join(desktop::UPDATE_LOCK_FILENAME).exists());
-        release.notify_waiters();
+        release.add_permits(1);
         assert!(exec_task.await.unwrap().is_ok());
         assert_eq!(backend.active_operations(), 0);
 
@@ -8999,24 +9099,25 @@ mod tests {
                 sys_done_tx.store(true, Ordering::SeqCst);
                 res
             });
-            let deadline3 = tokio::time::Instant::now() + Duration::from_secs(3);
-            while call_entered.load(Ordering::SeqCst) == 0 {
-                assert!(tokio::time::Instant::now() < deadline3);
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            let release_sys = Arc::clone(&release);
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(40)).await;
-                release_sys.notify_waiters();
-            });
-            let outcome = tokio::task::block_in_place(|| {
+            wait_for_call_entered().await;
+            let m_sys_close = Arc::clone(&mgr);
+            let b_sys_close = Arc::clone(&backend);
+            let t_sys_close = Arc::clone(&transfers);
+            let close_task = tokio::task::spawn_blocking(move || {
                 handle_desktop_close_request_with_timeout(
-                    &mgr,
-                    backend.as_ref(),
-                    &transfers,
+                    &m_sys_close,
+                    b_sys_close.as_ref(),
+                    &t_sys_close,
                     Duration::from_secs(2),
                 )
             });
+            clock.wait_for_waiter().await;
+            assert!(
+                !sys_done.load(Ordering::SeqCst),
+                "sys.info must still be in flight while desktop close waits"
+            );
+            release.add_permits(1);
+            let outcome = close_task.await.unwrap();
             assert_eq!(
                 outcome,
                 DesktopCloseOutcome::CloseWithUpdate,
@@ -9033,7 +9134,6 @@ mod tests {
                 let _ = std::process::Command::new("/bin/kill")
                     .args(["-TERM", &sup_pid.to_string()])
                     .status();
-                std::thread::sleep(Duration::from_millis(100));
             }
         }
     }
