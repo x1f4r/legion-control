@@ -763,12 +763,14 @@ test('Player: music screen, tags, covers in listing, MediaSession, auto-advance,
 
     const musicAudit = await page.evaluate(() => {
       const viewer = document.querySelector('.viewer');
+      const coverBox = document.querySelector('.music-cover-box');
       const coverRect = document.querySelector('.music-cover-wrap').getBoundingClientRect();
       const panelRect = document.querySelector('.music-meta-panel').getBoundingClientRect();
       return {
         nativeControls: viewer.querySelectorAll('audio[controls]').length,
         disabledCount: viewer.querySelectorAll('[disabled], [aria-disabled="true"]').length,
         coverLeftOfPanel: coverRect.x + coverRect.width <= panelRect.x + 8,
+        coverHairlineShadow: getComputedStyle(coverBox, '::after').boxShadow,
         mediaSessionTitle: navigator.mediaSession?.metadata?.title || '',
         mediaSessionArtist: navigator.mediaSession?.metadata?.artist || '',
         mediaSessionAlbum: navigator.mediaSession?.metadata?.album || '',
@@ -777,6 +779,8 @@ test('Player: music screen, tags, covers in listing, MediaSession, auto-advance,
     assert.equal(musicAudit.nativeControls, 0);
     assert.equal(musicAudit.disabledCount, 0);
     assert.equal(musicAudit.coverLeftOfPanel, true);
+    assert.match(musicAudit.coverHairlineShadow, /inset/i);
+    assert.match(musicAudit.coverHairlineShadow, /1px/);
     assert.equal(musicAudit.mediaSessionTitle, 'Morning Light');
     assert.equal(musicAudit.mediaSessionArtist, 'Klara');
     assert.equal(musicAudit.mediaSessionAlbum, 'Early Hours');
