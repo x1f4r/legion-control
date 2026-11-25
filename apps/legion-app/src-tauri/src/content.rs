@@ -5,22 +5,19 @@
 //! view play and seek straight from the machine without copying files into memory or exposing the
 //! interface origin.
 //!
-//! - **Linux, macOS, iOS/iPadOS, and Windows** mount `legion-content` on a lazy HTTP/1.1 listener
-//!   bound strictly to `127.0.0.1:0` (system-chosen ephemeral port), stopping automatically once
-//!   no live tickets or active streams remain for [`DEFAULT_IDLE_SHUTDOWN`].
-//! - **Android** enforces `android:usesCleartextTraffic="false"` in `AndroidManifest.xml`, which
-//!   causes Android WebView to reject `http://127.0.0.1:<port>` with `ERR_CLEARTEXT_NOT_PERMITTED`.
-//!   Android therefore mounts the same `legion-content` handler on the Tauri custom URI scheme
-//!   `legion-content` (`http://legion-content.localhost/v1/content/<ticket>/<name>`), answering
-//!   open-ended ranges in bounded [`CUSTOM_SCHEME_MAX_RANGE_BYTES`] pieces so `wry` never buffers
-//!   whole videos into memory and no cleartext loopback port is opened on the device.
+//! All platforms (Linux, macOS, iOS/iPadOS, Windows, and Android) mount `legion-content` on a lazy
+//! HTTP/1.1 listener bound strictly to `127.0.0.1:0` (system-chosen ephemeral port), stopping
+//! automatically once no live tickets or active streams remain for [`DEFAULT_IDLE_SHUTDOWN`]. On
+//! Android, `res/xml/network_security_config.xml` denies cleartext traffic everywhere except the
+//! loopback literal `127.0.0.1`, allowing WebView to stream and seek arbitrarily large media with
+//! flat memory while keeping cleartext blocked for every other host.
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -96,23 +93,16 @@ const CROSS_ORIGIN_RESOURCE_POLICY: HeaderName =
 /// Transport mount used to reach [`AppContentServer`] from the web view.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContentMountMode {
-    /// Loopback HTTP/1.1 listener on `127.0.0.1:0` (Linux, macOS, iOS/iPadOS, Windows).
+    /// Streaming loopback HTTP/1.1 listener on `127.0.0.1:0` (all platforms).
     Loopback,
-    /// Tauri custom URI scheme `legion-content` answering bounded range pieces (Android).
+    /// Legacy buffered Tauri custom URI scheme `legion-content` (retained for tests).
     CustomScheme,
 }
 
 impl ContentMountMode {
     /// Returns the content transport mount selected for the current target platform.
     pub const fn current_platform() -> Self {
-        #[cfg(target_os = "android")]
-        {
-            Self::CustomScheme
-        }
-        #[cfg(not(target_os = "android"))]
-        {
-            Self::Loopback
-        }
+        Self::Loopback
     }
 }
 
@@ -138,6 +128,43 @@ pub struct ContentUrlResult {
     pub url: String,
     /// Ticket sliding lifetime in seconds.
     pub expires_in: u64,
+}
+
+/// Diagnostic status of the most recent content request(s) for one ticket URL.
+///
+/// Queried by the interface via `content_status` when an `<img>`, `<video>`, or `<audio>` element
+/// errors so the viewer distinguishes HTTP/transport/size/revocation failures from genuine media
+/// decode failures.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentUrlStatus {
+    /// Number of HTTP requests observed for this ticket URL so far.
+    pub request_count: u32,
+    /// HTTP status code of the most recent request, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// Response `Content-Type` header of the most recent request, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    /// True when any streaming body served for this ticket aborted mid-stream.
+    pub stream_failed: bool,
+    /// Structured Legion error code from an error response body, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// Human-readable error message from an error response body, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    /// True when the ticket referenced by the URL is still live in the ticket table.
+    pub ticket_live: bool,
+}
+
+struct TicketStatusEntry {
+    key_hash: [u8; 32],
+    request_count: u32,
+    status: Option<u16>,
+    content_type: Option<String>,
+    stream_failed: Arc<AtomicBool>,
+    error_code: Option<String>,
+    error_message: Option<String>,
 }
 
 /// Redacted request diagnostic entry (never stores ticket identifiers or credentials).
@@ -279,6 +306,7 @@ pub struct AppContentServer {
     active_streams: Arc<AtomicUsize>,
     activity: Arc<Mutex<ActivityState>>,
     request_log: Mutex<VecDeque<ContentRequestLog>>,
+    ticket_statuses: Mutex<VecDeque<TicketStatusEntry>>,
 }
 
 impl AppContentServer {
@@ -357,6 +385,7 @@ impl AppContentServer {
                 last_activity: Instant::now(),
             })),
             request_log: Mutex::new(VecDeque::with_capacity(MAX_REQUEST_LOG)),
+            ticket_statuses: Mutex::new(VecDeque::with_capacity(MAX_REQUEST_LOG)),
         }
     }
 
@@ -390,6 +419,104 @@ impl AppContentServer {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+    }
+
+    /// Returns the observed HTTP status, content type, mid-stream failure flag, and ticket
+    /// liveness for `raw_url` without exposing any secret ticket identifier.
+    pub fn content_status_for_url(&self, raw_url: &str) -> ContentUrlStatus {
+        let Some(ticket_id) = extract_ticket_id_from_url(raw_url) else {
+            return ContentUrlStatus::default();
+        };
+        let key_hash = ticket_hash(ticket_id);
+        let ticket_live = self.tickets.is_live(&key_hash);
+        let statuses = self
+            .ticket_statuses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(entry) = statuses.iter().find(|entry| entry.key_hash == key_hash) else {
+            return ContentUrlStatus {
+                ticket_live,
+                ..ContentUrlStatus::default()
+            };
+        };
+        ContentUrlStatus {
+            request_count: entry.request_count,
+            status: entry.status,
+            content_type: entry.content_type.clone(),
+            stream_failed: entry.stream_failed.load(Ordering::Acquire),
+            error_code: entry.error_code.clone(),
+            error_message: entry.error_message.clone(),
+            ticket_live,
+        }
+    }
+
+    fn ensure_ticket_stream_flag(&self, key_hash: [u8; 32]) -> Arc<AtomicBool> {
+        let mut statuses = self
+            .ticket_statuses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = statuses.iter().find(|entry| entry.key_hash == key_hash) {
+            return Arc::clone(&entry.stream_failed);
+        }
+        if statuses.len() >= MAX_REQUEST_LOG {
+            statuses.pop_front();
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        statuses.push_back(TicketStatusEntry {
+            key_hash,
+            request_count: 0,
+            status: None,
+            content_type: None,
+            stream_failed: Arc::clone(&flag),
+            error_code: None,
+            error_message: None,
+        });
+        flag
+    }
+
+    fn record_ticket_status(
+        &self,
+        key_hash: [u8; 32],
+        status: StatusCode,
+        headers: &HeaderMap,
+        error_body: Option<&[u8]>,
+        increment_count: bool,
+    ) {
+        let content_type = headers
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let (error_code, error_message) = if status.is_client_error() || status.is_server_error() {
+            parse_proto_error_summary(error_body)
+        } else {
+            (None, None)
+        };
+        let mut statuses = self
+            .ticket_statuses
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = statuses.iter_mut().find(|entry| entry.key_hash == key_hash) {
+            if increment_count {
+                entry.request_count = entry.request_count.saturating_add(1);
+            }
+            entry.status = Some(status.as_u16());
+            entry.content_type = content_type;
+            entry.error_code = error_code;
+            entry.error_message = error_message;
+            return;
+        }
+        if statuses.len() >= MAX_REQUEST_LOG {
+            statuses.pop_front();
+        }
+        statuses.push_back(TicketStatusEntry {
+            key_hash,
+            request_count: u32::from(increment_count),
+            status: Some(status.as_u16()),
+            content_type,
+            stream_failed: Arc::new(AtomicBool::new(false)),
+            error_code,
+            error_message,
+        });
     }
 
     /// Probes `path` on `machine` through `Link::open_content(..., 0, Some(0))`, issues a
@@ -608,14 +735,28 @@ impl AppContentServer {
         let response = self
             .handle_checked_request(&guard, &method, &uri, &headers, options)
             .await;
-        collect_bounded_response(
+        let ticket_key_hash = parse_content_path(uri.path()).map(|(id, _)| ticket_hash(id));
+        let initial_status = response.status();
+        let collected = collect_bounded_response(
             response,
             max_bytes,
             &self.custom_scheme_memory_budget,
             &self.custom_scheme_buffered_bytes,
             &self.custom_scheme_peak_buffered_bytes,
         )
-        .await
+        .await;
+        if let Some(key_hash) = ticket_key_hash
+            && collected.status() != initial_status
+        {
+            self.record_ticket_status(
+                key_hash,
+                collected.status(),
+                collected.headers(),
+                Some(collected.body().as_slice()),
+                false,
+            );
+        }
+        collected
     }
 
     fn touch_activity(&self) {
@@ -866,7 +1007,19 @@ impl AppContentServer {
 
         let cors_origin = match guard.check(headers, uri) {
             Ok(origin) => origin,
-            Err(rejection) => return guard_error_response(rejection, options.corp),
+            Err(rejection) => {
+                let resp = guard_error_response(rejection, options.corp);
+                if let Some((ticket_id, _)) = parse_content_path(uri.path()) {
+                    self.record_ticket_status(
+                        ticket_hash(ticket_id),
+                        resp.status(),
+                        resp.headers(),
+                        resp.body().fixed_bytes(),
+                        true,
+                    );
+                }
+                return resp;
+            }
         };
 
         if *method == Method::OPTIONS {
@@ -876,6 +1029,8 @@ impl AppContentServer {
         let Some((ticket_id, file_name)) = parse_content_path(uri.path()) else {
             return not_found_response(options.corp, cors_origin);
         };
+        let key_hash = ticket_hash(ticket_id);
+        let stream_failed = self.ensure_ticket_stream_flag(key_hash);
 
         self.active_streams.fetch_add(1, Ordering::AcqRel);
         let active_guard = ActiveStreamGuard {
@@ -885,6 +1040,7 @@ impl AppContentServer {
         let hooks = StreamHooks {
             limiter: Some(self.limiter.clone()),
             bytes_served: None,
+            stream_failed: Some(stream_failed),
             active_guard: Some(Box::new(active_guard)),
         };
 
@@ -905,6 +1061,13 @@ impl AppContentServer {
             apply_cors_headers(response.headers_mut(), origin);
         }
 
+        self.record_ticket_status(
+            key_hash,
+            response.status(),
+            response.headers(),
+            response.body().fixed_bytes(),
+            true,
+        );
         self.record_request_log(method, file_name, headers, &response);
         response
     }
@@ -984,6 +1147,42 @@ fn parse_content_path(path: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((ticket_id, file_name))
+}
+
+fn ticket_hash(ticket_id: &str) -> [u8; 32] {
+    *blake3::hash(ticket_id.as_bytes()).as_bytes()
+}
+
+fn extract_ticket_id_from_url(raw_url: &str) -> Option<&str> {
+    let trimmed = raw_url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
+    let path = if let Some(after_scheme) = without_query.split_once("://").map(|(_, rest)| rest) {
+        let slash = after_scheme.find('/')?;
+        &after_scheme[slash..]
+    } else {
+        without_query
+    };
+    parse_content_path(path).map(|(ticket_id, _)| ticket_id)
+}
+
+fn parse_proto_error_summary(raw: Option<&[u8]>) -> (Option<String>, Option<String>) {
+    let Some(bytes) = raw else {
+        return (None, None);
+    };
+    let Ok(err) = serde_json::from_slice::<ProtoErrorBody>(bytes) else {
+        return (None, None);
+    };
+    let code = serde_json::to_value(err.code)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned));
+    (code, Some(err.message))
 }
 
 fn apply_base_security_headers(headers: &mut HeaderMap, corp: CorpPolicy) {
@@ -3076,6 +3275,255 @@ mod tests {
         .await;
         assert_eq!(long_status, 200, "{long_head}");
         assert_eq!(long_body, image_bytes);
+
+        server.shutdown();
+    }
+
+    #[test]
+    fn current_platform_uses_loopback_everywhere() {
+        assert_eq!(
+            ContentMountMode::current_platform(),
+            ContentMountMode::Loopback
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_handles_range_edge_cases_parallel_small_and_duplicate_ranges() {
+        let payload: Vec<u8> = (0..(2 * 1024 * 1024usize))
+            .map(|i| ((i * 37 + 11) % 251) as u8)
+            .collect();
+        let mut files = HashMap::new();
+        files.insert("/home/me/master.flac".to_owned(), payload.clone());
+
+        let backend = Arc::new(MockContentBackend::new(files));
+        let server = Arc::new(AppContentServer::with_config(
+            backend,
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["http://tauri.localhost".to_owned()],
+        ));
+
+        let t1 = server
+            .mint_url("tower", "/home/me/master.flac", false)
+            .await
+            .unwrap();
+        let t2 = server
+            .mint_url("tower", "/home/me/master.flac", false)
+            .await
+            .unwrap();
+        let port = server.loopback_port().unwrap();
+        let path1 = t1
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .to_owned();
+        let path2 = t2
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .to_owned();
+
+        // 1) Open-ended range `bytes=0-` streams the full 2 MiB file over loopback.
+        let (st, head, body) = raw_http(
+            port,
+            &format!(
+                "GET {path1} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nRange: bytes=0-\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(st, 206, "{head}");
+        assert_eq!(body.len(), payload.len());
+        assert_eq!(body, payload);
+
+        // 2) Huge range past end (`bytes=1048576-999999999`) clamps cleanly to EOF.
+        let (st, head, body) = raw_http(
+            port,
+            &format!(
+                "GET {path1} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nRange: bytes=1048576-999999999\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(st, 206, "{head}");
+        assert_eq!(body, &payload[1048576..]);
+
+        // 3) Past-the-end range -> 416 Range Not Satisfiable with `bytes */<size>`.
+        let (st, head, _) = raw_http(
+            port,
+            &format!(
+                "GET {path1} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nRange: bytes={}-\r\nConnection: close\r\n\r\n",
+                payload.len()
+            ),
+        )
+        .await;
+        assert_eq!(st, 416, "{head}");
+        assert!(
+            head.to_ascii_lowercase()
+                .contains(&format!("content-range: bytes */{}", payload.len())),
+            "{head}"
+        );
+
+        // 4) 16 small parallel ranges split across two tickets (8 per ticket, within per-ticket
+        // and per-holder caps) all succeed byte-exact.
+        let mut parallel_tasks = Vec::new();
+        for i in 0..16usize {
+            let p = if i < 8 { path1.clone() } else { path2.clone() };
+            let start = i * 65_536;
+            let end = start + 8191;
+            parallel_tasks.push(tokio::spawn(async move {
+                let (s, h, b) = raw_http(
+                    port,
+                    &format!(
+                        "GET {p} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nRange: bytes={start}-{end}\r\nConnection: close\r\n\r\n"
+                    ),
+                )
+                .await;
+                (start, end, s, h, b)
+            }));
+        }
+        for task in parallel_tasks {
+            let (start, end, s, h, b) = task.await.unwrap();
+            assert_eq!(s, 206, "{h}");
+            assert_eq!(b, &payload[start..=end]);
+        }
+
+        // 5) 8 duplicate identical ranges fired simultaneously on the same ticket all return 206
+        // with identical bytes.
+        let mut dup_tasks = Vec::new();
+        for _ in 0..8usize {
+            let p = path1.clone();
+            dup_tasks.push(tokio::spawn(async move {
+                raw_http(
+                    port,
+                    &format!(
+                        "GET {p} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nRange: bytes=4096-20479\r\nConnection: close\r\n\r\n"
+                    ),
+                )
+                .await
+            }));
+        }
+        for task in dup_tasks {
+            let (s, h, b) = task.await.unwrap();
+            assert_eq!(s, 206, "{h}");
+            assert_eq!(b, &payload[4096..20480]);
+        }
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn content_status_reports_healthy_media_truncation_http_errors_and_unrequested_urls() {
+        let flac_bytes: Vec<u8> = (0..(128 * 1024)).map(|i| (i % 251) as u8).collect();
+        let mut files = HashMap::new();
+        files.insert("/home/me/track.flac".to_owned(), flac_bytes.clone());
+
+        let backend = Arc::new(MockContentBackend::new(files));
+        let server = Arc::new(AppContentServer::with_config(
+            Arc::clone(&backend) as Arc<dyn Backend>,
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["http://tauri.localhost".to_owned()],
+        ));
+
+        // 1) Freshly minted URL before any request: ticket_live=true, request_count=0.
+        let healthy = server
+            .mint_url("tower", "/home/me/track.flac", false)
+            .await
+            .unwrap();
+        let port = server.loopback_port().unwrap();
+        let initial = server.content_status_for_url(&healthy.url);
+        assert!(initial.ticket_live);
+        assert_eq!(initial.request_count, 0);
+        assert_eq!(initial.status, None);
+        assert!(!initial.stream_failed);
+
+        // 2) Healthy 206 audio/flac delivery: status=206, content_type=audio/flac, stream_failed=false.
+        let healthy_path = healthy
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap();
+        let (st, head, body) = raw_http(
+            port,
+            &format!(
+                "GET {healthy_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nRange: bytes=0-4095\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(st, 206, "{head}");
+        assert_eq!(body.len(), 4096);
+        let after_ok = server.content_status_for_url(&healthy.url);
+        assert_eq!(after_ok.request_count, 1);
+        assert_eq!(after_ok.status, Some(206));
+        assert_eq!(after_ok.content_type.as_deref(), Some("audio/flac"));
+        assert!(!after_ok.stream_failed);
+        assert!(after_ok.ticket_live);
+
+        // 3) Mid-stream truncation on loopback: status=200 but stream_failed=true so the viewer
+        // knows NOT to blame the device's codec.
+        let truncated = server
+            .mint_url("tower", "/home/me/track.flac", false)
+            .await
+            .unwrap();
+        let truncated_path = truncated
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap();
+        *backend.fault.lock().unwrap() = MockStreamFault::TruncateAfterBytes(70 * 1024);
+        let (st_trunc, _, body_trunc) = raw_http(
+            port,
+            &format!(
+                "GET {truncated_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        *backend.fault.lock().unwrap() = MockStreamFault::None;
+        assert_eq!(st_trunc, 200);
+        assert!(body_trunc.len() < flac_bytes.len());
+        let after_trunc = server.content_status_for_url(&truncated.url);
+        assert_eq!(after_trunc.status, Some(200));
+        assert_eq!(after_trunc.content_type.as_deref(), Some("audio/flac"));
+        assert!(
+            after_trunc.stream_failed,
+            "mid-stream truncation must flip stream_failed=true"
+        );
+
+        // 4) Upstream 502 error records status=502 and structured error code/message.
+        let failing = server
+            .mint_url("tower", "/home/me/track.flac", false)
+            .await
+            .unwrap();
+        let failing_path = failing
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap();
+        *backend.fault.lock().unwrap() = MockStreamFault::ErrorOnGet {
+            code: ProtoCode::Unreachable,
+            message: "machine offline",
+        };
+        let (st_502, _, _) = raw_http(
+            port,
+            &format!(
+                "GET {failing_path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        *backend.fault.lock().unwrap() = MockStreamFault::None;
+        assert_eq!(st_502, 502);
+        let after_502 = server.content_status_for_url(&failing.url);
+        assert_eq!(after_502.status, Some(502));
+        assert_eq!(after_502.error_code.as_deref(), Some("unreachable"));
+        assert_eq!(after_502.error_message.as_deref(), Some("machine offline"));
+
+        // 5) Revoking tickets marks ticket_live=false.
+        server.revoke_all();
+        assert!(!server.content_status_for_url(&healthy.url).ticket_live);
+
+        // 6) Malformed URL returns empty default status cleanly.
+        assert_eq!(
+            server.content_status_for_url("not-a-content-url"),
+            ContentUrlStatus::default()
+        );
 
         server.shutdown();
     }

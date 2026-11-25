@@ -328,25 +328,21 @@ mount it:
   machine, separate from transfer and RPC pipes (which never share permits with content), with
   per-holder fair sharing and a short acquire timeout (`503 Service Unavailable` with `Retry-After`).
 - **The app**: the native side mounts `legion-content` behind `content_url({machine, path,
-  download})`, reading through `Link::open_content`. Linux, macOS, Windows, iOS and iPadOS mount it
-  lazily on a listener bound to `127.0.0.1` on a system-chosen port (capped at 32 simultaneous
-  connections with a 5-second header-read timeout, exponential backoff on accept errors, iOS
+  download})` and `content_status({url})`, reading through `Link::open_content`. Every platform
+  (Linux, macOS, Windows, iOS/iPadOS, and Android) mounts it lazily on a streaming HTTP/1.1
+  listener bound strictly to `127.0.0.1` on a system-chosen port (capped at 32 simultaneous
+  connections with a 5-second header-read timeout, exponential backoff on accept errors, mobile
   resume recovery, and stopping 60 seconds after no live tickets or active streams remain),
   protected by `HostOriginGuard` (loopback host+port and only that platform's bundled page origins,
-  never `null`) and `Cross-Origin-Resource-Policy: cross-origin`. Android keeps
-  `android:usesCleartextTraffic="false"` in its manifest, which causes Chromium WebView to refuse
-  cleartext loopback HTTP; Android therefore mounts the same `legion-content` crate on a Tauri
-  custom URI scheme (`legion-content`, reached as
-  `http://legion-content.localhost/v1/content/<ticket>/<name>` and intercepted in-process via
-  `shouldInterceptRequest`), answering open-ended `Range` requests in bounded 2 MiB pieces,
-  refusing unranged responses over 16 MiB with `413 Payload Too Large` before reading a byte, and
-  capping total concurrent buffered memory at 24 MiB. Tickets are read-only, short-lived, exist
-  only for files opened in the app, and die immediately when their pairing is removed or replaced
-  or when the app quits.
+  never `null`) and `Cross-Origin-Resource-Policy: cross-origin`. On Android,
+  `res/xml/network_security_config.xml` denies cleartext traffic globally while exempting only the
+  loopback literal `127.0.0.1`, allowing WebView to stream and seek arbitrarily large media with
+  flat memory without permitting cleartext to any other host. Tickets are read-only, short-lived,
+  exist only for files opened in the app, and die immediately when their pairing is removed or
+  replaced or when the app quits.
 
 The interface's content security policy grows by exactly what this needs: `img-src` and
-`media-src` for `http://127.0.0.1:*` (desktop and iOS) or `http://legion-content.localhost`
-(Android).
+`media-src` for `http://127.0.0.1:*`.
 
 ### To and from the device
 

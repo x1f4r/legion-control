@@ -149,18 +149,6 @@ pub fn run() {
 
     let builder = tauri::Builder::default();
 
-    #[cfg(target_os = "android")]
-    let builder = builder.register_asynchronous_uri_scheme_protocol(
-        content::CUSTOM_SCHEME_NAME,
-        |ctx, request, responder| {
-            let content_server = Arc::clone(&ctx.app_handle().state::<SharedContentServer>().0);
-            tauri::async_runtime::spawn(async move {
-                let response = content_server.handle_custom_scheme(request).await;
-                responder.respond(response);
-            });
-        },
-    );
-
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
         if let Some(desktop) = app.try_state::<SharedDesktopTransferPlatform>() {
@@ -281,6 +269,7 @@ pub fn run() {
                 commands::device_name,
                 commands::ready,
                 commands::content_url,
+                commands::content_status,
                 commands::transfer_download,
                 commands::transfer_pick_uploads,
                 commands::transfer_upload,
