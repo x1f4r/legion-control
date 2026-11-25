@@ -11,6 +11,7 @@ use tar::{Archive, Builder, EntryType, Header};
 
 use crate::error::{Error, Result, classify_io};
 use crate::file::{IfExists, MAX_RENAME_ATTEMPTS, PlaceOutcome, numbered_candidate, place_file};
+use crate::hash::{Hash, hash_file};
 use crate::manifest::{CaseCollision, EntryKind, SkippedEntry, Timestamp};
 use crate::path::parse_relative_path_bytes;
 use crate::platform;
@@ -165,6 +166,7 @@ pub fn unpack<R: Read>(root: &Path, reader: R) -> Result<UnpackReport> {
         false,
         |_, _| true,
         |_, _| Ok(()),
+        |_| None,
     )
 }
 
@@ -184,7 +186,15 @@ where
     R: Read,
     F: FnMut(&str, EntryKind) -> bool,
 {
-    unpack_impl(root, reader, IfExists::Replace, true, filter, |_, _| Ok(()))
+    unpack_impl(
+        root,
+        reader,
+        IfExists::Replace,
+        true,
+        filter,
+        |_, _| Ok(()),
+        |_| None,
+    )
 }
 
 /// Like [`unpack_filtered`], enforcing `if_exists` atomically on every regular file and symlink
@@ -201,21 +211,50 @@ where
     F: FnMut(&str, EntryKind) -> bool,
     C: FnMut(&Path, EntryKind) -> Result<()>,
 {
-    unpack_impl(root, reader, if_exists, true, filter, check_target)
+    unpack_impl(root, reader, if_exists, true, filter, check_target, |_| None)
 }
 
-fn unpack_impl<R, F, C>(
+/// Like [`unpack_with_options`], also re-reading and verifying each regular file's stored bytes on
+/// disk after `sync_all` against `expected_hash` (when `Some`) before placing it into `root`.
+pub fn unpack_with_options_and_hashes<R, F, C, H>(
+    root: &Path,
+    reader: R,
+    if_exists: IfExists,
+    filter: F,
+    check_target: C,
+    expected_hash: H,
+) -> Result<UnpackReport>
+where
+    R: Read,
+    F: FnMut(&str, EntryKind) -> bool,
+    C: FnMut(&Path, EntryKind) -> Result<()>,
+    H: FnMut(&str) -> Option<Hash>,
+{
+    unpack_impl(
+        root,
+        reader,
+        if_exists,
+        true,
+        filter,
+        check_target,
+        expected_hash,
+    )
+}
+
+fn unpack_impl<R, F, C, H>(
     root: &Path,
     reader: R,
     if_exists: IfExists,
     filtered: bool,
     mut filter: F,
     mut check_target: C,
+    mut expected_hash: H,
 ) -> Result<UnpackReport>
 where
     R: Read,
     F: FnMut(&str, EntryKind) -> bool,
     C: FnMut(&Path, EntryKind) -> Result<()>,
+    H: FnMut(&str) -> Option<Hash>,
 {
     fs::create_dir_all(root).map_err(|e| classify_io(root, e))?;
     let canonical_root = fs::canonicalize(root).map_err(|e| classify_io(root, e))?;
@@ -393,6 +432,20 @@ where
                     .sync_all()
                     .map_err(|e| classify_io(guard.path(), e))?;
                 drop(tmp_file);
+
+                // Re-read and verify the stored bytes on disk after `sync_all` whenever the plan
+                // supplied an expected hash (such as moves and checksum transfers), matching the
+                // single-file path so source removal is gated on verified on-disk storage.
+                if let Some(expected) = expected_hash(&rel) {
+                    let actual = hash_file(guard.path())?;
+                    if actual != expected {
+                        return Err(Error::HashMismatch {
+                            path: dest,
+                            expected,
+                            actual,
+                        });
+                    }
+                }
 
                 if let Some(mode) = safe_mode {
                     platform::set_mode(guard.path(), mode)?;
@@ -1852,5 +1905,48 @@ mod tests {
             fs::read(dst_rename.path().join("sub/b.txt")).unwrap(),
             b"new-b"
         );
+    }
+
+    #[test]
+    fn unpack_verifies_stored_file_hash_after_sync() {
+        let src = tempfile::tempdir().unwrap();
+        fs::write(src.path().join("data.bin"), b"verified payload").unwrap();
+        let mut tar_bytes = Vec::new();
+        pack(src.path(), &["data.bin"], &mut tar_bytes).unwrap();
+
+        let good_hash = crate::hash::hash_bytes(b"verified payload");
+        let wrong_hash = crate::hash::hash_bytes(b"different bytes");
+
+        // Matching hash places the file cleanly.
+        let dst_ok = tempfile::tempdir().unwrap();
+        let rep = unpack_with_options_and_hashes(
+            dst_ok.path(),
+            Cursor::new(&tar_bytes),
+            IfExists::Replace,
+            |_, _| true,
+            |_, _| Ok(()),
+            |_| Some(good_hash),
+        )
+        .unwrap();
+        assert_eq!(rep.files, vec!["data.bin"]);
+        assert_eq!(
+            fs::read(dst_ok.path().join("data.bin")).unwrap(),
+            b"verified payload"
+        );
+
+        // Mismatched hash refuses before placing and cleans up temp files.
+        let dst_bad = tempfile::tempdir().unwrap();
+        let err = unpack_with_options_and_hashes(
+            dst_bad.path(),
+            Cursor::new(&tar_bytes),
+            IfExists::Replace,
+            |_, _| true,
+            |_, _| Ok(()),
+            |_| Some(wrong_hash),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::HashMismatch { .. }), "{err:?}");
+        assert!(!dst_bad.path().join("data.bin").exists());
+        assert_eq!(fs::read_dir(dst_bad.path()).unwrap().count(), 0);
     }
 }

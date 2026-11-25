@@ -21,11 +21,13 @@ mod platform;
 
 pub use archive::{
     PackReport, RenamedEntry, UnpackReport, pack, unpack, unpack_filtered, unpack_with_options,
+    unpack_with_options_and_hashes,
 };
 pub use error::{Error, Result};
 pub use file::{
-    GetStream, IfExists, PART_SUFFIX, PlaceOutcome, PutOutcome, PutReport, PutSession, get,
-    numbered_candidate, open_get, part_path, put, resume_offset,
+    GetStream, IfExists, PART_SUFFIX, PlaceOutcome, PutOutcome, PutReport, PutSession,
+    STALE_TEMP_AGE, get, numbered_candidate, open_get, part_path, put, resume_offset,
+    sweep_stale_temps,
 };
 pub use hash::{Hash, HashingReader, HashingWriter};
 pub use manifest::{

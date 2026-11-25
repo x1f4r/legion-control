@@ -3,7 +3,9 @@
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
+use legion_os::atomic::RenameNoReplaceError;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result, classify_io};
@@ -13,6 +15,10 @@ use crate::platform;
 
 /// Suffix appended to a target filename while a single-file [`put`] is in progress.
 pub const PART_SUFFIX: &str = ".legion-part";
+
+/// Default age threshold after which abandoned `.legion-put-*` / `.legion-unpack-*` temporary
+/// files are swept opportunistically.
+pub const STALE_TEMP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Fixed copy buffer size so large transfers run in constant memory.
 const STREAM_BUFFER_SIZE: usize = 64 * 1024;
@@ -95,45 +101,85 @@ pub(crate) fn numbered_filename(name: &str, n: u32) -> String {
     }
 }
 
-/// Atomically places `temp` at `target` according to `if_exists`.
+/// Atomically places `temp` at `target` according to `if_exists`, never using hard links.
 ///
 /// Under [`IfExists::Replace`], `temp` is renamed over `target`. Under [`IfExists::Fail`],
-/// [`IfExists::Skip`], and [`IfExists::Rename`], placement uses [`fs::hard_link`] so two concurrent
-/// transfers racing for the same destination name never overwrite each other; `temp` is unlinked on
-/// successful placement, and left for the caller to clean up on [`PlaceOutcome::Skipped`] or error.
+/// [`IfExists::Skip`], and [`IfExists::Rename`], placement first attempts the kernel's atomic
+/// no-replace rename (`renameat2(RENAME_NOREPLACE)`, `renamex_np(RENAME_EXCL)`, or `MoveFileExW`
+/// without `MOVEFILE_REPLACE_EXISTING`). When the filesystem does not support no-replace rename
+/// (such as FAT, exFAT, some SMB/FUSE mounts), it falls back to atomically claiming the candidate
+/// name with `O_CREAT | O_EXCL` (`CREATE_NEW`) and renaming the verified `temp` over the claim we
+/// own, removing the claim if the rename fails. Two concurrent transfers racing for the same name
+/// never overwrite each other and no temporary file ever shares an inode with a placed file.
 pub(crate) fn place_file<F>(
     temp: &Path,
     target: &Path,
     if_exists: IfExists,
-    mut check_target: F,
+    check_target: F,
 ) -> Result<PlaceOutcome>
 where
     F: FnMut(&Path) -> Result<()>,
 {
+    place_file_with_ops(
+        temp,
+        target,
+        if_exists,
+        check_target,
+        platform::rename_no_replace,
+        platform::create_new_private,
+        platform::replace_file,
+    )
+}
+
+fn place_file_with_ops<F, RN, CL, RP>(
+    temp: &Path,
+    target: &Path,
+    if_exists: IfExists,
+    mut check_target: F,
+    mut rename_no_replace: RN,
+    mut claim_new: CL,
+    mut replace_over: RP,
+) -> Result<PlaceOutcome>
+where
+    F: FnMut(&Path) -> Result<()>,
+    RN: FnMut(&Path, &Path) -> std::result::Result<(), RenameNoReplaceError>,
+    CL: FnMut(&Path) -> io::Result<File>,
+    RP: FnMut(&Path, &Path) -> Result<()>,
+{
     match if_exists {
         IfExists::Replace => {
-            platform::replace_file(temp, target)?;
+            replace_over(temp, target)?;
             Ok(PlaceOutcome::Placed(target.to_path_buf()))
         }
-        IfExists::Fail => match fs::hard_link(temp, target) {
-            Ok(()) => {
-                let _ = fs::remove_file(temp);
+        IfExists::Fail => {
+            if place_one_no_replace(
+                temp,
+                target,
+                &mut rename_no_replace,
+                &mut claim_new,
+                &mut replace_over,
+            )? {
                 Ok(PlaceOutcome::Placed(target.to_path_buf()))
+            } else {
+                Err(Error::Exists {
+                    path: target.to_path_buf(),
+                    source: None,
+                })
             }
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Err(Error::Exists {
-                path: target.to_path_buf(),
-                source: Some(err),
-            }),
-            Err(err) => Err(classify_io(target, err)),
-        },
-        IfExists::Skip => match fs::hard_link(temp, target) {
-            Ok(()) => {
-                let _ = fs::remove_file(temp);
+        }
+        IfExists::Skip => {
+            if place_one_no_replace(
+                temp,
+                target,
+                &mut rename_no_replace,
+                &mut claim_new,
+                &mut replace_over,
+            )? {
                 Ok(PlaceOutcome::Placed(target.to_path_buf()))
+            } else {
+                Ok(PlaceOutcome::Skipped)
             }
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(PlaceOutcome::Skipped),
-            Err(err) => Err(classify_io(target, err)),
-        },
+        }
         IfExists::Rename => {
             for attempt in 1..=MAX_RENAME_ATTEMPTS {
                 let candidate = if attempt == 1 {
@@ -143,13 +189,14 @@ where
                     check_target(&cand)?;
                     cand
                 };
-                match fs::hard_link(temp, &candidate) {
-                    Ok(()) => {
-                        let _ = fs::remove_file(temp);
-                        return Ok(PlaceOutcome::Placed(candidate));
-                    }
-                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-                    Err(err) => return Err(classify_io(&candidate, err)),
+                if place_one_no_replace(
+                    temp,
+                    &candidate,
+                    &mut rename_no_replace,
+                    &mut claim_new,
+                    &mut replace_over,
+                )? {
+                    return Ok(PlaceOutcome::Placed(candidate));
                 }
             }
             Err(Error::Exists {
@@ -160,27 +207,79 @@ where
     }
 }
 
+/// Attempts to place `temp` at `candidate` without replacing an existing entry.
+///
+/// Returns `Ok(true)` when placed, `Ok(false)` when `candidate` already existed (untouched), or
+/// `Err` on any I/O failure (removing any newly created claim before returning).
+fn place_one_no_replace<RN, CL, RP>(
+    temp: &Path,
+    candidate: &Path,
+    rename_no_replace: &mut RN,
+    claim_new: &mut CL,
+    replace_over: &mut RP,
+) -> Result<bool>
+where
+    RN: FnMut(&Path, &Path) -> std::result::Result<(), RenameNoReplaceError>,
+    CL: FnMut(&Path) -> io::Result<File>,
+    RP: FnMut(&Path, &Path) -> Result<()>,
+{
+    match rename_no_replace(temp, candidate) {
+        Ok(()) => Ok(true),
+        Err(RenameNoReplaceError::AlreadyExists) => Ok(false),
+        Err(RenameNoReplaceError::Io(err)) => Err(classify_io(candidate, err)),
+        Err(RenameNoReplaceError::Unsupported) => {
+            // Claim `candidate` atomically with `O_CREAT | O_EXCL` (`CREATE_NEW`), then rename
+            // `temp` over the claim we own. Never touches any pre-existing file at `candidate`.
+            match claim_new(candidate) {
+                Ok(claim_file) => {
+                    drop(claim_file);
+                    if let Err(err) = replace_over(temp, candidate) {
+                        let _ = fs::remove_file(candidate);
+                        return Err(err);
+                    }
+                    Ok(true)
+                }
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+                Err(err) => Err(classify_io(candidate, err)),
+            }
+        }
+    }
+}
+
 /// An opened single-file receive session holding an exclusive lock on its partial file so
 /// concurrent transfers to the same target path never corrupt each other's partial data.
 #[derive(Debug)]
 pub struct PutSession {
     target: PathBuf,
     partial: PathBuf,
-    file: File,
+    file: Option<File>,
     size: u64,
     offset: u64,
     if_exists: IfExists,
-    /// `true` when another transfer held the canonical `.legion-part` lock and this session fell
-    /// back to a private unique sibling partial file that should be removed if interrupted.
+    /// `true` when another transfer held the canonical `.legion-part` lock (or the canonical
+    /// partial had multiple hard links) and this session opened a private unique sibling partial
+    /// file that is removed if dropped before committing.
     ephemeral: bool,
+    /// `true` once the session has committed or explicitly cleaned up its partial file.
+    committed: bool,
+}
+
+impl Drop for PutSession {
+    fn drop(&mut self) {
+        self.file.take();
+        if self.ephemeral && !self.committed {
+            let _ = fs::remove_file(&self.partial);
+        }
+    }
 }
 
 impl PutSession {
     /// Prepares to receive a file of `size` bytes at `target` under `if_exists`.
     ///
-    /// Locks `<name>.legion-part` exclusively when free so a single interrupted transfer resumes
-    /// from its length on disk; if another concurrent transfer holds that lock, opens a unique
-    /// sibling partial file at offset 0 so both transfers race cleanly to commit atomically.
+    /// Locks `<name>.legion-part` exclusively when free and single-linked so a single interrupted
+    /// transfer resumes from its length on disk; if another concurrent transfer holds that lock or
+    /// the canonical partial has more than one hard link, opens a unique sibling partial file at
+    /// offset 0 so transfers race cleanly without ever mutating an existing placed file.
     pub fn open(target: &Path, size: u64, if_exists: IfExists) -> Result<Self> {
         if let Ok(meta) = fs::symlink_metadata(target) {
             if if_exists == IfExists::Fail {
@@ -197,27 +296,33 @@ impl PutSession {
             }
         }
 
+        if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
+            let _ = sweep_stale_temps(parent, STALE_TEMP_AGE);
+        }
+
         let canonical_partial = part_path(target)?;
         match try_open_locked_partial(&canonical_partial, size)? {
             Some((file, offset)) => Ok(Self {
                 target: target.to_path_buf(),
                 partial: canonical_partial,
-                file,
+                file: Some(file),
                 size,
                 offset,
                 if_exists,
                 ephemeral: false,
+                committed: false,
             }),
             None => {
                 let (partial, file) = create_unique_partial(target)?;
                 Ok(Self {
                     target: target.to_path_buf(),
                     partial,
-                    file,
+                    file: Some(file),
                     size,
                     offset: 0,
                     if_exists,
                     ephemeral: true,
+                    committed: false,
                 })
             }
         }
@@ -242,6 +347,10 @@ impl PutSession {
         R: Read,
         F: FnMut(&Path) -> Result<()>,
     {
+        let mut file = self.file.take().ok_or_else(|| Error::Conflict {
+            path: self.partial.clone(),
+            reason: "partial file handle was already closed".to_string(),
+        })?;
         let remaining = self.size - self.offset;
         let mut buf = vec![0u8; STREAM_BUFFER_SIZE];
         let mut written = 0u64;
@@ -252,13 +361,10 @@ impl PutSession {
                 .min(buf.len());
             let n = match reader.read(&mut buf[..to_read]) {
                 Ok(0) => {
-                    let _ = self.file.flush();
-                    drop(self.file);
-                    if self.ephemeral {
-                        let _ = fs::remove_file(&self.partial);
-                    }
+                    let _ = file.flush();
+                    drop(file);
                     return Err(Error::Io {
-                        path: Some(self.partial),
+                        path: Some(self.partial.clone()),
                         source: io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             format!(
@@ -271,40 +377,31 @@ impl PutSession {
                 }
                 Ok(n) => n,
                 Err(err) => {
-                    let _ = self.file.flush();
-                    drop(self.file);
-                    if self.ephemeral {
-                        let _ = fs::remove_file(&self.partial);
-                    }
+                    let _ = file.flush();
+                    drop(file);
                     return Err(Error::Io {
                         path: None,
                         source: err,
                     });
                 }
             };
-            if let Err(err) = self.file.write_all(&buf[..n]) {
-                drop(self.file);
-                if self.ephemeral {
-                    let _ = fs::remove_file(&self.partial);
-                }
+            if let Err(err) = file.write_all(&buf[..n]) {
+                drop(file);
                 return Err(classify_io(&self.partial, err));
             }
             written += n as u64;
         }
 
-        self.file
-            .flush()
-            .map_err(|e| classify_io(&self.partial, e))?;
-        self.file
-            .sync_all()
-            .map_err(|e| classify_io(&self.partial, e))?;
-        drop(self.file);
+        file.flush().map_err(|e| classify_io(&self.partial, e))?;
+        file.sync_all().map_err(|e| classify_io(&self.partial, e))?;
+        drop(file);
 
         let actual_hash = hash_file(&self.partial)?;
         if actual_hash != expected_hash {
             let _ = fs::remove_file(&self.partial);
+            self.committed = true;
             return Err(Error::HashMismatch {
-                path: self.target,
+                path: self.target.clone(),
                 expected: expected_hash,
                 actual: actual_hash,
             });
@@ -319,13 +416,25 @@ impl PutSession {
                 .map(|m| m & 0o777)
                 .unwrap_or(0o644),
         };
-        platform::set_mode(&self.partial, final_mode)?;
+        if let Err(err) = platform::set_mode(&self.partial, final_mode) {
+            let _ = fs::remove_file(&self.partial);
+            self.committed = true;
+            return Err(err);
+        }
 
         let outcome = match place_file(&self.partial, &self.target, self.if_exists, check_target) {
             Ok(outcome) => outcome,
             Err(err) => {
-                if self.ephemeral || matches!(err, Error::Exists { .. }) {
+                if self.ephemeral
+                    || matches!(
+                        err,
+                        Error::Exists { .. }
+                            | Error::Conflict { .. }
+                            | Error::PermissionDenied { .. }
+                    )
+                {
                     let _ = fs::remove_file(&self.partial);
+                    self.committed = true;
                 }
                 return Err(err);
             }
@@ -339,6 +448,7 @@ impl PutSession {
 
         match outcome {
             PlaceOutcome::Placed(final_path) => {
+                self.committed = true;
                 let parent = match final_path.parent() {
                     Some(p) if !p.as_os_str().is_empty() => p,
                     _ => Path::new("."),
@@ -352,6 +462,7 @@ impl PutSession {
             }
             PlaceOutcome::Skipped => {
                 let _ = fs::remove_file(&self.partial);
+                self.committed = true;
                 Ok(PutOutcome {
                     report,
                     path: None,
@@ -360,6 +471,62 @@ impl PutSession {
             }
         }
     }
+}
+
+/// Removes abandoned temporary files (`.legion-put-*.legion-part`, `.legion-unpack-*.tmp`,
+/// `.legion-link-*.tmp`, `.legion-move-probe-*.tmp`) in `dir` whose modification time is older
+/// than `max_age` and that are not locked by a live transfer.
+pub fn sweep_stale_temps(dir: &Path, max_age: Duration) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let now = SystemTime::now();
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let name_os = entry.file_name();
+        let Some(name) = name_os.to_str() else {
+            continue;
+        };
+        let is_sweepable = (name.starts_with(".legion-put-") && name.ends_with(PART_SUFFIX))
+            || ((name.starts_with(".legion-unpack-")
+                || name.starts_with(".legion-link-")
+                || name.starts_with(".legion-move-probe-"))
+                && name.ends_with(".tmp"));
+        if !is_sweepable {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.file_type().is_file() {
+            continue;
+        }
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age < max_age {
+            continue;
+        }
+        // Only remove if no active transfer holds a lock on the file.
+        let lockable = match OpenOptions::new().write(true).open(&path) {
+            Ok(file) => match file.try_lock() {
+                Ok(()) => {
+                    drop(file);
+                    true
+                }
+                Err(_) => false,
+            },
+            Err(_) => false,
+        };
+        if lockable && fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 fn try_open_locked_partial(partial: &Path, size: u64) -> Result<Option<(File, u64)>> {
@@ -372,6 +539,10 @@ fn try_open_locked_partial(partial: &Path, size: u64) -> Result<Option<(File, u6
                     path: partial.to_path_buf(),
                     reason: "partial path exists and is not a regular file".to_string(),
                 });
+            }
+            // Never resume into or truncate a partial that shares an inode with another link.
+            if platform::symlink_file_identity(partial).is_ok_and(|id| id.nlink > 1) {
+                return Ok(None);
             }
             OpenOptions::new()
                 .write(true)
@@ -388,6 +559,16 @@ fn try_open_locked_partial(partial: &Path, size: u64) -> Result<Option<(File, u6
     }
 
     let meta = file.metadata().map_err(|e| classify_io(partial, e))?;
+    if !meta.is_file() {
+        return Err(Error::Conflict {
+            path: partial.to_path_buf(),
+            reason: "partial path exists and is not a regular file".to_string(),
+        });
+    }
+    if platform::open_file_identity(&file).is_ok_and(|id| id.nlink > 1) {
+        return Ok(None);
+    }
+
     let mut offset = meta.len();
     if offset > size {
         file.set_len(0).map_err(|e| classify_io(partial, e))?;
@@ -411,7 +592,11 @@ fn create_unique_partial(target: &Path) -> Result<(PathBuf, File)> {
         let seq = platform::next_temp_id();
         let candidate = parent.join(format!(".legion-put-{pid}-{seq}{PART_SUFFIX}"));
         match platform::create_new_private(&candidate) {
-            Ok(file) => return Ok((candidate, file)),
+            Ok(file) => {
+                // Hold an exclusive lock on the ephemeral partial so opportunistic sweeps skip it.
+                let _ = file.try_lock();
+                return Ok((candidate, file));
+            }
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(err) => return Err(classify_io(&candidate, err)),
         }
@@ -430,7 +615,7 @@ pub fn part_path(target: &Path) -> Result<PathBuf> {
 }
 
 /// Returns the resumable byte offset for `target`: the partial file's current length, or `0` if no
-/// partial file exists yet.
+/// safe single-linked regular partial file exists yet.
 pub fn resume_offset(target: &Path) -> Result<u64> {
     let partial = part_path(target)?;
     match fs::symlink_metadata(&partial) {
@@ -440,6 +625,9 @@ pub fn resume_offset(target: &Path) -> Result<u64> {
                     path: partial,
                     reason: "partial path exists and is not a regular file".to_string(),
                 });
+            }
+            if platform::symlink_file_identity(&partial).is_ok_and(|id| id.nlink > 1) {
+                return Ok(0);
             }
             Ok(meta.len())
         }
@@ -675,15 +863,30 @@ fn open_partial_at_offset(target: &Path, partial: &Path, size: u64, offset: u64)
                         reason: "partial path exists and is not a regular file".to_string(),
                     });
                 }
+                if platform::symlink_file_identity(partial).is_ok_and(|id| id.nlink > 1) {
+                    return Err(Error::Conflict {
+                        path: partial.to_path_buf(),
+                        reason: "partial file has multiple hard links and cannot be resumed safely"
+                            .to_string(),
+                    });
+                }
                 let actual = meta.len();
                 if actual > size {
                     // A stale partial file larger than the whole incoming file cannot be a valid
                     // prefix of this transfer; truncate and start cleanly from offset 0.
                     let file = OpenOptions::new()
                         .write(true)
-                        .truncate(true)
                         .open(partial)
                         .map_err(|e| classify_io(partial, e))?;
+                    if platform::open_file_identity(&file).is_ok_and(|id| id.nlink > 1) {
+                        return Err(Error::Conflict {
+                            path: partial.to_path_buf(),
+                            reason:
+                                "partial file has multiple hard links and cannot be resumed safely"
+                                    .to_string(),
+                        });
+                    }
+                    file.set_len(0).map_err(|e| classify_io(partial, e))?;
                     platform::set_mode(partial, 0o600)?;
                     return Ok(file);
                 }
@@ -698,6 +901,13 @@ fn open_partial_at_offset(target: &Path, partial: &Path, size: u64, offset: u64)
                     .write(true)
                     .open(partial)
                     .map_err(|e| classify_io(partial, e))?;
+                if platform::open_file_identity(&file).is_ok_and(|id| id.nlink > 1) {
+                    return Err(Error::Conflict {
+                        path: partial.to_path_buf(),
+                        reason: "partial file has multiple hard links and cannot be resumed safely"
+                            .to_string(),
+                    });
+                }
                 platform::set_mode(partial, 0o600)?;
                 Ok(file)
             }
@@ -721,6 +931,13 @@ fn open_partial_at_offset(target: &Path, partial: &Path, size: u64, offset: u64)
                 reason: "partial path exists and is not a regular file".to_string(),
             });
         }
+        if platform::symlink_file_identity(partial).is_ok_and(|id| id.nlink > 1) {
+            return Err(Error::Conflict {
+                path: partial.to_path_buf(),
+                reason: "partial file has multiple hard links and cannot be resumed safely"
+                    .to_string(),
+            });
+        }
         let actual = meta.len();
         if actual != offset {
             return Err(Error::BadOffset {
@@ -740,6 +957,13 @@ fn open_partial_at_offset(target: &Path, partial: &Path, size: u64, offset: u64)
             .write(true)
             .open(partial)
             .map_err(|e| classify_io(partial, e))?;
+        if platform::open_file_identity(&file).is_ok_and(|id| id.nlink > 1) {
+            return Err(Error::Conflict {
+                path: partial.to_path_buf(),
+                reason: "partial file has multiple hard links and cannot be resumed safely"
+                    .to_string(),
+            });
+        }
         file.seek(SeekFrom::Start(offset))
             .map_err(|e| classify_io(partial, e))?;
         Ok(file)
@@ -1261,5 +1485,200 @@ mod tests {
             }
         }
         assert_eq!((ok_count, exists_count), (1, 1));
+    }
+
+    #[test]
+    fn claim_then_rename_fallback_works_without_hard_links_and_cleans_up_on_kill() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("photo.jpg");
+        fs::write(&existing, b"original-200kb-content").unwrap();
+
+        // Simulate a filesystem (FAT / exFAT / SMB) that supports neither `rename_no_replace`
+        // nor hard links: placement uses `O_CREAT|O_EXCL` claim + rename exclusively.
+        let tmp_fail = dir.path().join(".tmp-fail");
+        fs::write(&tmp_fail, b"new-fail").unwrap();
+        let err = place_file_with_ops(
+            &tmp_fail,
+            &existing,
+            IfExists::Fail,
+            |_| Ok(()),
+            |_, _| Err(RenameNoReplaceError::Unsupported),
+            platform::create_new_private,
+            platform::replace_file,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Exists { .. }), "{err:?}");
+        assert_eq!(fs::read(&existing).unwrap(), b"original-200kb-content");
+        let _ = fs::remove_file(&tmp_fail);
+
+        let tmp_skip = dir.path().join(".tmp-skip");
+        fs::write(&tmp_skip, b"new-skip").unwrap();
+        let skipped = place_file_with_ops(
+            &tmp_skip,
+            &existing,
+            IfExists::Skip,
+            |_| Ok(()),
+            |_, _| Err(RenameNoReplaceError::Unsupported),
+            platform::create_new_private,
+            platform::replace_file,
+        )
+        .unwrap();
+        assert_eq!(skipped, PlaceOutcome::Skipped);
+        assert_eq!(fs::read(&existing).unwrap(), b"original-200kb-content");
+        let _ = fs::remove_file(&tmp_skip);
+
+        // Simulate failure / crash right between claim (`create_new`) and rename: the claim we
+        // created must be removed and the pre-existing file untouched.
+        let fresh = dir.path().join("fresh.bin");
+        let tmp_crash = dir.path().join(".tmp-crash");
+        fs::write(&tmp_crash, b"fresh-data").unwrap();
+        let err = place_file_with_ops(
+            &tmp_crash,
+            &fresh,
+            IfExists::Fail,
+            |_| Ok(()),
+            |_, _| Err(RenameNoReplaceError::Unsupported),
+            platform::create_new_private,
+            |_, to| {
+                // Verify the claim exists before rename fails.
+                assert!(to.exists());
+                Err(Error::Io {
+                    path: Some(to.to_path_buf()),
+                    source: io::Error::other("simulated kill between claim and rename"),
+                })
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Io { .. }), "{err:?}");
+        assert!(!fresh.exists(), "failed claim must be cleaned up");
+        assert!(tmp_crash.exists(), "partial stays intact for retry");
+
+        // Concurrent Rename race under claim-then-rename fallback (no `rename_no_replace`, no
+        // hard links): 4 racing threads all land at distinct numbered files with distinct inodes.
+        let race_target = dir.path().join("exfat.bin");
+        let barrier = Arc::new(Barrier::new(4));
+        let mut threads = Vec::new();
+        for i in 0u8..4 {
+            let race_target = race_target.clone();
+            let barrier = Arc::clone(&barrier);
+            let tmp = dir.path().join(format!(".tmp-race-{i}"));
+            let payload = vec![b'0' + i; 4096];
+            fs::write(&tmp, &payload).unwrap();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                let placed = place_file_with_ops(
+                    &tmp,
+                    &race_target,
+                    IfExists::Rename,
+                    |_| Ok(()),
+                    |_, _| Err(RenameNoReplaceError::Unsupported),
+                    platform::create_new_private,
+                    platform::replace_file,
+                )
+                .unwrap();
+                match placed {
+                    PlaceOutcome::Placed(path) => (path, payload),
+                    PlaceOutcome::Skipped => panic!("Rename must not skip"),
+                }
+            }));
+        }
+        let mut seen_paths = std::collections::BTreeSet::new();
+        let mut seen_inodes = std::collections::BTreeSet::new();
+        for t in threads {
+            let (path, expected) = t.join().unwrap();
+            assert_eq!(fs::read(&path).unwrap(), expected);
+            assert!(seen_paths.insert(path.clone()));
+            if let Ok(id) = platform::symlink_file_identity(&path) {
+                assert_eq!(id.nlink, 1, "placed file must have nlink=1");
+                assert!(seen_inodes.insert((id.dev, id.ino)));
+            }
+        }
+        assert_eq!(seen_paths.len(), 4);
+    }
+
+    #[test]
+    fn never_resumes_into_hard_linked_partial_or_destroys_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("x.bin");
+        let original = vec![0xAAu8; 200 * 1024];
+        fs::write(&target, &original).unwrap();
+
+        // Simulate a stale partial sharing an inode with the placed target (nlink == 2).
+        let partial = part_path(&target).unwrap();
+        fs::hard_link(&target, &partial).unwrap();
+        assert_eq!(
+            platform::symlink_file_identity(&partial).unwrap().nlink,
+            2
+        );
+
+        // `resume_offset` must refuse to treat a multi-linked partial as resumable.
+        assert_eq!(resume_offset(&target).unwrap(), 0);
+
+        // Legacy `put` refuses to open or truncate a multi-linked partial.
+        let smaller = vec![0xBBu8; 50 * 1024];
+        let err = put(
+            &target,
+            smaller.len() as u64,
+            hash_bytes(&smaller),
+            0,
+            Cursor::new(&smaller),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Conflict { .. }), "{err:?}");
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            original,
+            "original must never be truncated or modified"
+        );
+
+        // `PutSession::open` under Rename starts fresh in an ephemeral partial at offset 0 and
+        // writes `x (2).bin` on a new inode without touching `x.bin`.
+        let session = PutSession::open(&target, smaller.len() as u64, IfExists::Rename).unwrap();
+        assert_eq!(session.offset(), 0);
+        let outcome = session
+            .finish(hash_bytes(&smaller), Cursor::new(&smaller), None, |_| Ok(()))
+            .unwrap();
+        let placed = outcome.path.unwrap();
+        assert_eq!(placed, dir.path().join("x (2).bin"));
+        assert_eq!(fs::read(&target).unwrap(), original);
+        assert_eq!(fs::read(&placed).unwrap(), smaller);
+        let id_orig = platform::symlink_file_identity(&target).unwrap();
+        let id_new = platform::symlink_file_identity(&placed).unwrap();
+        assert!(
+            !id_orig.same_file(&id_new),
+            "x.bin and x (2).bin must have distinct inodes"
+        );
+    }
+
+    #[test]
+    fn sweeps_stale_put_temporaries_by_age_and_preserves_locked_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join(".legion-put-123-0.legion-part");
+        let fresh = dir.path().join(".legion-put-123-1.legion-part");
+        let locked = dir.path().join(".legion-put-123-2.legion-part");
+        let user_file = dir.path().join("keep.txt");
+        fs::write(&stale, b"old").unwrap();
+        fs::write(&fresh, b"new").unwrap();
+        fs::write(&locked, b"active").unwrap();
+        fs::write(&user_file, b"user").unwrap();
+
+        let old_time = SystemTime::now() - Duration::from_secs(48 * 60 * 60);
+        let old_times = fs::FileTimes::new().set_modified(old_time);
+        fs::set_times(&stale, old_times).unwrap();
+        fs::set_times(&locked, old_times).unwrap();
+
+        let held = OpenOptions::new().write(true).open(&locked).unwrap();
+        held.try_lock().unwrap();
+
+        let removed = sweep_stale_temps(dir.path(), STALE_TEMP_AGE);
+        assert_eq!(removed, 1);
+        assert!(!stale.exists(), "stale unlocked temp must be removed");
+        assert!(fresh.exists(), "recent temp must remain");
+        assert!(locked.exists(), "actively locked temp must remain");
+        assert!(user_file.exists(), "unrelated user file must remain");
+        drop(held);
     }
 }

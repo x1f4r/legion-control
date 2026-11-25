@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWriteExt};
 
 use crate::{OsError, Result};
@@ -247,6 +248,125 @@ where
     let parent_owned = parent.to_path_buf();
     let _ = tokio::task::spawn_blocking(move || sync_parent_dir(&parent_owned)).await;
     Ok(written)
+}
+
+/// Platform-independent filesystem identity of an inode/file object on a single machine.
+///
+/// On Unix, `(dev, ino)` are `st_dev` and `st_ino` and `nlink` is `st_nlink`. On Windows, `dev`
+/// is the volume serial number, `ino` is the 64-bit NTFS/ReFS file index, and `nlink` is
+/// `nNumberOfLinks` from `GetFileInformationByHandle`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FileIdentity {
+    /// Device or volume identifier.
+    pub dev: u64,
+    /// Inode number or 64-bit Windows file index.
+    pub ino: u64,
+    /// Hard-link count reported by the filesystem.
+    pub nlink: u64,
+}
+
+impl FileIdentity {
+    /// Returns `true` when both identities denote the exact same file object on this machine.
+    pub fn same_file(&self, other: &Self) -> bool {
+        self.dev == other.dev && self.ino == other.ino
+    }
+}
+
+/// Returns the [`FileIdentity`] of `path`, following any final symbolic link.
+pub fn file_identity(path: impl AsRef<Path>) -> io::Result<FileIdentity> {
+    file_identity_path_impl(path.as_ref(), true)
+}
+
+/// Returns the [`FileIdentity`] of `path` without following a final symbolic link.
+pub fn symlink_file_identity(path: impl AsRef<Path>) -> io::Result<FileIdentity> {
+    file_identity_path_impl(path.as_ref(), false)
+}
+
+/// Returns the [`FileIdentity`] of an already-open [`File`] handle.
+pub fn file_identity_from_file(file: &File) -> io::Result<FileIdentity> {
+    file_identity_handle_impl(file)
+}
+
+#[cfg(unix)]
+fn file_identity_path_impl(path: &Path, follow_symlinks: bool) -> io::Result<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = if follow_symlinks {
+        fs::metadata(path)?
+    } else {
+        fs::symlink_metadata(path)?
+    };
+    Ok(FileIdentity {
+        dev: meta.dev(),
+        ino: meta.ino(),
+        nlink: meta.nlink(),
+    })
+}
+
+#[cfg(unix)]
+fn file_identity_handle_impl(file: &File) -> io::Result<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = file.metadata()?;
+    Ok(FileIdentity {
+        dev: meta.dev(),
+        ino: meta.ino(),
+        nlink: meta.nlink(),
+    })
+}
+
+#[cfg(windows)]
+fn file_identity_path_impl(path: &Path, follow_symlinks: bool) -> io::Result<FileIdentity> {
+    let (dev, ino, nlink) = crate::win_proc::file_identity_by_path(path, follow_symlinks)?;
+    Ok(FileIdentity { dev, ino, nlink })
+}
+
+#[cfg(windows)]
+fn file_identity_handle_impl(file: &File) -> io::Result<FileIdentity> {
+    let (dev, ino, nlink) = crate::win_proc::file_identity_by_handle(file)?;
+    Ok(FileIdentity { dev, ino, nlink })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_identity_path_impl(_path: &Path, _follow_symlinks: bool) -> io::Result<FileIdentity> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "file identity is not supported on this platform",
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_identity_handle_impl(_file: &File) -> io::Result<FileIdentity> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "file identity is not supported on this platform",
+    ))
+}
+
+/// Outcome of a kernel exclusive-rename attempt ([`rename_no_replace`]).
+#[derive(Debug)]
+pub enum RenameNoReplaceError {
+    /// Destination path already exists and was left untouched.
+    AlreadyExists,
+    /// Kernel or filesystem does not support no-replace rename.
+    Unsupported,
+    /// Another I/O or permission error occurred.
+    Io(io::Error),
+}
+
+/// Atomically renames `from` to `to` only when `to` does not exist.
+///
+/// Uses `renameat2(RENAME_NOREPLACE)` on Linux, `renamex_np(RENAME_EXCL)` on macOS, and
+/// `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` on Windows. Never falls back to a replacing
+/// rename or hard links.
+pub fn rename_no_replace(
+    from: impl AsRef<Path>,
+    to: impl AsRef<Path>,
+) -> std::result::Result<(), RenameNoReplaceError> {
+    match rename_exclusive_impl(from.as_ref(), to.as_ref()) {
+        Ok(()) => Ok(()),
+        Err(ExclusiveRenameError::AlreadyExists) => Err(RenameNoReplaceError::AlreadyExists),
+        Err(ExclusiveRenameError::Unsupported) => Err(RenameNoReplaceError::Unsupported),
+        Err(ExclusiveRenameError::Io(err)) => Err(RenameNoReplaceError::Io(err)),
+    }
 }
 
 /// Atomically replace `to` with `from`.
