@@ -243,7 +243,7 @@ pub struct TransferSettings {
     /// and resume automatically on unmetered Wi-Fi. Defaults to `false`.
     #[serde(default)]
     pub wifi_only_large: bool,
-    /// Byte threshold defining a "large" transfer (default 50 MiB).
+    /// Byte threshold defining a "large" transfer (default 50 MB).
     #[serde(default = "default_large_threshold")]
     pub large_threshold_bytes: u64,
 }
@@ -2576,14 +2576,7 @@ impl TransferManager {
         let mut attempt: u32 = 0;
 
         for n in 1..=9999u32 {
-            let candidate_name = if n == 1 {
-                safe_base.clone()
-            } else {
-                match ext.as_deref() {
-                    Some(e) => format!("{stem} ({n}).{e}"),
-                    None => format!("{stem} ({n})"),
-                }
-            };
+            let candidate_name = file_policy::numbered_candidate_name(&safe_base, n);
             let candidate_path = join_remote_with_sep(&dir_prefix, sep, &candidate_name);
 
             loop {

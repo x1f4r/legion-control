@@ -24,6 +24,8 @@ class TransferSecurityTest {
     assertEquals("download", TransferPathPolicy.sanitizeFileName("   ..   "))
     assertEquals("passwd", TransferPathPolicy.sanitizeFileName("../../etc/passwd"))
     assertEquals("win.ini", TransferPathPolicy.sanitizeFileName("C:\\Windows\\win.ini"))
+    assertEquals("version.dll", TransferPathPolicy.sanitizeFileName("dir/C:version.dll"))
+    assertEquals("payload.exe", TransferPathPolicy.sanitizeFileName("C:D:payload.exe"))
     assertEquals("report.pdf", TransferPathPolicy.sanitizeFileName("report.pdf:Zone.Identifier"))
     assertEquals("_CON", TransferPathPolicy.sanitizeFileName("CON"))
     assertEquals("_nul.txt", TransferPathPolicy.sanitizeFileName("nul.txt"))
@@ -78,12 +80,19 @@ class TransferSecurityTest {
       TransferPathPolicy.resolveContainedChild(partsDir, linkFile)
     }
 
-    // New cache file stays strictly inside open-externally even with hostile transferId / fileName.
+    // New cache file stays strictly inside open-externally and never overwrites existing entries.
     val cacheDir = File(root, "open-externally").apply { mkdirs() }
-    val cacheTarget = TransferPathPolicy.resolveNewCacheFile(cacheDir, "../../id", "..\\..\\evil.jpg")
-    assertEquals(cacheDir.canonicalFile, cacheTarget.parentFile?.canonicalFile)
-    assertNotEquals("evil.jpg", cacheTarget.name)
-    assertTrue(cacheTarget.name.endsWith(".jpg"))
+    val first = TransferPathPolicy.createUniqueCacheFile(cacheDir, "../../id", "..\\..\\evil.jpg")
+    first.writeText("first")
+    val second = TransferPathPolicy.createUniqueCacheFile(cacheDir, "../../id", "..\\..\\evil.jpg")
+    second.writeText("second")
+    assertEquals(cacheDir.canonicalFile, first.parentFile?.canonicalFile)
+    assertEquals(cacheDir.canonicalFile, second.parentFile?.canonicalFile)
+    assertNotEquals(first, second)
+    assertEquals("first", first.readText())
+    assertEquals("second", second.readText())
+    assertTrue(first.name.endsWith(".jpg"))
+    assertTrue(second.name.endsWith(".jpg"))
   }
 
   @Test

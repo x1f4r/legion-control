@@ -20,26 +20,28 @@ object TransferPathPolicy {
   const val MAX_FILE_NAME_UTF8_BYTES = 200
   const val MAX_OPEN_EXTERNALLY_CACHE_FILES = 24
   const val MAX_OPEN_EXTERNALLY_CACHE_AGE_MS = 24L * 60L * 60L * 1000L
-  const val MAX_OPEN_EXTERNALLY_CACHE_BYTES = 256L * 1024L * 1024L
+  const val MAX_OPEN_EXTERNALLY_CACHE_BYTES = 256L * 1000L * 1000L
 
   private val REFUSED_OPEN_EXTENSIONS: Set<String> = setOf(
-    // Android packages
-    "apk", "apks", "xapk", "aab",
+    // Android packages and native binaries
+    "apk", "apks", "apkm", "xapk", "aab", "dex", "odex", "so",
     // Windows executables, installers, scripts, shortcuts, Office macros
-    "exe", "msi", "msp", "msu", "com", "scr", "pif",
+    "exe", "dll", "sys", "msi", "msp", "msu", "mst", "com", "scr", "pif",
     "bat", "cmd", "ps1", "psm1", "psd1",
-    "vbs", "vbe", "js", "jse", "wsf", "wsh", "hta",
+    "vbs", "vbe", "js", "jse", "mjs", "cjs", "wsf", "wsh", "hta",
     "cpl", "msc", "reg", "inf", "lnk", "url", "scf", "gadget",
+    "settingcontent-ms", "appref-ms", "msix", "msixbundle", "appx", "appxbundle", "chm",
     "xll", "xlam", "docm", "xlsm", "pptm", "dotm",
     // Unix / macOS scripts, bundles, installers, packages, binaries, launchers
-    "sh", "bash", "zsh", "ksh", "csh", "fish", "command",
-    "app", "pkg", "mpkg", "action", "workflow", "applescript", "scpt", "webloc",
+    "sh", "bash", "zsh", "ksh", "csh", "fish", "command", "tool",
+    "app", "pkg", "mpkg", "action", "workflow", "applescript", "osascript", "scpt", "scptd",
+    "mobileconfig", "terminal", "inetloc", "webloc", "macho", "dylib",
     "appimage", "deb", "rpm", "flatpak", "flatpakref", "snap",
     "run", "bin", "elf", "desktop",
-    // Disk images & archives that auto-mount or execute
-    "dmg", "iso", "img", "vhd", "vhdx",
+    // Disk images that auto-mount or execute
+    "dmg", "iso", "img", "vhd", "vhdx", "vmdk",
     // Cross-platform runnable bytecode / scripts
-    "jar", "jnlp", "py", "pyc", "rb", "pl", "php",
+    "jar", "jnlp", "py", "pyc", "pyw", "rb", "pl", "php",
   )
 
   private val RESERVED_WINDOWS_STEMS: Set<String> = setOf(
@@ -69,22 +71,23 @@ object TransferPathPolicy {
    * Sanitizes an untrusted filename into a single safe cross-platform path component.
    */
   fun sanitizeFileName(raw: String): String {
+    // 1. Keep only the final path segment across POSIX and Windows separators.
     var s = raw
-    // Strip leading Windows drive prefix (e.g. "C:" or "C:\foo").
-    if (s.length >= 2 && s[0].isLetter() && s[1] == ':') {
-      s = s.substring(2)
-    }
-    // Keep only the final path segment across POSIX and Windows separators.
     val lastSep = maxOf(s.lastIndexOf('/'), s.lastIndexOf('\\'))
     if (lastSep >= 0) {
       s = s.substring(lastSep + 1)
     }
-    // Strip NTFS Alternate Data Stream suffix (`report.pdf:Zone.Identifier` -> `report.pdf`).
+    // 2. Strip leading ASCII Windows drive designators (e.g. `C:version.dll`, `C:D:foo.txt`).
+    while (s.length >= 2 && (s[0] in 'A'..'Z' || s[0] in 'a'..'z') && s[1] == ':') {
+      s = s.substring(2)
+    }
+    // 3. Strip NTFS Alternate Data Stream suffix (`report.pdf:Zone.Identifier` -> `report.pdf`).
     val colonIdx = s.indexOf(':')
     if (colonIdx >= 0) {
       s = s.substring(0, colonIdx)
     }
 
+    // 4. Drop forbidden characters, Unicode control (Cc), and Unicode format (Cf) characters.
     val sb = StringBuilder(s.length)
     var i = 0
     while (i < s.length) {
@@ -95,12 +98,9 @@ object TransferPathPolicy {
         cp == 0 ||
           type == Character.CONTROL.toInt() ||
           type == Character.FORMAT.toInt()
-      if (!isControlOrFormat) {
-        if (charCount == 1 && FORBIDDEN_CHARS.indexOf(cp.toChar()) >= 0) {
-          sb.append('_')
-        } else {
-          sb.appendCodePoint(cp)
-        }
+      val isForbidden = charCount == 1 && FORBIDDEN_CHARS.indexOf(cp.toChar()) >= 0
+      if (!isControlOrFormat && !isForbidden) {
+        sb.appendCodePoint(cp)
       }
       i += charCount
     }
@@ -110,13 +110,13 @@ object TransferPathPolicy {
       return "download"
     }
 
-    cleaned = neutralizeReservedWindowsName(cleaned)
     cleaned = truncateUtf8KeepingExtension(cleaned, MAX_FILE_NAME_UTF8_BYTES)
     cleaned = cleaned.trim { ch -> ch == '.' || ch.isWhitespace() }
     if (cleaned.isEmpty() || cleaned == "." || cleaned == "..") {
       return "download"
     }
-    return neutralizeReservedWindowsName(cleaned)
+    cleaned = neutralizeReservedWindowsName(cleaned)
+    return truncateUtf8KeepingExtension(cleaned, MAX_FILE_NAME_UTF8_BYTES)
   }
 
   private fun neutralizeReservedWindowsName(name: String): String {
@@ -271,6 +271,33 @@ object TransferPathPolicy {
       throw SecurityException("Refusing cache file outside open-externally directory.")
     }
     return target
+  }
+
+  /**
+   * Atomically claims a brand-new cache file inside `cacheDir` using `createNewFile()` (`O_EXCL`)
+   * without ever overwriting an existing file, trying numbered siblings on collision.
+   */
+  fun createUniqueCacheFile(cacheDir: File, transferId: String, fileName: String): File {
+    val base = resolveNewCacheFile(cacheDir, transferId, fileName)
+    val canonicalDir = cacheDir.canonicalFile
+    if (base.createNewFile()) {
+      return base
+    }
+    val baseName = base.name
+    val dot = baseName.lastIndexOf('.')
+    val stem = if (dot > 0 && dot < baseName.length - 1) baseName.substring(0, dot) else baseName
+    val ext = if (dot > 0 && dot < baseName.length - 1) baseName.substring(dot) else ""
+    for (attempt in 2..9999) {
+      val candidateName = sanitizeFileName("$stem ($attempt)$ext")
+      val candidate = File(canonicalDir, candidateName)
+      if (candidate.parentFile?.canonicalFile != canonicalDir) {
+        throw SecurityException("Refusing cache file outside open-externally directory.")
+      }
+      if (candidate.createNewFile()) {
+        return candidate
+      }
+    }
+    throw IllegalStateException("Could not allocate a unique cache file for $baseName.")
   }
 
   /**

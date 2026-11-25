@@ -333,17 +333,22 @@ object TransferBridge {
     }
     TransferPathPolicy.pruneCacheDirectory(cacheDir)
 
-    val destFile = TransferPathPolicy.resolveNewCacheFile(cacheDir, transferId, fileName)
-    FileInputStream(partFile).use { input ->
-      FileOutputStream(destFile).use { out ->
-        val buf = ByteArray(MAX_CHUNK_BYTES)
-        while (true) {
-          val read = input.read(buf)
-          if (read <= 0) break
-          out.write(buf, 0, read)
+    val destFile = TransferPathPolicy.createUniqueCacheFile(cacheDir, transferId, fileName)
+    try {
+      FileInputStream(partFile).use { input ->
+        FileOutputStream(destFile).use { out ->
+          val buf = ByteArray(MAX_CHUNK_BYTES)
+          while (true) {
+            val read = input.read(buf)
+            if (read <= 0) break
+            out.write(buf, 0, read)
+          }
+          out.flush()
         }
-        out.flush()
       }
+    } catch (e: Exception) {
+      runCatching { destFile.delete() }
+      throw e
     }
     runCatching { partFile.delete() }
 

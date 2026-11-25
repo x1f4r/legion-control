@@ -525,6 +525,7 @@ jobs:
             local launch_out app_pid
             launch_out="$(SIMCTL_CHILD_LEGION_APP_READY_FILE="$ready_file" \
               SIMCTL_CHILD_LEGION_APP_MEDIA_CHECK_FILE="$media_spec" \
+              SIMCTL_CHILD_LEGION_APP_ALLOW_LOOPBACK_ENDPOINTS=1 \
               xcrun simctl launch --stdout="$stdout_log" --stderr="$stderr_log" "$udid" com.x1f4r.legion)"
             echo "$launch_out"
             app_pid="$(printf '%s\n' "$launch_out" | awk '{print $2}')"
