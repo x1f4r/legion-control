@@ -819,10 +819,17 @@ button.row:active {
   border-top: 0;
 }
 
+.swipe-actions {
+  flex: none;
+  display: flex;
+  align-items: stretch;
+}
+
 .swipe-action {
   flex: none;
   display: inline-flex;
   align-items: center;
+  min-width: var(--tap);
   padding: 0 14px;
   border: 0;
   background: var(--bad);
@@ -830,6 +837,17 @@ button.row:active {
   font-weight: 600;
   font-size: var(--text-sub);
   cursor: pointer;
+}
+
+.swipe-action.neutral {
+  background: var(--raised);
+  color: var(--text);
+  border-left: 1px solid var(--line);
+}
+
+.swipe-action.accent {
+  background: var(--accent);
+  color: var(--accent-ink);
 }
 
 /* How a thing went, in one word with a mark. */
@@ -1683,6 +1701,707 @@ button.row:active {
 
   .sheet::before {
     display: none;
+  }
+}
+
+/* ── Files ──────────────────────────────────────────────────────────────────────────────────── */
+
+/* A row that starts with a picture of what it is. */
+.row .thumb {
+  flex: none;
+  width: 44px;
+  height: 44px;
+  display: grid;
+  place-items: center;
+  border-radius: 9px;
+  background: var(--raised);
+  color: var(--dim);
+  overflow: hidden;
+}
+
+.row .thumb svg {
+  width: 22px;
+  height: 22px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.row .thumb.folder {
+  color: var(--accent);
+}
+
+.row .thumb img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.row .star {
+  flex: none;
+  color: var(--accent);
+  font-size: 13px;
+}
+
+.row.picked {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.row .check {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 1.5px solid var(--line-strong);
+}
+
+.row.picked .check {
+  border-color: var(--accent);
+  background: var(--accent);
+  box-shadow: inset 0 0 0 4px var(--surface);
+}
+
+.row .chev.word {
+  font: 500 var(--text-sub) var(--sans);
+  color: var(--dim);
+}
+
+/* The path, first thing in the scrolling area and stuck to its top; the last part is where you are. */
+.where {
+  position: sticky;
+  top: -4px;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  margin: -4px calc(var(--pad) * -1) 6px;
+  padding: 4px var(--pad) 8px;
+  background: var(--bg);
+  font-size: var(--text-sub);
+  color: var(--dim);
+  white-space: nowrap;
+}
+
+.where::-webkit-scrollbar {
+  display: none;
+}
+
+.where a {
+  color: inherit;
+  text-decoration: none;
+  padding: 4px 2px;
+}
+
+.where a:last-child {
+  color: var(--text);
+}
+
+.where i {
+  font-style: normal;
+  color: var(--faint);
+}
+
+/* Pictures and video as a grid. Three across on a phone, more as the shell widens. */
+.grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 3px;
+  margin: 0 calc(var(--pad) * -1 + 3px);
+}
+
+.grid .cell {
+  position: relative;
+  aspect-ratio: 1;
+  overflow: hidden;
+  border-radius: 4px;
+  border: 0;
+  padding: 0;
+  background: var(--raised);
+  color: var(--dim);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.grid .cell > img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.grid .cell .cell-icon {
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 6px;
+  width: 100%;
+  height: 100%;
+  padding: 8px;
+  font-size: var(--text-small);
+  text-align: center;
+  color: var(--dim);
+}
+
+.grid .cell .cell-icon svg {
+  width: 28px;
+  height: 28px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.grid .cell .cell-name {
+  display: block;
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.grid .cell .len {
+  position: absolute;
+  right: 5px;
+  bottom: 5px;
+  width: auto;
+  height: auto;
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: rgb(0 0 0 / 0.65);
+  color: #fff;
+  font: 500 11px/1.3 var(--sans);
+}
+
+.grid .cell .cell-star {
+  position: absolute;
+  left: 5px;
+  top: 5px;
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: rgb(0 0 0 / 0.55);
+  color: var(--accent);
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.grid .cell .cell-check {
+  position: absolute;
+  right: 6px;
+  top: 6px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 1.5px solid #fff;
+  background: rgb(0 0 0 / 0.35);
+}
+
+.grid .cell.picked .cell-check {
+  border-color: var(--accent);
+  background: var(--accent);
+  box-shadow: inset 0 0 0 4px var(--surface);
+}
+
+.grid .cell.picked {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.grid .cell.folder {
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 6px;
+  color: var(--dim);
+  font-size: var(--text-small);
+  text-align: center;
+  padding: 6px;
+}
+
+.grid .cell.folder svg {
+  width: 30px;
+  height: 30px;
+  stroke: var(--accent);
+  fill: none;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* The dock when it holds a search box and tools, and when it holds actions for a selection. */
+.dock.tools {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.dock.tools .input {
+  flex: 1;
+  min-width: 0;
+}
+
+.dock.tools .btn.icon[aria-pressed="true"] {
+  color: var(--accent);
+}
+
+.bar4 {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  gap: 4px;
+}
+
+.bar4 button {
+  display: grid;
+  justify-items: center;
+  align-content: center;
+  gap: 4px;
+  min-height: 54px;
+  padding: 8px 2px 6px;
+  border: 0;
+  border-radius: 10px;
+  background: none;
+  color: var(--text);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.bar4 button svg {
+  width: 22px;
+  height: 22px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.bar4 button.active {
+  color: var(--accent);
+}
+
+.bar4 button.active svg {
+  fill: var(--accent);
+}
+
+.bar4 button.danger {
+  color: var(--bad);
+}
+
+.bar4 button[disabled] {
+  color: var(--faint);
+  cursor: default;
+}
+
+/* Kind filters above the search box: they scroll sideways and never wrap. */
+.filters {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  padding: 0 0 8px;
+}
+
+.filters::-webkit-scrollbar {
+  display: none;
+}
+
+.filters button {
+  flex: none;
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 16px;
+  background: none;
+  color: var(--dim);
+  font-size: var(--text-sub);
+  cursor: pointer;
+}
+
+.filters button[aria-pressed="true"] {
+  border-color: var(--accent);
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+/* The viewer covers everything, on black, with its actions at the bottom. */
+.viewer {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  background: #000;
+  color: #fff;
+}
+
+.viewer-top {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: calc(var(--safe-top) + 10px) 8px 8px;
+  background: linear-gradient(rgb(0 0 0 / 0.72), transparent);
+  transition: opacity 0.16s;
+}
+
+.viewer-top .name {
+  flex: 1;
+  min-width: 0;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.viewer-top .name small {
+  display: block;
+  font-weight: 400;
+  font-size: var(--text-small);
+  color: #aaa;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.viewer-top .btn {
+  color: #fff;
+}
+
+.viewer-stage {
+  position: relative;
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  touch-action: none;
+}
+
+.viewer-stage.scrollable {
+  display: block;
+  overflow: auto;
+  touch-action: pan-x pan-y;
+  padding: 12px var(--pad) 20px;
+}
+
+.viewer-img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  user-select: none;
+  -webkit-user-drag: none;
+  transform-origin: center center;
+}
+
+.viewer-video {
+  width: 100%;
+  max-height: 100%;
+  background: #111;
+}
+
+.viewer-audio {
+  display: grid;
+  justify-items: center;
+  gap: 16px;
+  width: min(360px, 100%);
+  padding: 24px 16px;
+  text-align: center;
+}
+
+.viewer-audio-art {
+  width: 96px;
+  height: 96px;
+  border-radius: 22px;
+  display: grid;
+  place-items: center;
+  background: #1a1c20;
+  color: var(--accent);
+}
+
+.viewer-audio-art svg {
+  width: 44px;
+  height: 44px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.viewer-audio audio {
+  width: 100%;
+}
+
+.viewer-text {
+  margin: 0;
+  padding: 14px;
+  border-radius: var(--radius);
+  background: #141619;
+  color: #eceef0;
+  font: 13px/1.55 var(--mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  tab-size: 4;
+}
+
+.viewer-text-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+  color: #aaa;
+  font-size: var(--text-sub);
+}
+
+.viewer-text-foot .btn {
+  color: #fff;
+  border-color: #444;
+}
+
+.viewer-stage .said {
+  max-width: 300px;
+  padding: 0 16px;
+  text-align: center;
+  color: #ccc;
+}
+
+.viewer-stage .said strong {
+  display: block;
+  color: #fff;
+  font-size: 17px;
+  margin-bottom: 6px;
+}
+
+.viewer-said-icon {
+  width: 64px;
+  height: 64px;
+  margin: 0 auto 14px;
+  border-radius: 16px;
+  display: grid;
+  place-items: center;
+  background: #1a1c20;
+  color: #aaa;
+}
+
+.viewer-said-icon svg {
+  width: 30px;
+  height: 30px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.viewer-said-actions {
+  display: grid;
+  gap: 8px;
+  margin: 18px 0 0;
+}
+
+.viewer-said-actions .btn:not(.primary) {
+  color: #fff;
+  border-color: #444;
+}
+
+.viewer-bar {
+  padding: 6px 10px calc(var(--safe-bottom) + 8px);
+  background: linear-gradient(transparent, rgb(0 0 0 / 0.72));
+  transition: opacity 0.16s;
+}
+
+.viewer-bar .bar4 button {
+  color: #fff;
+}
+
+.viewer-bar .bar4 button.active {
+  color: var(--accent);
+}
+
+.viewer.chrome-hidden .viewer-top,
+.viewer.chrome-hidden .viewer-bar {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* How far along something is, under a row's title. */
+.row .progress {
+  display: block;
+  height: 3px;
+  margin-top: 7px;
+  border-radius: 2px;
+  background: var(--raised);
+  overflow: hidden;
+}
+
+.row .progress i {
+  display: block;
+  height: 100%;
+  width: calc(var(--v, 0) * 1%);
+  background: var(--accent);
+}
+
+.tile .thumb {
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  background: var(--raised);
+  color: var(--accent);
+  overflow: hidden;
+}
+
+.tile .thumb svg {
+  width: 20px;
+  height: 20px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.tile .thumb img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.tile strong {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tile span {
+  font-size: var(--text-sub);
+  color: var(--dim);
+}
+
+/* Non-modal confirmation toast above the dock or nav (never blocks browsing). */
+.toast-banner {
+  position: absolute;
+  left: var(--pad);
+  right: var(--pad);
+  bottom: calc(var(--safe-bottom) + 74px);
+  z-index: 25;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 0.35);
+}
+
+.app.docked .toast-banner {
+  bottom: calc(var(--safe-bottom) + 136px);
+}
+
+.toast-banner span {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--text-sub);
+}
+
+.sheet-sub {
+  margin: 0 0 12px;
+  color: var(--dim);
+}
+
+.sheet-cta {
+  display: grid;
+  gap: 8px;
+  margin: 18px 0 0;
+}
+
+.sheet-btn-stack {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0 0;
+}
+
+.search-note {
+  margin: 16px 2px 0;
+  font-size: var(--text-sub);
+  color: var(--dim);
+}
+
+.transfer-ctl {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.folder-pager {
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+  padding: 16px 0 8px;
+  color: var(--dim);
+  font-size: var(--text-sub);
+}
+
+.files-wide-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 8px;
+}
+
+.files-wide-head h2 {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  font: 600 20px/1.2 var(--sans);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.files-wide-tools {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 10px;
+}
+
+.files-wide-tools .input {
+  flex: 1;
+  min-width: 0;
+}
+
+@container shell (min-width: 820px) {
+  .grid {
+    grid-template-columns: repeat(auto-fill, minmax(124px, 1fr));
+    gap: 6px;
+    margin: 0;
+  }
+
+  .where {
+    margin: -4px 0 8px;
+    padding: 4px 0 8px;
+  }
+
+  .toast-banner {
+    left: auto;
+    right: 28px;
+    bottom: 24px;
+    max-width: 420px;
+  }
+
+  .app.docked .toast-banner {
+    bottom: 84px;
   }
 }
 

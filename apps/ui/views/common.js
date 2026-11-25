@@ -29,6 +29,19 @@ export function Meter({ value, level, className = '' }) {
   return html`<span ref=${ref} class=${cls}><i></i></span>`;
 }
 
+// Inline progress bar for transfer and sync rows (uses CSSOM for --v to stay CSP-safe).
+export function ProgressBar({ value, className = '' }) {
+  const ref = useRef(null);
+  const pct = clampPct(value);
+  useEffect(() => {
+    if (ref.current) {
+      ref.current.style.setProperty('--v', String(pct));
+    }
+  }, [pct]);
+  const cls = ['progress', className].filter(Boolean).join(' ');
+  return html`<span ref=${ref} class=${cls} role="progressbar" aria-valuenow=${pct} aria-valuemin="0" aria-valuemax="100"><i></i></span>`;
+}
+
 export function Notice({
   error,
   title,
@@ -160,14 +173,20 @@ export function QrCode({ text, label = 'Invite QR code' }) {
   `;
 }
 
-// Wraps a list row so a leftward pointer swipe reveals a destructive/secondary action button.
-export function SwipeRow({ actionLabel, onAction, disabled = false, children }) {
+// Wraps a list row so a leftward pointer swipe reveals one or more action buttons.
+export function SwipeRow({ actionLabel, onAction, actions = null, disabled = false, children }) {
   const [open, setOpen] = useState(false);
   const startRef = useRef(null);
   const suppressClickRef = useRef(false);
 
+  const resolvedActions = Array.isArray(actions) && actions.length > 0
+    ? actions
+    : actionLabel
+      ? [{ label: actionLabel, onAction, tone: 'danger' }]
+      : [];
+
   function onPointerDown(e) {
-    if (disabled || e.button > 0) return;
+    if (disabled || resolvedActions.length === 0 || e.button > 0) return;
     startRef.current = { x: e.clientX, y: e.clientY, id: e.pointerId };
   }
 
@@ -211,20 +230,33 @@ export function SwipeRow({ actionLabel, onAction, disabled = false, children }) 
       onClickCapture=${onClickCapture}
     >
       ${children}
-      ${open && !disabled
+      ${open && !disabled && resolvedActions.length > 0
         ? html`
-            <button
-              type="button"
-              class="swipe-action"
-              onClick=${(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                setOpen(false);
-                if (onAction) onAction();
-              }}
-            >
-              ${actionLabel}
-            </button>
+            <div class="swipe-actions">
+              ${resolvedActions.map((act) => {
+                const cls = [
+                  'swipe-action',
+                  act.tone === 'accent' ? 'accent' : act.tone === 'neutral' ? 'neutral' : '',
+                ]
+                  .filter(Boolean)
+                  .join(' ');
+                return html`
+                  <button
+                    key=${act.label}
+                    type="button"
+                    class=${cls}
+                    onClick=${(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setOpen(false);
+                      if (act.onAction) act.onAction();
+                    }}
+                  >
+                    ${act.label}
+                  </button>
+                `;
+              })}
+            </div>
           `
         : null}
     </div>
