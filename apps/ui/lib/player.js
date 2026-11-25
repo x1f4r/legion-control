@@ -1025,6 +1025,10 @@ export function createFullscreenController({
     return now() - lastPlatformExitAt < windowMs;
   }
 
+  function clearPlatformExitGuard() {
+    lastPlatformExitAt = -Infinity;
+  }
+
   function handlePopState() {
     const st = history?.state;
     const landedOnViewerEntry = Boolean(
@@ -1082,6 +1086,7 @@ export function createFullscreenController({
     leave,
     syncFromPlatform,
     recentlyExitedFromPlatform,
+    clearPlatformExitGuard,
     handlePopState,
     dispose,
   };

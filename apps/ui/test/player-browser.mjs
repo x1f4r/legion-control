@@ -1792,3 +1792,195 @@ test('Player: window-hidden pause stays resumable across loopback teardown, mint
     await new Promise((resolve) => server.close(resolve));
   }
 });
+
+test('Player: wide 1440x900 two-pane split layout isolates inert panes and rail, restores opener focus in either pane, and handles full screen and window hide', async () => {
+  const server = await startStaticUiServer();
+  const browser = await chromium.launch({
+    executablePath: findBrowser(),
+    headless: true,
+    args: ['--no-sandbox', '--disable-gpu', '--autoplay-policy=no-user-gesture-required'],
+  });
+  const consoleErrors = [];
+  const pageErrors = [];
+
+  try {
+    const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, colorScheme: 'dark' });
+    const page = await context.newPage();
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => pageErrors.push(String(err)));
+
+    await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.locator('.split-left .tile', { hasText: 'Passport.pdf' }).waitFor({ timeout: 5000 });
+    await page.locator('.split-right .grid a.cell[aria-label="Arrival.mp4"]').waitFor({ timeout: 5000 });
+
+    // Confirm two-pane wide shell structure at 1440x900 (two panes + nav rail, no narrow page header).
+    const shellCheck = await page.evaluate(() => ({
+      hasLeft: Boolean(document.querySelector('.split-left')),
+      hasRight: Boolean(document.querySelector('.split-right')),
+      hasNav: Boolean(document.querySelector('nav.nav')),
+      hasNarrowHeader: Boolean(document.querySelector('header.top')),
+    }));
+    assert.deepEqual(shellCheck, { hasLeft: true, hasRight: true, hasNav: true, hasNarrowHeader: false });
+
+    const assertShellInert = async (expectedInert) => {
+      const state = await page.evaluate(() => ({
+        left: Boolean(document.querySelector('.split-left')?.closest('[inert]')),
+        right: Boolean(document.querySelector('.split-right')?.closest('[inert]')),
+        nav: Boolean(document.querySelector('nav.nav')?.closest('[inert]')),
+      }));
+      assert.deepEqual(state, { left: expectedInert, right: expectedInert, nav: expectedInert });
+    };
+
+    // 1. Open viewer from a left-pane pinned file tile -> covers full 1440x900 viewport, marks
+    //    both panes and the navigation rail inert, traps Tab inside viewer, and restores focus to
+    //    that exact left-pane tile on close.
+    const leftTile = page.locator('.split-left .tile', { hasText: 'Passport.pdf' });
+    await leftTile.focus();
+    await leftTile.click();
+    await page.locator('.viewer').waitFor({ timeout: 5000 });
+    await assertShellInert(true);
+
+    const viewerBox = await page.locator('.viewer').boundingBox();
+    assert.ok(
+      viewerBox &&
+        viewerBox.x === 0 &&
+        viewerBox.y === 0 &&
+        viewerBox.width === 1440 &&
+        viewerBox.height === 900,
+      `Expected viewer to cover full 1440x900 viewport, got ${JSON.stringify(viewerBox)}`,
+    );
+
+    // Tab cycling stays strictly inside `.viewer`.
+    for (let i = 0; i < 6; i += 1) {
+      await page.keyboard.press('Tab');
+      const inViewer = await page.evaluate(() => Boolean(document.querySelector('.viewer')?.contains(document.activeElement)));
+      assert.equal(inViewer, true, `Tab step ${i + 1} must stay inside .viewer`);
+    }
+
+    await page.keyboard.press('Escape');
+    await page.locator('.viewer').waitFor({ state: 'detached', timeout: 5000 });
+    await assertShellInert(false);
+    const leftFocusAfterClose = await page.evaluate(() => ({
+      inLeft: Boolean(document.activeElement?.closest('.split-left')),
+      text: document.activeElement?.textContent?.trim() || '',
+    }));
+    assert.equal(leftFocusAfterClose.inLeft, true, 'Focus must return inside .split-left');
+    assert.ok(
+      leftFocusAfterClose.text.includes('Passport.pdf'),
+      `Expected focus on Passport.pdf tile, got "${leftFocusAfterClose.text}"`,
+    );
+
+    // 2. Open video from the right pane -> both panes and rail inert, Full screen enter/exit works,
+    //    window-hidden pauses playback in place & leaves full screen, and close returns focus to
+    //    the right-pane Arrival.mp4 cell.
+    const rightCell = page.locator('.split-right .grid a.cell[aria-label="Arrival.mp4"]');
+    await rightCell.focus();
+    await rightCell.click();
+    await page.locator('.viewer video.viewer-video[src]').waitFor({ timeout: 5000 });
+    await page.waitForFunction(() => {
+      const v = document.querySelector('.viewer video');
+      return Boolean(v && v.readyState >= 1);
+    });
+    await assertShellInert(true);
+
+    await page.evaluate(() => {
+      window.__LEGION_MOCK_IMMERSIVE_CALLS__.length = 0;
+      window.__LEGION_MOCK_KEEP_SCREEN_ON_CALLS__.length = 0;
+    });
+    await page.locator('.viewer button[aria-label="Full screen"]').click();
+    await page.locator('.viewer button[aria-label="Exit full screen"]').waitFor({ timeout: 3000 });
+    assert.deepEqual(
+      await page.evaluate(() => window.__LEGION_MOCK_IMMERSIVE_CALLS__.map((c) => c.on)),
+      [true],
+    );
+    await page.locator('.viewer button[aria-label="Exit full screen"]').click();
+    await page.locator('.viewer button[aria-label="Full screen"]').waitFor({ timeout: 3000 });
+    assert.deepEqual(
+      await page.evaluate(() => window.__LEGION_MOCK_IMMERSIVE_CALLS__.map((c) => c.on)),
+      [true, false],
+    );
+
+    // Re-enter full screen, start playing, then trigger desktop window-hidden -> pauses in place,
+    // leaves full screen, releases keepScreenOn, and keeps the viewer open.
+    await page.locator('.viewer button[aria-label="Full screen"]').click();
+    await page.locator('.viewer button[aria-label="Exit full screen"]').waitFor({ timeout: 3000 });
+    await page.evaluate(async () => {
+      const v = document.querySelector('.viewer video');
+      await v.play();
+    });
+    await page.waitForFunction(() => {
+      const v = document.querySelector('.viewer video');
+      return Boolean(v && !v.paused);
+    });
+
+    await page.evaluate(() => window.__LEGION_MOCK_TRIGGER_WINDOW_HIDDEN__?.());
+    await page.locator('.viewer button[aria-label="Full screen"]').waitFor({ timeout: 3000 });
+    const afterHideVideo = await page.evaluate(() => ({
+      paused: document.querySelector('.viewer video')?.paused ?? false,
+      keepScreenOnLast: window.__LEGION_MOCK_KEEP_SCREEN_ON_CALLS__.at(-1)?.on,
+      exitFsButtons: document.querySelectorAll('.viewer button[aria-label="Exit full screen"]').length,
+      viewerStillOpen: Boolean(document.querySelector('.viewer')),
+    }));
+    assert.equal(afterHideVideo.paused, true);
+    assert.equal(afterHideVideo.keepScreenOnLast, false);
+    assert.equal(afterHideVideo.exitFsButtons, 0);
+    assert.equal(afterHideVideo.viewerStillOpen, true);
+
+    await page.keyboard.press('Escape');
+    await page.locator('.viewer').waitFor({ state: 'detached', timeout: 5000 });
+    await assertShellInert(false);
+    const rightFocusAfterClose = await page.evaluate(() => ({
+      inRight: Boolean(document.activeElement?.closest('.split-right')),
+      label: document.activeElement?.getAttribute?.('aria-label') || '',
+    }));
+    assert.equal(rightFocusAfterClose.inRight, true, 'Focus must return inside .split-right');
+    assert.equal(rightFocusAfterClose.label, 'Arrival.mp4');
+
+    // 3. Open music row from the right pane -> both panes and rail inert, window-hidden pauses
+    //    audio in place, and close returns focus to that exact right-pane music row.
+    await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FMusic%2FAlbum`, {
+      waitUntil: 'domcontentloaded',
+    });
+    const musicRow = page.locator('.split-right a.row', { hasText: '01 - Morning Light.flac' });
+    await musicRow.waitFor({ timeout: 5000 });
+    await musicRow.focus();
+    await musicRow.click();
+    await page.locator('.viewer audio[src]').waitFor({ state: 'attached', timeout: 5000 });
+    await assertShellInert(true);
+
+    await page.evaluate(async () => {
+      const a = document.querySelector('.viewer audio');
+      await a.play();
+    });
+    await page.waitForFunction(() => {
+      const a = document.querySelector('.viewer audio');
+      return Boolean(a && !a.paused);
+    });
+    await page.evaluate(() => window.__LEGION_MOCK_TRIGGER_WINDOW_HIDDEN__?.());
+    assert.equal(await page.evaluate(() => document.querySelector('.viewer audio')?.paused), true);
+
+    await page.keyboard.press('Escape');
+    await page.locator('.viewer').waitFor({ state: 'detached', timeout: 5000 });
+    await assertShellInert(false);
+    const musicFocusAfterClose = await page.evaluate(() => ({
+      inRight: Boolean(document.activeElement?.closest('.split-right')),
+      text: document.activeElement?.textContent?.trim() || '',
+    }));
+    assert.equal(musicFocusAfterClose.inRight, true, 'Focus must return inside .split-right for music row');
+    assert.ok(
+      musicFocusAfterClose.text.includes('01 - Morning Light.flac'),
+      `Expected focus on 01 - Morning Light.flac row, got "${musicFocusAfterClose.text}"`,
+    );
+
+    assert.deepEqual(consoleErrors, [], `Console errors: ${consoleErrors.join('; ')}`);
+    assert.deepEqual(pageErrors, [], `Page errors: ${pageErrors.join('; ')}`);
+    await context.close();
+  } finally {
+    await browser.close();
+    await server.stop();
+  }
+});

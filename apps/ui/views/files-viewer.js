@@ -478,6 +478,7 @@ export function FilesViewer({
       if (fullscreenController.getState().active) {
         fullscreenController.leave();
       }
+      fullscreenController.clearPlatformExitGuard?.();
       setChromeHidden(false);
       link?.keepScreenOn?.(false);
     });
