@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use legion_content::extract_file_name;
-use legion_link::{ContentTime, PutRequest};
+use legion_link::{CAP_PUT_NO_REPLACE, ContentTime, PutRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tauri::ipc::Channel as IpcChannel;
@@ -3151,7 +3151,7 @@ impl TransferManager {
         requested_path: &str,
         requested_name: &str,
         cancel: &CancellationToken,
-    ) -> Result<(String, String), WorkerStop> {
+    ) -> Result<(String, String, u32), WorkerStop> {
         let (dir_prefix, sep) = split_remote_dir(requested_path);
         let safe_base = sanitize_file_name(requested_name);
         let path_ref = Path::new(&safe_base);
@@ -3217,7 +3217,7 @@ impl TransferManager {
                     Err(err) => {
                         let app_err = AppError::from(err);
                         if app_err.code == ErrorCode::NotFound {
-                            return Ok((candidate_path, candidate_name));
+                            return Ok((candidate_path, candidate_name, n));
                         }
                         if self
                             .should_retry(&app_err, &mut retry_started, &mut attempt, cancel)
@@ -3236,7 +3236,7 @@ impl TransferManager {
             None => format!("{stem}-{}", now_unix_secs()),
         };
         let fallback_path = join_remote_with_sep(&dir_prefix, sep, &fallback_name);
-        Ok((fallback_path, fallback_name))
+        Ok((fallback_path, fallback_name, 9999))
     }
 
     fn lock_resolved_upload_path(&self, id: &str, remote_path: &str, name: &str) {
@@ -3285,16 +3285,33 @@ impl TransferManager {
             return Err(WorkerStop::WifiOnlyPause);
         }
 
-        // Resolve a non-colliding remote destination path once and lock it on the transfer record
-        // so uploads never silently overwrite an existing remote file while still resuming into
-        // the same chosen path across pauses or restarts.
-        //
-        // Future wire hook: once the remote `put` protocol supports `if_exists: "rename"`, pass it
-        // on the `PutRequest` as well to close any concurrent multi-client race on the node.
-        let remote_path = if initial.remote_path_resolved {
-            initial.transfer.path.clone()
+        let (dir_prefix, sep) = split_remote_dir(&initial.transfer.path);
+        let base_name = sanitize_file_name(&initial.transfer.name);
+
+        // Choose the remote destination path without overwriting existing files:
+        // - When the machine is already known to support `put.no_replace`, skip `fs.stat` and rely
+        //   on `put` with `"no_replace": true`, stepping to the next numbered sibling on `Exists`.
+        // - When the machine is older (`Some(false)`), keep `fs.stat`-then-`put` without
+        //   `no_replace`.
+        // - Before the first stream greeting (`None`), probe with `fs.stat` (so older machines
+        //   never overwrite even on 0-byte uploads) and still send `"no_replace": true` so newer
+        //   machines enforce atomic no-replace on the very first upload and cache their capability.
+        let initial_target: ContentTarget = self
+            .backend
+            .content_target(&initial.transfer.machine)
+            .map_err(WorkerStop::Failed)?;
+        let initial_supports_no_replace = initial_target
+            .link
+            .stream_supports(&initial_target.link_node, CAP_PUT_NO_REPLACE);
+
+        let (mut remote_path, mut candidate_n) = if initial.remote_path_resolved {
+            (initial.transfer.path.clone(), 1u32)
+        } else if initial_supports_no_replace == Some(true) {
+            let candidate_path = join_remote_with_sep(&dir_prefix, sep, &base_name);
+            self.lock_resolved_upload_path(id, &candidate_path, &base_name);
+            (candidate_path, 1u32)
         } else {
-            let (resolved_path, resolved_name) = self
+            let (resolved_path, resolved_name, resolved_n) = self
                 .resolve_unique_remote_path(
                     &initial.transfer.machine,
                     &initial.transfer.path,
@@ -3303,8 +3320,9 @@ impl TransferManager {
                 )
                 .await?;
             self.lock_resolved_upload_path(id, &resolved_path, &resolved_name);
-            resolved_path
+            (resolved_path, resolved_n)
         };
+        let mut fallback_exists_attempts: u32 = 0;
 
         let mut retry_started: Option<Instant> = None;
         let mut attempt: u32 = 0;
@@ -3322,12 +3340,18 @@ impl TransferManager {
                 .content_target(&initial.transfer.machine)
                 .map_err(WorkerStop::Failed)?;
 
+            let use_no_replace = target
+                .link
+                .stream_supports(&target.link_node, CAP_PUT_NO_REPLACE)
+                != Some(false);
+
             let req = PutRequest {
                 path: remote_path.clone(),
                 size: total_size,
                 hash: local_hash.clone(),
                 mode: Some(0o644),
                 mtime: local_file_mtime(local_path),
+                no_replace: use_no_replace,
             };
 
             let mut put = match target
@@ -3337,6 +3361,23 @@ impl TransferManager {
             {
                 Ok(put) => put,
                 Err(err) => {
+                    if use_no_replace
+                        && err.code == legion_link::proto::ErrorCode::Exists
+                        && let Some((next_path, next_name)) = advance_upload_candidate(
+                            &dir_prefix,
+                            sep,
+                            &base_name,
+                            &mut candidate_n,
+                            &mut fallback_exists_attempts,
+                        )
+                    {
+                        remote_path = next_path;
+                        self.lock_resolved_upload_path(id, &remote_path, &next_name);
+                        self.update_progress(id, 0, total_size, None);
+                        retry_started = None;
+                        attempt = 0;
+                        continue;
+                    }
                     let app_err = AppError::from(err);
                     if self
                         .should_retry(&app_err, &mut retry_started, &mut attempt, cancel)
@@ -3492,6 +3533,23 @@ impl TransferManager {
                     });
                 }
                 Err(err) => {
+                    if use_no_replace
+                        && err.code == legion_link::proto::ErrorCode::Exists
+                        && let Some((next_path, next_name)) = advance_upload_candidate(
+                            &dir_prefix,
+                            sep,
+                            &base_name,
+                            &mut candidate_n,
+                            &mut fallback_exists_attempts,
+                        )
+                    {
+                        remote_path = next_path;
+                        self.lock_resolved_upload_path(id, &remote_path, &next_name);
+                        self.update_progress(id, 0, total_size, None);
+                        retry_started = None;
+                        attempt = 0;
+                        continue;
+                    }
                     let app_err = AppError::from(err);
                     if self
                         .should_retry(&app_err, &mut retry_started, &mut attempt, cancel)
@@ -3642,6 +3700,42 @@ impl TransferManager {
         }
         self.persist_locked_snapshot();
     }
+}
+
+fn advance_upload_candidate(
+    dir_prefix: &str,
+    sep: char,
+    base_name: &str,
+    candidate_n: &mut u32,
+    fallback_attempts: &mut u32,
+) -> Option<(String, String)> {
+    if *candidate_n < 9999 {
+        *candidate_n += 1;
+        let next_name = file_policy::numbered_candidate_name(base_name, *candidate_n);
+        let next_path = join_remote_with_sep(dir_prefix, sep, &next_name);
+        return Some((next_path, next_name));
+    }
+    if *fallback_attempts >= 16 {
+        return None;
+    }
+    *fallback_attempts += 1;
+    let path_ref = Path::new(base_name);
+    let stem = path_ref
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(base_name);
+    let ext = path_ref
+        .extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| !e.is_empty());
+    let suffix = format!("{}-{}", now_unix_secs(), *fallback_attempts);
+    let next_name = match ext {
+        Some(e) => format!("{stem}-{suffix}.{e}"),
+        None => format!("{stem}-{suffix}"),
+    };
+    let next_path = join_remote_with_sep(dir_prefix, sep, &next_name);
+    Some((next_path, next_name))
 }
 
 fn push_unique_cleanup_path(paths: &mut Vec<String>, path: String) {
@@ -4164,6 +4258,11 @@ mod tests {
         fail_first_gets: usize,
         stall_get: bool,
         stall_put: bool,
+        advertise_cap_no_replace: bool,
+        reply_no_replace: bool,
+        race_create_on_put_finish: std::collections::HashSet<String>,
+        stat_calls: AtomicUsize,
+        put_requests: Mutex<Vec<Value>>,
         active_streams: AtomicUsize,
         max_concurrent_observed: AtomicUsize,
     }
@@ -4191,7 +4290,18 @@ mod tests {
                         return;
                     }
                     let req: Value = serde_json::from_str(&line).unwrap();
-                    let _ = server_out.write_all(b"{\"protocol\":1}\n").await;
+                    let (advertise_cap, reply_no_replace) = {
+                        let st = remote.lock().unwrap();
+                        (st.advertise_cap_no_replace, st.reply_no_replace)
+                    };
+                    let greeting = if advertise_cap {
+                        json!({ "protocol": 1, "capabilities": [CAP_PUT_NO_REPLACE] })
+                    } else {
+                        json!({ "protocol": 1 })
+                    };
+                    let _ = server_out
+                        .write_all(format!("{greeting}\n").as_bytes())
+                        .await;
                     let op = req["op"].as_str().unwrap_or("");
                     if op == "get" {
                         let path = req["path"].as_str().unwrap_or("").to_owned();
@@ -4296,20 +4406,37 @@ mod tests {
                         let path = req["path"].as_str().unwrap_or("").to_owned();
                         let size = req["size"].as_u64().unwrap() as usize;
                         let expected_hash = req["hash"].as_str().unwrap_or("").to_owned();
-                        let (mut existing, stall_put) = {
+                        let wants_no_replace = req.get("no_replace").and_then(Value::as_bool)
+                            == Some(true)
+                            && (advertise_cap || reply_no_replace);
+                        let (mut existing, stall_put, already_exists) = {
                             let st = remote.lock().unwrap();
+                            st.put_requests.lock().unwrap().push(req.clone());
+                            let exists =
+                                st.files.contains_key(&path) || st.uploaded.contains_key(&path);
                             (
                                 st.partial_uploads.get(&path).cloned().unwrap_or_default(),
                                 st.stall_put,
+                                exists,
                             )
                         };
+                        if wants_no_replace && already_exists {
+                            let err = json!({
+                                "error": ErrorBody::new(ProtoCode::Exists, "destination file already exists")
+                            });
+                            let _ = server_out.write_all(format!("{err}\n").as_bytes()).await;
+                            let _ = server_out.shutdown().await;
+                            return;
+                        }
                         if existing.len() > size {
                             existing.clear();
                         }
                         let resume_off = existing.len();
-                        let _ = server_out
-                            .write_all(format!("{{\"offset\":{resume_off}}}\n").as_bytes())
-                            .await;
+                        let mut ready = json!({ "offset": resume_off });
+                        if wants_no_replace && reply_no_replace {
+                            ready["no_replace"] = json!(true);
+                        }
+                        let _ = server_out.write_all(format!("{ready}\n").as_bytes()).await;
                         if stall_put {
                             // Stop reading from the upload duplex so the writer back-pressures
                             // and stalls cleanly.
@@ -4347,10 +4474,37 @@ mod tests {
                             let _ = server_out.write_all(format!("{err}\n").as_bytes()).await;
                             return;
                         }
-                        {
+                        let raced_exists = {
                             let mut st = remote.lock().unwrap();
-                            st.partial_uploads.remove(&path);
-                            st.uploaded.insert(path, got);
+                            if wants_no_replace {
+                                if st.race_create_on_put_finish.remove(&path) {
+                                    st.files
+                                        .insert(path.clone(), b"concurrent-device-file".to_vec());
+                                    st.partial_uploads.remove(&path);
+                                    true
+                                } else if st.files.contains_key(&path)
+                                    || st.uploaded.contains_key(&path)
+                                {
+                                    st.partial_uploads.remove(&path);
+                                    true
+                                } else {
+                                    st.partial_uploads.remove(&path);
+                                    st.uploaded.insert(path, got);
+                                    false
+                                }
+                            } else {
+                                st.partial_uploads.remove(&path);
+                                st.uploaded.insert(path, got);
+                                false
+                            }
+                        };
+                        if raced_exists {
+                            let err = json!({
+                                "error": ErrorBody::new(ProtoCode::Exists, "destination created concurrently")
+                            });
+                            let _ = server_out.write_all(format!("{err}\n").as_bytes()).await;
+                            let _ = server_out.shutdown().await;
+                            return;
                         }
                         let done = json!({ "ok": true, "size": size, "hash": actual });
                         let _ = server_out.write_all(format!("{done}\n").as_bytes()).await;
@@ -4417,6 +4571,7 @@ mod tests {
                                     .unwrap_or("");
                                 let st = remote.lock().unwrap();
                                 if tool == "fs.stat" {
+                                    st.stat_calls.fetch_add(1, Ordering::SeqCst);
                                     if let Some(data) =
                                         st.files.get(path).or_else(|| st.uploaded.get(path))
                                     {
@@ -6775,5 +6930,306 @@ mod tests {
         assert!(!saved_path.exists());
         assert!(!mgr2.part_path(&id).exists());
         mgr2.shutdown();
+    }
+
+    #[tokio::test]
+    async fn upload_uses_atomic_no_replace_when_machine_supports_it_and_skips_stat() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes1 = b"first-upload-concurrent-race".to_vec();
+        let bytes2 = b"second-upload-skips-stat".to_vec();
+        let src1 = dir.path().join("notes.txt");
+        let src2 = dir.path().join("report.pdf");
+        fs::write(&src1, &bytes1).unwrap();
+        fs::write(&src2, &bytes2).unwrap();
+
+        let remote = Arc::new(Mutex::new(MockRemoteState::default()));
+        {
+            let mut st = remote.lock().unwrap();
+            st.advertise_cap_no_replace = true;
+            st.reply_no_replace = true;
+            // Simulate a concurrent second device creating `/home/me/uploads/notes.txt` after
+            // `fs.stat` and `PutReady` succeeded, right before final commit (`PutDone`).
+            st.race_create_on_put_finish
+                .insert("/home/me/uploads/notes.txt".into());
+            // Pre-existing file for upload #2 so `PutReady` rejects with `Exists`.
+            st.files.insert(
+                "/home/me/uploads/report.pdf".into(),
+                b"original-pdf".to_vec(),
+            );
+        }
+
+        let backend: Arc<dyn Backend> = Arc::new(MockBackend::new(Arc::clone(&remote)));
+        let platform = Arc::new(MockPlatform::new(dir.path()));
+        let mgr = TransferManager::with_options(
+            dir.path(),
+            backend,
+            platform.clone(),
+            2,
+            Duration::from_secs(2),
+        );
+
+        // Upload #1 (before any stream greeting): probes `fs.stat`, still sends `no_replace: true`,
+        // catches the concurrent race at `PutDone` (`ErrorCode::Exists`), and retries cleanly as
+        // `notes (2).txt` without overwriting the concurrent device's file.
+        platform
+            .picked_files
+            .lock()
+            .unwrap()
+            .push(PickedUploadFile {
+                local_path: src1.to_string_lossy().into_owned(),
+                name: "notes.txt".into(),
+                size: bytes1.len() as u64,
+                mime: None,
+            });
+        let picked1 = mgr.pick_uploads().await.unwrap();
+        let up1 = mgr
+            .enqueue_upload(
+                "tower".into(),
+                "/home/me/uploads".into(),
+                Some(vec![picked1[0].handle.clone()]),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let done1 = wait_for_state(&mgr, &up1.id, |s| s == TransferState::Done).await;
+        assert_eq!(done1.path, "/home/me/uploads/notes (2).txt");
+        assert_eq!(done1.name, "notes (2).txt");
+        {
+            let st = remote.lock().unwrap();
+            assert_eq!(
+                st.files.get("/home/me/uploads/notes.txt").unwrap(),
+                b"concurrent-device-file"
+            );
+            assert_eq!(
+                st.uploaded.get("/home/me/uploads/notes (2).txt").unwrap(),
+                &bytes1
+            );
+            assert!(
+                st.stat_calls.load(Ordering::SeqCst) >= 1,
+                "first upload before stream greeting probes fs.stat for older-machine safety"
+            );
+        }
+
+        // Upload #2: capability `put.no_replace` is now cached -> makes ZERO `fs.stat` calls,
+        // hits `Exists` at `PutReady` for `report.pdf`, and succeeds at `report (2).pdf`.
+        remote.lock().unwrap().stat_calls.store(0, Ordering::SeqCst);
+        {
+            let mut picked = platform.picked_files.lock().unwrap();
+            picked.clear();
+            picked.push(PickedUploadFile {
+                local_path: src2.to_string_lossy().into_owned(),
+                name: "report.pdf".into(),
+                size: bytes2.len() as u64,
+                mime: None,
+            });
+        }
+        let picked2 = mgr.pick_uploads().await.unwrap();
+        let up2 = mgr
+            .enqueue_upload(
+                "tower".into(),
+                "/home/me/uploads".into(),
+                Some(vec![picked2[0].handle.clone()]),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let done2 = wait_for_state(&mgr, &up2.id, |s| s == TransferState::Done).await;
+        assert_eq!(done2.path, "/home/me/uploads/report (2).pdf");
+        assert_eq!(done2.name, "report (2).pdf");
+        {
+            let st = remote.lock().unwrap();
+            assert_eq!(
+                st.stat_calls.load(Ordering::SeqCst),
+                0,
+                "upload must skip fs.stat once machine advertised put.no_replace"
+            );
+            assert_eq!(
+                st.files.get("/home/me/uploads/report.pdf").unwrap(),
+                b"original-pdf"
+            );
+            assert_eq!(
+                st.uploaded.get("/home/me/uploads/report (2).pdf").unwrap(),
+                &bytes2
+            );
+            let reqs = st.put_requests.lock().unwrap();
+            assert!(reqs.iter().all(|r| r["no_replace"] == Value::Bool(true)));
+        }
+        mgr.shutdown();
+    }
+
+    #[tokio::test]
+    async fn upload_detects_no_replace_from_put_ready_reply_and_falls_back_on_older_machine() {
+        // Subcase A: Machine advertises `no_replace: true` only on PutReady (no greeting caps).
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let src1 = dir.path().join("first.txt");
+            let src2 = dir.path().join("second.txt");
+            fs::write(&src1, b"one").unwrap();
+            fs::write(&src2, b"two").unwrap();
+
+            let remote = Arc::new(Mutex::new(MockRemoteState::default()));
+            {
+                let mut st = remote.lock().unwrap();
+                st.advertise_cap_no_replace = false;
+                st.reply_no_replace = true;
+                st.files
+                    .insert("/home/me/uploads/second.txt".into(), b"keep-me".to_vec());
+            }
+            let backend: Arc<dyn Backend> = Arc::new(MockBackend::new(Arc::clone(&remote)));
+            let platform = Arc::new(MockPlatform::new(dir.path()));
+            let mgr = TransferManager::with_options(
+                dir.path(),
+                backend,
+                platform.clone(),
+                2,
+                Duration::from_secs(2),
+            );
+
+            platform
+                .picked_files
+                .lock()
+                .unwrap()
+                .push(PickedUploadFile {
+                    local_path: src1.to_string_lossy().into_owned(),
+                    name: "first.txt".into(),
+                    size: 3,
+                    mime: None,
+                });
+            let p1 = mgr.pick_uploads().await.unwrap();
+            let u1 = mgr
+                .enqueue_upload(
+                    "tower".into(),
+                    "/home/me/uploads".into(),
+                    Some(vec![p1[0].handle.clone()]),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let _ = wait_for_state(&mgr, &u1.id, |s| s == TransferState::Done).await;
+
+            // Upload #2 skips `fs.stat` because PutReady confirmed `no_replace: true`.
+            remote.lock().unwrap().stat_calls.store(0, Ordering::SeqCst);
+            {
+                let mut picked = platform.picked_files.lock().unwrap();
+                picked.clear();
+                picked.push(PickedUploadFile {
+                    local_path: src2.to_string_lossy().into_owned(),
+                    name: "second.txt".into(),
+                    size: 3,
+                    mime: None,
+                });
+            }
+            let p2 = mgr.pick_uploads().await.unwrap();
+            let u2 = mgr
+                .enqueue_upload(
+                    "tower".into(),
+                    "/home/me/uploads".into(),
+                    Some(vec![p2[0].handle.clone()]),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let d2 = wait_for_state(&mgr, &u2.id, |s| s == TransferState::Done).await;
+            assert_eq!(d2.path, "/home/me/uploads/second (2).txt");
+            let st = remote.lock().unwrap();
+            assert_eq!(st.stat_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                st.files.get("/home/me/uploads/second.txt").unwrap(),
+                b"keep-me"
+            );
+            assert_eq!(
+                st.uploaded.get("/home/me/uploads/second (2).txt").unwrap(),
+                b"two"
+            );
+            mgr.shutdown();
+        }
+
+        // Subcase B: Older machine (no greeting caps and no PutReady.no_replace) keeps
+        // fs.stat-then-put and stops sending `no_replace` once detected.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let src1 = dir.path().join("a.txt");
+            let src2 = dir.path().join("b.txt");
+            fs::write(&src1, b"aaa").unwrap();
+            fs::write(&src2, b"bbb").unwrap();
+
+            let remote = Arc::new(Mutex::new(MockRemoteState::default()));
+            remote
+                .lock()
+                .unwrap()
+                .files
+                .insert("/home/me/uploads/b.txt".into(), b"existing-b".to_vec());
+
+            let backend: Arc<dyn Backend> = Arc::new(MockBackend::new(Arc::clone(&remote)));
+            let platform = Arc::new(MockPlatform::new(dir.path()));
+            let mgr = TransferManager::with_options(
+                dir.path(),
+                backend,
+                platform.clone(),
+                2,
+                Duration::from_secs(2),
+            );
+
+            platform
+                .picked_files
+                .lock()
+                .unwrap()
+                .push(PickedUploadFile {
+                    local_path: src1.to_string_lossy().into_owned(),
+                    name: "a.txt".into(),
+                    size: 3,
+                    mime: None,
+                });
+            let p1 = mgr.pick_uploads().await.unwrap();
+            let u1 = mgr
+                .enqueue_upload(
+                    "tower".into(),
+                    "/home/me/uploads".into(),
+                    Some(vec![p1[0].handle.clone()]),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let _ = wait_for_state(&mgr, &u1.id, |s| s == TransferState::Done).await;
+
+            remote.lock().unwrap().stat_calls.store(0, Ordering::SeqCst);
+            {
+                let mut picked = platform.picked_files.lock().unwrap();
+                picked.clear();
+                picked.push(PickedUploadFile {
+                    local_path: src2.to_string_lossy().into_owned(),
+                    name: "b.txt".into(),
+                    size: 3,
+                    mime: None,
+                });
+            }
+            let p2 = mgr.pick_uploads().await.unwrap();
+            let u2 = mgr
+                .enqueue_upload(
+                    "tower".into(),
+                    "/home/me/uploads".into(),
+                    Some(vec![p2[0].handle.clone()]),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let d2 = wait_for_state(&mgr, &u2.id, |s| s == TransferState::Done).await;
+            assert_eq!(d2.path, "/home/me/uploads/b (2).txt");
+            let st = remote.lock().unwrap();
+            assert!(
+                st.stat_calls.load(Ordering::SeqCst) >= 2,
+                "older machine must keep fs.stat collision probing"
+            );
+            assert_eq!(
+                st.files.get("/home/me/uploads/b.txt").unwrap(),
+                b"existing-b"
+            );
+            let reqs = st.put_requests.lock().unwrap();
+            assert!(
+                reqs.last().unwrap().get("no_replace").is_none(),
+                "older machine must not receive no_replace once lack of support is known"
+            );
+            mgr.shutdown();
+        }
     }
 }
