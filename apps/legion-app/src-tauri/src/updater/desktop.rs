@@ -867,9 +867,10 @@ fn validate_tar_rel_path(path: &Path) -> Result<PathBuf, AppError> {
     Ok(clean)
 }
 
-/// Validates every symlink in `symlinks` against the archive root by resolving multi-hop symlink
-/// chains (forward or backward in archive order) up to [`MAX_SYMLINK_CHAIN_DEPTH`]. Refuses any
-/// symlink chain that escapes the archive root, uses an absolute target, or loops.
+/// Validates every symlink in `symlinks` against the `.app` bundle root by resolving multi-hop
+/// symlink chains (forward or backward in archive order) up to [`MAX_SYMLINK_CHAIN_DEPTH`].
+/// Refuses any top-level symlink, absolute target, symlink loop, or symlink chain that escapes
+/// the top-level `.app` bundle directory (even one level up to the archive root or to a sibling).
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn validate_all_symlink_chains(symlinks: &BTreeMap<PathBuf, PathBuf>) -> Result<(), AppError> {
     for (link_rel, raw_target) in symlinks {
@@ -884,6 +885,20 @@ fn validate_all_symlink_chains(symlinks: &BTreeMap<PathBuf, PathBuf>) -> Result<
                     .collect()
             })
             .unwrap_or_default();
+
+        // Every symlink in a macOS app-tar must live inside `<Bundle>.app/...`; refuse any
+        // top-level symlink at the archive root.
+        if stack.is_empty() {
+            return Err(AppError::new(
+                ErrorCode::Denied,
+                format!(
+                    "Refusing top-level symlink {} -> {} outside the .app bundle root.",
+                    link_rel.display(),
+                    raw_target.display()
+                ),
+            ));
+        }
+        let bundle_root = stack[0].clone();
 
         let mut remaining: Vec<Component<'_>> = raw_target.components().collect();
         let mut pending_targets: Vec<PathBuf> = Vec::new();
@@ -915,19 +930,32 @@ fn validate_all_symlink_chains(symlinks: &BTreeMap<PathBuf, PathBuf>) -> Result<
 
         while let Some(seg) = work_queue.pop() {
             if seg == OsStr::new("..") {
-                if stack.pop().is_none() {
+                // `stack[0]` is `<Bundle>.app`; popping it would escape one level above the `.app`
+                // bundle root (for example into `/Applications` once swapped into place).
+                if stack.len() <= 1 {
                     return Err(AppError::new(
                         ErrorCode::Denied,
                         format!(
-                            "Refusing escaping symlink chain starting at {} -> {} inside update archive.",
+                            "Refusing escaping symlink chain starting at {} -> {} leaving bundle root.",
                             link_rel.display(),
                             raw_target.display()
                         ),
                     ));
                 }
+                stack.pop();
                 continue;
             }
             stack.push(seg);
+            if stack.first() != Some(&bundle_root) {
+                return Err(AppError::new(
+                    ErrorCode::Denied,
+                    format!(
+                        "Refusing symlink chain starting at {} -> {} leaving bundle root.",
+                        link_rel.display(),
+                        raw_target.display()
+                    ),
+                ));
+            }
             let current_rel: PathBuf = stack.iter().collect();
             if let Some(next_target) = symlinks.get(&current_rel) {
                 hops += 1;
@@ -1101,6 +1129,25 @@ where
         "GDMSESSION",
         "QT_QPA_PLATFORM",
         "MOZ_ENABLE_WAYLAND",
+        "GTK_IM_MODULE",
+        "QT_IM_MODULE",
+        "QT4_IM_MODULE",
+        "CLUTTER_IM_MODULE",
+        "SDL_IM_MODULE",
+        "GLFW_IM_MODULE",
+        "XMODIFIERS",
+        "INPUT_METHOD",
+        "IMSETTINGS_MODULE",
+        "QT_IM_MODULES",
+        "IBUS_ADDRESS",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+        "all_proxy",
         "LEGION_HOME",
         "LEGION_APP_READY_FILE",
         "LEGION_APP_ALLOW_LOOPBACK_ENDPOINTS",
@@ -1230,23 +1277,40 @@ wait_limit="${LEGION_WAIT_SECS:-30}"
 ticks=$((wait_limit * 4))
 j=0
 started=0
+proc_done=0
 while [ "$j" -lt "$ticks" ]; do
   if [ -f "$LEGION_READY_MARKER" ]; then
     started=1
     break
   fi
-  if ! kill -0 "$NEW_PID" 2>/dev/null; then
-    break
+  if [ "$proc_done" -eq 0 ]; then
+    exited_now=0
+    if ! kill -0 "$NEW_PID" 2>/dev/null; then
+      exited_now=1
+    else
+      new_stat="$("$PS" -o stat= -p "$NEW_PID" 2>/dev/null || true)"
+      case "$new_stat" in
+        ""|*Z*) exited_now=1 ;;
+      esac
+    fi
+    if [ "$exited_now" -eq 1 ]; then
+      proc_done=1
+      wait "$NEW_PID" 2>/dev/null
+      new_rc=$?
+      printf 'supervisor: new_pid=%s exited with rc=%s\n' "$NEW_PID" "$new_rc"
+      if [ "$new_rc" -ne 0 ]; then
+        break
+      fi
+      # Exit code 0 before the ready marker appears can occur if the user reopened the new build
+      # concurrently (single-instance hand-over); keep polling until wait_limit for that running
+      # instance to write the ready marker instead of rolling back prematurely.
+    fi
   fi
-  new_stat="$("$PS" -o stat= -p "$NEW_PID" 2>/dev/null || true)"
-  case "$new_stat" in
-    ""|*Z*) break ;;
-  esac
   "$SLEEP" 0.25 2>/dev/null || "$SLEEP" 1
   j=$((j + 1))
 done
 
-# One final check after process exit (in verify_only mode the new binary writes the marker and exits 0).
+# One final check after loop exit.
 if [ -f "$LEGION_READY_MARKER" ]; then
   started=1
 fi
@@ -1262,11 +1326,11 @@ printf 'supervisor: ready marker missing after %s ticks; rolling back\n' "$j"
 kill "$NEW_PID" 2>/dev/null || true
 "$SLEEP" 1
 kill -9 "$NEW_PID" 2>/dev/null || true
-printf '%s\n' "$LEGION_ROLLBACK_JSON" > "$LEGION_ROLLBACK_FILE"
-"$RM" -rf -- "$LEGION_TARGET"
-"$MV" -f -- "$LEGION_BACKUP" "$LEGION_TARGET"
-if [ "$verify_mode" != "1" ]; then
-  launch_target 0
+printf '%s\n' "$LEGION_ROLLBACK_JSON" > "$LEGION_ROLLBACK_FILE" || true
+"$RM" -rf -- "$LEGION_TARGET" || true
+"$MV" -f -- "$LEGION_BACKUP" "$LEGION_TARGET" || true
+if [ "$verify_mode" != "1" ] && [ -x "$LEGION_EXEC" ]; then
+  launch_target 0 || true
 fi
 exit 1
 "#;
@@ -1536,9 +1600,11 @@ pub fn windows_system_powershell_path() -> PathBuf {
 pub const WINDOWS_NSIS_SUPERVISOR_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 function Write-Log([string]$msg) {
-  $line = "$(Get-Date -Format 'yyyy-MM-ddTHH:mm:ss.fffZ') $msg"
-  [Console]::Out.WriteLine($line)
-  [Console]::Out.Flush()
+  try {
+    $line = "$(Get-Date -Format 'yyyy-MM-ddTHH:mm:ss.fffZ') $msg"
+    [Console]::Out.WriteLine($line)
+    [Console]::Out.Flush()
+  } catch {}
 }
 
 function Start-Direct([string]$filePath, [string]$arguments, [bool]$noWindow) {
@@ -1571,18 +1637,64 @@ if (Test-Path -LiteralPath $env:LEGION_READY_MARKER) {
   Remove-Item -LiteralPath $env:LEGION_READY_MARKER -Force -ErrorAction SilentlyContinue
 }
 
+$script:restoreAttempted = $false
 function Restore-Previous([string]$why) {
+  if ($script:restoreAttempted) { return }
+  $script:restoreAttempted = $true
   Write-Log "restoring previous install: $why"
-  Set-Content -LiteralPath $env:LEGION_ROLLBACK_FILE -Value $env:LEGION_ROLLBACK_JSON -Encoding UTF8
-  if (Test-Path -LiteralPath $env:LEGION_BACKUP_DIR) {
-    Get-ChildItem -LiteralPath $env:LEGION_BACKUP_DIR -Force | ForEach-Object {
-      Copy-Item -LiteralPath $_.FullName -Destination $env:LEGION_INSTALL_DIR -Recurse -Force
-    }
+  $restoreErrors = New-Object System.Collections.Generic.List[string]
+
+  $hasBackup = $false
+  try {
+    $hasBackup = [bool]($env:LEGION_BACKUP_DIR -and (Test-Path -LiteralPath $env:LEGION_BACKUP_DIR))
+  } catch {
+    Write-Log "failed to inspect backup dir: $($_.Exception.Message)"
+    $restoreErrors.Add($_.Exception.Message)
   }
-  if ((-not $verifyOnly) -and (Test-Path -LiteralPath $env:LEGION_EXE)) {
-    Remove-Item Env:LEGION_UPDATE_VERIFY_ONLY -ErrorAction SilentlyContinue
-    if ($env:LEGION_RELAUNCH_PATH) { $env:PATH = $env:LEGION_RELAUNCH_PATH }
-    Start-Direct $env:LEGION_EXE '' $false | Out-Null
+
+  if ($hasBackup) {
+    $items = @()
+    try {
+      $items = @(Get-ChildItem -LiteralPath $env:LEGION_BACKUP_DIR -Force)
+    } catch {
+      Write-Log "failed to list backup dir: $($_.Exception.Message)"
+      $restoreErrors.Add($_.Exception.Message)
+    }
+    foreach ($item in $items) {
+      try {
+        Copy-Item -LiteralPath $item.FullName -Destination $env:LEGION_INSTALL_DIR -Recurse -Force
+      } catch {
+        Write-Log "failed to restore $($item.Name): $($_.Exception.Message)"
+        $restoreErrors.Add("$($item.Name): $($_.Exception.Message)")
+      }
+    }
+  } else {
+    Write-Log "backup dir missing: $($env:LEGION_BACKUP_DIR)"
+    $restoreErrors.Add("backup directory missing")
+  }
+
+  try {
+    if ($restoreErrors.Count -gt 0) {
+      Write-Log "restore finished with $($restoreErrors.Count) error(s)"
+    }
+    Set-Content -LiteralPath $env:LEGION_ROLLBACK_FILE -Value $env:LEGION_ROLLBACK_JSON -Encoding UTF8
+  } catch {
+    Write-Log "failed to write rollback notice: $($_.Exception.Message)"
+  }
+
+  if (-not $verifyOnly) {
+    try {
+      if (Test-Path -LiteralPath $env:LEGION_EXE) {
+        Remove-Item Env:LEGION_UPDATE_VERIFY_ONLY -ErrorAction SilentlyContinue
+        if ($env:LEGION_RELAUNCH_PATH) { $env:PATH = $env:LEGION_RELAUNCH_PATH }
+        Write-Log "relaunching in-place executable after rollback: $($env:LEGION_EXE)"
+        Start-Direct $env:LEGION_EXE '' $false | Out-Null
+      } else {
+        Write-Log "cannot relaunch after rollback: executable missing at $($env:LEGION_EXE)"
+      }
+    } catch {
+      Write-Log "failed to relaunch executable after rollback: $($_.Exception.Message)"
+    }
   }
 }
 
@@ -1611,14 +1723,20 @@ try {
   $waitSecs = [int]$env:LEGION_WAIT_SECS
   if ($waitSecs -le 0) { $waitSecs = 30 }
   $started = $false
+  $exitedLogged = $false
   for ($j = 0; $j -lt ($waitSecs * 4); $j++) {
     if (Test-Path -LiteralPath $env:LEGION_READY_MARKER) {
       $started = $true
       break
     }
     if ($proc.HasExited) {
-      Write-Log "updated app exited early with code $($proc.ExitCode)"
-      break
+      if (-not $exitedLogged) {
+        $exitedLogged = $true
+        Write-Log "updated app exited with code $($proc.ExitCode)"
+      }
+      if ($proc.ExitCode -ne 0) {
+        break
+      }
     }
     Start-Sleep -Milliseconds 250
   }
@@ -1647,6 +1765,68 @@ try {
   exit 1
 }
 "#;
+
+/// Fixed allow-list of harmless Windows session, OS, and proxy variables preserved when spawning
+/// the detached PowerShell supervisor and relaunching Legion.
+pub const WIN_ALLOWED_VARS: &[&str] = &[
+    "SystemRoot",
+    "WINDIR",
+    "SystemDrive",
+    "COMSPEC",
+    "PATHEXT",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "USERNAME",
+    "USERDOMAIN",
+    "COMPUTERNAME",
+    "PUBLIC",
+    "ALLUSERSPROFILE",
+    "TEMP",
+    "TMP",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramW6432",
+    "ProgramData",
+    "CommonProgramFiles",
+    "CommonProgramFiles(x86)",
+    "CommonProgramW6432",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_IDENTIFIER",
+    "PROCESSOR_LEVEL",
+    "PROCESSOR_REVISION",
+    "OS",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "ALL_PROXY",
+    "LEGION_HOME",
+    "LEGION_APP_READY_FILE",
+    "LEGION_APP_ALLOW_LOOPBACK_ENDPOINTS",
+];
+
+/// Filters `raw_env` to the fixed allow-list of harmless Windows variables (plus `WEBVIEW2_*`) so
+/// the relaunched app keeps standard Windows and proxy variables while stripping hostile variables.
+pub fn build_sanitized_windows_env<I>(raw_env: I) -> BTreeMap<OsString, OsString>
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    let mut kept = BTreeMap::new();
+    for (k, v) in raw_env {
+        if let Some(key) = k.to_str()
+            && (WIN_ALLOWED_VARS
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(key))
+                || key.to_ascii_uppercase().starts_with("WEBVIEW2_"))
+        {
+            kept.insert(k, v);
+        }
+    }
+    kept
+}
 
 /// Copies-while-hashing the verified NSIS installer into `verified_dir`, backs up the current
 /// Windows installation directory, and spawns the detached System32 PowerShell supervisor via
@@ -1735,33 +1915,7 @@ pub fn stage_and_spawn_windows_nsis(
         })
         .unwrap_or_else(|| clean_path.clone());
 
-    const WIN_ALLOWED_VARS: &[&str] = &[
-        "SystemRoot",
-        "WINDIR",
-        "SystemDrive",
-        "COMSPEC",
-        "LOCALAPPDATA",
-        "APPDATA",
-        "USERPROFILE",
-        "HOMEDRIVE",
-        "HOMEPATH",
-        "USERNAME",
-        "USERDOMAIN",
-        "COMPUTERNAME",
-        "TEMP",
-        "TMP",
-        "ProgramFiles",
-        "ProgramFiles(x86)",
-        "ProgramData",
-        "CommonProgramFiles",
-        "NUMBER_OF_PROCESSORS",
-        "PROCESSOR_ARCHITECTURE",
-        "OS",
-        "LEGION_HOME",
-        "LEGION_APP_READY_FILE",
-        "LEGION_APP_ALLOW_LOOPBACK_ENDPOINTS",
-    ];
-
+    let sanitized_win_env = build_sanitized_windows_env(std::env::vars_os());
     let encoded_script = encode_powershell_command(WINDOWS_NSIS_SUPERVISOR_SCRIPT);
     let log_path = ready_marker_path.parent().map(|d| d.join("supervisor.log"));
     if let Some(lp) = &log_path {
@@ -1778,16 +1932,7 @@ pub fn stage_and_spawn_windows_nsis(
         let (stdout_cfg, stderr_cfg) = open_supervisor_log_stdio(log_path.as_deref());
         let mut cmd = Command::new(&ps_path);
         cmd.env_clear();
-        for (k, v) in std::env::vars_os() {
-            if let Some(key) = k.to_str()
-                && (WIN_ALLOWED_VARS
-                    .iter()
-                    .any(|allowed| allowed.eq_ignore_ascii_case(key))
-                    || key.to_ascii_uppercase().starts_with("WEBVIEW2_"))
-            {
-                cmd.env(&k, &v);
-            }
-        }
+        cmd.envs(&sanitized_win_env);
         cmd.env("PATH", &clean_path)
             .env("LEGION_RELAUNCH_PATH", &relaunch_path)
             .args([
@@ -2040,6 +2185,103 @@ mod tests {
                 assert!(trimmed.contains("Copy-Item -LiteralPath "), "{trimmed}");
             }
         }
+
+        // Restore-Previous must guard every step individually so a partial restore failure or
+        // notice write error still relaunches whatever executable is in place, and must prevent
+        // double-execution from the outer catch block.
+        let restore_start = WINDOWS_NSIS_SUPERVISOR_SCRIPT
+            .find("function Restore-Previous")
+            .unwrap();
+        let restore_end = WINDOWS_NSIS_SUPERVISOR_SCRIPT[restore_start..]
+            .find("\ntry {")
+            .unwrap()
+            + restore_start;
+        let restore_body = &WINDOWS_NSIS_SUPERVISOR_SCRIPT[restore_start..restore_end];
+        assert!(
+            restore_body.contains("$script:restoreAttempted"),
+            "Restore-Previous must guard against double invocation"
+        );
+        assert!(
+            restore_body.matches("try {").count() >= 4,
+            "Restore-Previous must isolate list, per-item copy, notice write, and relaunch in separate try/catch guards:\n{restore_body}"
+        );
+        assert!(
+            restore_body.matches("} catch {").count() >= 4,
+            "Restore-Previous must catch failures per step:\n{restore_body}"
+        );
+        assert!(
+            WINDOWS_NSIS_SUPERVISOR_SCRIPT.contains("if ($proc.ExitCode -ne 0)"),
+            "Windows supervisor must keep polling for ready marker after clean exit code 0 (close-then-reopen race)"
+        );
+    }
+
+    #[test]
+    fn windows_sanitized_env_preserves_pathext_programw6432_and_proxies_while_stripping_hostile_vars()
+     {
+        let raw = vec![
+            (OsString::from("SystemRoot"), OsString::from(r"C:\Windows")),
+            (
+                OsString::from("PATHEXT"),
+                OsString::from(".COM;.EXE;.BAT;.CMD"),
+            ),
+            (
+                OsString::from("ProgramW6432"),
+                OsString::from(r"C:\Program Files"),
+            ),
+            (
+                OsString::from("CommonProgramW6432"),
+                OsString::from(r"C:\Program Files\Common Files"),
+            ),
+            (
+                OsString::from("CommonProgramFiles(x86)"),
+                OsString::from(r"C:\Program Files (x86)\Common Files"),
+            ),
+            (
+                OsString::from("HTTPS_PROXY"),
+                OsString::from("http://proxy.example:8080"),
+            ),
+            (
+                OsString::from("no_proxy"),
+                OsString::from("localhost,127.0.0.1"),
+            ),
+            (
+                OsString::from("WEBVIEW2_USER_DATA_FOLDER"),
+                OsString::from(r"C:\Users\me\AppData\Local\Legion"),
+            ),
+            (
+                OsString::from("PSModulePath"),
+                OsString::from(r"C:\evil\modules"),
+            ),
+            (OsString::from("EVIL_VAR"), OsString::from("injected")),
+        ];
+        let kept = build_sanitized_windows_env(raw);
+        assert_eq!(
+            kept.get(OsStr::new("PATHEXT")),
+            Some(&OsString::from(".COM;.EXE;.BAT;.CMD"))
+        );
+        assert_eq!(
+            kept.get(OsStr::new("ProgramW6432")),
+            Some(&OsString::from(r"C:\Program Files"))
+        );
+        assert_eq!(
+            kept.get(OsStr::new("CommonProgramW6432")),
+            Some(&OsString::from(r"C:\Program Files\Common Files"))
+        );
+        assert_eq!(
+            kept.get(OsStr::new("CommonProgramFiles(x86)")),
+            Some(&OsString::from(r"C:\Program Files (x86)\Common Files"))
+        );
+        assert_eq!(
+            kept.get(OsStr::new("HTTPS_PROXY")),
+            Some(&OsString::from("http://proxy.example:8080"))
+        );
+        assert_eq!(
+            kept.get(OsStr::new("no_proxy")),
+            Some(&OsString::from("localhost,127.0.0.1"))
+        );
+        assert!(kept.contains_key(OsStr::new("WEBVIEW2_USER_DATA_FOLDER")));
+        assert!(!kept.contains_key(OsStr::new("PSModulePath")));
+        assert!(!kept.contains_key(OsStr::new("EVIL_VAR")));
     }
 
     #[cfg(unix)]
@@ -2203,6 +2445,42 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(small_limit_err.code, ErrorCode::Denied);
+
+        // 7. Symlinks that escape one level above the `.app` bundle root (pointing to the archive
+        //    root or a sibling entry, which would escape into `/Applications` once swapped) must
+        //    be refused, while symlinks staying inside the `.app` bundle remain valid.
+        for (label, link_name, link_target) in [
+            (
+                "escape-one-above-contents",
+                "Legion.app/Contents/escape",
+                "../..",
+            ),
+            ("escape-one-above-bundle", "Legion.app/escape", ".."),
+            (
+                "escape-to-sibling",
+                "Legion.app/Contents/sibling",
+                "../../Other",
+            ),
+            ("top-level-symlink", "escape", "Legion.app"),
+        ] {
+            let tar_path = dir.path().join(format!("{label}.app.tar.gz"));
+            {
+                let file = fs::File::create(&tar_path).unwrap();
+                let enc = GzEncoder::new(file, Compression::default());
+                let mut builder = Builder::new(enc);
+                let mut lh = Header::new_gnu();
+                lh.set_entry_type(tar::EntryType::Symlink);
+                lh.set_size(0);
+                lh.set_cksum();
+                builder
+                    .append_link(&mut lh, link_name, link_target)
+                    .unwrap();
+                builder.into_inner().unwrap().finish().unwrap();
+            }
+            let err = extract_macos_app_tar(&tar_path, &dir.path().join(format!("out-{label}")))
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Denied, "{label}: {err:?}");
+        }
     }
 
     #[cfg(unix)]
@@ -2277,6 +2555,26 @@ mod tests {
             ),
             (OsString::from("HOME"), OsString::from("/home/me")),
             (OsString::from("DISPLAY"), OsString::from(":0")),
+            (OsString::from("GTK_IM_MODULE"), OsString::from("fcitx")),
+            (OsString::from("QT_IM_MODULE"), OsString::from("fcitx")),
+            (OsString::from("XMODIFIERS"), OsString::from("@im=fcitx")),
+            (
+                OsString::from("GTK_IM_MODULE_FILE"),
+                fake_appdir
+                    .join("usr/lib/gtk-3.0/immodules.cache")
+                    .as_os_str()
+                    .to_os_string(),
+            ),
+            (
+                OsString::from("HTTPS_PROXY"),
+                OsString::from("http://proxy.example:3128"),
+            ),
+            (
+                OsString::from("http_proxy"),
+                OsString::from("http://proxy.example:3128"),
+            ),
+            (OsString::from("NO_PROXY"), OsString::from("localhost")),
+            (OsString::from("BASH_ENV"), OsString::from("/tmp/evil.sh")),
         ];
 
         let sanitized = build_sanitized_unix_env(poisoned_env, Some(&fake_appdir));
@@ -2298,6 +2596,37 @@ mod tests {
                 .contains_key(OsStr::new("LD_PRELOAD"))
         );
         assert!(!sanitized.session_vars.contains_key(OsStr::new("GTK_PATH")));
+        assert!(
+            !sanitized
+                .session_vars
+                .contains_key(OsStr::new("GTK_IM_MODULE_FILE"))
+        );
+        assert!(!sanitized.session_vars.contains_key(OsStr::new("BASH_ENV")));
+        // Harmless input-method and proxy variables must survive sanitization and relaunch.
+        assert_eq!(
+            sanitized.session_vars.get(OsStr::new("GTK_IM_MODULE")),
+            Some(&OsString::from("fcitx"))
+        );
+        assert_eq!(
+            sanitized.session_vars.get(OsStr::new("QT_IM_MODULE")),
+            Some(&OsString::from("fcitx"))
+        );
+        assert_eq!(
+            sanitized.session_vars.get(OsStr::new("XMODIFIERS")),
+            Some(&OsString::from("@im=fcitx"))
+        );
+        assert_eq!(
+            sanitized.session_vars.get(OsStr::new("HTTPS_PROXY")),
+            Some(&OsString::from("http://proxy.example:3128"))
+        );
+        assert_eq!(
+            sanitized.session_vars.get(OsStr::new("http_proxy")),
+            Some(&OsString::from("http://proxy.example:3128"))
+        );
+        assert_eq!(
+            sanitized.session_vars.get(OsStr::new("NO_PROXY")),
+            Some(&OsString::from("localhost"))
+        );
         let xdg = sanitized
             .session_vars
             .get(OsStr::new("XDG_DATA_DIRS"))
@@ -2305,6 +2634,51 @@ mod tests {
             .to_string_lossy();
         assert!(!xdg.contains(&*fake_appdir.to_string_lossy()));
         assert_eq!(xdg, "/usr/local/share:/usr/share");
+
+        // Also confirm an APPDIR located outside `/tmp` (e.g. under `$HOME/.local`) is stripped
+        // from PATH and session variables just like `/tmp/.mount_*`.
+        let non_tmp_appdir = PathBuf::from("/home/me/.local/fake_appdir");
+        let non_tmp_env = vec![
+            (
+                OsString::from("APPDIR"),
+                non_tmp_appdir.as_os_str().to_os_string(),
+            ),
+            (
+                OsString::from("PATH"),
+                OsString::from("/home/me/.local/fake_appdir/usr/bin:/usr/bin:/bin"),
+            ),
+            (
+                OsString::from("XDG_DATA_DIRS"),
+                OsString::from("/home/me/.local/fake_appdir/usr/share:/usr/share"),
+            ),
+            (OsString::from("GTK_IM_MODULE"), OsString::from("ibus")),
+        ];
+        let non_tmp_sanitized = build_sanitized_unix_env(non_tmp_env, None);
+        assert!(
+            !non_tmp_sanitized
+                .relaunch_path
+                .to_string_lossy()
+                .contains("/home/me/.local/fake_appdir"),
+            "non-/tmp APPDIR leaked into relaunch PATH: {:?}",
+            non_tmp_sanitized.relaunch_path
+        );
+        assert!(
+            !non_tmp_sanitized
+                .session_vars
+                .contains_key(OsStr::new("APPDIR"))
+        );
+        assert_eq!(
+            non_tmp_sanitized
+                .session_vars
+                .get(OsStr::new("XDG_DATA_DIRS")),
+            Some(&OsString::from("/usr/share"))
+        );
+        assert_eq!(
+            non_tmp_sanitized
+                .session_vars
+                .get(OsStr::new("GTK_IM_MODULE")),
+            Some(&OsString::from("ibus"))
+        );
 
         // Now run the real swap supervisor with the sanitized env and capture the relaunched
         // process's complete environment to prove zero planted tools ran and zero APPDIR/LD vars
@@ -2381,6 +2755,8 @@ mod tests {
             "APPIMAGE=",
             "LD_LIBRARY_PATH=",
             "LD_PRELOAD=",
+            "GTK_IM_MODULE_FILE=",
+            "BASH_ENV=",
             "LEGION_RELAUNCH_PATH=",
             "LEGION_TARGET=",
         ] {
@@ -2389,6 +2765,89 @@ mod tests {
                 "relaunched env leaked {forbidden}:\n{dumped}"
             );
         }
+        for preserved in [
+            "GTK_IM_MODULE=fcitx",
+            "QT_IM_MODULE=fcitx",
+            "XMODIFIERS=@im=fcitx",
+            "HTTPS_PROXY=http://proxy.example:3128",
+            "http_proxy=http://proxy.example:3128",
+            "NO_PROXY=localhost",
+        ] {
+            assert!(
+                dumped.contains(preserved),
+                "relaunched env lost {preserved}:\n{dumped}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_swap_supervisor_close_then_reopen_race_does_not_roll_back() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("Legion.AppImage");
+        let staged = dir.path().join(".Legion.AppImage.new-2");
+        let backup = dir.path().join(".Legion.AppImage.prev");
+        let ready = dir.path().join("started-2.ok");
+        let rollback = dir.path().join("rollback-2.json");
+
+        fs::write(&target, "#!/bin/sh\necho v1\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Simulate a close-then-reopen race where the verify-only launch exits 0 immediately
+        // (for instance after handing off to a concurrently reopened instance of the new build)
+        // while the reopened instance finishes painting and writes `started-2.ok` 600ms later.
+        let v2_handover = format!(
+            "#!/bin/sh\n(sleep 0.6; printf 'ok\\n' > '{}') &\nexit 0\n",
+            ready.display()
+        );
+        fs::write(&staged, v2_handover).unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut exited_child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let exited_pid = exited_child.id();
+        let _ = exited_child.wait();
+
+        spawn_unix_swap_supervisor(&UnixSwapPlan {
+            old_pid: exited_pid,
+            target_path: target.clone(),
+            staged_new_path: staged,
+            backup_path: backup.clone(),
+            exec_path: target.clone(),
+            ready_marker_path: ready.clone(),
+            rollback_marker_path: rollback.clone(),
+            rollback_json: "{\"sequence\":2}".to_owned(),
+            log_path: None,
+            wait_secs: 5,
+            verify_only: true,
+        })
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            if ready.exists() && !backup.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(ready.exists(), "expected ready marker to be written");
+        assert!(
+            !rollback.exists(),
+            "close-then-reopen race must NOT write a rollback file"
+        );
+        assert!(
+            !backup.exists(),
+            "supervisor should clean up .prev backup once ready marker arrives"
+        );
+        assert!(
+            fs::read_to_string(&target).unwrap().contains("sleep 0.6"),
+            "new v2 binary should stay installed rather than rolling back to v1"
+        );
     }
 
     #[cfg(unix)]

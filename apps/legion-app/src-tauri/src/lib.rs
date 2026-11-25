@@ -16,6 +16,22 @@ use crate::link_backend::LinkBackend;
 use crate::store::AppStore;
 use crate::updater::{SharedUpdater, UpdateManager};
 
+/// Returns `true` when this desktop process was spawned by the update supervisor purely to verify
+/// startup (`LEGION_UPDATE_VERIFY_ONLY=1`) and exit without opening a window.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn is_verify_only_launch() -> bool {
+    std::env::var_os("LEGION_UPDATE_VERIFY_ONLY").is_some_and(|v| v == "1")
+}
+
+/// Returns `true` when desktop single-instance hand-over should be registered.
+///
+/// Verify-only update probes skip single-instance hand-over so reopening the app while the
+/// window-close supervisor runs can never make the probe hand off and exit before writing
+/// `started-<seq>.ok` (which would cause a spurious rollback of a healthy build).
+pub const fn should_register_single_instance(verify_only: bool) -> bool {
+    !verify_only
+}
+
 /// Returns `true` only for the bundled app origin on the current platform.
 ///
 /// Linux, macOS and iOS serve bundled assets from `tauri://localhost`; Android and Windows serve
@@ -77,15 +93,22 @@ pub fn run() {
     let builder = tauri::Builder::default();
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-        if let Some(window) = app.get_webview_window("main") {
-            let _ = window.unminimize();
-            let _ = window.show();
-            let _ = window.set_focus();
-        }
-    }));
+    let verify_only = is_verify_only_launch();
 
-    let builder = builder.setup(|app| {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let builder = if should_register_single_instance(verify_only) {
+        builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
+    } else {
+        builder
+    };
+
+    let builder = builder.setup(move |app| {
         let data_dir = app.path().app_data_dir()?;
         #[cfg(target_os = "windows")]
         let updates_base_dir = app
@@ -104,7 +127,7 @@ pub fn run() {
         // cleanly (writing `started-<seq>.ok`, `current-build.json`, advancing `floor.json`, and
         // recording the post-update notice) and exit without popping a window open.
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        if std::env::var_os("LEGION_UPDATE_VERIFY_ONLY").is_some_and(|v| v == "1") {
+        if verify_only {
             updater.on_app_ready();
             app.handle().exit(0);
             return Ok(());
@@ -112,9 +135,10 @@ pub fn run() {
 
         let store = AppStore::in_dir(&data_dir);
         store.prepare_dir()?;
-        let backend = LinkBackend::from_store(store.clone());
+        let backend: Arc<dyn crate::backend::Backend> =
+            Arc::new(LinkBackend::from_store(store.clone()));
         app.manage(store);
-        app.manage(SharedBackend(Arc::new(backend)));
+        app.manage(SharedBackend(Arc::clone(&backend)));
         app.manage(SharedUpdater(Arc::clone(&updater)));
 
         let window_config = app
@@ -132,9 +156,11 @@ pub fn run() {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             let close_updater = Arc::clone(&updater);
+            let close_backend = Arc::clone(&backend);
             window.on_window_event(move |event| {
                 if let tauri::WindowEvent::CloseRequested { .. } = event {
-                    let _ = close_updater.try_spawn_desktop_close_install();
+                    let _ = close_updater
+                        .try_spawn_desktop_close_install(close_backend.active_operations());
                 }
             });
         }
@@ -315,5 +341,11 @@ mod tests {
             "desktop template should keep Name=Legion for application launchers"
         );
         Ok(())
+    }
+
+    #[test]
+    fn verify_only_launch_disables_single_instance_handover() {
+        assert!(!should_register_single_instance(true));
+        assert!(should_register_single_instance(false));
     }
 }
