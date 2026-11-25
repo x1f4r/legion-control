@@ -422,6 +422,9 @@ export function VideoPlayer({
   const ctrlPlayingRef = useRef(ctrl.playing);
   ctrlPlayingRef.current = ctrl.playing;
   const wantPlayAfterSwapRef = useRef(false);
+  const [pendingPlayIntent, setPendingPlayIntent] = useState(null);
+  const pendingPlayIntentRef = useRef(null);
+  pendingPlayIntentRef.current = pendingPlayIntent;
 
   const commitSeekOnMedia = useCallback((targetTime, seq) => {
     activeSeekSeqRef.current = seq;
@@ -469,10 +472,18 @@ export function VideoPlayer({
       if (durationRef.current > 0) {
         resumeStore.save(prevId, currentTimeRef.current, durationRef.current);
       }
-      wantPlayAfterSwapRef.current = Boolean(ctrlPlayingRef.current);
+      const carryPlay = Boolean(
+        pendingPlayIntentRef.current != null ? pendingPlayIntentRef.current : ctrlPlayingRef.current,
+      );
+      wantPlayAfterSwapRef.current = carryPlay;
+      pendingPlayIntentRef.current = carryPlay;
+      setPendingPlayIntent(carryPlay);
       prevIdentityRef.current = identityRef.current;
     } else {
       prevIdentityRef.current = identityRef.current;
+      wantPlayAfterSwapRef.current = false;
+      pendingPlayIntentRef.current = null;
+      setPendingPlayIntent(null);
     }
     resumedAppliedRef.current = false;
     setCurrentTime(0);
@@ -540,7 +551,8 @@ export function VideoPlayer({
   }, [moreOpen, speedOpen, controller]);
 
   // Screen stays on while video plays (including across a file swap while playing); released on pause/end/close.
-  const holdScreenOn = Boolean(ctrl.playing || (mediaLoading && wantPlayAfterSwapRef.current));
+  const effectivePlaying = pendingPlayIntent != null ? pendingPlayIntent : ctrl.playing;
+  const holdScreenOn = Boolean(effectivePlaying);
   useEffect(() => {
     link?.keepScreenOn?.(holdScreenOn);
   }, [link, holdScreenOn]);
@@ -655,6 +667,8 @@ export function VideoPlayer({
     if (typeof link?.onWindowHidden !== 'function') return undefined;
     return link.onWindowHidden(() => {
       wantPlayAfterSwapRef.current = false;
+      pendingPlayIntentRef.current = null;
+      setPendingPlayIntent(null);
       const v = videoRef.current;
       if (v && !v.paused) {
         try {
@@ -690,8 +704,18 @@ export function VideoPlayer({
 
   const togglePlay = useCallback(() => {
     const v = videoRef.current;
-    if (!v || !mediaUrlRef.current) return;
     controller.notifyActivity({ show: true });
+    const loadingNext = !v || !mediaUrlRef.current || v.readyState < 1;
+    if (loadingNext) {
+      const nextWant = !wantPlayAfterSwapRef.current;
+      wantPlayAfterSwapRef.current = nextWant;
+      pendingPlayIntentRef.current = nextWant;
+      setPendingPlayIntent(nextWant);
+      return;
+    }
+    wantPlayAfterSwapRef.current = false;
+    pendingPlayIntentRef.current = null;
+    setPendingPlayIntent(null);
     if (v.paused || v.ended) {
       if (v.ended) {
         try {
@@ -702,7 +726,6 @@ export function VideoPlayer({
       }
       v.play().catch(() => {});
     } else {
-      wantPlayAfterSwapRef.current = false;
       v.pause();
       controller.setPlaying(false);
     }
@@ -974,9 +997,23 @@ export function VideoPlayer({
             }
           }
           controller.setLoading(false);
-          if (!recovered && wantPlayAfterSwapRef.current) {
-            wantPlayAfterSwapRef.current = false;
-            v.play().catch(() => {});
+          const wantPlay = wantPlayAfterSwapRef.current;
+          wantPlayAfterSwapRef.current = false;
+          pendingPlayIntentRef.current = null;
+          setPendingPlayIntent(null);
+          if (!recovered) {
+            if (wantPlay) {
+              v.play().catch(() => {});
+            } else {
+              if (!v.paused) {
+                try {
+                  v.pause();
+                } catch {
+                  // Ignore pause errors.
+                }
+              }
+              controller.setPlaying(false);
+            }
           }
         }}
         onLoadedData=${(e) => {
@@ -1148,10 +1185,10 @@ export function VideoPlayer({
           <button
             type="button"
             class="btn icon player-center-btn main"
-            aria-label=${ctrl.playing ? 'Pause' : 'Play'}
+            aria-label=${effectivePlaying ? 'Pause' : 'Play'}
             onClick=${togglePlay}
           >
-            <${Icon} name=${ctrl.playing ? 'pause' : 'play'} />
+            <${Icon} name=${effectivePlaying ? 'pause' : 'play'} />
           </button>
           <button
             type="button"
@@ -1356,6 +1393,8 @@ export function MusicPlayer({
   currentTimeRef.current = currentTime;
   const mediaUrlRef = useRef(mediaUrl);
   mediaUrlRef.current = mediaUrl;
+  const pathRef = useRef(path);
+  pathRef.current = path;
   const prevIdentityRef = useRef(identity);
   const moreOpenRef = useRef(moreOpen);
   moreOpenRef.current = moreOpen;
@@ -1572,7 +1611,17 @@ export function MusicPlayer({
 
   const togglePlay = useCallback(() => {
     const a = audioRef.current;
-    if (!a || !mediaUrlRef.current) return;
+    const loadingNext = !a || !mediaUrlRef.current || a.readyState < 1;
+    if (loadingNext) {
+      const currentWant = Boolean(
+        autoPlayNextRef.current?.play &&
+          (!autoPlayNextRef.current.path || autoPlayNextRef.current.path === pathRef.current),
+      );
+      const nextWant = !currentWant;
+      autoPlayNextRef.current = nextWant ? { path: pathRef.current, play: true } : null;
+      setPlaying(nextWant);
+      return;
+    }
     if (a.paused || a.ended) {
       if (a.ended) {
         try {
@@ -1583,12 +1632,13 @@ export function MusicPlayer({
       }
       a.play().catch(() => {});
     } else {
+      autoPlayNextRef.current = null;
       a.pause();
       setPlaying(false);
       setPendingSeekTime(null);
       clearStallTimer();
     }
-  }, [clearStallTimer]);
+  }, [autoPlayNextRef, clearStallTimer]);
 
   const handlePrev = useCallback(() => {
     const a = audioRef.current;
@@ -1598,7 +1648,12 @@ export function MusicPlayer({
       return;
     }
     if (onNavigateSibling) {
-      autoPlayNextRef.current = !a?.paused ? { path: queueRef.current.prev.path, play: true } : null;
+      const wantContinue = Boolean(
+        (mediaUrlRef.current && a && !a.paused) ||
+          (autoPlayNextRef.current?.play &&
+            (!autoPlayNextRef.current.path || autoPlayNextRef.current.path === pathRef.current)),
+      );
+      autoPlayNextRef.current = wantContinue ? { path: queueRef.current.prev.path, play: true } : null;
       onNavigateSibling(queueRef.current.prev);
     }
   }, [pendingSeekTime, commitSeek, onNavigateSibling, autoPlayNextRef]);
@@ -1606,7 +1661,12 @@ export function MusicPlayer({
   const handleNext = useCallback(() => {
     const a = audioRef.current;
     if (queueRef.current.next && onNavigateSibling) {
-      autoPlayNextRef.current = !a?.paused ? { path: queueRef.current.next.path, play: true } : null;
+      const wantContinue = Boolean(
+        (mediaUrlRef.current && a && !a.paused) ||
+          (autoPlayNextRef.current?.play &&
+            (!autoPlayNextRef.current.path || autoPlayNextRef.current.path === pathRef.current)),
+      );
+      autoPlayNextRef.current = wantContinue ? { path: queueRef.current.next.path, play: true } : null;
       onNavigateSibling(queueRef.current.next);
     }
   }, [onNavigateSibling, autoPlayNextRef]);
@@ -1936,9 +1996,20 @@ export function MusicPlayer({
             }
           }
           const pendingAuto = autoPlayNextRef.current;
-          if (!recovered && pendingAuto?.play && (!pendingAuto.path || pendingAuto.path === path)) {
-            autoPlayNextRef.current = null;
-            a.play().catch(() => {});
+          autoPlayNextRef.current = null;
+          if (!recovered) {
+            if (pendingAuto?.play && (!pendingAuto.path || pendingAuto.path === path)) {
+              a.play().catch(() => {});
+            } else {
+              if (!a.paused) {
+                try {
+                  a.pause();
+                } catch {
+                  // Ignore pause errors.
+                }
+              }
+              setPlaying(false);
+            }
           }
         }}
         onPlay=${(e) => {

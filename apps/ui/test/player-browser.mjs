@@ -1187,3 +1187,117 @@ test('Player: hiding the desktop window pauses video and music in place and leav
     await server.stop();
   }
 });
+
+test('Player: Space play/pause intent pressed while next file loads applies once ready', async () => {
+  const server = await startStaticUiServer();
+  const browser = await chromium.launch({
+    executablePath: findBrowser(),
+    headless: true,
+    args: ['--no-sandbox', '--disable-gpu', '--autoplay-policy=no-user-gesture-required'],
+  });
+  const consoleErrors = [];
+  const pageErrors = [];
+
+  try {
+    const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
+    const page = await context.newPage();
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => pageErrors.push(String(err)));
+
+    // 1. Video paused -> N -> press Space while Beach.mp4 is still minting (no src) -> auto-plays when ready!
+    await page.goto(`${server.url}/?mock=slow-content#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').click();
+    await page.locator('.viewer video.viewer-video[src]').waitFor({ timeout: 5000 });
+    await page.waitForFunction(
+      () => {
+        const v = document.querySelector('.viewer video');
+        return v && v.readyState >= 1 && v.paused;
+      },
+      null,
+      { timeout: 5000 },
+    );
+
+    await page.keyboard.press('n');
+    await page.locator('.player-top .name', { hasText: 'Beach.mp4' }).waitFor({ timeout: 3000 });
+    assert.equal(
+      await page.evaluate(() => document.querySelector('.viewer video')?.hasAttribute('src')),
+      false,
+    );
+    await page.keyboard.press('Space');
+    await page.locator('.viewer video.viewer-video[src]').waitFor({ timeout: 5000 });
+    await page.waitForFunction(
+      () => {
+        const v = document.querySelector('.viewer video');
+        return v && v.readyState >= 1 && !v.paused;
+      },
+      null,
+      { timeout: 5000 },
+    );
+
+    // 2. Video playing -> P back to Arrival.mp4 -> press Space while loading to PAUSE -> stays paused when ready!
+    await page.keyboard.press('p');
+    await page.locator('.player-top .name', { hasText: 'Arrival.mp4' }).waitFor({ timeout: 3000 });
+    assert.equal(
+      await page.evaluate(() => document.querySelector('.viewer video')?.hasAttribute('src')),
+      false,
+    );
+    await page.keyboard.press('Space');
+    await page.locator('.viewer video.viewer-video[src]').waitFor({ timeout: 5000 });
+    await page.waitForFunction(
+      () => {
+        const v = document.querySelector('.viewer video');
+        return v && v.readyState >= 1;
+      },
+      null,
+      { timeout: 5000 },
+    );
+    await page.waitForTimeout(200);
+    assert.equal(
+      await page.evaluate(() => document.querySelector('.viewer video')?.paused),
+      true,
+      'Space pressed during load while playing must pause once next video loads',
+    );
+
+    // 3. Music paused -> N -> press Space while next track URL is minting -> auto-plays when ready!
+    await page.goto(`${server.url}/?mock=slow-content#/files/tower/%2Fhome%2Fme%2FMusic%2FAlbum`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.locator('.list a.row', { hasText: '01 - Morning Light.flac' }).click();
+    await page.locator('.viewer audio[src]').waitFor({ state: 'attached', timeout: 5000 });
+    await page.waitForFunction(
+      () => {
+        const a = document.querySelector('.viewer audio');
+        return a && a.readyState >= 1 && a.paused;
+      },
+      null,
+      { timeout: 5000 },
+    );
+    await page.keyboard.press('n');
+    await page.locator('.music-title', { hasText: 'Rain on Glass' }).waitFor({ timeout: 5000 });
+    assert.equal(
+      await page.evaluate(() => document.querySelector('.viewer audio')?.hasAttribute('src')),
+      false,
+    );
+    await page.keyboard.press('Space');
+    await page.locator('.viewer audio[src]').waitFor({ state: 'attached', timeout: 5000 });
+    await page.waitForFunction(
+      () => {
+        const a = document.querySelector('.viewer audio');
+        return a && a.readyState >= 1 && !a.paused;
+      },
+      null,
+      { timeout: 5000 },
+    );
+
+    assert.deepEqual(consoleErrors, [], `Console errors: ${consoleErrors.join('; ')}`);
+    assert.deepEqual(pageErrors, [], `Page errors: ${pageErrors.join('; ')}`);
+    await context.close();
+  } finally {
+    await browser.close();
+    await server.stop();
+  }
+});
