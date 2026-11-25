@@ -49,9 +49,9 @@ use crate::config::{FleetFile, validate_machine_name};
 use crate::connector::PipeHandle;
 use crate::pool::Fleet;
 use crate::stream::{
-    self, CAP_IF_EXISTS, CAP_MOVE, CAP_PROBE, CAP_RENAME, DeleteDone, GetReady, Host,
-    ManifestDone, PackReady, Planned, ProbeReply, PutDone, PutReady, RenameDone, StatReply,
-    UnpackDone, UnpackReady,
+    self, CAP_IF_EXISTS, CAP_MOVE, CAP_PROBE, CAP_RENAME, DeleteDone, GetReady, Host, ManifestDone,
+    PackReady, Planned, ProbeReply, PutDone, PutReady, RenameDone, StatReply, UnpackDone,
+    UnpackReady,
 };
 
 /// How many bytes the relay and the in-process pipes hold at once: memory stays bounded however
@@ -1273,7 +1273,7 @@ impl Transfer<'_> {
         let (mut there, to_caps): (StatReply, HashSet<String>) = self
             .request_with_caps(
                 to,
-                json!({"op": "stat", "path": to.path, "checksum": true, "if_size": size}),
+                json!({"op": "stat", "path": to.path, "checksum": true, "if_size": size, "if_hash": hash}),
                 &[],
             )
             .await?;
@@ -1282,7 +1282,7 @@ impl Transfer<'_> {
             there = self
                 .request(
                     &target,
-                    json!({"op": "stat", "path": target.path, "checksum": true, "if_size": size}),
+                    json!({"op": "stat", "path": target.path, "checksum": true, "if_size": size, "if_hash": hash}),
                 )
                 .await?;
         }
@@ -1302,10 +1302,13 @@ impl Transfer<'_> {
                     .is_some_and(|(a, b)| a.same_file(&b));
                 let src_name = file_name(&from.path);
                 let dst_name = file_name(&target.path);
-                let is_folding_rename = same_parent
+                let is_folding_rename = !source.is_symlink
+                    && !there.is_symlink
+                    && same_parent
                     && src_name != dst_name
                     && (src_id.nlink == 1
-                        || src_name.to_lowercase() == dst_name.to_lowercase());
+                        || (there.case_insensitive.unwrap_or(false)
+                            && src_name.to_lowercase() == dst_name.to_lowercase()));
                 if is_folding_rename {
                     if !from_caps.contains(CAP_RENAME) {
                         return Err(missing_peer_capability(&from.machine, "rename"));
@@ -1355,10 +1358,10 @@ impl Transfer<'_> {
                     .probe_same_directory(from, &from_parent, &[], &target, &to_parent, false)
                     .await?;
                 if probed_same_dir && there.kind != "missing" {
-                    let proven_distinct_same_dev =
-                        source.file_id.zip(there.file_id).is_some_and(|(a, b)| {
-                            a.dev == b.dev && a.ino != b.ino
-                        });
+                    let proven_distinct_same_dev = source
+                        .file_id
+                        .zip(there.file_id)
+                        .is_some_and(|(a, b)| a.dev == b.dev && a.ino != b.ino);
                     if !proven_distinct_same_dev {
                         return Err(same_file_move_error(from, &target));
                     }
@@ -1634,7 +1637,11 @@ impl Transfer<'_> {
                         .is_some_and(|(a, b)| a.same_file(&b));
                     let src_name = file_name(&from.path);
                     let dst_name = file_name(&to.path);
-                    if same_parent && src_name != dst_name {
+                    if !source_stat.is_symlink
+                        && !there.is_symlink
+                        && same_parent
+                        && src_name != dst_name
+                    {
                         if !from_caps.contains(CAP_RENAME) {
                             return Err(missing_peer_capability(&from.machine, "rename"));
                         }
@@ -4141,7 +4148,10 @@ mod tests {
     #[test]
     fn replace_path_filename_preserves_caller_form_across_unix_and_windows() {
         // Caller gave `~/…`: always reports `~/…` with forward slashes regardless of remote OS.
-        assert_eq!(replace_path_filename("~/doc.txt", "doc (2).txt"), "~/doc (2).txt");
+        assert_eq!(
+            replace_path_filename("~/doc.txt", "doc (2).txt"),
+            "~/doc (2).txt"
+        );
         assert_eq!(
             replace_path_filename("~/sub/dir/doc.txt", "doc (2).txt"),
             "~/sub/dir/doc (2).txt"

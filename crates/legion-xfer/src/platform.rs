@@ -6,8 +6,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use legion_os::atomic::{
-    FileIdentity, RenameNoReplaceError, file_identity_from_file, rename_no_replace as os_rename_no_replace,
-    replace_file as os_replace_file, symlink_file_identity as os_symlink_file_identity,
+    FileIdentity, RenameNoReplaceError, file_identity_from_file,
+    rename_no_replace as os_rename_no_replace, replace_file as os_replace_file,
+    symlink_file_identity as os_symlink_file_identity,
 };
 
 use crate::error::{Result, classify_io};

@@ -171,6 +171,8 @@ pub(crate) enum Op {
         checksum: bool,
         #[serde(default)]
         if_size: Option<u64>,
+        #[serde(default)]
+        if_hash: Option<String>,
     },
     Get {
         path: String,
@@ -346,6 +348,9 @@ pub(crate) struct StatReply {
     /// Filesystem identities of existing ancestor directories of `path` (for subtree detection).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ancestor_ids: Vec<FileIdentity>,
+    /// Whether the path as given (before following the final link) is a symbolic link.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_symlink: bool,
 }
 
 /// The line that ends a `manifest`.
@@ -897,7 +902,8 @@ fn run<R: BufRead, W: Write>(
             path,
             checksum,
             if_size,
-        } => stat(grant, &path, checksum, if_size, output),
+            if_hash,
+        } => stat(grant, &path, checksum, if_size, if_hash.as_deref(), output),
         Op::Get { path, offset } => get(host, grant, pairing_id, &path, offset, output),
         Op::Put {
             path,
@@ -1035,16 +1041,25 @@ fn stat<W: Write>(
     path: &str,
     checksum: bool,
     if_size: Option<u64>,
+    if_hash: Option<&str>,
     output: &mut W,
 ) -> Result<(), Failure> {
     // The partial file a `put` to this path would continue sits beside the path as given, a link
-    // kept as a link, and is only looked at when it may be read itself.
+    // kept as a link, and is only looked at when it may be read itself and matches the expected
+    // source size and hash.
     let given = grant.check_path(path, Access::Read)?;
+    let is_symlink = fs::symlink_metadata(&given).is_ok_and(|meta| meta.file_type().is_symlink());
+    let expected_hash = if_hash.and_then(|s| s.parse::<Hash>().ok());
     let partial = || {
         legion_xfer::part_path(&given)
             .ok()
             .filter(|part| grant.check_path(part, Access::Read).is_ok())
-            .and_then(|_| legion_xfer::resume_offset(&given).ok())
+            .and_then(|_| match if_size {
+                Some(expected_size) => {
+                    legion_xfer::resume_offset_for(&given, expected_size, expected_hash).ok()
+                }
+                None => legion_xfer::resume_offset(&given).ok(),
+            })
             .filter(|len| *len > 0)
     };
     let path = resolve_root(grant, path, Access::Read)?;
@@ -1094,6 +1109,7 @@ fn stat<W: Write>(
             file_id: fid,
             parent_id,
             ancestor_ids: ancestor_ids(),
+            is_symlink,
             ..StatReply::default()
         }
     } else if kind.is_file() {
@@ -1112,11 +1128,12 @@ fn stat<W: Write>(
             mtime: entry.as_ref().map(|entry| entry.mtime),
             hash: entry.and_then(|entry| entry.hash),
             partial: partial(),
-            case_insensitive: None,
+            case_insensitive: case_insensitive(&path),
             resolved_path,
             file_id: fid,
             parent_id,
             ancestor_ids: Vec::new(),
+            is_symlink,
         }
     } else {
         StatReply {
@@ -1129,6 +1146,7 @@ fn stat<W: Write>(
             resolved_path,
             file_id: fid,
             parent_id,
+            is_symlink: is_symlink || kind.is_symlink(),
             ..StatReply::default()
         }
     };
@@ -1238,11 +1256,18 @@ fn put<R: BufRead, W: Write>(
 ) -> Result<(), Failure> {
     let target = grant.check_path(path, Access::Write)?;
     grant.check_create(&target, CreateKind::File, true)?;
-    // The partial file beside the target is created, continued, truncated and removed, so it is
-    // held to what the target is: beside a role's root, it is outside it.
+    // The partial file and its metadata/lock sidecars beside the target are created, continued,
+    // truncated and removed, so they are held to what the target is: beside a role's root, they
+    // are outside it.
     let part = legion_xfer::part_path(&target).map_err(xfer_error)?;
     grant.check_path(&part, Access::Write)?;
     grant.check_create(&part, CreateKind::File, true)?;
+    let part_meta = legion_xfer::part_meta_path(&target).map_err(xfer_error)?;
+    grant.check_path(&part_meta, Access::Write)?;
+    grant.check_create(&part_meta, CreateKind::File, true)?;
+    let part_lock = legion_xfer::part_lock_path(&target).map_err(xfer_error)?;
+    grant.check_path(&part_lock, Access::Write)?;
+    grant.check_create(&part_lock, CreateKind::File, true)?;
     let hash: Hash = hash.parse().map_err(xfer_error)?;
     if let Ok(meta) = fs::symlink_metadata(&target) {
         if if_exists == IfExists::Fail {
@@ -1292,7 +1317,7 @@ fn put<R: BufRead, W: Write>(
     // The sender's offset is only a hint: what is on disk decides, so a sender that lost track
     // of an earlier attempt still continues it rather than starting over, while a concurrent
     // transfer to the same target falls back to its own private partial file.
-    let session = PutSession::open(&target, size, if_exists).map_err(xfer_error)?;
+    let session = PutSession::open(&target, size, hash, if_exists).map_err(xfer_error)?;
     let offset = session.offset();
     reply(output, &PutReady { offset })?;
     let grant_for_check = grant.clone();
@@ -2002,19 +2027,23 @@ fn rename_same_file<W: Write>(
     let from_path = grant.check_path(from, Access::Write)?;
     let to_path = grant.check_path(to, Access::Write)?;
 
-    let from_id = file_identity(&from_path)
+    let from_id = symlink_file_identity(&from_path)
         .map_err(|err| Failure::Reply(io_error("inspect", &from_path, &err)))?;
-    let to_id = file_identity(&to_path)
-        .map_err(|err| Failure::Reply(io_error("inspect", &to_path, &err)))?;
-    if !from_id.same_file(&to_id) {
-        return Err(Failure::Reply(ErrorBody::new(
-            ErrorCode::Conflict,
-            format!(
-                "{} and {} do not refer to the same entry on this node.",
-                from_path.display(),
-                to_path.display()
-            ),
-        )));
+    match symlink_file_identity(&to_path) {
+        Ok(to_id) => {
+            if !from_id.same_file(&to_id) {
+                return Err(Failure::Reply(ErrorBody::new(
+                    ErrorCode::Conflict,
+                    format!(
+                        "{} already exists and does not refer to the same entry as {}.",
+                        to_path.display(),
+                        from_path.display()
+                    ),
+                )));
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(Failure::Reply(io_error("inspect", &to_path, &err))),
     }
     let (Some(from_parent), Some(to_parent)) = (from_path.parent(), to_path.parent()) else {
         return Err(Failure::Reply(ErrorBody::new(
@@ -2059,11 +2088,27 @@ fn rename_same_file<W: Write>(
         ))
     })?;
     grant.check_path(&temp, Access::Write)?;
-    fs::rename(&from_path, &temp)
-        .map_err(|err| Failure::Reply(io_error("rename", &from_path, &err)))?;
-    if let Err(err) = fs::rename(&temp, &to_path) {
+    let move_no_replace = |src: &Path, dst: &Path| -> Result<(), Failure> {
+        match legion_os::atomic::rename_no_replace(src, dst) {
+            Ok(()) => Ok(()),
+            Err(legion_os::atomic::RenameNoReplaceError::Unsupported) => {
+                fs::rename(src, dst).map_err(|err| Failure::Reply(io_error("rename", dst, &err)))
+            }
+            Err(legion_os::atomic::RenameNoReplaceError::AlreadyExists) => {
+                Err(Failure::Reply(ErrorBody::new(
+                    ErrorCode::Exists,
+                    format!("{} already exists.", dst.display()),
+                )))
+            }
+            Err(legion_os::atomic::RenameNoReplaceError::Io(err)) => {
+                Err(Failure::Reply(io_error("rename", dst, &err)))
+            }
+        }
+    };
+    move_no_replace(&from_path, &temp)?;
+    if let Err(err) = move_no_replace(&temp, &to_path) {
         let _ = fs::rename(&temp, &from_path);
-        return Err(Failure::Reply(io_error("rename", &to_path, &err)));
+        return Err(err);
     }
     #[cfg(unix)]
     if let Ok(dir_handle) = fs::File::open(from_parent) {

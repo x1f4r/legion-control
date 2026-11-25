@@ -1141,8 +1141,8 @@ async fn apply_local_write(
             )
             .await;
         }
-        let _ = legion_tools::job::cancel_revoked_transfer_jobs(&paths_for_sessions, None, None)
-            .await;
+        let _ =
+            legion_tools::job::cancel_revoked_transfer_jobs(&paths_for_sessions, None, None).await;
 
         let hash_before = merge_outcome
             .bytes_before

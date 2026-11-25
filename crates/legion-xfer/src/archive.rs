@@ -211,7 +211,9 @@ where
     F: FnMut(&str, EntryKind) -> bool,
     C: FnMut(&Path, EntryKind) -> Result<()>,
 {
-    unpack_impl(root, reader, if_exists, true, filter, check_target, |_| None)
+    unpack_impl(root, reader, if_exists, true, filter, check_target, |_| {
+        None
+    })
 }
 
 /// Like [`unpack_with_options`], also re-reading and verifying each regular file's stored bytes on
@@ -753,6 +755,9 @@ fn remove_stale_part_file(dest: &Path) {
         && meta.file_type().is_file()
     {
         let _ = fs::remove_file(&partial);
+        if let Ok(meta_path) = crate::file::part_meta_path(dest) {
+            let _ = fs::remove_file(&meta_path);
+        }
     }
 }
 

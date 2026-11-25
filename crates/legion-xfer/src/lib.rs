@@ -25,9 +25,9 @@ pub use archive::{
 };
 pub use error::{Error, Result};
 pub use file::{
-    GetStream, IfExists, PART_SUFFIX, PlaceOutcome, PutOutcome, PutReport, PutSession,
-    STALE_TEMP_AGE, get, numbered_candidate, open_get, part_path, put, resume_offset,
-    sweep_stale_temps,
+    GetStream, IfExists, PART_LOCK_SUFFIX, PART_META_SUFFIX, PART_SUFFIX, PlaceOutcome, PutOutcome,
+    PutReport, PutSession, STALE_TEMP_AGE, get, numbered_candidate, open_get, part_lock_path,
+    part_meta_path, part_path, put, resume_offset, resume_offset_for, sweep_stale_temps,
 };
 pub use hash::{Hash, HashingReader, HashingWriter};
 pub use manifest::{
