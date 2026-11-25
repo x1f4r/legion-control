@@ -113,6 +113,7 @@ export function serializeFleetCache(node, machines, now = Date.now()) {
       arch: m.arch || null,
       system: m.system || null,
       version: m.version || null,
+      build: m.build || null,
       canWake: Boolean(m.canWake),
       reachable: Boolean(m.reachable),
       lastSeenAt: typeof m.lastSeenAt === 'number' ? m.lastSeenAt : null,
@@ -155,6 +156,7 @@ export function hydrateFleetCache(cached, expectedNode = null) {
         os: m.os || null,
         arch: m.arch || null,
         version: m.version || null,
+        build: m.build || null,
         system: m.system || null,
         latencyMs: null,
         canWake: Boolean(m.canWake),
@@ -198,6 +200,7 @@ function makeEntry(name, isLocal, listed, prev) {
     os: prev?.os || null,
     arch: prev?.arch || null,
     version: prev?.version || null,
+    build: prev?.build || null,
     system: prev?.system || null,
     latencyMs: keepLive ? prev.latencyMs ?? null : null,
     canWake: Boolean(
@@ -361,6 +364,7 @@ export async function refreshFleetProgressive({
               os: prev.os || ver.os || null,
               arch: prev.arch || ver.arch || null,
               version: ver.version || prev.version,
+              build: ver.build || prev.build || null,
             }));
           })
           .catch(onErr),
@@ -505,6 +509,7 @@ export async function refreshFleetProgressive({
       os: pingEntry.os || prev.os,
       arch: pingEntry.arch || prev.arch,
       version: pingEntry.version || prev.version,
+      build: pingEntry.build || prev.build || null,
       system: pingEntry.system || prev.system,
       latencyMs: pingEntry.latency_ms ?? null,
     }));

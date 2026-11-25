@@ -332,8 +332,20 @@ function makeLongLogText() {
   return `${lines.join('\n')}\n`;
 }
 
-export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedRef = () => true, canReadRef = () => true }) {
+export function createMockFilesState({
+  machines,
+  flags,
+  isMachineOld: isMachineOldProp = null,
+  activeNodeRef,
+  isAuthedRef = () => true,
+  canReadRef = () => true,
+}) {
   const isOld = flags.has('old') || flags.has('legacy');
+  const isMixed = !isOld && (flags.has('mixed') || flags.has('old-peer'));
+  const isMachineOld =
+    typeof isMachineOldProp === 'function'
+      ? isMachineOldProp
+      : (name) => isOld || (isMixed && name === 'studio');
   const isNoSync = flags.has('nosync') || isOld;
   const isLarge = flags.has('large');
   const isInexact = flags.has('inexact');
@@ -601,6 +613,9 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
           makeEntry('/home/me/Projects', { kind: 'dir', mtime: isoAgo(day) }),
           makeEntry('/home/me/Documents', { kind: 'dir', mtime: isoAgo(day * 3) }),
           makeEntry('/home/me/Pictures', { kind: 'dir', mtime: isoAgo(day * 2) }),
+          ...(isMixed
+            ? [makeEntry('/home/me/BigFolder', { kind: 'dir', mtime: isoAgo(day * 4) })]
+            : []),
         ],
       ],
       [
@@ -620,11 +635,30 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
       ],
       [
         '/home/me/Documents',
-        [makeEntry('/home/me/Documents/design-notes.md', { size: 840, mtime: isoAgo(day * 3) })],
+        [
+          makeEntry('/home/me/Documents/design-notes.md', { size: 840, mtime: isoAgo(day * 3) }),
+          ...(isMixed
+            ? [
+                makeEntry('/home/me/Documents/Report.pdf', { size: 2_400_000, mtime: isoAgo(day * 5) }),
+                makeEntry('/home/me/Documents/avatar.png', { size: 48_000, mtime: isoAgo(day), palette: PALETTES[2], sampleMedia: 'image' }),
+                makeEntry('/home/me/Documents/Poster.jpg', { size: 4_800_000, mtime: isoAgo(day * 6), palette: PALETTES[4], sampleMedia: 'image' }),
+                makeEntry('/home/me/Documents/Clip.mp4', { size: 640_000_000, mtime: isoAgo(day * 2), duration_s: 312, palette: PALETTES[0], sampleMedia: 'video' }),
+                makeEntry('/home/me/Documents/Track.mp3', { size: 6_200_000, mtime: isoAgo(day * 7), sampleMedia: 'audio' }),
+                makeEntry('/home/me/Documents/archive.zip', { size: 18_500_000, mtime: isoAgo(day * 8) }),
+              ]
+            : []),
+        ],
       ],
       [
         '/home/me/Pictures',
-        [makeEntry('/home/me/Pictures/Camera', { kind: 'dir', mtime: isoAgo(day * 2) })],
+        [
+          makeEntry('/home/me/Pictures/Camera', { kind: 'dir', mtime: isoAgo(day * 2) }),
+          ...(isMixed
+            ? [
+                makeEntry('/home/me/Pictures/avatar.png', { size: 48_000, mtime: isoAgo(day), palette: PALETTES[2], sampleMedia: 'image' }),
+              ]
+            : []),
+        ],
       ],
       [
         '/home/me/Pictures/Camera',
@@ -645,6 +679,21 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
       ['/home/me/Downloads', []],
     ]),
   };
+
+  if (isMixed) {
+    const big = [];
+    for (let i = 1; i <= 520; i += 1) {
+      const idx = String(i).padStart(3, '0');
+      const ext = i % 4 === 0 ? 'jpg' : i % 4 === 1 ? 'txt' : i % 4 === 2 ? 'pdf' : 'mp4';
+      big.push(
+        makeEntry(`/home/me/BigFolder/file-${idx}.${ext}`, {
+          size: 2048 * ((i % 40) + 1),
+          mtime: isoAgo(day + i * 30),
+        }),
+      );
+    }
+    trees.studio.set('/home/me/BigFolder', big);
+  }
 
   if (isLarge) {
     const big = [];
@@ -732,18 +781,22 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
       added_at: isoAgo(day * 15),
       added_by: 'phone',
     },
-    {
-      id: 'fav-4',
-      machine: 'studio',
-      path: '/home/me/Projects',
-      kind: 'dir',
-      category: null,
-      label: 'Projects',
-      pinned: true,
-      exists: true,
-      added_at: isoAgo(day * 12),
-      added_by: 'phone',
-    },
+    ...(!isMixed
+      ? [
+          {
+            id: 'fav-4',
+            machine: 'studio',
+            path: '/home/me/Projects',
+            kind: 'dir',
+            category: null,
+            label: 'Projects',
+            pinned: true,
+            exists: true,
+            added_at: isoAgo(day * 12),
+            added_by: 'phone',
+          },
+        ]
+      : []),
     {
       id: 'fav-5',
       machine: 'tower',
@@ -1113,7 +1166,7 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
     return p.replace(/\/+$/, '') || '/';
   }
 
-  function formatEntry(entry) {
+  function formatEntry(entry, oldMachine = isOld) {
     const out = {
       name: entry.name,
       path: entry.path,
@@ -1122,7 +1175,7 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
       mtime: entry.mtime,
       mode: entry.mode,
     };
-    if (!isOld && entry.kind === 'file') {
+    if (!oldMachine && entry.kind === 'file') {
       out.category = categoryFromName(entry.name);
       out.mime = mimeFromName(entry.name);
       if (entry.duration_s != null) out.duration_s = entry.duration_s;
@@ -1166,6 +1219,7 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
 
   function handleTool(machineName, tool, args, onEvent) {
     const tree = trees[machineName];
+    const oldMachine = isMachineOld(machineName);
     switch (tool) {
       case 'fs.list': {
         const requested = normalizePath(args?.path || '~');
@@ -1183,25 +1237,25 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
         }
         const includeHidden = args?.hidden !== false;
         let filtered = rawEntries.filter((e) => includeHidden || !isHiddenName(e.name));
-        if (!isOld && Array.isArray(args?.categories) && args.categories.length > 0) {
+        if (!oldMachine && Array.isArray(args?.categories) && args.categories.length > 0) {
           const catSet = new Set(args.categories);
           filtered = filtered.filter((e) => e.kind === 'dir' || catSet.has(categoryFromName(e.name)));
         }
-        const sorted = !isOld
+        const sorted = !oldMachine
           ? sortEntries(filtered, { sort: args?.sort || 'name', order: args?.order || 'asc' })
           : sortEntries(filtered, { sort: 'name', order: 'asc' });
 
         const total = sorted.length;
-        const offset = !isOld && Number.isInteger(args?.offset) && args.offset > 0 ? args.offset : 0;
+        const offset = !oldMachine && Number.isInteger(args?.offset) && args.offset > 0 ? args.offset : 0;
         const limit = Number.isInteger(args?.limit) && args.limit > 0 ? args.limit : 500;
-        const slice = sorted.slice(offset, offset + limit).map(formatEntry);
+        const slice = sorted.slice(offset, offset + limit).map((e) => formatEntry(e, oldMachine));
         const truncated = offset + slice.length < total;
         const res = {
           path: requested,
           entries: slice,
           truncated,
         };
-        if (!isOld) {
+        if (!oldMachine) {
           res.total = total;
           res.total_exact = !(isInexact && requested === '/home/me/Archive5000');
           res.offset = offset;
@@ -1219,14 +1273,18 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
         if (content === undefined) {
           const entry = findEntryOnMachine(machineName, requested);
           if (entry && entry.kind === 'file') {
+            const isSmallPng =
+              categoryFromName(entry.name) === 'image' && entry.size <= 1048576;
+            const b64 = isSmallPng ? SAMPLE_PNG_BASE64 : 'AAECAwQFBgcICQoLDA0ODw==';
+            const eof = entry.size <= (Number.isInteger(args?.length) ? args.length : 1048576);
             return {
               path: requested,
               size: entry.size,
               offset: 0,
-              length: 16,
+              length: isSmallPng ? entry.size : 16,
               encoding: 'base64',
-              content: 'AAECAwQFBgcICQoLDA0ODw==',
-              eof: true,
+              content: b64,
+              eof,
             };
           }
           throw { code: 'not_found', message: `${requested} does not exist.`, hint: null, machine: machineName };
@@ -1252,7 +1310,7 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
           throw { code: 'not_found', message: `${requested} does not exist.`, hint: null, machine: machineName };
         }
         return {
-          ...formatEntry(entry),
+          ...formatEntry(entry, oldMachine),
           readonly: false,
         };
       }
@@ -1276,7 +1334,7 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
       }
 
       case 'fs.thumb': {
-        if (isOld) {
+        if (oldMachine) {
           throw { code: 'unknown_tool', message: 'Unknown tool: fs.thumb', hint: null, machine: machineName };
         }
         const paths = Array.isArray(args?.paths) ? args.paths.slice(0, 32) : [];
@@ -1322,7 +1380,10 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
         const includeHidden = Boolean(args?.hidden);
         let q = args?.name || '';
         if (!q && typeof args?.glob === 'string') {
-          q = args.glob.replace(/[*?]/g, '');
+          // Support both simple `*word*` globs and case-insensitive character-class globs like `*[nN][oO]*`.
+          q = args.glob
+            .replace(/\[([a-zA-Z])[a-zA-Z]\]/g, '$1')
+            .replace(/[*?]/g, '');
         }
         const categories = Array.isArray(args?.categories) ? [...args.categories] : [];
         if (args?.kind === 'dir' && categories.length === 0) {
@@ -1341,10 +1402,11 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
           order: args?.order || 'asc',
         });
         const limit = Number.isInteger(args?.limit) && args.limit > 0 ? args.limit : 200;
-        const slice = sorted.slice(0, limit).map(formatEntry);
+        const slice = sorted.slice(0, limit).map((e) => formatEntry(e, oldMachine));
         const payload = {
           path: requested,
           entries: slice,
+          matches: slice,
           truncated: sorted.length > slice.length,
           reason: sorted.length > slice.length ? 'limit' : undefined,
         };
@@ -1505,7 +1567,7 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
           }
         }
 
-        if (!isOld && args?.background && !args?.dry_run) {
+        if (!oldMachine && args?.background && !args?.dry_run) {
           const id = `j-xfer-${transferSeq++}`;
           const job = {
             id,
@@ -1743,8 +1805,16 @@ export function createMockFilesState({ machines, flags, activeNodeRef, isAuthedR
           if (!m.reachable) {
             throw m.error || { code: 'unreachable', message: `${target} is off.`, hint: null, machine: target };
           }
-          if (!canReadRef()) {
+          if (!canReadRef(target)) {
             throw { code: 'denied', message: 'Not allowed to read files on this machine.', hint: null, machine: target };
+          }
+          if (isMachineOld(target)) {
+            throw {
+              code: 'unsupported',
+              message: `${target} does not support content streaming yet.`,
+              hint: null,
+              machine: target,
+            };
           }
           const norm = normalizePath(path);
           const entry = findEntryOnMachine(target, norm);
