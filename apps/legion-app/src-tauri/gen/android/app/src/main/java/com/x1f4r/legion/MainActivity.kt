@@ -161,6 +161,9 @@ class MainActivity : TauriActivity() {
     TransferBridge.setActiveActivity(this)
     applySystemBarStyle(resources.configuration)
     super.onCreate(savedInstanceState)
+    // If the process stayed alive for TransferForegroundService after the user swiped Legion away
+    // from Recents, notify Rust so it rebuilds the main WebView inside this recreated Activity.
+    TransferBridge.sendEvent(JSONObject().put("event", "activity_created"))
 
     // Observe system bar + display cutout insets on the decor view without consuming them so the
     // WebView still receives raw WindowInsets and we can feed CSS variables whenever they change.

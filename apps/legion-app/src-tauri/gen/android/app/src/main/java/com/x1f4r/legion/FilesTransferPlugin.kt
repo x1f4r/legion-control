@@ -134,7 +134,7 @@ class FilesTransferPlugin(private val activity: Activity) : Plugin(activity) {
       return
     }
 
-    val resolver = activity.contentResolver
+    val resolver = activity.applicationContext.contentResolver
     val filesArray = JSArray()
     for (uri in uris) {
       runCatching {

@@ -100,6 +100,26 @@ fn android_files_transfer_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
         .build()
 }
 
+/// Builds the main Legion WebView window from `tauri.conf.json` with our strict bundled-origin
+/// navigation guard and new-window denial.
+///
+/// Called once during startup and again on Android if `MainActivity` was swiped away while
+/// `TransferForegroundService` kept the process alive and the user later reopens Legion.
+pub fn create_main_webview_window(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let window_config = app
+        .config()
+        .app
+        .windows
+        .first()
+        .cloned()
+        .ok_or_else(|| tauri::Error::Io(std::io::Error::other("missing main window config")))?;
+    WebviewWindowBuilder::from_config(app, &window_config)?
+        .on_navigation(is_allowed_navigation_url)
+        .on_new_window(|_, _| NewWindowResponse::Deny)
+        .build()?;
+    Ok(())
+}
+
 /// Starts the Tauri application.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -147,8 +167,9 @@ pub fn run() {
 
         #[cfg(target_os = "android")]
         let platform: Arc<dyn TransferPlatform> = {
-            let android_platform = transfers::android::AndroidTransferPlatform::new(&data_dir)
-                .map_err(|err| std::io::Error::other(err.message))?;
+            let android_platform =
+                transfers::android::AndroidTransferPlatform::new(app.handle().clone(), &data_dir)
+                    .map_err(|err| std::io::Error::other(err.message))?;
             app.manage(SharedAndroidTransferPlatform(Arc::clone(&android_platform)));
             if let Some(plugin) = app.try_state::<SharedAndroidTransferPlugin>() {
                 android_platform.attach_plugin(Arc::clone(&plugin.0));
@@ -184,17 +205,7 @@ pub fn run() {
         app.manage(SharedTransfers(transfers));
         app.manage(SharedUpdater(Arc::new(updater)));
 
-        let window_config = app
-            .config()
-            .app
-            .windows
-            .first()
-            .cloned()
-            .ok_or_else(|| std::io::Error::other("missing main window config"))?;
-        WebviewWindowBuilder::from_config(app.handle(), &window_config)?
-            .on_navigation(is_allowed_navigation_url)
-            .on_new_window(|_, _| NewWindowResponse::Deny)
-            .build()?;
+        create_main_webview_window(app.handle())?;
 
         Ok(())
     });

@@ -23,6 +23,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tauri::{AppHandle, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
@@ -128,6 +129,7 @@ impl BridgeClient {
 
 /// Android implementation of [`TransferPlatform`].
 pub struct AndroidTransferPlatform {
+    app_handle: AppHandle,
     socket_path: PathBuf,
     auth_token: String,
     plugin: Mutex<Option<Arc<AndroidTransferPluginHandle>>>,
@@ -140,7 +142,7 @@ pub struct AndroidTransferPlatform {
 
 impl AndroidTransferPlatform {
     /// Creates the Android platform bridge and binds `<data_dir>/transfers/bridge.sock` (`0o600`).
-    pub fn new(data_dir: &Path) -> Result<Arc<Self>, AppError> {
+    pub fn new(app_handle: AppHandle, data_dir: &Path) -> Result<Arc<Self>, AppError> {
         let dir = data_dir.join("transfers");
         fs::create_dir_all(&dir).map_err(|err| {
             AppError::new(
@@ -165,6 +167,7 @@ impl AndroidTransferPlatform {
             .collect::<String>();
 
         let platform = Arc::new(Self {
+            app_handle,
             socket_path,
             auth_token,
             plugin: Mutex::new(None),
@@ -393,6 +396,23 @@ impl AndroidTransferPlatform {
                         mgr.on_network_changed(wifi);
                     }
                 }
+            }
+            "activity_created" if self.app_handle.get_webview_window("main").is_none() => {
+                let app = self.app_handle.clone();
+                tokio::task::spawn_blocking(move || {
+                    if app.get_webview_window("main").is_none() {
+                        log::info!(
+                            target: "legion-transfers",
+                            "recreating main WebView window for resumed Android Activity"
+                        );
+                        if let Err(err) = crate::create_main_webview_window(&app) {
+                            log::warn!(
+                                target: "legion-transfers",
+                                "failed to recreate main WebView window: {err}"
+                            );
+                        }
+                    }
+                });
             }
             _ => {}
         }
