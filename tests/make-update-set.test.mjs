@@ -12,6 +12,7 @@ import {
   macosBundleVersion,
   makeUpdateSet,
   parseArtifactSpec,
+  tauriBundleConfig,
   verifyUpdateSet,
 } from '../scripts/make-update-set.mjs';
 
@@ -29,6 +30,16 @@ test('sequence and platform version derivation stay strictly monotonic', () => {
   assert.throws(() => androidVersionCode(202602300000));
   assert.equal(desktopBundleVersion('0.1.0', 202611250137), '0.1.0+202611250137');
   assert.equal(macosBundleVersion(202611250137), '202611250137');
+  assert.deepEqual(tauriBundleConfig({ baseVersion: '0.1.0', sequence: 202611250137, os: 'linux' }), {
+    version: '0.1.0+202611250137',
+  });
+  assert.deepEqual(tauriBundleConfig({ baseVersion: '0.1.0', sequence: 202611250137, os: 'macos' }), {
+    version: '0.1.0',
+    bundle: { macOS: { bundleVersion: '202611250137' } },
+  });
+  assert.deepEqual(tauriBundleConfig({ baseVersion: '0.1.0', sequence: 202611250137, os: 'windows' }), {
+    version: '0.1.0',
+  });
 });
 
 test('createPreviewKey writes mode 600 outside the repo and refuses overwrite or repo paths', () => {

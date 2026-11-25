@@ -113,6 +113,36 @@ export function macosBundleVersion(rawSequence) {
   return String(sequence);
 }
 
+/**
+ * Derive a Tauri `--config` JSON object that encodes the build sequence in platform bundle version
+ * fields while respecting each bundler's constraints (Windows NSIS VIProductVersion rejects 4th
+ * components > 65535, so Windows keeps clean semver while Linux uses `<ver>+<seq>` and macOS sets
+ * `bundle.macOS.bundleVersion = <seq>`).
+ */
+export function tauriBundleConfig({ baseVersion, sequence, os: targetOs }) {
+  const clean = String(baseVersion || '').trim().split('+', 1)[0];
+  if (!clean || !/^[A-Za-z0-9.-]+$/.test(clean)) {
+    throw new Error(`Invalid base version ${JSON.stringify(baseVersion)}.`);
+  }
+  const seq = Number(sequence);
+  if (!Number.isSafeInteger(seq) || seq <= 0) {
+    throw new Error(`Invalid sequence ${JSON.stringify(sequence)}.`);
+  }
+  if (targetOs === 'linux') {
+    return { version: desktopBundleVersion(clean, seq) };
+  }
+  if (targetOs === 'macos') {
+    return {
+      version: clean,
+      bundle: { macOS: { bundleVersion: macosBundleVersion(seq) } },
+    };
+  }
+  if (targetOs === 'windows') {
+    return { version: clean };
+  }
+  throw new Error(`Unsupported target OS for tauri-config: ${JSON.stringify(targetOs)} (expected linux, macos, or windows).`);
+}
+
 /** Validate a bare filename inside an update set (matching `legion_update::validate_entry_name`). */
 export function validateEntryName(name) {
   if (typeof name !== 'string' || name.length === 0 || name.length > 255) {
@@ -530,6 +560,7 @@ function usage() {
     '  node scripts/make-update-set.mjs keygen [--key PATH] [--public-key PATH]',
     '  node scripts/make-update-set.mjs sequence',
     '  node scripts/make-update-set.mjs version-code <sequence>',
+    '  node scripts/make-update-set.mjs tauri-config --os <linux|macos|windows> --version VER --sequence SEQ',
     '  node scripts/make-update-set.mjs create --out DIR --channel <preview|stable> --version VER --build REV [--sequence SEQ] [--notes TEXT | --notes-file PATH] --key KEY [--public-key PUB] --artifact SPEC [--artifact SPEC ...] [--force]',
     '  node scripts/make-update-set.mjs verify --dir DIR --public-key PUB',
   ].join('\n');
@@ -549,6 +580,19 @@ function runCli(argv) {
     const seq = rest[0];
     if (!seq) throw new Error('version-code requires <sequence>.');
     console.log(String(androidVersionCode(seq)));
+    return;
+  }
+  if (cmd === 'tauri-config') {
+    let targetOs;
+    let baseVersion;
+    let sequence;
+    for (let i = 0; i < rest.length; i += 1) {
+      if (rest[i] === '--os') targetOs = rest[++i];
+      else if (rest[i] === '--version') baseVersion = rest[++i];
+      else if (rest[i] === '--sequence') sequence = rest[++i];
+      else throw new Error(`Unknown option: ${rest[i]}`);
+    }
+    console.log(JSON.stringify(tauriBundleConfig({ baseVersion, sequence, os: targetOs })));
     return;
   }
   if (cmd === 'keygen') {

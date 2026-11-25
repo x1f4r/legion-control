@@ -500,7 +500,7 @@ jobs:
     name: macOS desktop bundle
     if: github.event_name != 'workflow_dispatch' || inputs.job == 'all' || inputs.job == 'macos-desktop'
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -604,12 +604,110 @@ jobs:
           name: legion-macos-screenshots
           path: ci-shots/macos/*.png
           if-no-files-found: ignore
+      - name: Verify macOS self-update from local node (preview key)
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/macos-update-test"
+          rm -rf "$WORK" "$HOME/Library/Application Support/com.x1f4r.legion/updates"
+          mkdir -p "$WORK/bin" "$WORK/run" "$WORK/node"
+          chmod 700 "$WORK"
+
+          node scripts/make-update-set.mjs keygen \
+            --key "$WORK/preview.key" \
+            --public-key "$WORK/preview.pub.pem"
+
+          LEGION_PREVIEW_UPDATE_KEY="$WORK/preview.pub.pem" \
+          CARGO_TARGET_DIR="$WORK/node-target" \
+            cargo build --release --locked --bin legion
+          cp "$WORK/node-target/release/legion" "$WORK/bin/legion"
+          chmod 755 "$WORK/bin/legion"
+
+          SEQ1=202611250501
+          SEQ2=202611250502
+
+          CFG1="$(node scripts/make-update-set.mjs tauri-config --os macos --version 0.1.0 --sequence "$SEQ1")"
+          (
+            cd apps/legion-app
+            LEGION_PREVIEW_UPDATE_KEY="$WORK/preview.pub.pem" \
+            LEGION_BUILD_SEQUENCE="$SEQ1" \
+            LEGION_BUILD_REV="seq-$SEQ1" \
+              cargo tauri build --bundles app --config "$CFG1"
+          )
+          APP1="$(find apps/legion-app/src-tauri/target/release/bundle/macos -maxdepth 1 -name '*.app' | head -n 1)"
+          cp -R "$APP1" "$WORK/run/Legion.app"
+          codesign --force --deep --sign - "$WORK/run/Legion.app"
+
+          CFG2="$(node scripts/make-update-set.mjs tauri-config --os macos --version 0.1.1 --sequence "$SEQ2")"
+          (
+            cd apps/legion-app
+            LEGION_PREVIEW_UPDATE_KEY="$WORK/preview.pub.pem" \
+            LEGION_BUILD_SEQUENCE="$SEQ2" \
+            LEGION_BUILD_REV="seq-$SEQ2" \
+              cargo tauri build --bundles app --config "$CFG2"
+          )
+          APP2="$(find apps/legion-app/src-tauri/target/release/bundle/macos -maxdepth 1 -name '*.app' | head -n 1)"
+          codesign --force --deep --sign - "$APP2"
+          tar -czf "$WORK/Legion-macos-aarch64.app.tar.gz" -C "$(dirname "$APP2")" "$(basename "$APP2")"
+
+          node scripts/make-update-set.mjs create \
+            --out "$WORK/set-2" \
+            --channel preview \
+            --version 0.1.1 \
+            --build "seq-$SEQ2" \
+            --sequence "$SEQ2" \
+            --notes "CI macOS self-update verification." \
+            --key "$WORK/preview.key" \
+            --artifact "$WORK/Legion-macos-aarch64.app.tar.gz:program=app,os=macos,arch=aarch64,kind=app-tar,name=Legion-macos-aarch64.app.tar.gz"
+
+          LEGION_HOME="$WORK/node" "$WORK/bin/legion" init --name tower >/dev/null
+          LEGION_HOME="$WORK/node" "$WORK/bin/legion" update.publish "from=$WORK/set-2" --json
+
+          APP_DATA="$HOME/Library/Application Support/com.x1f4r.legion/updates"
+          EXEC_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$WORK/run/Legion.app/Contents/Info.plist")"
+          EXEC_PATH="$WORK/run/Legion.app/Contents/MacOS/$EXEC_NAME"
+
+          PATH="$WORK/bin:$PATH" LEGION_HOME="$WORK/node" "$EXEC_PATH" >"$WORK/run1.log" 2>&1 &
+          PID1=$!
+
+          DL_FILE="$APP_DATA/downloads/preview-$SEQ2/Legion-macos-aarch64.app.tar.gz"
+          DOWNLOADED=0
+          for _i in $(seq 1 60); do
+            if [ -f "$APP_DATA/current-build.json" ] && grep -q "\"sequence\": $SEQ1" "$APP_DATA/current-build.json" \
+               && [ -f "$DL_FILE" ] && [ ! -f "$DL_FILE.part" ]; then
+              DOWNLOADED=1
+              break
+            fi
+            sleep 1
+          done
+          kill "$PID1" 2>/dev/null || true
+          wait "$PID1" 2>/dev/null || true
+          [ "$DOWNLOADED" -eq 1 ]
+
+          # Second launch triggers immediate next-start auto-install and atomic bundle swap.
+          PATH="$WORK/bin:$PATH" LEGION_HOME="$WORK/node" "$EXEC_PATH" >"$WORK/run2.log" 2>&1 &
+          PID2=$!
+
+          UPDATED=0
+          for _i in $(seq 1 90); do
+            if [ -f "$APP_DATA/started-$SEQ2.ok" ] \
+               && [ -f "$APP_DATA/current-build.json" ] \
+               && grep -q "\"sequence\": $SEQ2" "$APP_DATA/current-build.json" \
+               && [ ! -e "$WORK/run/.Legion.app.prev" ]; then
+              UPDATED=1
+              break
+            fi
+            sleep 1
+          done
+          pkill -f "$WORK/run/Legion.app" 2>/dev/null || true
+          kill "$PID2" 2>/dev/null || true
+          cat "$APP_DATA/current-build.json" || true
+          [ "$UPDATED" -eq 1 ]
 
   windows-desktop:
     name: Windows desktop installer
     if: github.event_name != 'workflow_dispatch' || inputs.job == 'all' || inputs.job == 'windows-desktop'
     runs-on: windows-latest
-    timeout-minutes: 35
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -719,3 +817,108 @@ jobs:
           name: legion-windows-screenshots
           path: ci-shots/windows/*.png
           if-no-files-found: ignore
+      - name: Verify Windows self-update from local node (preview key)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $work = Join-Path $env:RUNNER_TEMP 'windows-update-test'
+          $appUpdates = Join-Path $env:APPDATA 'com.x1f4r.legion\updates'
+          Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $appUpdates -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path (Join-Path $work 'bin'), (Join-Path $work 'install'), (Join-Path $work 'node') -Force | Out-Null
+
+          $privKey = Join-Path $work 'preview.key'
+          $pubKey = Join-Path $work 'preview.pub.pem'
+          node scripts/make-update-set.mjs keygen --key $privKey --public-key $pubKey
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $env:LEGION_PREVIEW_UPDATE_KEY = $pubKey
+          $env:CARGO_TARGET_DIR = Join-Path $work 'node-target'
+          cargo build --release --locked --bin legion
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $legionBin = Join-Path $work 'bin\legion.exe'
+          Copy-Item -LiteralPath (Join-Path $work 'node-target\release\legion.exe') -Destination $legionBin -Force
+          Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
+
+          $seq1 = 202611250501
+          $seq2 = 202611250502
+
+          $cfg1 = (node scripts/make-update-set.mjs tauri-config --os windows --version 0.1.0 --sequence $seq1)
+          Push-Location apps/legion-app
+          try {
+            $env:LEGION_BUILD_SEQUENCE = "$seq1"
+            $env:LEGION_BUILD_REV = "seq-$seq1"
+            cargo tauri build --bundles nsis --config $cfg1
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally { Pop-Location }
+          $nsis1 = Get-ChildItem -Path 'apps\legion-app\src-tauri\target\release\bundle\nsis' -Filter '*.exe' | Select-Object -First 1
+          $installer1 = Join-Path $work 'Legion-seq1-setup.exe'
+          Copy-Item -LiteralPath $nsis1.FullName -Destination $installer1 -Force
+
+          $cfg2 = (node scripts/make-update-set.mjs tauri-config --os windows --version 0.1.1 --sequence $seq2)
+          Push-Location apps/legion-app
+          try {
+            $env:LEGION_BUILD_SEQUENCE = "$seq2"
+            $env:LEGION_BUILD_REV = "seq-$seq2"
+            cargo tauri build --bundles nsis --config $cfg2
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally { Pop-Location }
+          $nsis2 = Get-ChildItem -Path 'apps\legion-app\src-tauri\target\release\bundle\nsis' -Filter '*.exe' | Select-Object -First 1
+          $installer2 = Join-Path $work 'Legion-windows-x86_64-setup.exe'
+          Copy-Item -LiteralPath $nsis2.FullName -Destination $installer2 -Force
+
+          $setDir = Join-Path $work 'set-2'
+          node scripts/make-update-set.mjs create `
+            --out $setDir `
+            --channel preview `
+            --version 0.1.1 `
+            --build "seq-$seq2" `
+            --sequence $seq2 `
+            --notes "CI Windows self-update verification." `
+            --key $privKey `
+            --artifact "${installer2}:program=app,os=windows,arch=x86_64,kind=nsis,name=Legion-windows-x86_64-setup.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $nodeHome = Join-Path $work 'node'
+          $env:LEGION_HOME = $nodeHome
+          & $legionBin init --name tower | Out-Null
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $legionBin update.publish "from=$setDir" --json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $installDir = Join-Path $work 'install'
+          $instProc = Start-Process -FilePath $installer1 -ArgumentList '/S', "/D=$installDir" -Wait -PassThru
+          if ($instProc.ExitCode -ne 0) { throw "NSIS seq1 install failed: $($instProc.ExitCode)" }
+          $exe = Get-ChildItem -Path $installDir -Filter '*.exe' | Where-Object { $_.Name -notmatch 'uninstall' } | Select-Object -First 1
+          if (-not $exe) { throw 'Installed seq1 Legion executable not found.' }
+
+          $env:PATH = "$(Join-Path $work 'bin');$env:PATH"
+          $proc1 = Start-Process -FilePath $exe.FullName -PassThru
+          $currentJson = Join-Path $appUpdates 'current-build.json'
+          $dlFile = Join-Path $appUpdates "downloads\preview-$seq2\Legion-windows-x86_64-setup.exe"
+          $downloaded = $false
+          for ($i = 1; $i -le 60; $i++) {
+            if ((Test-Path -LiteralPath $currentJson) -and ((Get-Content -LiteralPath $currentJson -Raw) -match "`"sequence`":\s*$seq1") -and (Test-Path -LiteralPath $dlFile) -and -not (Test-Path -LiteralPath "$dlFile.part")) {
+              $downloaded = $true
+              break
+            }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $proc1.HasExited) { Stop-Process -Id $proc1.Id -Force -ErrorAction SilentlyContinue }
+          if (-not $downloaded) { throw 'Timed out waiting for Windows seq1 to download verified seq2.' }
+
+          # Second launch triggers immediate next-start auto-install via silent NSIS upgrade.
+          Start-Process -FilePath $exe.FullName | Out-Null
+          $startedMarker = Join-Path $appUpdates "started-$seq2.ok"
+          $backupDir = Join-Path $appUpdates "backup-$seq1"
+          $updated = $false
+          for ($i = 1; $i -le 120; $i++) {
+            if ((Test-Path -LiteralPath $startedMarker) -and (Test-Path -LiteralPath $currentJson) -and ((Get-Content -LiteralPath $currentJson -Raw) -match "`"sequence`":\s*$seq2") -and -not (Test-Path -LiteralPath $backupDir)) {
+              $updated = $true
+              break
+            }
+            Start-Sleep -Seconds 1
+          }
+          Get-Process | Where-Object { $_.Path -and $_.Path.StartsWith($installDir, [System.StringComparison]::OrdinalIgnoreCase) } | Stop-Process -Force -ErrorAction SilentlyContinue
+          if (Test-Path -LiteralPath $currentJson) { Get-Content -LiteralPath $currentJson }
+          if (-not $updated) { throw 'Timed out waiting for Windows NSIS self-update to complete at seq2.' }
