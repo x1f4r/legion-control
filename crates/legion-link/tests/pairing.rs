@@ -1450,13 +1450,11 @@ async fn real_sshd_unconfirmed_lifecycle_confirmed_conflict_restore_and_compat()
 
 #[cfg(unix)]
 fn hold_flock(lock_path: &Path) -> Option<Child> {
-    if find_tool("flock").is_none() {
-        return None;
-    }
+    find_tool("flock")?;
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent).unwrap();
     }
-    let child = Command::new("flock")
+    let mut child = Command::new("flock")
         .args(["-o", "-x"])
         .arg(lock_path)
         .args(["sleep", "60"])
@@ -1477,6 +1475,8 @@ fn hold_flock(lock_path: &Path) -> Option<Child> {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+    let _ = child.kill();
+    let _ = child.wait();
     panic!("could not acquire lock {}", lock_path.display());
 }
 
