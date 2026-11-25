@@ -21,7 +21,10 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use crate::content::{ContentStream, StreamOpenError, handshake_get};
+use crate::content::{
+    ContentStream, ContentStreamOptions, DEFAULT_MAX_PARKED_STREAMS, ParkedStreamPool,
+    StreamOpenError, handshake_get_with_options,
+};
 use crate::invite::{Enrolled, SshTarget, SshTimeouts};
 use crate::session::{CallError, Session};
 
@@ -522,6 +525,9 @@ pub struct LinkOptions {
     /// Defaults to `false` so a remote node cannot redirect a controller to a local service;
     /// intended only for tests and debug-only loopback harnesses.
     pub allow_loopback_endpoints: bool,
+    /// Maximum number of parked content streams retained on this link before the least recently
+    /// parked stream is closed.
+    pub max_parked_streams: usize,
 }
 
 impl Default for LinkOptions {
@@ -531,6 +537,7 @@ impl Default for LinkOptions {
             ssh_timeouts: SshTimeouts::default(),
             unsynced_backoff: DEFAULT_UNSYNCED_BACKOFF,
             allow_loopback_endpoints: false,
+            max_parked_streams: DEFAULT_MAX_PARKED_STREAMS,
         }
     }
 }
@@ -571,6 +578,8 @@ struct LinkInner {
     unsynced_until: Mutex<HashMap<String, Instant>>,
     /// Last observed runtime route status per machine.
     routes: Mutex<HashMap<String, MachineRouteStatus>>,
+    /// Per-link LRU pool capping parked content streams.
+    parked_streams: Arc<ParkedStreamPool>,
     reaper_started: AtomicBool,
 }
 
@@ -673,6 +682,7 @@ impl Link {
                 active_calls: Mutex::new(HashMap::new()),
                 unsynced_until: Mutex::new(HashMap::new()),
                 routes: Mutex::new(HashMap::new()),
+                parked_streams: Arc::new(ParkedStreamPool::new(options.max_parked_streams)),
                 reaper_started: AtomicBool::new(false),
             }),
         }
@@ -2207,7 +2217,7 @@ impl Link {
             window_policy: opener.window_policy(),
         });
 
-        handshake_get(
+        handshake_get_with_options(
             raw,
             Some(reopener),
             machine,
@@ -2217,6 +2227,10 @@ impl Link {
             live.config_snapshot.principal.as_deref(),
             self.inner.options.ssh_timeouts.handshake,
             cancel,
+            ContentStreamOptions {
+                park_pool: Some(Arc::clone(&self.inner.parked_streams)),
+                ..ContentStreamOptions::default()
+            },
         )
         .await
     }

@@ -1404,7 +1404,7 @@ impl Drop for BoundedChannelReader {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let incomplete = !state.eof;
             state.reader_dropped = true;
-            state.queue.clear();
+            state.queue = VecDeque::new();
             state.buffered = 0;
             incomplete
         };

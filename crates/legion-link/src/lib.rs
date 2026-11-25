@@ -143,7 +143,10 @@ pub(crate) fn strip_remote_sent(mut err: legion_proto::ErrorBody) -> legion_prot
 }
 
 pub use command::{RemoteOs, Subcommand, remote_command, validate_program};
-pub use content::{ContentStream, ContentTime, RawStream, StreamOpenError, StreamOpener};
+pub use content::{
+    ContentStream, ContentTime, DEFAULT_MAX_PARKED_STREAMS, RawStream, StreamOpenError,
+    StreamOpener,
+};
 #[cfg(feature = "ssh")]
 pub use invite::enrol;
 pub use invite::{
