@@ -1240,10 +1240,8 @@ async fn real_sshd_unconfirmed_lifecycle_confirmed_conflict_restore_and_compat()
 
     let devices_toml_1 = fs::read_to_string(config_dir.join("devices.toml")).unwrap();
     assert!(
-        devices_toml_1.contains("unconfirmed = true"),
-        "devices.toml must record unconfirmed = true:\n{devices_toml_1}\n--- audit ---\n{}\n--- sshd ---\n{}",
-        fs::read_to_string(&audit_path).unwrap_or_default(),
-        sshd.log(),
+        !devices_toml_1.contains("unconfirmed"),
+        "devices.toml must NEVER carry an unconfirmed field:\n{devices_toml_1}"
     );
     let list_1 = run_legion(&legion_bin, &legion_home, &user_home, &["device.list"]);
     let devs_1 = list_1["devices"].as_array().unwrap();
@@ -1267,8 +1265,9 @@ async fn real_sshd_unconfirmed_lifecycle_confirmed_conflict_restore_and_compat()
     assert_eq!(legacy_entry.name, "vanish-a");
     assert_eq!(legacy_entry.principal, "device:vanish-a");
 
-    // 2. Fresh invite presented by the SAME device key replaces the unconfirmed leftover and
-    //    succeeds cleanly over real `sshd`.
+    // 2. Fresh invite presented by the SAME device key (with proof of possession) replaces the
+    //    unconfirmed leftover and succeeds cleanly over real `sshd`. The replacement starts
+    //    locally unconfirmed until its first real authenticated `legion gate` session.
     let inv2_res = run_legion(
         &legion_bin,
         &legion_home,
@@ -1297,6 +1296,21 @@ async fn real_sshd_unconfirmed_lifecycle_confirmed_conflict_restore_and_compat()
             )
         });
     assert_eq!(enrolled_a.principal, "device:vanish-a-fresh");
+
+    let list_2_before = run_legion(&legion_bin, &legion_home, &user_home, &["device.list"]);
+    let devs_2_before = list_2_before["devices"].as_array().unwrap();
+    assert_eq!(devs_2_before.len(), 1);
+    assert_eq!(
+        devs_2_before[0]["principal"],
+        json!("device:vanish-a-fresh")
+    );
+    assert_eq!(devs_2_before[0]["unconfirmed"], json!(true));
+
+    // Opening its first real session confirms `vanish-a-fresh`.
+    let _ = link_a
+        .call("tower", "meta.whoami", json!({}), None, |_| {})
+        .await
+        .unwrap();
     link_a.close().await;
 
     let list_2 = run_legion(&legion_bin, &legion_home, &user_home, &["device.list"]);
@@ -1798,4 +1812,380 @@ async fn real_sshd_cancel_before_machine_commits_stays_honest_and_retry_picks_up
     assert!(picked_up.recovered);
     assert!(link.config().node("tower").is_some());
     link.close().await;
+}
+
+#[cfg(unix)]
+fn forced_enrol_raw(
+    auth_keys: &Path,
+    user_home: &Path,
+    invite_text: &str,
+    request: &Value,
+    deliver: bool,
+) -> Option<Value> {
+    use std::io::{Read, Write};
+
+    let id = Invite::parse(invite_text).unwrap().id;
+    let keys = fs::read_to_string(auth_keys).unwrap_or_default();
+    let line = keys
+        .lines()
+        .find(|l| l.contains(&format!("--enrol {id}")) || l.contains(&format!("--enrol '{id}'")))
+        .unwrap_or_else(|| panic!("no invite line for {id} in:\n{keys}"));
+    let start = line.find("command=\"").unwrap() + "command=\"".len();
+    let end = start + line[start..].find('"').unwrap();
+    let cmd = line[start..end].replace("\\\"", "\"");
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .env("HOME", user_home)
+        .env_remove("LEGION_HOME")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    if !deliver {
+        drop(stdout);
+    } else {
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(format!("{request}\n").as_bytes()).unwrap();
+        drop(stdin);
+        let mut text = String::new();
+        let mut out = stdout;
+        out.read_to_string(&mut text).unwrap();
+        let _ = child.wait().unwrap();
+        return serde_json::from_str(text.trim()).ok();
+    }
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(format!("{request}\n").as_bytes()).unwrap();
+    drop(stdin);
+    let _ = child.wait().unwrap();
+    None
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn real_sshd_unauthenticated_invite_cannot_take_over_unconfirmed_device() {
+    if find_sshd().is_none() || find_tool("ssh-keygen").is_none() {
+        eprintln!(
+            "skipping real_sshd_unauthenticated_invite_cannot_take_over_unconfirmed_device: sshd/ssh-keygen unavailable"
+        );
+        return;
+    }
+    let Some(legion_bin) = find_legion_bin() else {
+        eprintln!("skipping: built `legion` binary not found");
+        return;
+    };
+
+    let root = strict_tempdir();
+    let user_home = root.path().join("home");
+    let legion_home = root.path().join("legion");
+    let config_dir = legion_home.join("config");
+    let ssh_dir = user_home.join(".ssh");
+    let auth_keys = ssh_dir.join("authorized_keys");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::create_dir_all(&ssh_dir).unwrap();
+    let _ = fs::set_permissions(&user_home, fs::Permissions::from_mode(0o700));
+    let _ = fs::set_permissions(&ssh_dir, fs::Permissions::from_mode(0o700));
+
+    let Some(sshd) = ThrowawaySshd::start(&auth_keys, &user_home) else {
+        return;
+    };
+    fs::write(
+        config_dir.join("node.toml"),
+        format!(
+            "name = \"tower\"\n\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\n",
+            toml_literal(&auth_keys),
+            toml_literal(&sshd.host_key_pub),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        config_dir.join("policy.toml"),
+        "default = \"owner\"\n\n\
+         [roles.operator]\n\
+         allow = [\"effect:read\"]\n\n\
+         [roles.guest]\n\
+         allow = [\"meta.whoami\"]\n",
+    )
+    .unwrap();
+
+    let port_arg = format!("port={}", sshd.port);
+    let user_arg = format!("user={}", sshd.user);
+
+    // 1. Victim enrols with operator invite `inv1`, reply is lost (device is locally unconfirmed).
+    let inv1_res = run_legion(
+        &legion_bin,
+        &legion_home,
+        &user_home,
+        &[
+            "device.invite",
+            "role=operator",
+            "name=phone",
+            "host=127.0.0.1",
+            &port_arg,
+            &user_arg,
+        ],
+    );
+    let inv1_text = inv1_res["invite"].as_str().unwrap();
+    let inv1_id = inv1_res["id"].as_str().unwrap();
+    let victim = DeviceKey::generate().unwrap();
+    let victim_pub = victim.public_key_line("phone").unwrap();
+    forced_enrol_raw(
+        &auth_keys,
+        &user_home,
+        inv1_text,
+        &json!({"enrol": 1, "id": inv1_id, "public_key": victim_pub, "name": "phone"}),
+        false,
+    );
+    let list_before = run_legion(&legion_bin, &legion_home, &user_home, &["device.list"]);
+    assert_eq!(
+        list_before["devices"][0]["principal"],
+        json!("device:phone")
+    );
+    assert_eq!(list_before["devices"][0]["unconfirmed"], json!(true));
+
+    // 2. Intruder holds a guest invite and submits the victim's PUBLIC key without proof of
+    //    possession. Machine MUST refuse with Conflict (NO details) and consume `inv2`.
+    let inv2_res = run_legion(
+        &legion_bin,
+        &legion_home,
+        &user_home,
+        &[
+            "device.invite",
+            "role=guest",
+            "name=intruder",
+            "host=127.0.0.1",
+            &port_arg,
+            &user_arg,
+        ],
+    );
+    let inv2_text = inv2_res["invite"].as_str().unwrap();
+    let inv2_id = inv2_res["id"].as_str().unwrap();
+    let reply = forced_enrol_raw(
+        &auth_keys,
+        &user_home,
+        inv2_text,
+        &json!({"enrol": 1, "id": inv2_id, "public_key": victim_pub, "name": "intruder"}),
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        reply["ok"],
+        json!(false),
+        "unauthenticated guest invite must NEVER take over unconfirmed operator device: {reply}"
+    );
+    assert_eq!(reply["error"]["code"], json!("conflict"), "{reply}");
+    assert!(
+        reply["error"].get("details").is_none(),
+        "conflict without proof must NOT leak existing_principal or device details: {reply}"
+    );
+    assert!(
+        !fs::read_to_string(&auth_keys)
+            .unwrap()
+            .contains(&format!("legion-invite:{inv2_id}")),
+        "conflict must consume the invite so it cannot be reused to probe keys"
+    );
+
+    // Victim's original operator pairing is completely untouched.
+    let list_after_attack = run_legion(&legion_bin, &legion_home, &user_home, &["device.list"]);
+    assert_eq!(list_after_attack["devices"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        list_after_attack["devices"][0]["principal"],
+        json!("device:phone")
+    );
+    assert_eq!(list_after_attack["devices"][0]["role"], json!("operator"));
+
+    // 3. The victim ITSELF holding the private key presents a fresh operator invite with valid
+    //    proof of possession -> cleanly replaces its own unconfirmed leftover.
+    let inv3_res = run_legion(
+        &legion_bin,
+        &legion_home,
+        &user_home,
+        &[
+            "device.invite",
+            "role=operator",
+            "name=phone2",
+            "host=127.0.0.1",
+            &port_arg,
+            &user_arg,
+        ],
+    );
+    let inv3_text = inv3_res["invite"].as_str().unwrap();
+    let victim_link = Link::new(LinkConfig {
+        device_key: Some(victim.to_openssh().unwrap()),
+        ..LinkConfig::default()
+    });
+    let replaced = victim_link
+        .pair(inv3_text, "phone2")
+        .await
+        .unwrap_or_else(|e| {
+            panic!("victim with valid proof must replace its own unconfirmed leftover: {e}")
+        });
+    assert_eq!(replaced.principal, "device:phone2");
+    assert_eq!(replaced.role, "operator");
+    victim_link.close().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn real_sshd_mixed_versions_and_restore_pairing_probe() {
+    // Runs against whatever `LEGION_BIN` points to (both this branch and `origin/main`!):
+    // verifies normal pairing, spent-invite refusal, confirmed duplicate-key conflict offering
+    // Restore pairing (even when the machine omits `details`), restoring cleanly, and malformed
+    // key refusal — all completing promptly with zero hangs.
+    if find_sshd().is_none() || find_tool("ssh-keygen").is_none() {
+        eprintln!(
+            "skipping real_sshd_mixed_versions_and_restore_pairing_probe: sshd/ssh-keygen unavailable"
+        );
+        return;
+    }
+    let Some(legion_bin) = find_legion_bin() else {
+        eprintln!("skipping: built `legion` binary not found");
+        return;
+    };
+
+    let root = strict_tempdir();
+    let user_home = root.path().join("home");
+    let legion_home = root.path().join("legion");
+    let config_dir = legion_home.join("config");
+    let ssh_dir = user_home.join(".ssh");
+    let auth_keys = ssh_dir.join("authorized_keys");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::create_dir_all(&ssh_dir).unwrap();
+    let _ = fs::set_permissions(&user_home, fs::Permissions::from_mode(0o700));
+    let _ = fs::set_permissions(&ssh_dir, fs::Permissions::from_mode(0o700));
+
+    let Some(sshd) = ThrowawaySshd::start(&auth_keys, &user_home) else {
+        return;
+    };
+    fs::write(
+        config_dir.join("node.toml"),
+        format!(
+            "name = \"tower\"\n\n[devices]\nauthorized_keys = {}\nhost_keys = [{}]\n",
+            toml_literal(&auth_keys),
+            toml_literal(&sshd.host_key_pub),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        config_dir.join("policy.toml"),
+        "default = \"owner\"\n\n[roles.operator]\nallow = [\"effect:read\"]\n",
+    )
+    .unwrap();
+
+    let port_arg = format!("port={}", sshd.port);
+    let user_arg = format!("user={}", sshd.user);
+
+    // 1. Plain success + first session confirming the pairing.
+    let inv1_res = run_legion(
+        &legion_bin,
+        &legion_home,
+        &user_home,
+        &[
+            "device.invite",
+            "role=operator",
+            "name=phone",
+            "host=127.0.0.1",
+            &port_arg,
+            &user_arg,
+        ],
+    );
+    let inv1_text = inv1_res["invite"].as_str().unwrap();
+    let key = DeviceKey::generate().unwrap();
+    let link = Link::new(LinkConfig {
+        device_key: Some(key.to_openssh().unwrap()),
+        ..LinkConfig::default()
+    });
+    let enrolled = link
+        .pair(inv1_text, "phone")
+        .await
+        .unwrap_or_else(|e| panic!("pair failed against {}: {e}", legion_bin.display()));
+    assert_eq!(enrolled.principal, "device:phone");
+    let whoami = link
+        .call("tower", "meta.whoami", json!({}), None, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(whoami["principal"], json!("device:phone"));
+    link.close().await;
+
+    // 2. Spent invite refused promptly for a different key.
+    let other_key = DeviceKey::generate().unwrap();
+    let other_link = Link::new(LinkConfig {
+        device_key: Some(other_key.to_openssh().unwrap()),
+        ..LinkConfig::default()
+    });
+    let spent = other_link.pair(inv1_text, "tablet").await.unwrap_err();
+    assert_eq!(spent.code, ErrorCode::Denied, "{spent}");
+    other_link.close().await;
+
+    // 3. Fresh invite presented by the already-confirmed key from a fresh LinkConfig (lost local
+    //    state): hits Conflict AND probes the machine with `key` against pinned host keys so
+    //    `details.restorable == true` and `details.existing_principal == "device:phone"` even
+    //    when running against an `origin/main` machine!
+    let inv2_res = run_legion(
+        &legion_bin,
+        &legion_home,
+        &user_home,
+        &[
+            "device.invite",
+            "role=operator",
+            "name=phone2",
+            "host=127.0.0.1",
+            &port_arg,
+            &user_arg,
+        ],
+    );
+    let inv2_text = inv2_res["invite"].as_str().unwrap();
+    let fresh_link = Link::new(LinkConfig {
+        device_key: Some(key.to_openssh().unwrap()),
+        ..LinkConfig::default()
+    });
+    let conflict = fresh_link.pair(inv2_text, "phone").await.unwrap_err();
+    assert_eq!(conflict.code, ErrorCode::Conflict, "{conflict}");
+    let details = conflict
+        .details
+        .as_ref()
+        .expect("Conflict on device: invite must carry restorable details from probe/machine");
+    assert_eq!(details["existing_principal"], json!("device:phone"));
+    assert_eq!(details["node"], json!("tower"));
+    assert_eq!(details["restorable"], json!(true));
+    assert!(fresh_link.config().node("tower").is_none());
+
+    // Restore pairing succeeds cleanly (even passing empty expected_principal).
+    let restored = fresh_link
+        .restore_pairing(inv2_text, "", "phone", CancellationToken::new())
+        .await
+        .unwrap_or_else(|e| panic!("restore_pairing failed: {e}"));
+    assert_eq!(restored.principal, "device:phone");
+    assert!(restored.recovered);
+    assert!(fresh_link.config().node("tower").is_some());
+    fresh_link.close().await;
+
+    // 4. Malformed public key refused cleanly without hanging.
+    let inv3_res = run_legion(
+        &legion_bin,
+        &legion_home,
+        &user_home,
+        &[
+            "device.invite",
+            "role=operator",
+            "name=badkey",
+            "host=127.0.0.1",
+            &port_arg,
+            &user_arg,
+        ],
+    );
+    let inv3_text = inv3_res["invite"].as_str().unwrap();
+    let inv3_id = inv3_res["id"].as_str().unwrap();
+    let bad = forced_enrol_raw(
+        &auth_keys,
+        &user_home,
+        inv3_text,
+        &json!({"enrol": 1, "id": inv3_id, "public_key": "ssh-ed25519 AAAA", "name": "badkey"}),
+        true,
+    )
+    .unwrap();
+    assert_eq!(bad["ok"], json!(false), "{bad}");
+    assert_eq!(bad["error"]["code"], json!("invalid_args"), "{bad}");
 }

@@ -59,7 +59,8 @@ export function classifyPairError(err, nodeName = '', deviceNoun = 'device') {
     typeof err?.details?.existing_principal === 'string'
       ? err.details.existing_principal.trim()
       : '';
-  if (err?.code === 'conflict' && existingPrincipal) {
+  const conflictRestorable = Boolean(existingPrincipal) || err?.details?.restorable === true;
+  if (err?.code === 'conflict' && conflictRestorable) {
     const conflictNode =
       (typeof err?.details?.node === 'string' && err.details.node.trim()) ||
       target ||
@@ -67,12 +68,15 @@ export function classifyPairError(err, nodeName = '', deviceNoun = 'device') {
     const existingDevice =
       typeof err?.details?.existing_device === 'string' ? err.details.existing_device.trim() : '';
     const noun = String(deviceNoun || 'device').trim() || 'device';
+    const message = existingPrincipal
+      ? `This ${noun} is already paired with ${conflictNode} as ${existingPrincipal}.`
+      : `This ${noun} is already paired with ${conflictNode}.`;
     return {
       kind: 'already_paired',
       existingPrincipal,
       existingDevice,
       node: conflictNode,
-      message: `This ${noun} is already paired with ${conflictNode} as ${existingPrincipal}.`,
+      message,
       retryable: false,
       restorable: true,
     };
@@ -333,13 +337,12 @@ export function createPairingController({
       state.inFlight ||
       !state.invite.trim() ||
       !state.notice?.restorable ||
-      !state.notice?.existingPrincipal ||
       typeof link?.restorePairing !== 'function'
     ) {
       return Promise.resolve({ ok: false, empty: true });
     }
     const trimmed = state.invite.trim();
-    const existingPrincipal = state.notice.existingPrincipal;
+    const existingPrincipal = state.notice.existingPrincipal || '';
     const resolvedName = String(state.deviceName ?? '').trim();
     const node = state.notice.node || state.node || inviteTargetNode(trimmed);
     const screen = state.screen || 'start';

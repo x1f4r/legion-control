@@ -1015,10 +1015,10 @@ impl Link {
             .with_hint("Pass a short label such as `phone` or `tablet`."));
         }
         let expected = expected_principal.trim();
-        if expected.is_empty() || expected.chars().any(|c| c.is_control()) {
+        if expected.chars().any(|c| c.is_control()) {
             return Err(ErrorBody::new(
                 ErrorCode::InvalidArgs,
-                "Existing principal must be a non-empty single-line string.",
+                "Existing principal must be a single-line string.",
             ));
         }
         if cancel.is_cancelled() {

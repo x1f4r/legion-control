@@ -3115,7 +3115,8 @@ role = "owner"
             EnrolReply::Err { ref error, .. } if error.code == ErrorCode::Denied
         ));
 
-        // Enrolling a key already present on a foreign line in authorized_keys is refused.
+        // Enrolling a key already present on a foreign line in authorized_keys is refused with
+        // Conflict AND consumes the invite so one invite cannot be used to probe key after key.
         let foreign_key_req = format!(
             "{{\"enrol\":1,\"id\":\"{id}\",\"public_key\":\"{}\",\"name\":\"Foreign Key\"}}\n",
             foreign_key.public_key
@@ -3125,6 +3126,27 @@ role = "owner"
             foreign_key_reply,
             EnrolReply::Err { ref error, .. } if error.code == ErrorCode::Conflict
         ));
+        assert!(
+            !std::fs::read_to_string(&h.auth_keys)
+                .unwrap()
+                .contains(&format!("legion-invite:{id}")),
+            "Conflict must consume the invite from authorized_keys"
+        );
+        let after_conflict_reuse = run_enrol(&h.node, id, foreign_key_req.as_bytes()).await;
+        assert!(matches!(
+            after_conflict_reuse,
+            EnrolReply::Err { ref error, .. } if error.code == ErrorCode::NotFound
+        ));
+
+        // Issue a fresh invite for the valid enrolment.
+        let inv1b = h
+            .call(
+                "device.invite",
+                json!({"principal": "phone", "host": ["tower.example", "100.64.0.1"], "user": "me"}),
+            )
+            .await
+            .unwrap();
+        let id = inv1b["id"].as_str().unwrap();
 
         // Valid enrolment succeeds.
         let req1 = format!(
@@ -3166,7 +3188,7 @@ role = "owner"
         )
         .unwrap();
 
-        // Second device with the same requested name gets a unique slug (`my-pixel-2`).
+        // Enrolling an already-paired device's key is refused with Conflict and consumes `id2`.
         let inv2 = h
             .call(
                 "device.invite",
@@ -3175,7 +3197,6 @@ role = "owner"
             .await
             .unwrap();
         let id2 = inv2["id"].as_str().unwrap();
-        // Enrolling an already-paired device's key is also refused.
         let dup_device_req = format!(
             "{{\"enrol\":1,\"id\":\"{id2}\",\"public_key\":\"{}\",\"name\":\"Duplicate Key\"}}\n",
             device_key1.public_key
@@ -3183,14 +3204,31 @@ role = "owner"
         let dup_device_reply = run_enrol(&h.node, id2, dup_device_req.as_bytes()).await;
         assert!(matches!(
             dup_device_reply,
-            EnrolReply::Err { ref error, .. } if error.code == ErrorCode::Conflict
+            EnrolReply::Err { ref error, .. }
+                if error.code == ErrorCode::Conflict && error.details.is_none()
         ));
+        assert!(
+            !std::fs::read_to_string(&h.auth_keys)
+                .unwrap()
+                .contains(&format!("legion-invite:{id2}")),
+            "duplicate-key Conflict must consume the invite"
+        );
+
+        // Second device with the same requested name gets a unique slug (`my-pixel-2`) via a fresh invite.
+        let inv3 = h
+            .call(
+                "device.invite",
+                json!({"principal": "phone", "host": ["tower.example", "100.64.0.1"], "user": "me"}),
+            )
+            .await
+            .unwrap();
+        let id3 = inv3["id"].as_str().unwrap();
         let device_key2 = generate_ephemeral_ed25519().unwrap();
         let req2 = format!(
-            "{{\"enrol\":1,\"id\":\"{id2}\",\"public_key\":\"{}\",\"name\":\"My Pixel!\"}}\n",
+            "{{\"enrol\":1,\"id\":\"{id3}\",\"public_key\":\"{}\",\"name\":\"My Pixel!\"}}\n",
             device_key2.public_key
         );
-        let reply2 = run_enrol(&h.node, id2, req2.as_bytes()).await;
+        let reply2 = run_enrol(&h.node, id3, req2.as_bytes()).await;
         assert_eq!(
             reply2,
             EnrolReply::Ok {
@@ -7174,14 +7212,24 @@ role = "observer"
             .await
             .unwrap();
         let inv1_id = inv1["id"].as_str().unwrap().to_owned();
-        let key1 = generate_ephemeral_ed25519().unwrap();
+        let inv1_host_fps = keys::host_key_fingerprints(
+            &inv1["host_keys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_owned())
+                .collect::<Vec<_>>(),
+        );
+        let seed1 = [0x41u8; 32];
+        let key1_pub = keys::ed25519_public_key_from_seed(&seed1);
         let req1 = format!(
             "{}\n",
             json!({
                 "enrol": 1,
                 "id": inv1_id,
-                "public_key": key1.public_key,
+                "public_key": key1_pub,
                 "name": "vanish-phone",
+                "proof": keys::sign_enrol_proof(&seed1, &inv1_id, "tower", &inv1_host_fps),
             })
         );
         let io1 = enrol::run_enrol_io(
@@ -7230,10 +7278,10 @@ role = "observer"
             "audit.jsonl must record undelivered/unconfirmed enrolment: {audit_text}"
         );
 
-        // 2. A fresh invite presented with the SAME device key replaces that unconfirmed leftover
-        //    under the same locks, tombstones the old entry, removes the old `device:*` principal,
-        //    and succeeds cleanly (the replacement itself is born locally unconfirmed until its
-        //    first real authenticated `legion gate` session).
+        // 2. A fresh invite presented WITH a valid proof of possession by the SAME device key
+        //    replaces that unconfirmed leftover under the same locks, tombstones the old entry,
+        //    removes the old `device:*` principal, and succeeds cleanly (the replacement itself is
+        //    born locally unconfirmed until its first real authenticated `legion gate` session).
         let inv2 = h
             .call(
                 "device.invite",
@@ -7242,13 +7290,22 @@ role = "observer"
             .await
             .unwrap();
         let inv2_id = inv2["id"].as_str().unwrap().to_owned();
+        let inv2_host_fps = keys::host_key_fingerprints(
+            &inv2["host_keys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_owned())
+                .collect::<Vec<_>>(),
+        );
         let req2 = format!(
             "{}\n",
             json!({
                 "enrol": 1,
                 "id": inv2_id,
-                "public_key": key1.public_key,
+                "public_key": key1_pub,
                 "name": "vanish-retry",
+                "proof": keys::sign_enrol_proof(&seed1, &inv2_id, "tower", &inv2_host_fps),
             })
         );
         let mut out2 = Vec::new();
@@ -7313,13 +7370,14 @@ role = "observer"
             .await
             .unwrap();
         let inv3_id = inv3["id"].as_str().unwrap().to_owned();
-        let key2 = generate_ephemeral_ed25519().unwrap();
+        let seed2 = [0x42u8; 32];
+        let key2_pub = keys::ed25519_public_key_from_seed(&seed2);
         let req3 = format!(
             "{}\n",
             json!({
                 "enrol": 1,
                 "id": inv3_id,
-                "public_key": key2.public_key,
+                "public_key": key2_pub,
                 "name": "confirm-on-open",
             })
         );
@@ -7380,8 +7438,9 @@ role = "observer"
         assert!(entry3.get("unconfirmed").is_none());
         assert!(entry3.get("status").is_none());
 
-        // 4. Confirmed device presenting a fresh invite is still refused with `ErrorCode::Conflict`
-        //    and now includes optional `details.existing_principal`, `existing_device`, and `node`.
+        // 4. Confirmed device presenting a fresh invite WITH valid proof is refused with
+        //    `ErrorCode::Conflict` carrying `details.existing_principal`, `existing_device`, and
+        //    `node`, AND consumes the invite.
         let inv4 = h
             .call(
                 "device.invite",
@@ -7390,13 +7449,22 @@ role = "observer"
             .await
             .unwrap();
         let inv4_id = inv4["id"].as_str().unwrap().to_owned();
+        let inv4_host_fps = keys::host_key_fingerprints(
+            &inv4["host_keys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_owned())
+                .collect::<Vec<_>>(),
+        );
         let req4 = format!(
             "{}\n",
             json!({
                 "enrol": 1,
                 "id": inv4_id,
-                "public_key": key2.public_key,
+                "public_key": key2_pub,
                 "name": "confirm-dup",
+                "proof": keys::sign_enrol_proof(&seed2, &inv4_id, "tower", &inv4_host_fps),
             })
         );
         let mut out4 = Vec::new();
@@ -7839,5 +7907,225 @@ role = "observer"
             assert!(!state.invites.contains_key(&inv_id));
             assert_eq!(state.unconfirmed.len(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn enrol_proof_of_possession_matrix_replacement_conflict_and_invite_consumption() {
+        let h = Harness::new();
+        let seed_victim = [0x61u8; 32];
+        let seed_attacker = [0x62u8; 32];
+        let victim_pub = keys::ed25519_public_key_from_seed(&seed_victim);
+
+        let host_fps_of = |inv: &serde_json::Value| -> Vec<String> {
+            keys::host_key_fingerprints(
+                &inv["host_keys"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        // 1. Fresh enrolment without proof (older phone) succeeds and is born unconfirmed.
+        let inv1 = h
+            .call(
+                "device.invite",
+                json!({"role": "observer", "name": "victim-phone", "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap();
+        let inv1_id = inv1["id"].as_str().unwrap().to_owned();
+        let req1 = format!(
+            "{}\n",
+            json!({"enrol": 1, "id": inv1_id, "public_key": victim_pub, "name": "victim-phone"})
+        );
+        assert!(run_enrol(&h.node, &inv1_id, req1.as_bytes()).await.is_ok());
+        assert_eq!(
+            store::load_state(h.node.paths()).unwrap().unconfirmed.len(),
+            1
+        );
+
+        // 2. Absent proof against unconfirmed leftover MUST NOT replace, returns Conflict with
+        //    NO details, and consumes the invite.
+        let inv_no_proof = h
+            .call(
+                "device.invite",
+                json!({"role": "nobody", "name": "steal-no-proof", "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap();
+        let inv_np_id = inv_no_proof["id"].as_str().unwrap().to_owned();
+        let req_np = format!(
+            "{}\n",
+            json!({"enrol": 1, "id": inv_np_id, "public_key": victim_pub, "name": "steal-no-proof"})
+        );
+        match run_enrol(&h.node, &inv_np_id, req_np.as_bytes()).await {
+            EnrolReply::Err { ok: false, error } => {
+                assert_eq!(error.code, ErrorCode::Conflict);
+                assert!(
+                    error.details.is_none(),
+                    "conflict without proof must omit details: {error:?}"
+                );
+            }
+            other => panic!("expected Conflict without proof, got {other:?}"),
+        }
+        assert!(
+            !std::fs::read_to_string(&h.auth_keys)
+                .unwrap()
+                .contains(&format!("legion-invite:{inv_np_id}")),
+            "Conflict must consume the invite"
+        );
+        assert!(
+            !store::load_state(h.node.paths())
+                .unwrap()
+                .invites
+                .contains_key(&inv_np_id)
+        );
+
+        // 3. Invalid proofs (wrong key, different invite, different node, different host keys)
+        //    all return Denied and write nothing.
+        let inv_bad = h
+            .call(
+                "device.invite",
+                json!({"role": "nobody", "name": "bad-proof", "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap();
+        let inv_bad_id = inv_bad["id"].as_str().unwrap().to_owned();
+        let fps_bad = host_fps_of(&inv_bad);
+        let other_host_fps =
+            keys::host_key_fingerprints(&[keys::ed25519_public_key_from_seed(&[0xee; 32])]);
+        let bad_proofs = [
+            (
+                "wrong_key",
+                keys::sign_enrol_proof(&seed_attacker, &inv_bad_id, "tower", &fps_bad),
+            ),
+            (
+                "wrong_invite",
+                keys::sign_enrol_proof(&seed_victim, "other-invite-id", "tower", &fps_bad),
+            ),
+            (
+                "wrong_node",
+                keys::sign_enrol_proof(&seed_victim, &inv_bad_id, "other-node", &fps_bad),
+            ),
+            (
+                "wrong_host_keys",
+                keys::sign_enrol_proof(&seed_victim, &inv_bad_id, "tower", &other_host_fps),
+            ),
+            ("garbage", "not-a-valid-sshsig".to_owned()),
+        ];
+        for (label, proof) in bad_proofs {
+            let req = format!(
+                "{}\n",
+                json!({"enrol": 1, "id": inv_bad_id, "public_key": victim_pub, "name": "bad-proof", "proof": proof})
+            );
+            match run_enrol(&h.node, &inv_bad_id, req.as_bytes()).await {
+                EnrolReply::Err { ok: false, error } => {
+                    assert_eq!(error.code, ErrorCode::Denied, "{label}: {error:?}");
+                }
+                other => panic!("{label}: expected Denied, got {other:?}"),
+            }
+        }
+        // Original unconfirmed victim pairing is still intact.
+        let reg_mid = registry::load_devices_raw(h.node.paths()).unwrap().unwrap();
+        assert_eq!(reg_mid.devices.len(), 1);
+        assert_eq!(
+            reg_mid.devices.values().next().unwrap().principal,
+            "device:victim-phone"
+        );
+
+        // 4. Valid proof from the same device key replaces the unconfirmed leftover cleanly,
+        //    taking whatever the new invite grants.
+        let valid_proof = keys::sign_enrol_proof(&seed_victim, &inv_bad_id, "tower", &fps_bad);
+        let req_replace = format!(
+            "{}\n",
+            json!({"enrol": 1, "id": inv_bad_id, "public_key": victim_pub, "name": "bad-proof", "proof": valid_proof})
+        );
+        let replaced = run_enrol(&h.node, &inv_bad_id, req_replace.as_bytes()).await;
+        assert!(
+            replaced.is_ok(),
+            "valid proof must replace unconfirmed leftover: {replaced:?}"
+        );
+        let reg_after = registry::load_devices_raw(h.node.paths()).unwrap().unwrap();
+        assert_eq!(reg_after.devices.len(), 1);
+        let (new_pid, new_dev) = reg_after.devices.iter().next().unwrap();
+        assert_eq!(new_dev.principal, "device:bad-proof");
+        assert_eq!(new_dev.role.as_deref(), Some("nobody"));
+
+        // 5. Confirm via real gate session -> confirmed duplicate WITH proof gives details and
+        //    consumes invite; WITHOUT proof gives NO details and consumes invite.
+        let node_file = h.node.config().get::<NodeFile>().unwrap();
+        registry::verify_gate_device(
+            h.node.paths(),
+            "tower",
+            &node_file,
+            &new_dev.name,
+            new_pid,
+            &new_dev.principal,
+            None,
+        )
+        .unwrap();
+
+        let inv_conf_no_proof = h
+            .call(
+                "device.invite",
+                json!({"role": "observer", "name": "conf-np", "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap();
+        let cnp_id = inv_conf_no_proof["id"].as_str().unwrap().to_owned();
+        let req_cnp = format!(
+            "{}\n",
+            json!({"enrol": 1, "id": cnp_id, "public_key": victim_pub, "name": "conf-np"})
+        );
+        match run_enrol(&h.node, &cnp_id, req_cnp.as_bytes()).await {
+            EnrolReply::Err { ok: false, error } => {
+                assert_eq!(error.code, ErrorCode::Conflict);
+                assert!(error.details.is_none());
+            }
+            other => panic!("expected Conflict without details, got {other:?}"),
+        }
+        assert!(
+            !std::fs::read_to_string(&h.auth_keys)
+                .unwrap()
+                .contains(&format!("legion-invite:{cnp_id}"))
+        );
+
+        let inv_conf_proof = h
+            .call(
+                "device.invite",
+                json!({"role": "observer", "name": "conf-p", "host": "tower.example", "user": "me"}),
+            )
+            .await
+            .unwrap();
+        let cp_id = inv_conf_proof["id"].as_str().unwrap().to_owned();
+        let cp_fps = host_fps_of(&inv_conf_proof);
+        let req_cp = format!(
+            "{}\n",
+            json!({
+                "enrol": 1,
+                "id": cp_id,
+                "public_key": victim_pub,
+                "name": "conf-p",
+                "proof": keys::sign_enrol_proof(&seed_victim, &cp_id, "tower", &cp_fps),
+            })
+        );
+        match run_enrol(&h.node, &cp_id, req_cp.as_bytes()).await {
+            EnrolReply::Err { ok: false, error } => {
+                assert_eq!(error.code, ErrorCode::Conflict);
+                let details = error
+                    .details
+                    .expect("confirmed conflict with proof must carry details");
+                assert_eq!(details["existing_principal"], json!("device:bad-proof"));
+                assert_eq!(details["node"], json!("tower"));
+            }
+            other => panic!("expected Conflict with details, got {other:?}"),
+        }
+        assert!(
+            !std::fs::read_to_string(&h.auth_keys)
+                .unwrap()
+                .contains(&format!("legion-invite:{cp_id}"))
+        );
     }
 }

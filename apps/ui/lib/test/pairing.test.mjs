@@ -335,7 +335,23 @@ test('confirmed conflict detail offers restore pairing via pinned-key probe whil
   assert.equal(pairedEvents[0].node, 'tower');
   assert.equal(ctrl.getState().invite, '');
 
-  // Older machine returning `conflict` WITHOUT `details.existing_principal` stays a normal error.
+  // Conflict marked `restorable: true` without `existing_principal` still offers Restore pairing
+  // with a clean sentence (details only improve the sentence).
+  const probeOnlyOutcome = classifyPairError(
+    {
+      code: 'conflict',
+      message: 'That public key is already present in authorized_keys.',
+      machine: 'tower',
+      details: { restorable: true, node: 'tower' },
+    },
+    'tower',
+    'phone',
+  );
+  assert.equal(probeOnlyOutcome.kind, 'already_paired');
+  assert.equal(probeOnlyOutcome.restorable, true);
+  assert.equal(probeOnlyOutcome.message, 'This phone is already paired with tower.');
+
+  // Conflict WITHOUT `details` or `restorable` (for example a foreign SSH key) stays a normal error.
   const olderOutcome = classifyPairError(
     {
       code: 'conflict',

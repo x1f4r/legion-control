@@ -1270,12 +1270,6 @@ impl Backend for LinkBackend {
                 );
             }
             let trimmed_principal = existing_principal.trim();
-            if trimmed_principal.is_empty() {
-                return Err(AppError::new(
-                    ErrorCode::InvalidArgs,
-                    "Existing principal cannot be empty.",
-                ));
-            }
             let parsed = Invite::parse(trimmed_invite).map_err(AppError::from)?;
             let target_node_name = parsed.node.clone();
             let device_label = {

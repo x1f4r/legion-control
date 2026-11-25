@@ -27,7 +27,9 @@ use super::authkeys::{
     resolve_safe_write_path, resolve_target, verify_exe_not_group_or_world_writable,
     verify_owner_matches_euid,
 };
-use super::keys::{generate_pairing_id, validate_ed25519_public_key, validate_invite_id};
+use super::keys::{
+    generate_pairing_id, validate_ed25519_public_key, validate_invite_id, verify_enrol_proof,
+};
 use super::registry::{
     DEVICE_PRINCIPAL_PREFIX, DeviceRegistryPushAudit, DeviceTombstone, DevicesFile, FleetDevice,
     FleetPushOutcome, MAX_DEVICES_TOML_BYTES, NON_OWNER_DEVICES_TOML_LIMIT_BYTES, PairedBy,
@@ -52,13 +54,18 @@ pub const ENROL_MAX_LINE_BYTES: usize = 2048;
 const ENROL_PROTOCOL: u32 = 1;
 
 /// Incoming enrolment line sent over stdin.
+///
+/// Unknown fields are ignored for forward compatibility, while every known field is validated
+/// strictly. Optional `proof` carries an OpenSSH `SSHSIG` (namespace `legion-enrol`) proving the
+/// caller controls the private half of `public_key` for this invite and machine.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct EnrolRequest {
     enrol: u32,
     id: String,
     public_key: String,
     name: String,
+    #[serde(default)]
+    proof: Option<String>,
 }
 
 /// Reply written as one JSON line to stdout by `legion gate --enrol`.
@@ -617,6 +624,22 @@ fn process_enrol_blocking_impl(
         (principal, None, None, base_args.clone(), Err(error))
     };
 
+    // Any `Conflict` reply consumes the invite from both `authorized_keys` and `state.invites` so
+    // a single invite can never be used to probe key after key.
+    let consume_invite_on_conflict = |principal: Option<String>, error: ErrorBody| {
+        let mut state_after = load_state(paths).unwrap_or_default();
+        let _ = edit_auth_keys_with_retry(&target, &write_path, |mut disk_auth| {
+            let (swept, _) = sweep(&mut disk_auth, &mut state_after, now);
+            let removed = disk_auth.retain(
+                |line| !matches!(&line.kind, LineKind::Invite { id, .. } if id == forced_id),
+            );
+            Ok(((swept || removed).then_some(disk_auth), ()))
+        });
+        state_after.invites.remove(forced_id);
+        let _ = save_state(paths, &state_after);
+        (principal, None, None, base_args.clone(), Err(error))
+    };
+
     let Some(invite) = state.invites.get(forced_id).cloned() else {
         let expired = invite_record
             .as_ref()
@@ -641,6 +664,26 @@ fn process_enrol_blocking_impl(
     let validated_key = match validate_ed25519_public_key(&request.public_key) {
         Ok(key) => key,
         Err(error) => return fail_with_sweep(Some(principal), error),
+    };
+
+    // Verify optional proof of possession before inspecting duplicates or writing anything.
+    // Invalid proof is refused immediately with `Denied` and writes nothing; absent proof is
+    // accepted for fresh enrolments from older clients but never allows replacing an unconfirmed
+    // entry or disclosing existing pairing details on conflict.
+    let proof_verified = match request.proof.as_deref() {
+        None => false,
+        Some(raw_proof) => {
+            if let Err(error) = verify_enrol_proof(
+                raw_proof,
+                forced_id,
+                &validated_key,
+                &node_name,
+                &invite.host_key_fingerprints,
+            ) {
+                return fail_with_sweep(Some(principal), error);
+            }
+            true
+        }
     };
 
     // Resolve and verify the principal's role against policy.toml under the config lock.
@@ -681,7 +724,7 @@ fn process_enrol_blocking_impl(
             );
         }
         if principal_exists_in_policy {
-            return fail_with_sweep(
+            return consume_invite_on_conflict(
                 Some(principal.clone()),
                 ErrorBody::new(
                     ErrorCode::Conflict,
@@ -827,41 +870,57 @@ fn process_enrol_blocking_impl(
         device: invite.created_by_device.clone(),
     });
 
-    let replaced_unconfirmed: Option<(String, FleetDevice)> = if !has_non_owned_auth_key
+    let replaced_unconfirmed: Option<(String, FleetDevice)> = if proof_verified
+        && !has_non_owned_auth_key
         && matching_registry.len() == 1
         && state.unconfirmed.contains_key(&matching_registry[0].0)
     {
-        // A fresh invite from the same device key whose previous enrolment on this machine has not
-        // yet opened an authenticated session replaces that unconfirmed leftover atomically under
-        // the same locks.
+        // Only a caller that proves possession of the private key for this invite and machine may
+        // replace a single local unconfirmed leftover for that key, taking whatever the new invite
+        // grants.
         Some(matching_registry[0].clone())
     } else if !matching_registry.is_empty() {
-        let existing = matching_registry
-            .iter()
-            .find(|(id, _)| !state.unconfirmed.contains_key(id))
-            .map(|(_, dev)| dev)
-            .unwrap_or(&matching_registry[0].1);
-        return fail_with_sweep(
+        if proof_verified {
+            let existing = matching_registry
+                .iter()
+                .find(|(id, _)| !state.unconfirmed.contains_key(id))
+                .map(|(_, dev)| dev)
+                .unwrap_or(&matching_registry[0].1);
+            return consume_invite_on_conflict(
+                Some(principal),
+                ErrorBody::new(
+                    ErrorCode::Conflict,
+                    format!(
+                        "This device is already paired with {} as {}.",
+                        node.name(),
+                        existing.principal
+                    ),
+                )
+                .with_hint(
+                    "Restore the existing pairing on this device, or remove it on this machine with `legion device.remove` before pairing again.",
+                )
+                .with_details(json!({
+                    "existing_principal": existing.principal,
+                    "existing_device": existing.name,
+                    "node": node.name(),
+                })),
+            );
+        }
+        // Without a verified proof (older client), never replace an unconfirmed entry and never
+        // disclose existing pairing details: match `main`'s plain conflict response and consume
+        // the invite.
+        return consume_invite_on_conflict(
             Some(principal),
             ErrorBody::new(
                 ErrorCode::Conflict,
-                format!(
-                    "This device is already paired with {} as {}.",
-                    node.name(),
-                    existing.principal
-                ),
+                "That public key is already present in authorized_keys.",
             )
             .with_hint(
-                "Restore the existing pairing on this device, or remove it on this machine with `legion device.remove` before pairing again.",
-            )
-            .with_details(json!({
-                "existing_principal": existing.principal,
-                "existing_device": existing.name,
-                "node": node.name(),
-            })),
+                "Generate a fresh, dedicated Ed25519 key pair for this device and try again.",
+            ),
         );
     } else if has_non_owned_auth_key {
-        return fail_with_sweep(
+        return consume_invite_on_conflict(
             Some(principal),
             ErrorBody::new(
                 ErrorCode::Conflict,
@@ -888,7 +947,7 @@ fn process_enrol_blocking_impl(
             .values()
             .any(|tomb| tomb.principal == principal))
     {
-        return fail_with_sweep(
+        return consume_invite_on_conflict(
             Some(principal.clone()),
             ErrorBody::new(
                 ErrorCode::Conflict,
@@ -1219,13 +1278,12 @@ fn process_enrol_blocking_impl(
         Ok((Some(disk_auth), ()))
     });
     if let Err(error) = add_key_result {
-        return (
-            Some(principal),
-            None,
-            None,
-            base_args,
-            Err(rollback_state(error, policy_touched, true)),
-        );
+        let is_conflict = error.code == ErrorCode::Conflict;
+        let rolled = rollback_state(error, policy_touched, true);
+        if is_conflict {
+            return consume_invite_on_conflict(Some(principal), rolled);
+        }
+        return (Some(principal), None, None, base_args, Err(rolled));
     }
     #[cfg(test)]
     if kill_point == Some(EnrolKillPoint::AfterAuthKeysBeforeInviteRemoval) {
