@@ -2,8 +2,9 @@
 // Appearance, Technical details, Refreshing, and About.
 
 import { html, useEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
+import { Icon } from '../icons.js';
 import { CodeText, CopyButton, Notice, QrCode, SwipeRow } from './common.js';
-import { ScrollContainer } from './scroll-container.js';
+import { SplitView } from './split-view.js';
 import { ToolDetail } from './tools.js';
 import {
   describePlainPermissions,
@@ -54,6 +55,7 @@ function ThisDevicePage({
   nodeInfo,
   tools,
   technical,
+  hideFirstLabel = false,
   onRequestConfirm,
   onDisconnected,
 }) {
@@ -107,7 +109,7 @@ function ThisDevicePage({
           `
         : null}
 
-      <p class="label">Identity</p>
+      ${!(hideFirstLabel && !error && !unreachable) ? html`<p class="label">Identity</p>` : null}
       <div class="list">
         <dl class=${technical ? 'kv' : 'kv plain'}>
           <dt>${technical ? 'principal' : 'Name'}</dt>
@@ -1249,6 +1251,7 @@ function ConnectionsPage({
   allowedSet,
   snapshot,
   technical,
+  hideFirstLabel = false,
   pairNotice,
   onDismissPairNotice,
   onRequestConfirm,
@@ -1575,7 +1578,16 @@ function ConnectionsPage({
         `;
       })}
 
-      <p class="label">Paired machines</p>
+      ${!(
+        hideFirstLabel &&
+        !error &&
+        !notice &&
+        !syncBanner &&
+        identityChangedNodes.length === 0 &&
+        disagreements.length === 0
+      )
+        ? html`<p class="label">Paired machines</p>`
+        : null}
       ${nodes.length > 0
         ? html`
             <div class="list">
@@ -1763,10 +1775,10 @@ function ConnectionsPage({
 
 // ── Appearance page ──────────────────────────────────────────────────────────────────────────
 
-function AppearancePage({ deviceNoun, settings, onUpdateSettings }) {
+function AppearancePage({ deviceNoun, settings, hideFirstLabel = false, onUpdateSettings }) {
   return html`
     <div>
-      <p class="label">Theme</p>
+      ${!hideFirstLabel ? html`<p class="label">Theme</p>` : null}
       <div class="seg" role="group" aria-label="Theme">
         ${[
           ['system', `Like the ${deviceNoun}`],
@@ -1874,10 +1886,10 @@ function AppearancePage({ deviceNoun, settings, onUpdateSettings }) {
 
 // ── Refreshing page ──────────────────────────────────────────────────────────────────────────
 
-function RefreshingPage({ settings, onUpdateSettings }) {
+function RefreshingPage({ settings, hideFirstLabel = false, onUpdateSettings }) {
   return html`
     <div>
-      <p class="label">Refresh automatically</p>
+      ${!hideFirstLabel ? html`<p class="label">Refresh automatically</p>` : null}
       <div class="seg" role="group" aria-label="Refresh interval">
         ${[
           [15, '15 s'],
@@ -1930,6 +1942,7 @@ function AboutPage({
   link,
   nodeInfo,
   technical,
+  hideFirstLabel = false,
   updateState,
   onCheckUpdates,
   onInstallUpdate,
@@ -1986,7 +1999,7 @@ function AboutPage({
 
   return html`
     <div>
-      <p class="label">Updates</p>
+      ${!hideFirstLabel ? html`<p class="label">Updates</p>` : null}
       ${actionError ? html`<${Notice} error=${actionError} />` : null}
       ${updateState?.rolled_back
         ? html`
@@ -2265,6 +2278,7 @@ export function SettingsView({
           nodeInfo=${nodeInfo}
           tools=${tools}
           technical=${technical}
+          hideFirstLabel=${wide}
           onRequestConfirm=${onRequestConfirm}
           onDisconnected=${onDisconnected}
         />
@@ -2283,6 +2297,7 @@ export function SettingsView({
           allowedSet=${allowedSet}
           snapshot=${snapshot}
           technical=${technical}
+          hideFirstLabel=${wide}
           pairNotice=${pairNotice}
           onDismissPairNotice=${onDismissPairNotice}
           onRequestConfirm=${onRequestConfirm}
@@ -2299,13 +2314,18 @@ export function SettingsView({
         <${AppearancePage}
           deviceNoun=${deviceNoun}
           settings=${settings}
+          hideFirstLabel=${wide}
           onUpdateSettings=${onUpdateSettings}
         />
       `;
     }
     if (page === 'refreshing') {
       return html`
-        <${RefreshingPage} settings=${settings} onUpdateSettings=${onUpdateSettings} />
+        <${RefreshingPage}
+          settings=${settings}
+          hideFirstLabel=${wide}
+          onUpdateSettings=${onUpdateSettings}
+        />
       `;
     }
     if (page === 'about') {
@@ -2314,6 +2334,7 @@ export function SettingsView({
           link=${link}
           nodeInfo=${nodeInfo}
           technical=${technical}
+          hideFirstLabel=${wide}
           updateState=${updateState}
           onCheckUpdates=${onCheckUpdates}
           onInstallUpdate=${onInstallUpdate}
@@ -2326,15 +2347,68 @@ export function SettingsView({
   }
 
   if (wide) {
+    let rightTitle = null;
+    let rightFact = null;
+    let rightLabel = null;
+
+    if (selectedPage === 'device') {
+      rightTitle = `This ${deviceNoun}`;
+      rightLabel = 'Identity';
+    } else if (selectedPage === 'connections') {
+      if (route.sub) {
+        const subTitle =
+          route.sub === 'pair'
+            ? 'Pair a machine'
+            : route.sub === 'invite'
+              ? 'Let another device in'
+              : route.sub === 'add'
+                ? 'Add a machine'
+                : route.item || 'Connections';
+        rightTitle = html`
+          <a
+            class="btn icon split-back"
+            href=${routeHref({ section: 'settings', page: 'connections' })}
+            aria-label="Back to Connections"
+          >
+            <${Icon} name="back" />
+          </a>
+          <span class="pane-title-text">${subTitle}</span>
+        `;
+        rightLabel = html`
+          <nav class="where" aria-label="Settings location">
+            <a href=${routeHref({ section: 'settings', page: 'connections' })}>Connections</a>
+            <i aria-hidden="true">›</i>
+            <span class="current">${subTitle}</span>
+          </nav>
+        `;
+      } else {
+        rightTitle = 'Connections';
+        rightFact = `${nodeCount} ${nodeCount === 1 ? 'machine' : 'machines'}`;
+        rightLabel = 'Paired machines';
+      }
+    } else if (selectedPage === 'appearance') {
+      rightTitle = 'Appearance';
+      rightLabel = 'Theme';
+    } else if (selectedPage === 'refreshing') {
+      rightTitle = 'Refreshing';
+      rightLabel = 'Refresh automatically';
+    } else if (selectedPage === 'about') {
+      rightTitle = 'About';
+      rightFact = `Legion ${updateState?.current?.version || UI_VERSION}`;
+      rightLabel = 'Updates';
+    }
+
     return html`
-      <div class="split">
-        <${ScrollContainer} as="section">
-          ${indexPane}
-        <//>
-        <${ScrollContainer} as="section">
-          <div class="settings-pane">${renderPage(selectedPage)}</div>
-        <//>
-      </div>
+      <${SplitView}
+        leftTitle="Settings"
+        leftLabel="General"
+        leftBody=${indexPane}
+        rightTitle=${rightTitle}
+        rightFact=${rightFact}
+        rightLabel=${rightLabel}
+        rightEmpty=${!selectedPage ? 'Choose a setting on the left.' : null}
+        rightBody=${selectedPage ? html`<div class="settings-pane">${renderPage(selectedPage)}</div>` : null}
+      />
     `;
   }
 

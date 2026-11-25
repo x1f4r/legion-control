@@ -391,3 +391,208 @@ test('refreshFleetProgressive in app mode keeps selected node fixed when A is of
   // In app mode, detail calls carry explicit `on: machine` so Link routes directly.
   assert.ok(seenOn.some((c) => c.tool === 'sys.info' && c.on === 'pi'));
 });
+
+test('desktop local node in fleet produces one row first in list and never emits local', async () => {
+  const link = {
+    kind: 'app',
+    async call(tool, args = {}, opts = {}) {
+      if (tool === 'fleet.list') {
+        return {
+          node: 'studio',
+          answered_by: 'local',
+          machines: [
+            { name: 'alpha', this_node: false, systems: [], wake_via: [] },
+            { name: 'studio', this_node: true, systems: [], wake_via: [] },
+            { name: 'tower', this_node: false, systems: [], wake_via: [] },
+          ],
+        };
+      }
+      if (tool === 'fleet.ping') {
+        const target = args.machines?.[0];
+        return { results: [{ machine: target, reachable: true, os: 'linux', arch: 'x86_64', version: '0.2.0', latency_ms: 3 }] };
+      }
+      if (tool === 'meta.version') return { version: '0.2.0', os: 'macos', arch: 'aarch64' };
+      if (tool === 'sys.info') return { node: opts.on || 'studio', os: { family: 'macos', arch: 'aarch64' }, uptime_s: 100, cpu: { usage_pct: 5 }, memory: { total: 100, used: 20 }, disks: [], gpus: [] };
+      if (tool === 'job.list') return { jobs: [] };
+      if (tool === 'power.status') return { system: 'macos', busy: { state: 'idle', reasons: [] } };
+      throw new Error(`unexpected ${tool}`);
+    },
+  };
+
+  const finalSnap = await refreshFleetProgressive({
+    link,
+    localNode: 'studio',
+    isLocalComputer: true,
+    onUpdate() {},
+    now: () => 1700000400000,
+  });
+
+  assert.deepEqual(
+    finalSnap.machines.map((m) => m.name),
+    ['studio', 'alpha', 'tower'],
+    'local computer must appear once and first even before alphabetically earlier peers',
+  );
+  assert.equal(finalSnap.machines[0].isLocalComputer, true);
+  assert.equal(finalSnap.machines[0].thisNode, true);
+  assert.equal(finalSnap.machines[1].isLocalComputer, false);
+  assert.equal(finalSnap.machines.some((m) => m.name === 'local'), false);
+});
+
+test('desktop local node not in any fleet produces one row under its own node name', async () => {
+  const link = {
+    kind: 'app',
+    async call(tool) {
+      if (tool === 'fleet.list') {
+        return { node: 'studio', answered_by: 'local', machines: [] };
+      }
+      if (tool === 'meta.version') return { version: '0.2.0', os: 'macos', arch: 'aarch64' };
+      if (tool === 'sys.info') return { node: 'studio', os: { family: 'macos', arch: 'aarch64' }, uptime_s: 50, cpu: { usage_pct: 2 }, memory: { total: 100, used: 10 }, disks: [], gpus: [] };
+      if (tool === 'job.list') return { jobs: [] };
+      if (tool === 'power.status') return { system: 'macos', busy: { state: 'idle', reasons: [] } };
+      throw new Error(`unexpected ${tool}`);
+    },
+  };
+
+  const finalSnap = await refreshFleetProgressive({
+    link,
+    localNode: 'studio',
+    isLocalComputer: true,
+    onUpdate() {},
+    now: () => 1700000500000,
+  });
+
+  assert.equal(finalSnap.machines.length, 1);
+  assert.equal(finalSnap.machines[0].name, 'studio');
+  assert.equal(finalSnap.machines[0].isLocalComputer, true);
+  assert.equal(finalSnap.machines[0].reachable, true);
+});
+
+test('pending local node shows one row named This computer until known, then settles to its real node name without duplicating', async () => {
+  let nodeReady = false;
+  let learnedName = null;
+  const resolvedCallbacks = [];
+
+  const link = {
+    kind: 'app',
+    getLocalMachineName: () => learnedName,
+    setLocalMachineName(name) {
+      learnedName = name;
+    },
+    async call(tool, args = {}, opts = {}) {
+      if (!nodeReady) {
+        throw { code: 'unreachable', message: 'Starting up.', machine: 'This computer' };
+      }
+      if (tool === 'fleet.list') {
+        learnedName = 'studio';
+        return {
+          node: 'studio',
+          answered_by: 'studio',
+          machines: [
+            { name: 'studio', this_node: true, systems: [], wake_via: [] },
+            { name: 'tower', this_node: false, systems: [], wake_via: [] },
+          ],
+        };
+      }
+      if (tool === 'fleet.ping') {
+        return { results: [{ machine: args.machines[0], reachable: true, os: 'linux', arch: 'x86_64', version: '0.2.0', latency_ms: 5 }] };
+      }
+      if (tool === 'meta.whoami') return { node: 'studio', principal: 'local', role: 'owner', tools: [] };
+      if (tool === 'meta.version') return { version: '0.2.0', os: 'macos', arch: 'aarch64' };
+      if (tool === 'sys.info') return { node: opts.on === 'tower' ? 'tower' : 'studio', os: { family: 'macos', arch: 'aarch64' }, uptime_s: 30, cpu: { usage_pct: 4 }, memory: { total: 100, used: 15 }, disks: [], gpus: [] };
+      if (tool === 'job.list') return { jobs: [] };
+      if (tool === 'power.status') return { system: 'macos', busy: { state: 'idle', reasons: [] } };
+      throw new Error(`unexpected ${tool}`);
+    },
+  };
+
+  // Phase 1: node name cannot be read yet -> one row named "This computer".
+  const firstSnap = await refreshFleetProgressive({
+    link,
+    localNode: 'This computer',
+    isLocalComputer: true,
+    nodeNamePending: true,
+    onLocalNodeResolved: (n) => resolvedCallbacks.push(n),
+    onUpdate() {},
+    now: () => 1700000600000,
+  });
+
+  assert.deepEqual(
+    firstSnap.machines.map((m) => m.name),
+    ['This computer'],
+  );
+  assert.equal(firstSnap.machines[0].isLocalComputer, true);
+  assert.equal(firstSnap.machines[0].nodeNamePending, true);
+  assert.deepEqual(resolvedCallbacks, []);
+
+  // Phase 2: node becomes reachable -> settles in place to 'studio', never showing both rows.
+  nodeReady = true;
+  const seenSnapshots = [];
+  const secondSnap = await refreshFleetProgressive({
+    link,
+    localNode: 'This computer',
+    isLocalComputer: true,
+    nodeNamePending: true,
+    initialMachines: firstSnap.machines,
+    onLocalNodeResolved: (n) => resolvedCallbacks.push(n),
+    onUpdate(snap) {
+      seenSnapshots.push(snap.machines.map((m) => m.name));
+    },
+    now: () => 1700000605000,
+  });
+
+  for (const names of seenSnapshots) {
+    assert.equal(
+      names.includes('This computer') && names.includes('studio'),
+      false,
+      `This computer and studio must never coexist in one snapshot: ${JSON.stringify(names)}`,
+    );
+    assert.equal(names.includes('local'), false);
+  }
+  assert.deepEqual(
+    secondSnap.machines.map((m) => m.name),
+    ['studio', 'tower'],
+  );
+  assert.equal(secondSnap.machines[0].isLocalComputer, true);
+  assert.equal(secondSnap.machines[0].nodeNamePending, false);
+  assert.deepEqual(resolvedCallbacks, ['studio']);
+});
+
+test('browser HTTP door without local pipe remains unchanged', async () => {
+  const link = {
+    kind: 'http',
+    async call(tool, args = {}) {
+      if (tool === 'fleet.list') {
+        return {
+          node: 'tower',
+          machines: [
+            { name: 'tower', this_node: true, systems: [], wake_via: [] },
+            { name: 'pi', this_node: false, systems: [], wake_via: [] },
+          ],
+        };
+      }
+      if (tool === 'fleet.ping') {
+        return { results: [{ machine: args.machines[0], reachable: true, os: 'linux', arch: 'aarch64', version: '0.2.0', latency_ms: 4 }] };
+      }
+      if (tool === 'meta.version') return { version: '0.2.0', os: 'linux', arch: 'x86_64' };
+      if (tool === 'sys.info') return { os: { family: 'linux', arch: 'x86_64' }, uptime_s: 20, cpu: { usage_pct: 5 }, memory: { total: 100, used: 10 }, disks: [], gpus: [] };
+      if (tool === 'job.list') return { jobs: [] };
+      if (tool === 'power.status') return { system: 'linux', busy: { state: 'idle', reasons: [] } };
+      throw new Error(`unexpected ${tool}`);
+    },
+  };
+
+  const snap = await refreshFleetProgressive({
+    link,
+    localNode: 'tower',
+    onUpdate() {},
+    now: () => 1700000700000,
+  });
+
+  assert.deepEqual(
+    snap.machines.map((m) => m.name),
+    ['tower', 'pi'],
+  );
+  assert.equal(snap.machines[0].thisNode, true);
+  assert.equal(snap.machines[0].isLocalComputer, false);
+  assert.equal(snap.machines[1].isLocalComputer, false);
+});

@@ -220,15 +220,17 @@ pub async fn repair_store(
 pub async fn invalidate_sessions(
     backend: State<'_, SharedBackend>,
     content: State<'_, SharedContentServer>,
+    updater: State<'_, SharedUpdater>,
 ) -> Result<(), AppError> {
     #[cfg(any(target_os = "android", target_os = "ios"))]
     {
+        let _resume_guard = updater.0.track_external_operation();
         content.0.on_app_resumed();
         backend.0.invalidate_sessions().await
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
-        let _ = (backend, content);
+        let _ = (backend, content, updater);
         Ok(())
     }
 }
@@ -567,6 +569,9 @@ pub struct MediaCheckReport {
     /// Result of post-resume loopback media reload check when requested (iOS).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_ok: Option<bool>,
+    /// Lifecycle trigger that fired the post-resume media check (e.g. `tauri://resumed`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_trigger: Option<String>,
     /// Failure description when `ok` is false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,

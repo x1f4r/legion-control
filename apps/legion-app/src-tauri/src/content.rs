@@ -21,11 +21,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use http::header::{
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
     ACCESS_CONTROL_EXPOSE_HEADERS, CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, CONTENT_RANGE,
-    CONTENT_SECURITY_POLICY, CONTENT_TYPE, HOST, HeaderName, HeaderValue, RANGE, REFERRER_POLICY,
-    VARY, X_CONTENT_TYPE_OPTIONS,
+    CONTENT_SECURITY_POLICY, CONTENT_TYPE, HOST, HeaderName, HeaderValue, ORIGIN, RANGE,
+    REFERRER_POLICY, VARY, X_CONTENT_TYPE_OPTIONS,
 };
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use http_body::Body as _;
@@ -41,7 +43,8 @@ use legion_content::{
 };
 use legion_link::proto::{ErrorBody as ProtoErrorBody, ErrorCode as ProtoErrorCode};
 use serde::{Deserialize, Serialize};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -69,12 +72,45 @@ const CUSTOM_SCHEME_BUDGET_UNIT_BYTES: usize = 64 * 1024;
 /// Maximum simultaneous TCP connections accepted by the loopback content listener.
 pub const MAX_LOOPBACK_CONNECTIONS: usize = 32;
 
+/// Bounded TCP send buffer (`SO_SNDBUF`) for loopback content sockets (128 KiB), matching
+/// `legion-doors` so paused players and revoked or torn-down streams backpressure promptly rather
+/// than pulling megabytes into kernel loopback buffers.
+const LOOPBACK_SOCKET_SNDBUF: u32 = 128 * 1024;
+
 /// Maximum time an authenticated loopback client may take to send HTTP request headers (5 seconds).
 pub const LOOPBACK_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum time an unauthenticated loopback connection (one that has not yet presented a valid
 /// ticket) may take to send complete HTTP request headers before being closed (2 seconds).
 pub const LOOPBACK_UNAUTH_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Maximum total time allowed for a loopback proof-of-ownership liveness probe (400 ms).
+pub const LOOPBACK_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
+
+/// Maximum age of a verified loopback proof before `mint_url` re-probes ownership (2 seconds).
+pub const LOOPBACK_PROBE_FRESHNESS: Duration = Duration::from_secs(2);
+
+/// Fixed loopback-only path answered by the proof-of-ownership liveness probe.
+const LOOPBACK_PROBE_PATH: &str = "/v1/content/.probe";
+
+/// Header carrying the fresh 256-bit base64url challenge sent by the liveness probe.
+const LOOPBACK_PROBE_CHALLENGE_HEADER: HeaderName =
+    HeaderName::from_static("x-legion-probe-challenge");
+
+/// Header carrying the caller's keyed BLAKE3 authentication tag over the challenge.
+const LOOPBACK_PROBE_AUTH_HEADER: HeaderName = HeaderName::from_static("x-legion-probe-auth");
+
+/// Header carrying the listener's keyed BLAKE3 proof over the challenge.
+const LOOPBACK_PROBE_PROOF_HEADER: HeaderName = HeaderName::from_static("x-legion-probe-proof");
+
+/// Domain separation prefix for the probe request MAC.
+const LOOPBACK_PROBE_REQ_DOMAIN: &[u8] = b"legion-loopback-probe-req-v1:";
+
+/// Domain separation prefix for the probe response MAC.
+const LOOPBACK_PROBE_RESP_DOMAIN: &[u8] = b"legion-loopback-probe-resp-v1:";
+
+/// Maximum response bytes read from a loopback probe reply (4 KiB).
+const LOOPBACK_PROBE_MAX_RESPONSE_BYTES: usize = 4096;
 
 /// Initial exponential backoff delay after a transient `accept()` error.
 const ACCEPT_BACKOFF_INITIAL: Duration = Duration::from_millis(25);
@@ -196,6 +232,8 @@ struct ListenerHandle {
     shutdown: CancellationToken,
     accept_alive: Arc<AtomicBool>,
     accept_task: tokio::task::JoinHandle<()>,
+    probe_secret: [u8; 32],
+    last_verified: Instant,
 }
 
 impl ListenerHandle {
@@ -285,6 +323,11 @@ impl LoopbackConnTable {
             self.active.remove(idx);
         }
     }
+}
+
+struct LoopbackRequestCtx<'a> {
+    conn_authenticated: &'a AtomicBool,
+    probe_secret: &'a [u8; 32],
 }
 
 struct LoopbackConnGuard {
@@ -401,6 +444,8 @@ pub struct AppContentServer {
     allowed_origins: Vec<String>,
     idle_shutdown: Duration,
     header_read_timeout: Duration,
+    probe_timeout: Duration,
+    probe_freshness: Duration,
     loopback_conns: Arc<Mutex<LoopbackConnTable>>,
     custom_scheme_max_full_bytes: u64,
     custom_scheme_memory_budget: Arc<Semaphore>,
@@ -478,6 +523,8 @@ impl AppContentServer {
             allowed_origins,
             idle_shutdown,
             header_read_timeout,
+            probe_timeout: LOOPBACK_PROBE_TIMEOUT,
+            probe_freshness: LOOPBACK_PROBE_FRESHNESS,
             loopback_conns: Arc::new(Mutex::new(LoopbackConnTable::new(conn_cap))),
             custom_scheme_max_full_bytes,
             custom_scheme_memory_budget: Arc::new(Semaphore::new(budget_units)),
@@ -762,10 +809,10 @@ impl AppContentServer {
         });
     }
 
-    /// Verifies from our own listener state that an active loopback accept loop is still running;
-    /// if it has stopped or been cancelled while live tickets remain, tears down the stale handle
-    /// and binds a fresh OS-chosen port on `127.0.0.1:0` (never probing via TCP connect and never
-    /// reusing the previous port).
+    /// Verifies that an active loopback accept loop is still running AND answers a fresh
+    /// proof-of-ownership probe with this listener's secret; if either check fails while live
+    /// tickets remain, tears down the stale handle and binds a fresh OS-chosen port on
+    /// `127.0.0.1:0`.
     pub async fn probe_or_recover_loopback(self: &Arc<Self>) -> Result<Option<u16>, AppError> {
         if self.mode != ContentMountMode::Loopback {
             return Ok(None);
@@ -776,17 +823,32 @@ impl AppContentServer {
                 .listener
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            slot.as_ref().map(|h| (h.port, h.is_alive()))
+            slot.as_ref()
+                .map(|h| (h.port, h.is_alive(), h.probe_secret))
         };
-        let Some((port, alive)) = state else {
+        let Some((port, alive, secret)) = state else {
             return Ok(None);
         };
-        if alive {
-            return Ok(Some(port));
+        if alive && probe_loopback_ownership(port, &secret, self.probe_timeout).await {
+            let still_live = {
+                let mut slot = self
+                    .listener
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(h) = slot.as_mut().filter(|h| h.port == port && h.is_alive()) {
+                    h.last_verified = Instant::now();
+                    true
+                } else {
+                    false
+                }
+            };
+            if still_live {
+                return Ok(Some(port));
+            }
         }
 
-        // Accept task is no longer live: tear down the stale handle and bind a fresh OS-chosen
-        // port if live tickets remain.
+        // Accept task stopped or failed proof-of-ownership (e.g. reclaimed socket or squatter):
+        // tear down the stale handle and bind a fresh OS-chosen port if live tickets remain.
         self.teardown_listener_if_port(port);
         if self.tickets.is_empty() {
             return Ok(None);
@@ -906,8 +968,9 @@ impl AppContentServer {
     }
 
     /// Ensures a loopback listener owned by this server is alive before returning a freshly minted
-    /// URL. Decides liveness strictly from Legion's own accept-task state (never via a TCP connect
-    /// to the old port) and always binds a fresh OS-chosen port on recovery.
+    /// URL. Requires both a running accept task and, whenever the last successful proof is older
+    /// than [`LOOPBACK_PROBE_FRESHNESS`], a valid proof-of-ownership probe response; tears down and
+    /// binds a fresh OS-chosen port on any failure.
     async fn ensure_live_loopback_listener(self: &Arc<Self>) -> Result<u16, AppError> {
         let _guard = self.listener_lock.lock().await;
         let state = {
@@ -915,11 +978,31 @@ impl AppContentServer {
                 .listener
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            slot.as_ref().map(|h| (h.port, h.is_alive()))
+            slot.as_ref()
+                .map(|h| (h.port, h.is_alive(), h.probe_secret, h.last_verified))
         };
-        if let Some((port, alive)) = state {
+        if let Some((port, alive, secret, last_verified)) = state {
             if alive {
-                return Ok(port);
+                if last_verified.elapsed() < self.probe_freshness {
+                    return Ok(port);
+                }
+                if probe_loopback_ownership(port, &secret, self.probe_timeout).await {
+                    let still_live = {
+                        let mut slot = self
+                            .listener
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if let Some(h) = slot.as_mut().filter(|h| h.port == port && h.is_alive()) {
+                            h.last_verified = Instant::now();
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if still_live {
+                        return Ok(port);
+                    }
+                }
             }
             self.teardown_listener_if_port(port);
         }
@@ -937,11 +1020,32 @@ impl AppContentServer {
             return Ok(port);
         }
 
+        let mut probe_secret = [0u8; 32];
+        getrandom::fill(&mut probe_secret).map_err(|err| {
+            AppError::new(
+                ErrorCode::Internal,
+                format!("Could not generate local content listener secret: {err}"),
+            )
+        })?;
+
         let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
-        let tcp = TcpListener::bind(bind_addr).await.map_err(|err| {
+        let socket = TcpSocket::new_v4().map_err(|err| {
+            AppError::new(
+                ErrorCode::Internal,
+                format!("Could not create local content listener socket: {err}"),
+            )
+        })?;
+        let _ = socket.set_send_buffer_size(LOOPBACK_SOCKET_SNDBUF);
+        socket.bind(bind_addr).map_err(|err| {
             AppError::new(
                 ErrorCode::Internal,
                 format!("Could not bind local content listener on 127.0.0.1: {err}"),
+            )
+        })?;
+        let tcp = socket.listen(1024).map_err(|err| {
+            AppError::new(
+                ErrorCode::Internal,
+                format!("Could not listen on local content socket 127.0.0.1: {err}"),
             )
         })?;
         let port = tcp
@@ -961,7 +1065,7 @@ impl AppContentServer {
         let accept_flag = Arc::clone(&accept_alive);
         let accept_task = tokio::spawn(async move {
             server
-                .run_accept_loop(tcp, port, accept_shutdown, accept_flag)
+                .run_accept_loop(tcp, port, probe_secret, accept_shutdown, accept_flag)
                 .await;
         });
         {
@@ -974,6 +1078,8 @@ impl AppContentServer {
                 shutdown: shutdown.clone(),
                 accept_alive,
                 accept_task,
+                probe_secret,
+                last_verified: Instant::now(),
             });
         }
         self.touch_activity();
@@ -990,6 +1096,7 @@ impl AppContentServer {
         self: Arc<Self>,
         tcp: TcpListener,
         port: u16,
+        probe_secret: [u8; 32],
         shutdown: CancellationToken,
         accept_alive: Arc<AtomicBool>,
     ) {
@@ -1072,7 +1179,10 @@ impl AppContentServer {
                                 &uri,
                                 &headers,
                                 options,
-                                Some(&auth_flag),
+                                Some(LoopbackRequestCtx {
+                                    conn_authenticated: &auth_flag,
+                                    probe_secret: &probe_secret,
+                                }),
                             )
                             .await;
                         Ok::<Response<ContentBody>, Infallible>(resp)
@@ -1091,8 +1201,9 @@ impl AppContentServer {
                     tokio::select! {
                         biased;
                         () = conn_shutdown.cancelled() => {
-                            conn.as_mut().graceful_shutdown();
-                            let _ = conn.await;
+                            // Drop the connection immediately on listener shutdown/teardown so
+                            // in-flight streaming bodies stop reading from the remote source and
+                            // release permits/guards without waiting for a paused client.
                             break;
                         }
                         () = conn_evict.cancelled() => {
@@ -1161,7 +1272,7 @@ impl AppContentServer {
         uri: &Uri,
         headers: &HeaderMap,
         options: ServeOptions,
-        conn_authenticated: Option<&AtomicBool>,
+        loopback: Option<LoopbackRequestCtx<'_>>,
     ) -> Response<ContentBody> {
         self.touch_activity();
 
@@ -1176,6 +1287,20 @@ impl AppContentServer {
             return preflight_response(cors_origin, options.corp);
         }
 
+        // Loopback-only proof-of-ownership liveness probe. Must never flip `conn_authenticated`
+        // (counts as unauthenticated for connection limits), never log secrets or populate ticket
+        // diagnostics, and must fall through to the exact generic `404` when the secret is absent
+        // or invalid.
+        if *method == Method::GET
+            && uri.path() == LOOPBACK_PROBE_PATH
+            && uri.query().is_none()
+            && let Some(ctx) = loopback.as_ref()
+            && let Some(response) =
+                verify_and_build_probe_response(ctx.probe_secret, headers, options.corp)
+        {
+            return response;
+        }
+
         let Some((ticket_id, file_name)) = parse_content_path(uri.path()) else {
             return not_found_response(options.corp, cors_origin);
         };
@@ -1186,9 +1311,9 @@ impl AppContentServer {
         // header timeout.
         let valid_ticket = self.tickets.lookup(ticket_id);
         if valid_ticket.is_some()
-            && let Some(auth) = conn_authenticated
+            && let Some(ctx) = loopback.as_ref()
         {
-            auth.store(true, Ordering::Release);
+            ctx.conn_authenticated.store(true, Ordering::Release);
         }
         let key_hash = valid_ticket.as_ref().map(|t| t.key_hash);
         let stream_failed = key_hash.map(|h| self.ensure_ticket_stream_flag(h));
@@ -1458,6 +1583,149 @@ fn not_found_response(corp: CorpPolicy, cors_origin: Option<HeaderValue>) -> Res
     response
 }
 
+fn probe_mac(secret: &[u8; 32], domain: &[u8], challenge: &[u8; 32]) -> blake3::Hash {
+    let mut hasher = blake3::Hasher::new_keyed(secret);
+    hasher.update(domain);
+    hasher.update(challenge);
+    hasher.finalize()
+}
+
+fn decode_b64url_32(raw: &str) -> Option<[u8; 32]> {
+    let decoded = URL_SAFE_NO_PAD.decode(raw.as_bytes()).ok()?;
+    decoded.try_into().ok()
+}
+
+fn single_header_str<'a>(headers: &'a HeaderMap, name: &HeaderName) -> Option<&'a str> {
+    let mut iter = headers.get_all(name).iter();
+    let first = iter.next()?;
+    if iter.next().is_some() {
+        return None;
+    }
+    first.to_str().ok().map(str::trim)
+}
+
+fn verify_and_build_probe_response(
+    secret: &[u8; 32],
+    headers: &HeaderMap,
+    corp: CorpPolicy,
+) -> Option<Response<ContentBody>> {
+    // The internal loopback probe never sends an Origin header.
+    if headers.contains_key(ORIGIN) {
+        return None;
+    }
+    let challenge = decode_b64url_32(single_header_str(
+        headers,
+        &LOOPBACK_PROBE_CHALLENGE_HEADER,
+    )?)?;
+    let auth = decode_b64url_32(single_header_str(headers, &LOOPBACK_PROBE_AUTH_HEADER)?)?;
+    let expected_auth = probe_mac(secret, LOOPBACK_PROBE_REQ_DOMAIN, &challenge);
+    if expected_auth != blake3::Hash::from_bytes(auth) {
+        return None;
+    }
+    let proof = probe_mac(secret, LOOPBACK_PROBE_RESP_DOMAIN, &challenge);
+    let proof_b64 = URL_SAFE_NO_PAD.encode(proof.as_bytes());
+    let proof_val = HeaderValue::from_str(&proof_b64).ok()?;
+
+    let mut response = Response::new(ContentBody::empty());
+    *response.status_mut() = StatusCode::NO_CONTENT;
+    apply_base_security_headers(response.headers_mut(), corp);
+    response
+        .headers_mut()
+        .insert(LOOPBACK_PROBE_PROOF_HEADER, proof_val);
+    response
+        .headers_mut()
+        .insert(CONNECTION, HeaderValue::from_static("close"));
+    Some(response)
+}
+
+fn verify_probe_http_response(raw: &[u8], expected_proof: &blake3::Hash) -> bool {
+    let Some(header_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let Ok(head) = std::str::from_utf8(&raw[..header_end]) else {
+        return false;
+    };
+    let mut lines = head.split("\r\n");
+    let Some(status_line) = lines.next() else {
+        return false;
+    };
+    if status_line != "HTTP/1.1 204" && !status_line.starts_with("HTTP/1.1 204 ") {
+        return false;
+    }
+    let mut proof_value: Option<&str> = None;
+    for line in lines {
+        let Some((name, val)) = line.split_once(':') else {
+            return false;
+        };
+        if name
+            .trim()
+            .eq_ignore_ascii_case(LOOPBACK_PROBE_PROOF_HEADER.as_str())
+        {
+            if proof_value.is_some() {
+                return false;
+            }
+            proof_value = Some(val.trim());
+        }
+    }
+    let Some(proof_b64) = proof_value else {
+        return false;
+    };
+    let Some(proof_bytes) = decode_b64url_32(proof_b64) else {
+        return false;
+    };
+    *expected_proof == blake3::Hash::from_bytes(proof_bytes)
+}
+
+async fn probe_loopback_ownership(port: u16, secret: &[u8; 32], timeout: Duration) -> bool {
+    let mut challenge = [0u8; 32];
+    if getrandom::fill(&mut challenge).is_err() {
+        return false;
+    }
+    let challenge_b64 = URL_SAFE_NO_PAD.encode(challenge);
+    let req_tag = probe_mac(secret, LOOPBACK_PROBE_REQ_DOMAIN, &challenge);
+    let req_tag_b64 = URL_SAFE_NO_PAD.encode(req_tag.as_bytes());
+    let expected_proof = probe_mac(secret, LOOPBACK_PROBE_RESP_DOMAIN, &challenge);
+
+    let request = format!(
+        "GET {LOOPBACK_PROBE_PATH} HTTP/1.1\r\n\
+         Host: 127.0.0.1:{port}\r\n\
+         {LOOPBACK_PROBE_CHALLENGE_HEADER}: {challenge_b64}\r\n\
+         {LOOPBACK_PROBE_AUTH_HEADER}: {req_tag_b64}\r\n\
+         Connection: close\r\n\r\n"
+    );
+
+    let probe_fut = async {
+        let mut stream = TcpStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+            .await
+            .ok()?;
+        let _ = stream.set_nodelay(true);
+        stream.write_all(request.as_bytes()).await.ok()?;
+        stream.flush().await.ok()?;
+
+        let mut buf = Vec::with_capacity(512);
+        let mut chunk = [0u8; 512];
+        loop {
+            let n = stream.read(&mut chunk).await.ok()?;
+            if n == 0 {
+                break;
+            }
+            let remaining = LOOPBACK_PROBE_MAX_RESPONSE_BYTES.saturating_sub(buf.len());
+            buf.extend_from_slice(&chunk[..n.min(remaining)]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n")
+                || buf.len() >= LOOPBACK_PROBE_MAX_RESPONSE_BYTES
+            {
+                break;
+            }
+        }
+        Some(buf)
+    };
+
+    let Ok(Some(raw)) = tokio::time::timeout(timeout, probe_fut).await else {
+        return false;
+    };
+    verify_probe_http_response(&raw, &expected_proof)
+}
+
 fn is_fatal_accept_error(err: &std::io::Error) -> bool {
     matches!(
         err.kind(),
@@ -1631,7 +1899,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     use legion_link::proto::{
         ErrorBody, ErrorCode as ProtoCode, HelloResult, PROTOCOL, Response as ProtoResp, VERSION,
@@ -1641,8 +1909,8 @@ mod tests {
         StreamOpenError, StreamOpener, TransportHandle,
     };
     use serde_json::{Value, json};
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::TcpStream;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::sync::Notify;
 
     use super::*;
     use crate::backend::{
@@ -1682,10 +1950,99 @@ mod tests {
         TruncateAfterBytes(usize),
     }
 
+    #[derive(Clone)]
+    enum MockFile {
+        Bytes(Vec<u8>),
+        /// Deterministic virtual pattern file of arbitrary length without allocating RAM.
+        Pattern {
+            len: u64,
+            mul: u64,
+            add: u64,
+        },
+    }
+
+    impl MockFile {
+        fn len(&self) -> u64 {
+            match self {
+                Self::Bytes(bytes) => bytes.len() as u64,
+                Self::Pattern { len, .. } => *len,
+            }
+        }
+
+        fn fill_range(&self, offset: u64, out: &mut [u8]) {
+            match self {
+                Self::Bytes(bytes) => {
+                    let start = usize::try_from(offset).unwrap();
+                    out.copy_from_slice(&bytes[start..start + out.len()]);
+                }
+                Self::Pattern { mul, add, .. } => {
+                    for (idx, slot) in out.iter_mut().enumerate() {
+                        let pos = offset.wrapping_add(idx as u64);
+                        *slot = (pos.wrapping_mul(*mul).wrapping_add(*add) % 251) as u8;
+                    }
+                }
+            }
+        }
+
+        fn assert_matches(&self, offset: u64, actual: &[u8]) {
+            match self {
+                Self::Bytes(bytes) => {
+                    let start = usize::try_from(offset).unwrap();
+                    assert_eq!(actual, &bytes[start..start + actual.len()]);
+                }
+                Self::Pattern { mul, add, .. } => {
+                    for (idx, &byte) in actual.iter().enumerate() {
+                        let pos = offset.wrapping_add(idx as u64);
+                        let expected = (pos.wrapping_mul(*mul).wrapping_add(*add) % 251) as u8;
+                        assert_eq!(byte, expected, "pattern mismatch at byte offset {pos}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct MockStreamStats {
+        stream_opens: AtomicU64,
+        read_windows: AtomicU64,
+        bytes_produced: AtomicU64,
+        parked_streams: AtomicU64,
+        active_remote_tasks: AtomicUsize,
+        notify: Notify,
+    }
+
+    struct ActiveTaskGuard {
+        stats: Arc<MockStreamStats>,
+    }
+
+    impl Drop for ActiveTaskGuard {
+        fn drop(&mut self) {
+            self.stats
+                .active_remote_tasks
+                .fetch_sub(1, Ordering::AcqRel);
+            self.stats.notify.notify_waiters();
+        }
+    }
+
+    struct ParkGuard {
+        park: CancellationToken,
+        stats: Arc<MockStreamStats>,
+    }
+
+    impl Drop for ParkGuard {
+        fn drop(&mut self) {
+            if self.park.is_cancelled() {
+                self.stats.parked_streams.fetch_add(1, Ordering::AcqRel);
+                self.stats.notify.notify_waiters();
+            }
+        }
+    }
+
     struct MemoryFilesOpener {
-        files: Arc<HashMap<String, Vec<u8>>>,
+        files: Arc<HashMap<String, MockFile>>,
         window_policy: Option<legion_link::content::WindowPolicy>,
         fault: Arc<Mutex<MockStreamFault>>,
+        stats: Arc<MockStreamStats>,
     }
 
     impl StreamOpener for MemoryFilesOpener {
@@ -1700,16 +2057,24 @@ mod tests {
             let files = Arc::clone(&self.files);
             let supports_keep_open = self.window_policy.is_some();
             let fault = Arc::clone(&self.fault);
+            let stats = Arc::clone(&self.stats);
             Box::pin(async move {
+                stats.stream_opens.fetch_add(1, Ordering::AcqRel);
                 let (client_in, mut server_out) = tokio::io::duplex(64 * 1024);
                 let (server_in, client_out) = tokio::io::duplex(64 * 1024);
                 let cancel = CancellationToken::new();
                 let park = CancellationToken::new();
                 let watch_cancel = cancel.clone();
                 let watch_park = park.clone();
+                stats.active_remote_tasks.fetch_add(1, Ordering::AcqRel);
+                let task_stats = Arc::clone(&stats);
                 tokio::spawn(async move {
+                    let _task_guard = ActiveTaskGuard {
+                        stats: Arc::clone(&task_stats),
+                    };
                     let mut reader = BufReader::new(server_in);
                     let mut sent_protocol = false;
+                    let mut scratch = vec![0u8; 64 * 1024];
                     loop {
                         let mut line = String::new();
                         let read_res = tokio::select! {
@@ -1727,38 +2092,39 @@ mod tests {
                             sent_protocol = true;
                         }
                         let path = req["path"].as_str().unwrap_or("");
-                        let Some(payload) = files.get(path) else {
+                        let Some(file) = files.get(path) else {
                             let err = json!({
                                 "error": ErrorBody::new(ProtoCode::NotFound, "file not found")
                             });
                             let _ = server_out.write_all(format!("{err}\n").as_bytes()).await;
                             return;
                         };
-                        let offset = req["offset"].as_u64().unwrap_or(0) as usize;
-                        let req_len = req
-                            .get("length")
-                            .and_then(Value::as_u64)
-                            .map(|n| n as usize);
+                        let file_len = file.len();
+                        let offset = req["offset"].as_u64().unwrap_or(0);
+                        let req_len = req.get("length").and_then(Value::as_u64);
                         let active_fault = fault.lock().unwrap().clone();
                         if let MockStreamFault::ErrorOnGet { code, message } = active_fault {
                             let err = json!({ "error": ErrorBody::new(code, message) });
                             let _ = server_out.write_all(format!("{err}\n").as_bytes()).await;
                             return;
                         }
-                        if offset > payload.len() {
+                        if offset > file_len {
                             let err = json!({
                                 "error": ErrorBody::new(ProtoCode::Conflict, "offset past end")
-                                    .with_details(json!({"actual": payload.len()}))
+                                    .with_details(json!({"actual": file_len}))
                             });
                             let _ = server_out.write_all(format!("{err}\n").as_bytes()).await;
                             return;
                         }
-                        let avail = payload.len() - offset;
+                        let avail = file_len - offset;
                         let len = req_len.map_or(avail, |n| n.min(avail));
+                        if len > 0 {
+                            task_stats.read_windows.fetch_add(1, Ordering::AcqRel);
+                        }
                         let keep_open =
                             supports_keep_open && req["keep_open"].as_bool() == Some(true);
                         let mut ready = json!({
-                            "size": payload.len(),
+                            "size": file_len,
                             "offset": offset,
                             "length": len,
                             "mtime": { "secs": 1_700_000_000i64, "nanos": 0u32 },
@@ -1775,20 +2141,42 @@ mod tests {
                             return;
                         }
                         if let MockStreamFault::TruncateAfterBytes(cut) = active_fault
-                            && len > cut
+                            && len > cut as u64
                         {
-                            let _ = server_out.write_all(&payload[offset..offset + cut]).await;
+                            let cut_u64 = cut as u64;
+                            let mut cut_written = 0u64;
+                            while cut_written < cut_u64 {
+                                let step =
+                                    (cut_u64 - cut_written).min(scratch.len() as u64) as usize;
+                                file.fill_range(offset + cut_written, &mut scratch[..step]);
+                                if server_out.write_all(&scratch[..step]).await.is_err() {
+                                    return;
+                                }
+                                cut_written += step as u64;
+                                task_stats
+                                    .bytes_produced
+                                    .fetch_add(step as u64, Ordering::AcqRel);
+                            }
                             let _ = server_out.shutdown().await;
                             return;
                         }
-                        let write_ok = tokio::select! {
-                            biased;
-                            () = watch_cancel.cancelled() => false,
-                            () = watch_park.cancelled() => false,
-                            res = server_out.write_all(&payload[offset..offset + len]) => res.is_ok(),
-                        };
-                        if !write_ok {
-                            return;
+                        let mut written = 0u64;
+                        while written < len {
+                            let step = (len - written).min(scratch.len() as u64) as usize;
+                            file.fill_range(offset + written, &mut scratch[..step]);
+                            let write_ok = tokio::select! {
+                                biased;
+                                () = watch_cancel.cancelled() => false,
+                                () = watch_park.cancelled() => false,
+                                res = server_out.write_all(&scratch[..step]) => res.is_ok(),
+                            };
+                            if !write_ok {
+                                return;
+                            }
+                            written += step as u64;
+                            task_stats
+                                .bytes_produced
+                                .fetch_add(step as u64, Ordering::AcqRel);
                         }
                         if keep_open {
                             if server_out.write_all(b"{\"done\":true}\n").await.is_err() {
@@ -1800,13 +2188,17 @@ mod tests {
                         return;
                     }
                 });
+                let park_guard = ParkGuard {
+                    park: park.clone(),
+                    stats,
+                };
                 Ok(RawStream {
                     reader: Box::new(client_in),
                     writer: Box::new(client_out),
                     stderr: None,
                     cancel,
                     park: Some(park),
-                    guard: None,
+                    guard: Some(Box::new(park_guard)),
                 })
             })
         }
@@ -1817,23 +2209,30 @@ mod tests {
         live: Arc<AtomicBool>,
         holder: String,
         fault: Arc<Mutex<MockStreamFault>>,
+        stats: Arc<MockStreamStats>,
     }
 
     impl MockContentBackend {
         fn new(files: HashMap<String, Vec<u8>>) -> Self {
-            Self::with_options(files, LinkOptions::default(), None)
+            let mock_files = files
+                .into_iter()
+                .map(|(k, v)| (k, MockFile::Bytes(v)))
+                .collect();
+            Self::with_mock_files(mock_files, LinkOptions::default(), None)
         }
 
-        fn with_options(
-            files: HashMap<String, Vec<u8>>,
+        fn with_mock_files(
+            files: HashMap<String, MockFile>,
             link_options: LinkOptions,
             window_policy: Option<legion_link::content::WindowPolicy>,
         ) -> Self {
             let fault = Arc::new(Mutex::new(MockStreamFault::None));
+            let stats = Arc::new(MockStreamStats::default());
             let opener_files = Arc::new(MemoryFilesOpener {
                 files: Arc::new(files),
                 window_policy,
                 fault: Arc::clone(&fault),
+                stats: Arc::clone(&stats),
             });
             let session_opener: SessionOpener = Arc::new(move |entry, _, cancel| {
                 let opener_files = Arc::clone(&opener_files);
@@ -1905,6 +2304,7 @@ mod tests {
                 live: Arc::new(AtomicBool::new(true)),
                 holder: "pairing:tower:1".to_owned(),
                 fault,
+                stats,
             }
         }
     }
@@ -3105,17 +3505,100 @@ mod tests {
         }
     }
 
+    /// Connects to the loopback listener with a small `SO_RCVBUF` so paused reads trigger TCP
+    /// backpressure promptly across platforms (disabling Windows TCP receive-window autotuning).
+    async fn connect_bounded_client(port: u16) -> TcpStream {
+        let socket = TcpSocket::new_v4().unwrap();
+        let _ = socket.set_recv_buffer_size(16 * 1024);
+        socket
+            .connect(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)))
+            .await
+            .unwrap()
+    }
+
+    /// Waits deterministically until at least `expected_parked` mock streams have completed
+    /// `ParkActivity` parking (including `ParkedStreamPool::register` eviction) AND every remote
+    /// source task has exited.
+    async fn wait_for_parked_and_idle(
+        stats: &MockStreamStats,
+        expected_parked: u64,
+        timeout: Duration,
+    ) {
+        let res = tokio::time::timeout(timeout, async {
+            loop {
+                let notified = stats.notify.notified();
+                if stats.parked_streams.load(Ordering::Acquire) >= expected_parked
+                    && stats.active_remote_tasks.load(Ordering::Acquire) == 0
+                {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await;
+        assert!(
+            res.is_ok(),
+            "timed out waiting for {expected_parked} parked streams and 0 active remote tasks \
+             (parked={}, active={})",
+            stats.parked_streams.load(Ordering::Acquire),
+            stats.active_remote_tasks.load(Ordering::Acquire),
+        );
+    }
+
+    async fn wait_for_zero_active_tasks(stats: &MockStreamStats, timeout: Duration) {
+        let res = tokio::time::timeout(timeout, async {
+            loop {
+                let notified = stats.notify.notified();
+                if stats.active_remote_tasks.load(Ordering::Acquire) == 0 {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await;
+        assert!(
+            res.is_ok(),
+            "timed out waiting for remote source tasks to stop (active={})",
+            stats.active_remote_tasks.load(Ordering::Acquire),
+        );
+    }
+
+    async fn wait_for_active_streams(
+        server: &AppContentServer,
+        expected: usize,
+        timeout: Duration,
+    ) {
+        let res = tokio::time::timeout(timeout, async {
+            loop {
+                if server.active_streams() == expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            res.is_ok(),
+            "timed out waiting for active_streams == {expected} (actual={})",
+            server.active_streams(),
+        );
+    }
+
     #[tokio::test]
     async fn evicted_parked_stream_aborts_loopback_cleanly_and_fresh_ticket_recovers() {
-        // Large enough to exceed loopback kernel TCP send/recv buffers so a paused client pauses
-        // hyper body polling and triggers ContentStream's 2-second idle park.
-        let payload: Vec<u8> = (0..(12 * 1024 * 1024))
-            .map(|i| ((i * 29 + 13) % 251) as u8)
-            .collect();
+        // 2 GiB virtual pattern file: strictly larger than the RFC 7323 maximum TCP receive window
+        // (~1 GiB) with zero RAM allocated, so paused streams always hit backpressure and park
+        // regardless of OS loopback socket buffer sizing or autotuning.
+        let movie_len: u64 = 2 * 1024 * 1024 * 1024;
+        let movie = MockFile::Pattern {
+            len: movie_len,
+            mul: 29,
+            add: 13,
+        };
         let mut files = HashMap::new();
-        files.insert("/home/me/movie.bin".to_owned(), payload.clone());
+        files.insert("/home/me/movie.bin".to_owned(), movie.clone());
 
-        let backend = Arc::new(MockContentBackend::with_options(
+        let backend = Arc::new(MockContentBackend::with_mock_files(
             files,
             LinkOptions {
                 max_parked_streams: 1,
@@ -3126,6 +3609,7 @@ mod tests {
                 max_bytes: 256 * 1024,
             }),
         ));
+        let stats = Arc::clone(&backend.stats);
         let server = Arc::new(AppContentServer::with_config(
             backend,
             ContentMountMode::Loopback,
@@ -3152,8 +3636,9 @@ mod tests {
             .strip_prefix(&format!("http://127.0.0.1:{port}"))
             .unwrap();
 
-        // Start stream 1, read response headers + a small prefix, then pause past the 2s park timer.
-        let mut s1 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        // Start stream 1, read response headers + a small prefix, then wait until ContentStream's
+        // idle park watchdog closes the remote channel and parks stream 1.
+        let mut s1 = connect_bounded_client(port).await;
         s1.write_all(
             format!("GET {path1} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
                 .as_bytes(),
@@ -3165,14 +3650,14 @@ mod tests {
         assert!(
             head1
                 .to_ascii_lowercase()
-                .contains(&format!("content-length: {}", payload.len())),
+                .contains(&format!("content-length: {movie_len}")),
             "{head1}"
         );
-        tokio::time::sleep(Duration::from_millis(2400)).await;
+        wait_for_parked_and_idle(&stats, 1, Duration::from_secs(10)).await;
 
-        // Start stream 2, pause past the 2s park timer so it parks and evicts stream 1 from the
-        // cap-1 ParkedStreamPool.
-        let mut s2 = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        // Start stream 2 and wait until it parks, which evicts stream 1 from the cap-1
+        // ParkedStreamPool before stream 2's park guard drops.
+        let mut s2 = connect_bounded_client(port).await;
         s2.write_all(
             format!("GET {path2} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
                 .as_bytes(),
@@ -3181,10 +3666,14 @@ mod tests {
         .unwrap();
         let (status2, head2, _body2) = read_http_head_and_prefix(&mut s2, 4096).await;
         assert_eq!(status2, 200, "{head2}");
-        tokio::time::sleep(Duration::from_millis(2400)).await;
+        wait_for_parked_and_idle(&stats, 2, Duration::from_secs(10)).await;
 
-        // Resuming stream 1 must abort cleanly strictly before Content-Length rather than hanging
-        // or delivering corrupted bytes.
+        // Snapshot remote source counters right after eviction (both remote tasks are already
+        // gone). Resuming stream 1 must abort cleanly without reading from the source again.
+        let opens_at_eviction = stats.stream_opens.load(Ordering::Acquire);
+        let windows_at_eviction = stats.read_windows.load(Ordering::Acquire);
+        let bytes_at_eviction = stats.bytes_produced.load(Ordering::Acquire);
+
         let mut chunk = vec![0u8; 64 * 1024];
         loop {
             match s1.read(&mut chunk).await {
@@ -3192,15 +3681,34 @@ mod tests {
                 Ok(n) => body1.extend_from_slice(&chunk[..n]),
             }
         }
+        let body1_len = body1.len() as u64;
         assert!(
-            body1.len() < payload.len(),
-            "evicted parked stream must abort before full Content-Length ({} vs {})",
-            body1.len(),
-            payload.len()
+            body1_len < movie_len,
+            "evicted parked stream must abort before full Content-Length ({body1_len} vs {movie_len})",
         );
-        assert_eq!(body1, &payload[..body1.len()]);
+        movie.assert_matches(0, &body1);
+        assert_eq!(
+            stats.stream_opens.load(Ordering::Acquire),
+            opens_at_eviction,
+            "evicted parked stream must never reopen the remote source"
+        );
+        assert_eq!(
+            stats.read_windows.load(Ordering::Acquire),
+            windows_at_eviction,
+            "evicted parked stream must never request another window from the source"
+        );
+        assert_eq!(
+            stats.bytes_produced.load(Ordering::Acquire),
+            bytes_at_eviction,
+            "evicted parked stream must never read another byte from the source"
+        );
+        assert!(
+            server.content_status_for_url(&t1.url).stream_failed,
+            "evicted loopback stream must mark stream_failed for viewer recovery diagnostics"
+        );
 
-        // Minting a fresh ticket (what FilesViewer does on media error) recovers the exact tail.
+        // Minting a fresh ticket (what FilesViewer does on media error) recovers exact bytes
+        // immediately after the cut point as well as the end of the file.
         let t3 = server
             .mint_url("tower", "/home/me/movie.bin", false)
             .await
@@ -3209,18 +3717,31 @@ mod tests {
             .url
             .strip_prefix(&format!("http://127.0.0.1:{port}"))
             .unwrap();
+        let continue_len = 256 * 1024u64;
+        let continue_end = (body1_len + continue_len - 1).min(movie_len - 1);
         let (status3, head3, rest) = raw_http(
             port,
             &format!(
-                "GET {path3} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nRange: bytes={}-\r\nConnection: close\r\n\r\n",
-                body1.len()
+                "GET {path3} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nRange: bytes={body1_len}-{continue_end}\r\nConnection: close\r\n\r\n",
             ),
         )
         .await;
         assert_eq!(status3, 206, "{head3}");
-        body1.extend_from_slice(&rest);
-        assert_eq!(body1.len(), payload.len());
-        assert_eq!(body1, payload);
+        assert_eq!(rest.len() as u64, continue_end - body1_len + 1);
+        movie.assert_matches(body1_len, &rest);
+
+        let tail_start = movie_len - 4096;
+        let tail_end = movie_len - 1;
+        let (tail_status, tail_head, tail_bytes) = raw_http(
+            port,
+            &format!(
+                "GET {path3} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nRange: bytes={tail_start}-{tail_end}\r\nConnection: close\r\n\r\n",
+            ),
+        )
+        .await;
+        assert_eq!(tail_status, 206, "{tail_head}");
+        assert_eq!(tail_bytes.len(), 4096);
+        movie.assert_matches(tail_start, &tail_bytes);
 
         drop(s2);
         server.shutdown();
@@ -3300,15 +3821,22 @@ mod tests {
     async fn suspend_drops_loopback_listener_and_evicts_parked_streams_then_resume_recovers_cleanly()
      {
         let image_bytes = b"\x89PNG\r\n\x1a\nresume-image-payload".to_vec();
-        // Large enough to exceed loopback TCP buffers so a paused client triggers idle parking.
-        let movie_bytes: Vec<u8> = (0..(12 * 1024 * 1024))
-            .map(|i| ((i * 31 + 7) % 251) as u8)
-            .collect();
+        // 2 GiB virtual pattern file: strictly larger than any OS loopback TCP buffer without
+        // allocating RAM so paused streams always trigger idle parking deterministically.
+        let movie_len: u64 = 2 * 1024 * 1024 * 1024;
+        let movie = MockFile::Pattern {
+            len: movie_len,
+            mul: 31,
+            add: 7,
+        };
         let mut files = HashMap::new();
-        files.insert("/home/me/photo.png".to_owned(), image_bytes.clone());
-        files.insert("/home/me/movie.bin".to_owned(), movie_bytes.clone());
+        files.insert(
+            "/home/me/photo.png".to_owned(),
+            MockFile::Bytes(image_bytes.clone()),
+        );
+        files.insert("/home/me/movie.bin".to_owned(), movie.clone());
 
-        let backend = Arc::new(MockContentBackend::with_options(
+        let backend = Arc::new(MockContentBackend::with_mock_files(
             files,
             LinkOptions {
                 max_parked_streams: 1,
@@ -3319,6 +3847,7 @@ mod tests {
                 max_bytes: 256 * 1024,
             }),
         ));
+        let stats = Arc::clone(&backend.stats);
         let server = Arc::new(AppContentServer::with_config(
             backend,
             ContentMountMode::Loopback,
@@ -3347,9 +3876,7 @@ mod tests {
             .strip_prefix(&format!("http://127.0.0.1:{port_before}"))
             .unwrap();
 
-        let mut s1 = TcpStream::connect(("127.0.0.1", port_before))
-            .await
-            .unwrap();
+        let mut s1 = connect_bounded_client(port_before).await;
         s1.write_all(
             format!(
                 "GET {path1} HTTP/1.1\r\nHost: 127.0.0.1:{port_before}\r\nConnection: close\r\n\r\n"
@@ -3360,11 +3887,9 @@ mod tests {
         .unwrap();
         let (st1, head1, mut body1) = read_http_head_and_prefix(&mut s1, 4096).await;
         assert_eq!(st1, 200, "{head1}");
-        tokio::time::sleep(Duration::from_millis(2400)).await;
+        wait_for_parked_and_idle(&stats, 1, Duration::from_secs(10)).await;
 
-        let mut s2 = TcpStream::connect(("127.0.0.1", port_before))
-            .await
-            .unwrap();
+        let mut s2 = connect_bounded_client(port_before).await;
         s2.write_all(
             format!(
                 "GET {path2} HTTP/1.1\r\nHost: 127.0.0.1:{port_before}\r\nConnection: close\r\n\r\n"
@@ -3373,21 +3898,27 @@ mod tests {
         )
         .await
         .unwrap();
-        let (st2, head2, _body2) = read_http_head_and_prefix(&mut s2, 4096).await;
+        let (st2, head2, mut body2) = read_http_head_and_prefix(&mut s2, 4096).await;
         assert_eq!(st2, 200, "{head2}");
-        tokio::time::sleep(Duration::from_millis(2400)).await;
+        wait_for_parked_and_idle(&stats, 2, Duration::from_secs(10)).await;
+
+        let opens_at_eviction = stats.stream_opens.load(Ordering::Acquire);
+        let windows_at_eviction = stats.read_windows.load(Ordering::Acquire);
+        let bytes_at_eviction = stats.bytes_produced.load(Ordering::Acquire);
 
         // 2) Simulate OS background suspension reclaiming the listening socket while the stale
-        // ListenerHandle is still recorded in `server.listener`.
+        // ListenerHandle is still recorded in `server.listener`. Both streams on the old listener
+        // must drop immediately without reading from the source again.
         {
             let guard = server.listener.lock().unwrap();
             if let Some(h) = guard.as_ref() {
                 h.shutdown.cancel();
             }
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        wait_for_active_streams(&server, 0, Duration::from_secs(2)).await;
 
-        // Pre-suspend evicted stream aborts cleanly strictly before Content-Length.
+        // Pre-suspend evicted stream 1 and suspended stream 2 both abort cleanly strictly before
+        // Content-Length and never touch the source again.
         let mut chunk = vec![0u8; 64 * 1024];
         loop {
             match s1.read(&mut chunk).await {
@@ -3395,8 +3926,33 @@ mod tests {
                 Ok(n) => body1.extend_from_slice(&chunk[..n]),
             }
         }
-        assert!(body1.len() < movie_bytes.len());
-        assert_eq!(body1, &movie_bytes[..body1.len()]);
+        let body1_len = body1.len() as u64;
+        assert!(body1_len < movie_len);
+        movie.assert_matches(0, &body1);
+
+        loop {
+            match s2.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => body2.extend_from_slice(&chunk[..n]),
+            }
+        }
+        assert!((body2.len() as u64) < movie_len);
+        movie.assert_matches(0, &body2);
+        assert_eq!(
+            stats.stream_opens.load(Ordering::Acquire),
+            opens_at_eviction,
+            "evicted/suspended streams must never reopen the remote source"
+        );
+        assert_eq!(
+            stats.read_windows.load(Ordering::Acquire),
+            windows_at_eviction,
+            "evicted/suspended streams must never request another window from the source"
+        );
+        assert_eq!(
+            stats.bytes_produced.load(Ordering::Acquire),
+            bytes_at_eviction,
+            "evicted/suspended streams must never read another byte from the source"
+        );
         drop(s2);
 
         // 3) Resume: race `probe_or_recover_loopback()` against concurrent `mint_url()` calls
@@ -3434,17 +3990,18 @@ mod tests {
         assert_eq!(img_status, 200, "{img_head}");
         assert_eq!(img_body, image_bytes);
 
+        let continue_len = 256 * 1024u64;
+        let continue_end = (body1_len + continue_len - 1).min(movie_len - 1);
         let (vid_status, vid_head, vid_tail) = raw_http(
             recovered_port,
             &format!(
-                "GET {vid_path} HTTP/1.1\r\nHost: 127.0.0.1:{recovered_port}\r\nRange: bytes={}-\r\nConnection: close\r\n\r\n",
-                body1.len()
+                "GET {vid_path} HTTP/1.1\r\nHost: 127.0.0.1:{recovered_port}\r\nRange: bytes={body1_len}-{continue_end}\r\nConnection: close\r\n\r\n",
             ),
         )
         .await;
         assert_eq!(vid_status, 206, "{vid_head}");
-        body1.extend_from_slice(&vid_tail);
-        assert_eq!(body1, movie_bytes);
+        assert_eq!(vid_tail.len() as u64, continue_end - body1_len + 1);
+        movie.assert_matches(body1_len, &vid_tail);
 
         // 4) Simulate a long suspension where the listener was completely torn down and all
         // tickets were cleared: the very first post-resume `mint_url` recreates the listener.
@@ -3472,6 +4029,91 @@ mod tests {
         assert_eq!(long_body, image_bytes);
 
         server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn shutdown_immediately_aborts_active_loopback_stream_and_stops_source_reads() {
+        let movie_len: u64 = 2 * 1024 * 1024 * 1024;
+        let movie = MockFile::Pattern {
+            len: movie_len,
+            mul: 37,
+            add: 19,
+        };
+        let mut files = HashMap::new();
+        files.insert("/home/me/movie.bin".to_owned(), movie.clone());
+
+        let backend = Arc::new(MockContentBackend::with_mock_files(
+            files,
+            LinkOptions::default(),
+            Some(legion_link::content::WindowPolicy {
+                initial_bytes: 256 * 1024,
+                max_bytes: 256 * 1024,
+            }),
+        ));
+        let stats = Arc::clone(&backend.stats);
+        let server = Arc::new(AppContentServer::with_config(
+            backend,
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["tauri://localhost".to_owned()],
+        ));
+
+        let minted = server
+            .mint_url("tower", "/home/me/movie.bin", false)
+            .await
+            .unwrap();
+        let port = server.loopback_port().unwrap();
+        let path = minted
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap();
+
+        // Open an active (unparked) stream and read only 4 KiB so the socket is backpressured
+        // well before the 2-second idle park timer.
+        let mut sock = connect_bounded_client(port).await;
+        sock.write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let (status, head, mut body) = read_http_head_and_prefix(&mut sock, 4096).await;
+        assert_eq!(status, 200, "{head}");
+        assert_eq!(server.active_streams(), 1);
+
+        // Shut down the server while the stream is still active and backpressured: the connection
+        // task must abort immediately, releasing active_streams and stopping the remote source
+        // task BEFORE the client reads another byte or closes its socket.
+        server.shutdown();
+        wait_for_active_streams(&server, 0, Duration::from_secs(2)).await;
+        wait_for_zero_active_tasks(&stats, Duration::from_secs(2)).await;
+
+        let opens_after_shutdown = stats.stream_opens.load(Ordering::Acquire);
+        let windows_after_shutdown = stats.read_windows.load(Ordering::Acquire);
+        let bytes_after_shutdown = stats.bytes_produced.load(Ordering::Acquire);
+
+        let mut chunk = vec![0u8; 64 * 1024];
+        loop {
+            match sock.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => body.extend_from_slice(&chunk[..n]),
+            }
+        }
+        assert!((body.len() as u64) < movie_len);
+        movie.assert_matches(0, &body);
+        assert_eq!(
+            stats.stream_opens.load(Ordering::Acquire),
+            opens_after_shutdown
+        );
+        assert_eq!(
+            stats.read_windows.load(Ordering::Acquire),
+            windows_after_shutdown
+        );
+        assert_eq!(
+            stats.bytes_produced.load(Ordering::Acquire),
+            bytes_after_shutdown
+        );
     }
 
     #[test]
@@ -4087,6 +4729,503 @@ mod tests {
                 .contains("connection: close"),
             "replayed revoked URL should emit Connection: close:\n{head_after}"
         );
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn loopback_recovers_when_socket_is_reclaimed_under_running_accept_task() {
+        let payload = b"reclaimed-socket-recovery-payload".to_vec();
+        let mut files = HashMap::new();
+        files.insert("/home/me/clip.bin".to_owned(), payload.clone());
+
+        let backend = Arc::new(MockContentBackend::new(files));
+        let server = Arc::new(AppContentServer::with_config(
+            backend,
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["http://tauri.localhost".to_owned()],
+        ));
+
+        let initial = server
+            .mint_url("tower", "/home/me/clip.bin", false)
+            .await
+            .unwrap();
+        let initial_port = server.loopback_port().unwrap();
+        let initial_path = initial
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{initial_port}"))
+            .unwrap()
+            .to_owned();
+
+        // 1) Simulate OS reclaiming the listening socket underneath an accept task that is STILL
+        // running (shutdown NOT cancelled, accept_alive == true, accept_task NOT finished).
+        let dead_port = {
+            let probe_bind = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            probe_bind.local_addr().unwrap().port()
+        };
+        {
+            let mut slot = server.listener.lock().unwrap();
+            if let Some(old) = slot.take() {
+                old.shutdown.cancel();
+            }
+            let fake_shutdown = CancellationToken::new();
+            let fake_shutdown_task = fake_shutdown.clone();
+            let fake_accept_task = tokio::spawn(async move {
+                fake_shutdown_task.cancelled().await;
+            });
+            *slot = Some(ListenerHandle {
+                port: dead_port,
+                shutdown: fake_shutdown,
+                accept_alive: Arc::new(AtomicBool::new(true)),
+                accept_task: fake_accept_task,
+                probe_secret: [0x5Au8; 32],
+                last_verified: Instant::now(),
+            });
+            assert!(
+                slot.as_ref().unwrap().is_alive(),
+                "simulated reclaimed-socket handle must report accept task still running"
+            );
+        }
+
+        // Resume recovery ALWAYS forces a live proof-of-ownership probe even with fresh
+        // `last_verified`, detects the dead port, and binds a new OS-chosen port.
+        let recovered_port = server
+            .probe_or_recover_loopback()
+            .await
+            .unwrap()
+            .expect("resume probe must recover a new port while live tickets exist");
+        assert_ne!(recovered_port, dead_port);
+        assert_eq!(server.loopback_port(), Some(recovered_port));
+
+        let (st1, head1, body1) = raw_http(
+            recovered_port,
+            &format!(
+                "GET {initial_path} HTTP/1.1\r\nHost: 127.0.0.1:{recovered_port}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(st1, 200, "{head1}");
+        assert_eq!(body1, payload);
+
+        // 2) Live listener with aged `last_verified`: pre-mint probe succeeds and keeps the same
+        // port without unnecessary rebinding.
+        {
+            let mut slot = server.listener.lock().unwrap();
+            let h = slot.as_mut().unwrap();
+            h.last_verified = Instant::now() - (LOOPBACK_PROBE_FRESHNESS + Duration::from_secs(1));
+        }
+        let still_same = server
+            .mint_url("tower", "/home/me/clip.bin", false)
+            .await
+            .unwrap();
+        assert_eq!(server.loopback_port(), Some(recovered_port));
+        assert!(
+            still_same
+                .url
+                .starts_with(&format!("http://127.0.0.1:{recovered_port}/v1/content/"))
+        );
+
+        // 3) Reclaimed socket under a still-running accept task when `last_verified` has aged past
+        // `LOOPBACK_PROBE_FRESHNESS`: `mint_url` detects it via probe and binds a fresh OS port.
+        let dead_port_2 = {
+            let probe_bind = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            probe_bind.local_addr().unwrap().port()
+        };
+        {
+            let mut slot = server.listener.lock().unwrap();
+            if let Some(old) = slot.take() {
+                old.shutdown.cancel();
+            }
+            let fake_shutdown = CancellationToken::new();
+            let fake_shutdown_task = fake_shutdown.clone();
+            let fake_accept_task = tokio::spawn(async move {
+                fake_shutdown_task.cancelled().await;
+            });
+            *slot = Some(ListenerHandle {
+                port: dead_port_2,
+                shutdown: fake_shutdown,
+                accept_alive: Arc::new(AtomicBool::new(true)),
+                accept_task: fake_accept_task,
+                probe_secret: [0xA5u8; 32],
+                last_verified: Instant::now() - (LOOPBACK_PROBE_FRESHNESS + Duration::from_secs(1)),
+            });
+            assert!(slot.as_ref().unwrap().is_alive());
+        }
+
+        let after_mint = server
+            .mint_url("tower", "/home/me/clip.bin", false)
+            .await
+            .unwrap();
+        let new_port = server.loopback_port().unwrap();
+        assert_ne!(new_port, dead_port_2);
+        let new_path = after_mint
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{new_port}"))
+            .unwrap();
+        let (st2, head2, body2) = raw_http(
+            new_port,
+            &format!(
+                "GET {new_path} HTTP/1.1\r\nHost: 127.0.0.1:{new_port}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(st2, 200, "{head2}");
+        assert_eq!(body2, payload);
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn loopback_probe_rejects_fake_204_and_hanging_squatters_without_leaking_tickets() {
+        let payload = b"never-leak-ticket-to-squatter".to_vec();
+        let mut files = HashMap::new();
+        files.insert("/home/me/private.flac".to_owned(), payload.clone());
+
+        let backend = Arc::new(MockContentBackend::new(files));
+        let server = Arc::new(AppContentServer::with_config(
+            backend,
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["http://tauri.localhost".to_owned()],
+        ));
+
+        // Ensure at least one ticket exists.
+        let _ = server
+            .mint_url("tower", "/home/me/private.flac", false)
+            .await
+            .unwrap();
+
+        // 1) Hostile squatter answering every request with a forged `204 No Content` echoing back
+        // `X-Legion-Probe-Auth` as `X-Legion-Probe-Proof`.
+        let fake_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let fake_port = fake_listener.local_addr().unwrap().port();
+        let seen_requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_clone = Arc::clone(&seen_requests);
+        let fake_stop = CancellationToken::new();
+        let fake_stop_task = fake_stop.clone();
+        let fake_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = fake_stop_task.cancelled() => break,
+                    res = fake_listener.accept() => {
+                        let Ok((mut sock, _)) = res else { break };
+                        let mut buf = vec![0u8; 4096];
+                        if let Ok(n) = sock.read(&mut buf).await {
+                            let req_text = String::from_utf8_lossy(&buf[..n]).into_owned();
+                            let echoed_auth = req_text
+                                .lines()
+                                .find_map(|l| {
+                                    let (k, v) = l.split_once(':')?;
+                                    k.trim()
+                                        .eq_ignore_ascii_case("x-legion-probe-auth")
+                                        .then(|| v.trim().to_owned())
+                                })
+                                .unwrap_or_default();
+                            seen_clone.lock().unwrap().push(req_text);
+                            let resp = format!(
+                                "HTTP/1.1 204 No Content\r\nX-Legion-Probe-Proof: {echoed_auth}\r\nConnection: close\r\n\r\n"
+                            );
+                            let _ = sock.write_all(resp.as_bytes()).await;
+                        }
+                    }
+                }
+            }
+        });
+
+        {
+            let mut slot = server.listener.lock().unwrap();
+            if let Some(old) = slot.take() {
+                old.shutdown.cancel();
+            }
+            let fake_shutdown = CancellationToken::new();
+            let fake_shutdown_task = fake_shutdown.clone();
+            let fake_accept_task = tokio::spawn(async move {
+                fake_shutdown_task.cancelled().await;
+            });
+            *slot = Some(ListenerHandle {
+                port: fake_port,
+                shutdown: fake_shutdown,
+                accept_alive: Arc::new(AtomicBool::new(true)),
+                accept_task: fake_accept_task,
+                probe_secret: [0x33u8; 32],
+                last_verified: Instant::now() - (LOOPBACK_PROBE_FRESHNESS + Duration::from_secs(1)),
+            });
+        }
+
+        let minted = server
+            .mint_url("tower", "/home/me/private.flac", false)
+            .await
+            .unwrap();
+        let new_port = server.loopback_port().unwrap();
+        assert_ne!(
+            new_port, fake_port,
+            "forged 204 squatter must fail proof-of-ownership and force a fresh OS port"
+        );
+
+        let ticket_id = extract_ticket_id_from_url(&minted.url).unwrap().to_owned();
+        let reqs = seen_requests.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 1, "squatter should see only the single probe");
+        assert!(
+            reqs[0].starts_with(&format!("GET {LOOPBACK_PROBE_PATH} HTTP/1.1\r\n")),
+            "unexpected request sent to squatter: {}",
+            reqs[0]
+        );
+        assert!(
+            !reqs[0].contains(&ticket_id),
+            "squatter must never see any file ticket"
+        );
+
+        let new_path = minted
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{new_port}"))
+            .unwrap();
+        let (st, head, body) = raw_http(
+            new_port,
+            &format!(
+                "GET {new_path} HTTP/1.1\r\nHost: 127.0.0.1:{new_port}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(st, 200, "{head}");
+        assert_eq!(body, payload);
+
+        fake_stop.cancel();
+        let _ = fake_task.await;
+
+        // 2) Hanging/tarpit squatter that accepts TCP and sends nothing: probe times out quickly
+        // and recovers onto a fresh OS-chosen port.
+        let tarpit_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let tarpit_port = tarpit_listener.local_addr().unwrap().port();
+        let tarpit_stop = CancellationToken::new();
+        let tarpit_stop_task = tarpit_stop.clone();
+        let tarpit_task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                tokio::select! {
+                    biased;
+                    () = tarpit_stop_task.cancelled() => break,
+                    res = tarpit_listener.accept() => {
+                        if let Ok((sock, _)) = res {
+                            held.push(sock);
+                        }
+                    }
+                }
+            }
+        });
+
+        {
+            let mut slot = server.listener.lock().unwrap();
+            if let Some(old) = slot.take() {
+                old.shutdown.cancel();
+            }
+            let fake_shutdown = CancellationToken::new();
+            let fake_shutdown_task = fake_shutdown.clone();
+            let fake_accept_task = tokio::spawn(async move {
+                fake_shutdown_task.cancelled().await;
+            });
+            *slot = Some(ListenerHandle {
+                port: tarpit_port,
+                shutdown: fake_shutdown,
+                accept_alive: Arc::new(AtomicBool::new(true)),
+                accept_task: fake_accept_task,
+                probe_secret: [0x77u8; 32],
+                last_verified: Instant::now(),
+            });
+        }
+
+        let started = Instant::now();
+        let recovered = server
+            .probe_or_recover_loopback()
+            .await
+            .unwrap()
+            .expect("tarpit timeout must trigger rebind");
+        assert_ne!(recovered, tarpit_port);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "tarpit probe should time out promptly (elapsed={:?})",
+            started.elapsed()
+        );
+
+        let (st2, head2, body2) = raw_http(
+            recovered,
+            &format!(
+                "GET {new_path} HTTP/1.1\r\nHost: 127.0.0.1:{recovered}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(st2, 200, "{head2}");
+        assert_eq!(body2, payload);
+
+        tarpit_stop.cancel();
+        let _ = tarpit_task.await;
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn loopback_probe_hides_endpoint_from_unauthenticated_callers_and_counts_as_unauthenticated()
+     {
+        let payload = b"probe-privacy-payload".to_vec();
+        let mut files = HashMap::new();
+        files.insert("/home/me/song.flac".to_owned(), payload.clone());
+
+        let backend = Arc::new(MockContentBackend::new(files));
+        let server = Arc::new(AppContentServer::with_config(
+            backend,
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["http://tauri.localhost".to_owned()],
+        ));
+
+        let _ = server
+            .mint_url("tower", "/home/me/song.flac", false)
+            .await
+            .unwrap();
+        let (port, secret) = {
+            let slot = server.listener.lock().unwrap();
+            let h = slot.as_ref().unwrap();
+            (h.port, h.probe_secret)
+        };
+
+        // Baseline unknown-path 404.
+        let (base_st, base_head, base_body) = raw_http(
+            port,
+            &format!(
+                "GET /v1/content/nonexistent HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: keep-alive\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(base_st, 404, "{base_head}");
+
+        let challenge = [0x42u8; 32];
+        let challenge_b64 = URL_SAFE_NO_PAD.encode(challenge);
+        let valid_auth_b64 = URL_SAFE_NO_PAD
+            .encode(probe_mac(&secret, LOOPBACK_PROBE_REQ_DOMAIN, &challenge).as_bytes());
+        let wrong_auth_b64 = URL_SAFE_NO_PAD.encode([0x11u8; 32]);
+
+        // Unauthenticated, malformed, wrong-secret, query-bearing, wrong-method, or Origin-bearing
+        // calls to the probe path must return the exact same generic 404 + Connection: close.
+        for req in [
+            format!(
+                "GET {LOOPBACK_PROBE_PATH} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: keep-alive\r\n\r\n"
+            ),
+            format!(
+                "GET {LOOPBACK_PROBE_PATH} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{LOOPBACK_PROBE_CHALLENGE_HEADER}: {challenge_b64}\r\nConnection: keep-alive\r\n\r\n"
+            ),
+            format!(
+                "GET {LOOPBACK_PROBE_PATH} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{LOOPBACK_PROBE_CHALLENGE_HEADER}: {challenge_b64}\r\n{LOOPBACK_PROBE_AUTH_HEADER}: {wrong_auth_b64}\r\nConnection: keep-alive\r\n\r\n"
+            ),
+            format!(
+                "GET {LOOPBACK_PROBE_PATH}?x=1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{LOOPBACK_PROBE_CHALLENGE_HEADER}: {challenge_b64}\r\n{LOOPBACK_PROBE_AUTH_HEADER}: {valid_auth_b64}\r\nConnection: keep-alive\r\n\r\n"
+            ),
+            format!(
+                "POST {LOOPBACK_PROBE_PATH} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{LOOPBACK_PROBE_CHALLENGE_HEADER}: {challenge_b64}\r\n{LOOPBACK_PROBE_AUTH_HEADER}: {valid_auth_b64}\r\nConnection: keep-alive\r\n\r\n"
+            ),
+            format!(
+                "GET {LOOPBACK_PROBE_PATH} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://tauri.localhost\r\n{LOOPBACK_PROBE_CHALLENGE_HEADER}: {challenge_b64}\r\n{LOOPBACK_PROBE_AUTH_HEADER}: {valid_auth_b64}\r\nConnection: keep-alive\r\n\r\n"
+            ),
+        ] {
+            let (st, head, body) =
+                tokio::time::timeout(Duration::from_secs(2), raw_http(port, &req))
+                    .await
+                    .expect("invalid probe request must close immediately");
+            assert_eq!(st, 404, "expected 404 for {req}\ngot:\n{head}");
+            assert_eq!(body, base_body, "probe 404 body must match generic 404");
+            assert!(
+                head.to_ascii_lowercase().contains("connection: close"),
+                "probe 404 must emit Connection: close:\n{head}"
+            );
+            assert!(
+                !head
+                    .to_ascii_lowercase()
+                    .contains(LOOPBACK_PROBE_PROOF_HEADER.as_str()),
+                "404 must never leak probe proof header"
+            );
+        }
+
+        // Valid probe request returns 204 with valid proof, Connection: close (closes even when
+        // caller asks for keep-alive), does not log into `recent_requests`, and does NOT mark the
+        // connection authenticated.
+        let valid_req = format!(
+            "GET {LOOPBACK_PROBE_PATH} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{LOOPBACK_PROBE_CHALLENGE_HEADER}: {challenge_b64}\r\n{LOOPBACK_PROBE_AUTH_HEADER}: {valid_auth_b64}\r\nConnection: keep-alive\r\n\r\n"
+        );
+        let (ok_st, ok_head, ok_body) =
+            tokio::time::timeout(Duration::from_secs(2), raw_http(port, &valid_req))
+                .await
+                .expect("valid probe must close immediately");
+        assert_eq!(ok_st, 204, "{ok_head}");
+        assert!(ok_body.is_empty());
+        assert!(
+            ok_head.to_ascii_lowercase().contains("connection: close"),
+            "valid probe must emit Connection: close:\n{ok_head}"
+        );
+        assert!(
+            server.recent_requests().is_empty(),
+            "probe requests must not populate request_log"
+        );
+
+        // Directly confirm `handle_checked_request` leaves `conn_authenticated == false`.
+        let guard = HostOriginGuard {
+            port,
+            allowed_hosts: Vec::new(),
+            allowed_origins: vec!["http://tauri.localhost".to_owned()],
+            allow_same_origin: false,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HOST,
+            HeaderValue::from_str(&format!("127.0.0.1:{port}")).unwrap(),
+        );
+        headers.insert(
+            LOOPBACK_PROBE_CHALLENGE_HEADER,
+            HeaderValue::from_str(&challenge_b64).unwrap(),
+        );
+        headers.insert(
+            LOOPBACK_PROBE_AUTH_HEADER,
+            HeaderValue::from_str(&valid_auth_b64).unwrap(),
+        );
+        let uri: Uri = LOOPBACK_PROBE_PATH.parse().unwrap();
+        let conn_auth = AtomicBool::new(false);
+        let resp = server
+            .handle_checked_request(
+                &guard,
+                &Method::GET,
+                &uri,
+                &headers,
+                ServeOptions {
+                    corp: CorpPolicy::CrossOrigin,
+                    ..ServeOptions::default()
+                },
+                Some(LoopbackRequestCtx {
+                    conn_authenticated: &conn_auth,
+                    probe_secret: &secret,
+                }),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(
+            !conn_auth.load(Ordering::Acquire),
+            "probe must count as unauthenticated for connection limits"
+        );
+
+        // Even while 32 unauthenticated partial-header sockets are held open, the probe succeeds
+        // by evicting the oldest unauthenticated socket.
+        let mut holders = Vec::with_capacity(MAX_LOOPBACK_CONNECTIONS);
+        for _ in 0..MAX_LOOPBACK_CONNECTIONS {
+            let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            sock.write_all(b"GET /v1/content/").await.unwrap();
+            holders.push(sock);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            probe_loopback_ownership(port, &secret, LOOPBACK_PROBE_TIMEOUT).await,
+            "ownership probe must succeed even when 32 unauthenticated sockets are held"
+        );
+        drop(holders);
 
         server.shutdown();
     }

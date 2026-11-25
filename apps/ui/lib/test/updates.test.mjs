@@ -99,6 +99,27 @@ test('isSafeForAutoInstall only allows startup before interaction or silent Andr
     }),
     false,
   );
+  // Active foreground resume session recovery always blocks auto-install (startup and Android background).
+  assert.equal(
+    isSafeForAutoInstall({
+      updateState: readyDesktop,
+      trigger: 'startup',
+      isResuming: true,
+    }),
+    false,
+  );
+  assert.equal(
+    isSafeForAutoInstall({
+      updateState: {
+        ...readyDesktop,
+        current: { os: 'android', install_kind: 'apk', sequence: 202611250200 },
+        android: { supportsSilentSelfUpdate: true },
+      },
+      trigger: 'background',
+      isResuming: true,
+    }),
+    false,
+  );
   // Sequence-0 builds and previously failed updates never auto-install.
   assert.equal(
     isSafeForAutoInstall({
