@@ -1186,7 +1186,8 @@ fn p9_real_casefold_volume() {
 }
 
 /// File replaced by a directory on tower while pi edits the file, and a directory replaced by a
-/// file on tower while pi adds a file inside it.
+/// file on tower while pi adds a file inside it: zero pull errors, all four contents survive live
+/// on both members, and both converge to `UpToDate`.
 #[test]
 fn p10_file_dir_swaps_against_concurrent_edits() {
     let tmp = scratch();
@@ -1211,10 +1212,21 @@ fn p10_file_dir_swaps_against_concurrent_edits() {
     fs::write(t.join("pi/f"), b"PI EDIT of f").unwrap();
     fs::write(t.join("pi/d/new.txt"), b"PI NEW in d").unwrap();
     pi.scan(ts(11)).unwrap();
+
+    // Every pull in both directions MUST succeed with ZERO errors (never aborting on
+    // `ancestor 'd' is not a directory`).
     for k in 0..4 {
-        sync_all(&mut [&mut tower, &mut pi], 110 + 10 * k);
+        assert_eq!(
+            pull(&mut tower, &pi, 110 + 10 * k),
+            None,
+            "round {k}: tower<-pi must not abort on file/dir swap"
+        );
+        assert_eq!(
+            pull(&mut pi, &tower, 111 + 10 * k),
+            None,
+            "round {k}: pi<-tower must not abort on file/dir swap"
+        );
     }
-    let mut lost = Vec::new();
     for c in [
         &b"inner of f-dir"[..],
         b"d is a file now",
@@ -1223,16 +1235,246 @@ fn p10_file_dir_swaps_against_concurrent_edits() {
     ] {
         let tl = live_with(&t.join("tower"), c);
         let pl = live_with(&t.join("pi"), c);
-        eprintln!(
-            "{:?}: tower {:?} pi {:?}",
-            String::from_utf8_lossy(c),
-            tl,
-            pl
+        assert!(
+            !tl.is_empty() && !pl.is_empty(),
+            "not live on both: {:?} tower={tl:?} pi={pl:?}",
+            String::from_utf8_lossy(c)
         );
-        if tl.is_empty() || pl.is_empty() {
-            lost.push(String::from_utf8_lossy(c).to_string());
+    }
+    assert_eq!(tower.status().unwrap().state, MemberState::UpToDate);
+    assert_eq!(pi.status().unwrap().state, MemberState::UpToDate);
+}
+
+/// When a local ancestor genuinely cannot be made a directory (e.g. an unindexed ignored symlink
+/// blocking `d/`), pulling a page containing BOTH `d/blocked.txt` and `unrelated.txt` holds back
+/// ONLY `d/blocked.txt` unacked, lets `unrelated.txt` apply in the same pull, surfaces a durable
+/// problem naming `d/blocked.txt`, and resolves cleanly once the blocker is cleared.
+#[test]
+fn p10b_unplaceable_non_dir_ancestor_held_back_without_aborting_pull() {
+    use legion_sync::{
+        FolderConfig, FsCapabilities, FsMeta, FsWalkResult, IgnoreMatcher, SyncError, SyncFs,
+        SyncWrite,
+    };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct BlockingAncestorFs {
+        inner: RealFs,
+        block_d: Arc<AtomicBool>,
+    }
+    impl SyncFs for BlockingAncestorFs {
+        fn capabilities(&self) -> FsCapabilities {
+            self.inner.capabilities()
+        }
+        fn read_marker(&self) -> legion_sync::Result<Option<legion_sync::FolderMarker>> {
+            self.inner.read_marker()
+        }
+        fn write_marker(&self, m: &legion_sync::FolderMarker) -> legion_sync::Result<()> {
+            self.inner.write_marker(m)
+        }
+        fn append_deletion_log(&self, b: &[u8]) -> legion_sync::Result<()> {
+            self.inner.append_deletion_log(b)
+        }
+        fn read_deletion_log(&self) -> legion_sync::Result<Vec<u8>> {
+            self.inner.read_deletion_log()
+        }
+        fn compact_deletion_log(&self, b: &[u8]) -> legion_sync::Result<()> {
+            self.inner.compact_deletion_log(b)
+        }
+        fn ensure_internal_dirs(&self) -> legion_sync::Result<()> {
+            self.inner.ensure_internal_dirs()
+        }
+        fn check_not_nested(&self) -> legion_sync::Result<()> {
+            self.inner.check_not_nested()
+        }
+        fn available_space_for(&self, p: &str) -> legion_sync::Result<Option<u64>> {
+            if self.block_d.load(Ordering::SeqCst) && p.starts_with("d/") {
+                return Err(SyncError::Conflict {
+                    path: p.to_string(),
+                    reason: "ancestor 'd' is not a directory".to_string(),
+                });
+            }
+            self.inner.available_space_for(p)
+        }
+        fn needs_local_staging(&self, p: &str) -> legion_sync::Result<bool> {
+            self.inner.needs_local_staging(p)
+        }
+        fn walk(&self, i: &IgnoreMatcher) -> legion_sync::Result<FsWalkResult> {
+            self.inner.walk(i)
+        }
+        fn walk_subtree(&self, r: &str, i: &IgnoreMatcher) -> legion_sync::Result<FsWalkResult> {
+            self.inner.walk_subtree(r, i)
+        }
+        fn stat_live(&self, p: &str) -> legion_sync::Result<Option<FsMeta>> {
+            self.inner.stat_live(p)
+        }
+        fn hash_live(&self, p: &str) -> legion_sync::Result<(legion_xfer::Hash, u64)> {
+            self.inner.hash_live(p)
+        }
+        fn open_live_read_at(
+            &self,
+            p: &str,
+            o: u64,
+        ) -> legion_sync::Result<Box<dyn std::io::Read + Send>> {
+            self.inner.open_live_read_at(p, o)
+        }
+        fn create_dir_all_live(&self, p: &str) -> legion_sync::Result<()> {
+            if self.block_d.load(Ordering::SeqCst) && (p == "d" || p.starts_with("d/")) {
+                return Err(SyncError::Conflict {
+                    path: p.to_string(),
+                    reason: "ancestor 'd' is not a directory".to_string(),
+                });
+            }
+            self.inner.create_dir_all_live(p)
+        }
+        fn list_dir_live(&self, p: &str) -> legion_sync::Result<Vec<String>> {
+            self.inner.list_dir_live(p)
+        }
+        fn remove_empty_dir_live(&self, p: &str) -> legion_sync::Result<()> {
+            self.inner.remove_empty_dir_live(p)
+        }
+        fn create_symlink_live(&self, p: &str, t: &str) -> legion_sync::Result<()> {
+            self.inner.create_symlink_live(p, t)
+        }
+        fn remove_symlink_live(&self, p: &str) -> legion_sync::Result<()> {
+            self.inner.remove_symlink_live(p)
+        }
+        fn set_live_metadata(
+            &self,
+            p: &str,
+            m: legion_xfer::Timestamp,
+            md: Option<u32>,
+        ) -> legion_sync::Result<()> {
+            self.inner.set_live_metadata(p, m, md)
+        }
+        fn rename_live_to_live_no_replace(&self, f: &str, t: &str) -> legion_sync::Result<()> {
+            self.inner.rename_live_to_live_no_replace(f, t)
+        }
+        fn create_tmp(&self, t: &str) -> legion_sync::Result<Box<dyn SyncWrite>> {
+            self.inner.create_tmp(t)
+        }
+        fn open_tmp_append(&self, t: &str) -> legion_sync::Result<Box<dyn SyncWrite>> {
+            self.inner.open_tmp_append(t)
+        }
+        fn stat_tmp(&self, t: &str) -> legion_sync::Result<Option<FsMeta>> {
+            self.inner.stat_tmp(t)
+        }
+        fn set_tmp_metadata(
+            &self,
+            t: &str,
+            m: legion_xfer::Timestamp,
+            md: Option<u32>,
+        ) -> legion_sync::Result<()> {
+            self.inner.set_tmp_metadata(t, m, md)
+        }
+        fn hash_tmp(&self, t: &str) -> legion_sync::Result<(legion_xfer::Hash, u64)> {
+            self.inner.hash_tmp(t)
+        }
+        fn remove_tmp(&self, t: &str) -> legion_sync::Result<()> {
+            self.inner.remove_tmp(t)
+        }
+        fn list_tmp(&self) -> legion_sync::Result<Vec<String>> {
+            self.inner.list_tmp()
+        }
+        fn commit_tmp_to_live_no_replace(&self, t: &str, p: &str) -> legion_sync::Result<()> {
+            self.inner.commit_tmp_to_live_no_replace(t, p)
+        }
+        fn exchange_tmp_with_live(&self, t: &str, p: &str) -> legion_sync::Result<bool> {
+            self.inner.exchange_tmp_with_live(t, p)
+        }
+        fn move_live_to_tmp_no_replace(&self, p: &str, t: &str) -> legion_sync::Result<()> {
+            self.inner.move_live_to_tmp_no_replace(p, t)
+        }
+        fn move_tmp_to_bin_no_replace(&self, t: &str, b: &str) -> legion_sync::Result<()> {
+            self.inner.move_tmp_to_bin_no_replace(t, b)
+        }
+        fn move_live_to_bin_no_replace(&self, p: &str, b: &str) -> legion_sync::Result<()> {
+            self.inner.move_live_to_bin_no_replace(p, b)
+        }
+        fn write_bin_meta(&self, m: &str, b: &[u8]) -> legion_sync::Result<()> {
+            self.inner.write_bin_meta(m, b)
+        }
+        fn read_bin_meta(&self, m: &str) -> legion_sync::Result<Option<Vec<u8>>> {
+            self.inner.read_bin_meta(m)
+        }
+        fn stat_bin(&self, b: &str) -> legion_sync::Result<Option<FsMeta>> {
+            self.inner.stat_bin(b)
+        }
+        fn hash_bin(&self, b: &str) -> legion_sync::Result<(legion_xfer::Hash, u64)> {
+            self.inner.hash_bin(b)
+        }
+        fn copy_bin_to_tmp(&self, b: &str, t: &str) -> legion_sync::Result<()> {
+            self.inner.copy_bin_to_tmp(b, t)
+        }
+        fn remove_bin_file(&self, b: &str) -> legion_sync::Result<()> {
+            self.inner.remove_bin_file(b)
+        }
+        fn list_bin(&self) -> legion_sync::Result<Vec<String>> {
+            self.inner.list_bin()
         }
     }
-    eprintln!("tower {}\npi {}", st(&tower), st(&pi));
-    assert!(lost.is_empty(), "not live on both: {lost:?}");
+
+    let tmp = scratch();
+    let t = tmp.path();
+    let all = ["tower", "pi"];
+    fs::create_dir_all(t.join("pi/d")).unwrap();
+    fs::write(t.join("pi/d/blocked.txt"), b"inside d").unwrap();
+    fs::write(t.join("pi/unrelated.txt"), b"must still sync").unwrap();
+    let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
+    pi.scan(ts(0)).unwrap();
+
+    let block_d = Arc::new(AtomicBool::new(true));
+    let mut tower = SyncEngine::open(
+        FolderConfig::new("docs", "tower", ["tower".into(), "pi".into()]),
+        BlockingAncestorFs {
+            inner: RealFs::open(t.join("tower")).unwrap(),
+            block_d: Arc::clone(&block_d),
+        },
+        RedbIndexStore::open(t.join("tower.redb")).unwrap(),
+    )
+    .unwrap();
+
+    // Pull MUST succeed (not abort!) while holding back only `d`/`d/blocked.txt` and applying
+    // `unrelated.txt` in the exact same pull!
+    let rep = tower
+        .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(1))
+        .unwrap();
+    assert!(
+        rep.held_back >= 1,
+        "expected blocked ancestor record to be held back, got {rep:?}"
+    );
+    assert_eq!(
+        fs::read(t.join("tower/unrelated.txt")).unwrap(),
+        b"must still sync"
+    );
+    assert!(!t.join("tower/d/blocked.txt").exists());
+    match tower.status().unwrap().state {
+        MemberState::Problem { problems, .. } => {
+            assert!(
+                problems
+                    .iter()
+                    .any(|p| p.kind == ProblemKind::FilesystemError
+                        && (p.path == "d" || p.path == "d/blocked.txt")),
+                "expected durable FilesystemError naming blocked path, got {problems:?}"
+            );
+        }
+        other => panic!("expected Problem state while ancestor is blocked, got {other:?}"),
+    }
+
+    // Clear blocker -> next pull resolves held-back records and converges to UpToDate!
+    block_d.store(false, Ordering::SeqCst);
+    tower
+        .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(2))
+        .unwrap();
+    pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(3))
+        .unwrap();
+    tower
+        .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(4))
+        .unwrap();
+    assert_eq!(
+        fs::read(t.join("tower/d/blocked.txt")).unwrap(),
+        b"inside d"
+    );
+    assert_eq!(tower.status().unwrap().state, MemberState::UpToDate);
+    assert_eq!(pi.status().unwrap().state, MemberState::UpToDate);
 }

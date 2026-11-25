@@ -155,6 +155,38 @@ impl RealFs {
         Ok(true)
     }
 
+    /// Walks strict ancestors of `clean`, rejecting any symbolic-link ancestor with `InvalidPath`,
+    /// and returns the deepest existing directory ancestor (stopping at a missing or non-directory
+    /// ancestor such as a regular file that `ensure_ancestors_are_dirs` will convert during apply).
+    fn deepest_existing_dir_ancestor(&self, clean: &str) -> Result<PathBuf> {
+        let mut current = self.root.clone();
+        let mut deepest = self.root.clone();
+        for anc in ancestors(clean) {
+            let seg = anc.rsplit_once('/').map_or(anc, |(_, s)| s);
+            current.push(seg);
+            match fs::symlink_metadata(&current) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        let reason =
+                            format!("ancestor '{anc}' is a symbolic link and cannot be traversed");
+                        return Err(SyncError::InvalidPath {
+                            path: clean.to_string(),
+                            reason,
+                        });
+                    }
+                    if meta.file_type().is_dir() {
+                        deepest = current.clone();
+                    } else {
+                        break;
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => break,
+                Err(err) => return Err(SyncError::from_io(Some(anc.to_string()), err)),
+            }
+        }
+        Ok(deepest)
+    }
+
     /// Verifies that no strict ancestor directory of `rel_path` is a symlink or non-directory.
     fn ensure_no_symlink_ancestors(&self, clean: &str) -> Result<()> {
         let mut current = self.root.clone();
@@ -469,19 +501,15 @@ impl SyncFs for RealFs {
 
     fn available_space_for(&self, live_rel: &str) -> Result<Option<u64>> {
         let clean = validate_sync_path(live_rel)?;
-        self.ensure_no_symlink_ancestors(&clean)?;
-        let full = self.resolve_live(&clean, EntryKind::File)?;
-        let probe = full.parent().unwrap_or(&self.root);
-        Ok(available_space(probe).ok())
+        let probe = self.deepest_existing_dir_ancestor(&clean)?;
+        Ok(available_space(&probe).ok())
     }
 
     fn needs_local_staging(&self, live_rel: &str) -> Result<bool> {
         let clean = validate_sync_path(live_rel)?;
-        self.ensure_no_symlink_ancestors(&clean)?;
-        let full = self.resolve_live(&clean, EntryKind::File)?;
-        let probe = full.parent().unwrap_or(&self.root);
+        let probe = self.deepest_existing_dir_ancestor(&clean)?;
         let tmp_dir = self.tmp_dir();
-        match same_device(&tmp_dir, probe) {
+        match same_device(&tmp_dir, &probe) {
             Ok(same) => Ok(!same),
             Err(_) => Ok(false),
         }

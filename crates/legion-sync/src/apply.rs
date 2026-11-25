@@ -233,7 +233,15 @@ fn check_free_space_for_file<F: SyncFs>(
     if size == 0 {
         return Ok(None);
     }
-    let Some(avail) = fs.available_space_for(path)? else {
+    let Some(avail) = (match fs.available_space_for(path) {
+        Ok(avail) => avail,
+        Err(err) => {
+            if let Some(prob) = classify_local_placement_problem(fs, path, size, peer_id, &err) {
+                return Ok(Some(prob));
+            }
+            return Err(err);
+        }
+    }) else {
         return Ok(None);
     };
     if avail < required_free_space_bytes(size) {
@@ -299,6 +307,12 @@ fn classify_local_placement_problem<F: SyncFs>(
             kind: ProblemKind::FilesystemError,
             peer: Some(peer_id.to_string()),
             sentence: format!("'{path}' could not be placed on this file system: {reason}."),
+        }),
+        SyncError::Conflict { reason, .. } => Some(SyncProblem {
+            path: path.to_string(),
+            kind: ProblemKind::FilesystemError,
+            peer: Some(peer_id.to_string()),
+            sentence: format!("Could not place '{path}': {reason}."),
         }),
         _ => None,
     }
@@ -1701,18 +1715,19 @@ pub fn apply_new_files_group_commit<F: SyncFs, S: IndexStore>(
             let path = target.path.clone();
 
             let mut ancestor_ok = true;
+            let mut ancestor_held: Option<SyncProblem> = None;
             for anc in ancestors(&path) {
                 if created_ancestors.contains(anc) {
                     continue;
                 }
                 if let Some(rec) = store.get_record(anc)? {
                     if !rec.deleted && rec.kind == EntryKind::Dir {
-                        match fs.stat_live(anc)? {
-                            Some(m) if m.kind == EntryKind::Dir => {
+                        match fs.stat_live(anc) {
+                            Ok(Some(m)) if m.kind == EntryKind::Dir => {
                                 created_ancestors.insert(anc.to_string());
                                 continue;
                             }
-                            None => match fs.create_dir_all_live(anc) {
+                            Ok(None) => match fs.create_dir_all_live(anc) {
                                 Ok(()) => {
                                     created_ancestors.insert(anc.to_string());
                                     continue;
@@ -1721,11 +1736,36 @@ pub fn apply_new_files_group_commit<F: SyncFs, S: IndexStore>(
                                     ancestor_ok = false;
                                     break;
                                 }
-                                Err(err) => return Err(err),
+                                Err(err) => {
+                                    if let Some(prob) = classify_local_placement_problem(
+                                        fs,
+                                        &path,
+                                        target.size,
+                                        peer.member_id(),
+                                        &err,
+                                    ) {
+                                        ancestor_held = Some(prob);
+                                        break;
+                                    }
+                                    return Err(err);
+                                }
                             },
-                            Some(_) => {
+                            Ok(Some(_)) => {
                                 ancestor_ok = false;
                                 break;
+                            }
+                            Err(err) => {
+                                if let Some(prob) = classify_local_placement_problem(
+                                    fs,
+                                    &path,
+                                    target.size,
+                                    peer.member_id(),
+                                    &err,
+                                ) {
+                                    ancestor_held = Some(prob);
+                                    break;
+                                }
+                                return Err(err);
                             }
                         }
                     }
@@ -1734,18 +1774,52 @@ pub fn apply_new_files_group_commit<F: SyncFs, S: IndexStore>(
                         break;
                     }
                 }
-                if fs.stat_live(anc)?.is_some_and(|m| m.kind != EntryKind::Dir) {
-                    ancestor_ok = false;
-                    break;
+                match fs.stat_live(anc) {
+                    Ok(Some(m)) if m.kind != EntryKind::Dir => {
+                        ancestor_ok = false;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        if let Some(prob) = classify_local_placement_problem(
+                            fs,
+                            &path,
+                            target.size,
+                            peer.member_id(),
+                            &err,
+                        ) {
+                            ancestor_held = Some(prob);
+                            break;
+                        }
+                        return Err(err);
+                    }
                 }
-                if !matches!(
-                    ensure_ancestors_are_dirs(fs, store, &path, now)?,
-                    AncestorOutcome::Ready
-                ) {
-                    ancestor_ok = false;
-                    break;
+                match ensure_ancestors_are_dirs(fs, store, &path, now) {
+                    Ok(AncestorOutcome::Ready) => {
+                        created_ancestors.insert(anc.to_string());
+                    }
+                    Ok(_) => {
+                        ancestor_ok = false;
+                        break;
+                    }
+                    Err(err) => {
+                        if let Some(prob) = classify_local_placement_problem(
+                            fs,
+                            &path,
+                            target.size,
+                            peer.member_id(),
+                            &err,
+                        ) {
+                            ancestor_held = Some(prob);
+                            break;
+                        }
+                        return Err(err);
+                    }
                 }
-                created_ancestors.insert(anc.to_string());
+            }
+            if let Some(prob) = ancestor_held {
+                out.held_back_local.push((remote_seq, path, prob));
+                continue;
             }
             if !ancestor_ok {
                 out.fallback_records.push(target);
@@ -1763,7 +1837,22 @@ pub fn apply_new_files_group_commit<F: SyncFs, S: IndexStore>(
                 continue;
             }
 
-            let tmp_name = alloc_tmp_name_for(fs, "fetch", &path)?;
+            let tmp_name = match alloc_tmp_name_for(fs, "fetch", &path) {
+                Ok(t) => t,
+                Err(err) => {
+                    if let Some(prob) = classify_local_placement_problem(
+                        fs,
+                        &path,
+                        target.size,
+                        peer.member_id(),
+                        &err,
+                    ) {
+                        out.held_back_local.push((remote_seq, path, prob));
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
             chunk_bytes = chunk_bytes.saturating_add(target.size);
             chunk_specs.push((remote_seq, target, expected_hash, tmp_name));
         }
