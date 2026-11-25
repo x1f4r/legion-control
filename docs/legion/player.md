@@ -90,8 +90,9 @@ A song opens on a screen made for listening:
 - in landscape and on wide windows: cover left, everything else right.
 
 Controls never hide here. When a song ends the next one in the folder starts; after the last
-one it stops. Previous restarts the song when more than 3 seconds in, else goes one back.
-Recordings of ten minutes or more resume like videos do.
+one it stops. Previous is always shown on the music screen: on the first song or more than 3
+seconds in it restarts the song, else it goes one back. Recordings of ten minutes or more resume
+like videos do.
 
 Where the platform has media keys or a lock-screen player (`navigator.mediaSession`), Legion
 gives it title, artist, album, cover, and play, pause, previous, next and seek.

@@ -162,7 +162,9 @@ test('Player: video controls, viewer Fullscreen API, controlled-clock timing, si
       { timeout: 10_000 },
     );
 
-    // 1. Rules: NO native `controls` attribute, NO `[disabled]` control anywhere, every control is a named button, slider has spoken aria-valuetext.
+    // 1. Rules: NO native `controls` attribute, NO `[disabled]` control anywhere, every control is a named button,
+    // slider has spoken aria-valuetext, every control is >= 44x44 CSS px, times use sans tabular-nums with U+2212,
+    // and speed button is plain text without a border or box background.
     const rulesAudit = await page.evaluate(() => {
       const viewer = document.querySelector('.viewer');
       const videosWithControls = viewer.querySelectorAll('video[controls], audio[controls]').length;
@@ -173,6 +175,20 @@ test('Player: video controls, viewer Fullscreen API, controlled-clock timing, si
       ).length;
       const slider = viewer.querySelector('[role="slider"][aria-label="Position"]');
       const valueText = slider?.getAttribute('aria-valuetext') || '';
+      const controlSizes = [...buttons, slider].filter(Boolean).map((el) => {
+        const r = el.getBoundingClientRect();
+        return {
+          label: el.getAttribute('aria-label') || el.textContent.trim(),
+          width: Math.round(r.width * 10) / 10,
+          height: Math.round(r.height * 10) / 10,
+        };
+      });
+      const speedBtn = viewer.querySelector('.player-speed-btn');
+      const speedStyle = speedBtn ? getComputedStyle(speedBtn) : null;
+      const timesEl = viewer.querySelector('.player-times');
+      const timesStyle = timesEl ? getComputedStyle(timesEl) : null;
+      const remainingText = timesEl?.children?.[1]?.textContent || '';
+      const thumbBg = getComputedStyle(viewer.querySelector('.player-scrub-thumb')).backgroundColor;
       return {
         videosWithControls,
         disabledCount,
@@ -180,6 +196,14 @@ test('Player: video controls, viewer Fullscreen API, controlled-clock timing, si
         unnamedButtons,
         hasSlider: Boolean(slider),
         valueText,
+        controlSizes,
+        speedBorderWidth: speedStyle?.borderTopWidth || '',
+        speedBg: speedStyle?.backgroundColor || '',
+        timesFont: timesStyle?.fontFamily || '',
+        timesVariant: timesStyle?.fontVariantNumeric || '',
+        timesLetterSpacing: timesStyle?.letterSpacing || '',
+        remainingText,
+        thumbBg,
       };
     });
     assert.equal(rulesAudit.videosWithControls, 0);
@@ -188,6 +212,15 @@ test('Player: video controls, viewer Fullscreen API, controlled-clock timing, si
     assert.equal(rulesAudit.unnamedButtons, 0);
     assert.equal(rulesAudit.hasSlider, true);
     assert.match(rulesAudit.valueText, /seconds?/);
+    for (const c of rulesAudit.controlSizes) {
+      assert.ok(c.width >= 44 && c.height >= 44, `Video control "${c.label}" too small: ${c.width}x${c.height}`);
+    }
+    assert.equal(rulesAudit.speedBorderWidth, '0px');
+    assert.equal(rulesAudit.speedBg, 'rgba(0, 0, 0, 0)');
+    assert.equal(rulesAudit.timesVariant, 'tabular-nums');
+    assert.equal(rulesAudit.timesLetterSpacing, 'normal');
+    assert.equal(rulesAudit.remainingText.codePointAt(0), 0x2212);
+    assert.equal(rulesAudit.thumbBg, 'rgb(182, 242, 74)');
 
     // On first video in folder: Next is present, Previous is ABSENT (never disabled).
     assert.equal(await page.locator('.viewer button[aria-label="Next video"]').count(), 1);
@@ -509,9 +542,28 @@ test('Player: music screen, tags, covers in listing, MediaSession, auto-advance,
     assert.equal(musicAudit.mediaSessionArtist, 'Klara');
     assert.equal(musicAudit.mediaSessionAlbum, 'Early Hours');
 
-    // First song at 0:00 -> Previous is absent, Next is present.
-    assert.equal(await page.locator('.music-screen button[aria-label="Previous track"]').count(), 0);
+    // First song at 0:00 -> Previous is ALWAYS shown on the music screen (restarts song), Next is present,
+    // all controls are >= 44x44 CSS px, and Play never shifts between first, middle, and last song.
+    assert.equal(await page.locator('.music-screen button[aria-label="Restart track"]').count(), 1);
     assert.equal(await page.locator('.music-screen button[aria-label="Next track"]').count(), 1);
+
+    const firstPlayBox = await page.evaluate(() => {
+      const viewer = document.querySelector('.viewer');
+      const play = viewer.querySelector('.music-play-btn');
+      const playRect = play.getBoundingClientRect();
+      const playStyle = getComputedStyle(play);
+      const controls = [...viewer.querySelectorAll('button'), viewer.querySelector('[role="slider"][aria-label="Position"]')].filter(Boolean);
+      const sizes = controls.map((el) => {
+        const r = el.getBoundingClientRect();
+        return { label: el.getAttribute('aria-label') || el.textContent.trim(), width: r.width, height: r.height };
+      });
+      return { x: playRect.x, bg: playStyle.backgroundColor, color: playStyle.color, sizes };
+    });
+    assert.equal(firstPlayBox.bg, 'rgb(182, 242, 74)');
+    assert.equal(firstPlayBox.color, 'rgb(17, 22, 10)');
+    for (const c of firstPlayBox.sizes) {
+      assert.ok(c.width >= 44 && c.height >= 44, `Music control "${c.label}" too small: ${c.width}x${c.height}`);
+    }
 
     // Speed lives in More sheet.
     await page.locator('.music-top button[aria-label="More options"]').click();
@@ -524,13 +576,16 @@ test('Player: music screen, tags, covers in listing, MediaSession, auto-advance,
     await page.keyboard.press('Escape');
     await page.locator('.sheet').waitFor({ state: 'hidden' });
 
-    // Ending a song auto-advances to the next track (`02 - Rain on Glass.mp3`) and revokes the previous URL.
+    // Ending a song auto-advances to the next track (`02 - Rain on Glass.mp3`), revokes the previous URL,
+    // and keeps the Play button at the exact same horizontal position.
     const firstSongUrl = await page.evaluate(() => document.querySelector('.viewer audio')?.getAttribute('src') || '');
     assert.ok(firstSongUrl.length > 0);
     await page.evaluate(() => {
       document.querySelector('.viewer audio').dispatchEvent(new Event('ended'));
     });
     await page.locator('.music-title', { hasText: 'Rain on Glass' }).waitFor({ timeout: 5000 });
+    const midPlayX = await page.evaluate(() => document.querySelector('.music-play-btn').getBoundingClientRect().x);
+    assert.ok(Math.abs(midPlayX - firstPlayBox.x) < 0.5, `Play button shifted: ${firstPlayBox.x} -> ${midPlayX}`);
     const afterAutoNext = await page.evaluate((prev) => ({
       revokedPrev: Array.isArray(window.__LEGION_MOCK_REVOKED_URLS__) && window.__LEGION_MOCK_REVOKED_URLS__.includes(prev),
       nextUrl: document.querySelector('.viewer audio')?.getAttribute('src') || '',
@@ -538,7 +593,8 @@ test('Player: music screen, tags, covers in listing, MediaSession, auto-advance,
     assert.equal(afterAutoNext.revokedPrev, true, 'Auto-advancing to next song must revoke previous content URL');
     assert.notEqual(afterAutoNext.nextUrl, firstSongUrl);
 
-    // Close and open untagged song: title is filename without extension, no subtitle, no "Unknown artist", plain bg.
+    // Close and open untagged song (last song in folder): title is filename without extension, no subtitle,
+    // no "Unknown artist", plain bg, muted tile (NOT green), Next absent while Play stays in exact same slot!
     await page.locator('.music-top button[aria-label="Close"]').click();
     await page.locator('.viewer').waitFor({ state: 'hidden' });
     await page.locator('.list a.row', { hasText: 'field_recording_untagged.wav' }).click();
@@ -546,8 +602,56 @@ test('Player: music screen, tags, covers in listing, MediaSession, auto-advance,
     assert.equal(await page.locator('.music-subtitle').count(), 0);
     assert.equal(await page.locator('.music-backdrop').count(), 0);
     assert.equal(await page.locator('.music-cover-tile').count(), 1);
+    assert.equal(await page.locator('.music-screen button[aria-label="Next track"]').count(), 0);
+    assert.equal(await page.locator('.music-screen button[aria-label="Previous track"]').count(), 1);
+    const lastTrackAudit = await page.evaluate(() => ({
+      playX: document.querySelector('.music-play-btn').getBoundingClientRect().x,
+      tileColor: getComputedStyle(document.querySelector('.music-cover-tile')).color,
+    }));
+    assert.ok(
+      Math.abs(lastTrackAudit.playX - firstPlayBox.x) < 0.5,
+      `Play button shifted on last track without Next: ${firstPlayBox.x} -> ${lastTrackAudit.playX}`,
+    );
+    assert.equal(lastTrackAudit.tileColor, 'rgb(157, 164, 173)');
     const untaggedText = await page.locator('.viewer').innerText();
     assert.equal(untaggedText.includes('Unknown artist'), false);
+
+    // System light mode (prefers-color-scheme: light with default system theme) AND explicit light theme
+    // still render bright dark-surface accent (#b6f24a fill, #11160a ink) on the music Play button and scrubber.
+    await page.emulateMedia({ colorScheme: 'light' });
+    const lightSystemColors = await page.evaluate(() => ({
+      playBg: getComputedStyle(document.querySelector('.music-play-btn')).backgroundColor,
+      playInk: getComputedStyle(document.querySelector('.music-play-btn')).color,
+      thumbBg: getComputedStyle(document.querySelector('.player-scrub-thumb')).backgroundColor,
+    }));
+    assert.equal(lightSystemColors.playBg, 'rgb(182, 242, 74)');
+    assert.equal(lightSystemColors.playInk, 'rgb(17, 22, 10)');
+    assert.equal(lightSystemColors.thumbBg, 'rgb(182, 242, 74)');
+    await page.evaluate(() => document.documentElement.setAttribute('data-theme', 'light'));
+    const lightExplicitColors = await page.evaluate(() => ({
+      playBg: getComputedStyle(document.querySelector('.music-play-btn')).backgroundColor,
+      playInk: getComputedStyle(document.querySelector('.music-play-btn')).color,
+    }));
+    assert.equal(lightExplicitColors.playBg, 'rgb(182, 242, 74)');
+    assert.equal(lightExplicitColors.playInk, 'rgb(17, 22, 10)');
+    await page.evaluate(() => document.documentElement.removeAttribute('data-theme'));
+    await page.emulateMedia({ colorScheme: 'dark' });
+
+    // Portrait viewport: Play button is centered horizontally under the position bar even with Next absent.
+    await page.setViewportSize({ width: 412, height: 915 });
+    const portraitCenter = await page.evaluate(() => {
+      const scrub = document.querySelector('.player-scrub').getBoundingClientRect();
+      const play = document.querySelector('.music-play-btn').getBoundingClientRect();
+      return {
+        scrubCenterX: scrub.left + scrub.width / 2,
+        playCenterX: play.left + play.width / 2,
+      };
+    });
+    assert.ok(
+      Math.abs(portraitCenter.scrubCenterX - portraitCenter.playCenterX) < 1,
+      `Portrait Play button not centered under position bar: ${portraitCenter.playCenterX} vs ${portraitCenter.scrubCenterX}`,
+    );
+    await page.setViewportSize({ width: 1100, height: 720 });
 
     // 3. Large library (300 songs) with slow covers: title appears BEFORE cover loads.
     await page.goto(`${server.url}/?mock=big-music,slow-cover#/files/tower/%2Fhome%2Fme%2FMusic%2FLibrary300`, {

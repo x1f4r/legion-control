@@ -1173,7 +1173,7 @@ export function VideoPlayer({
               <div class="player-speed-wrap">
                 <button
                   type="button"
-                  class="btn small player-speed-btn"
+                  class="btn player-btn player-speed-btn"
                   aria-label=${`Playback speed ${formatSpeed(playbackRate)}`}
                   aria-haspopup="menu"
                   aria-expanded=${speedOpen ? 'true' : 'false'}
@@ -1495,11 +1495,11 @@ export function MusicPlayer({
   const handlePrev = useCallback(() => {
     const a = audioRef.current;
     const t = pendingSeekTime != null ? pendingSeekTime : a && Number.isFinite(a.currentTime) ? a.currentTime : currentTimeRef.current;
-    if (shouldMusicPrevRestart(t)) {
+    if (!queueRef.current.prev || shouldMusicPrevRestart(t)) {
       commitSeek(0);
       return;
     }
-    if (queueRef.current.prev && onNavigateSibling) {
+    if (onNavigateSibling) {
       autoPlayNextRef.current = !a?.paused ? { path: queueRef.current.prev.path, play: true } : null;
       onNavigateSibling(queueRef.current.prev);
     }
@@ -1574,7 +1574,7 @@ export function MusicPlayer({
     };
     safeSet('play', () => audioRef.current?.play?.().catch(() => {}));
     safeSet('pause', () => audioRef.current?.pause?.());
-    safeSet('previoustrack', queue.prev || currentTimeRef.current > 3 ? handlePrev : null);
+    safeSet('previoustrack', handlePrev);
     safeSet('nexttrack', queue.next ? handleNext : null);
     safeSet('seekto', (details) => {
       if (typeof details?.seekTime === 'number' && Number.isFinite(details.seekTime)) {
@@ -1660,7 +1660,7 @@ export function MusicPlayer({
   }, [togglePlay, commitSeek, showVolume, applyVolume, muted, volume, toggleMute, handleNext, handlePrev, onClose]);
 
   const displayTime = pendingSeekTime != null ? pendingSeekTime : currentTime;
-  const showPrev = Boolean(queue.prev || shouldMusicPrevRestart(displayTime));
+  const prevIsRestart = !queue.prev || shouldMusicPrevRestart(displayTime);
   const showNext = Boolean(queue.next);
 
   return html`
@@ -1730,40 +1730,42 @@ export function MusicPlayer({
           </div>
 
           <div class="music-transport">
-            ${showPrev
-              ? html`
-                  <button
-                    type="button"
-                    class="btn icon music-ctl-btn"
-                    aria-label=${shouldMusicPrevRestart(displayTime) ? 'Restart track' : 'Previous track'}
-                    onClick=${handlePrev}
-                  >
-                    <${Icon} name="prev" />
-                  </button>
-                `
-              : null}
-            <button
-              type="button"
-              class="btn icon music-play-btn"
-              aria-label=${playing ? 'Pause' : 'Play'}
-              onClick=${togglePlay}
-            >
-              ${stalled
-                ? html`<span class="music-spinner" aria-hidden="true"></span>`
-                : html`<${Icon} name=${playing ? 'pause' : 'play'} />`}
-            </button>
-            ${showNext
-              ? html`
-                  <button
-                    type="button"
-                    class="btn icon music-ctl-btn"
-                    aria-label="Next track"
-                    onClick=${handleNext}
-                  >
-                    <${Icon} name="next" />
-                  </button>
-                `
-              : null}
+            <div class="music-transport-slot">
+              <button
+                type="button"
+                class="btn icon music-ctl-btn"
+                aria-label=${prevIsRestart ? 'Restart track' : 'Previous track'}
+                onClick=${handlePrev}
+              >
+                <${Icon} name="prev" />
+              </button>
+            </div>
+            <div class="music-transport-slot">
+              <button
+                type="button"
+                class="btn icon primary music-play-btn"
+                aria-label=${playing ? 'Pause' : 'Play'}
+                onClick=${togglePlay}
+              >
+                ${stalled
+                  ? html`<span class="music-spinner" aria-hidden="true"></span>`
+                  : html`<${Icon} name=${playing ? 'pause' : 'play'} />`}
+              </button>
+            </div>
+            <div class="music-transport-slot">
+              ${showNext
+                ? html`
+                    <button
+                      type="button"
+                      class="btn icon music-ctl-btn"
+                      aria-label="Next track"
+                      onClick=${handleNext}
+                    >
+                      <${Icon} name="next" />
+                    </button>
+                  `
+                : null}
+            </div>
           </div>
 
           ${showVolume

@@ -36,7 +36,7 @@ export function formatRemainingTime(currentSeconds, durationSeconds) {
   if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) return '';
   const cur = Number.isFinite(currentSeconds) && currentSeconds > 0 ? currentSeconds : 0;
   const remaining = Math.max(0, Math.ceil(durationSeconds - cur));
-  return `-${formatPlayerTime(remaining)}`;
+  return `\u2212${formatPlayerTime(remaining)}`;
 }
 
 export function formatSpokenDuration(seconds) {

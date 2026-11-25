@@ -414,7 +414,8 @@ test('time formatting, spoken slider value, speed labels, orientation, and wire 
   assert.equal(formatPlayerTime(0), '0:00');
   assert.equal(formatPlayerTime(760), '12:40');
   assert.equal(formatPlayerTime(3661), '1:01:01');
-  assert.equal(formatRemainingTime(15, 75), '-1:00');
+  assert.equal(formatRemainingTime(15, 75), '\u22121:00');
+  assert.equal(formatRemainingTime(15, 75).codePointAt(0), 0x2212);
   assert.equal(formatPositionValueText(135, 724), '2 minutes 15 seconds of 12 minutes 4 seconds');
   assert.equal(formatSpeed(1), '1×');
   assert.equal(formatSpeed(1.25), '1.25×');
