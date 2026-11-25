@@ -1942,6 +1942,15 @@ fn poll_per_chunk(
                 }
                 Poll::Ready(Ok(chunk)) => {
                     *next_chunk = None;
+                    let active_cancel = chunk.chunk_cancel.clone();
+                    let master = cancel.clone();
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            biased;
+                            () = master.cancelled() => active_cancel.cancel(),
+                            () = active_cancel.cancelled() => {}
+                        }
+                    });
                     *active_slot = Some(chunk);
                 }
             }
@@ -2266,7 +2275,7 @@ async fn handshake_get_from_source(
         request_keep_open,
         timeout,
         options.max_busy_lines,
-        cancel,
+        cancel.clone(),
         on_greeting_capabilities,
     )
     .await?;
@@ -2275,7 +2284,7 @@ async fn handshake_get_from_source(
     let total_available = validated.size - validated.offset;
     let total_length = length.map_or(total_available, |n| n.min(total_available));
 
-    let stream_cancel = CancellationToken::new();
+    let stream_cancel = cancel.child_token();
     let active_cancel = opened.channel_cancel.clone();
     let master = stream_cancel.clone();
     tokio::spawn(async move {

@@ -603,7 +603,7 @@ async function runPhoneSuite() {
   await techToggle.waitFor({ state: 'visible', timeout: 15000 });
   await techToggle.click();
 
-  // Open a picture on pi in the Files viewer via the relayed custom-scheme content stream.
+  // Open a picture on pi in the Files viewer via the relayed loopback content stream.
   await page.evaluate((dir) => {
     window.location.hash = `#/files/pi/${dir}`;
   }, FILES_B_DIR);
@@ -619,7 +619,7 @@ async function runPhoneSuite() {
   );
   await takeShot(page, '02b-relayed-picture-pi.png');
 
-  // Ranged media read & seek on pi via real <audio> through custom-scheme `legion-content` over relay.
+  // Ranged media read & seek on pi via real <audio> through loopback `127.0.0.1` over relay.
   const audioRelayed = await page.evaluate(async (clipPath) => {
     const minted = await window.__TAURI__.core.invoke('content_url', {
       machine: 'pi',
@@ -655,6 +655,10 @@ async function runPhoneSuite() {
       audio.src = minted.url;
     });
   }, path.join(FILES_B_DIR, 'clip.wav'));
+  assert.ok(
+    typeof audioRelayed.url === 'string' && audioRelayed.url.startsWith('http://127.0.0.1:'),
+    `Expected universal loopback content URL on Android, got ${audioRelayed.url}`,
+  );
   assert.ok(audioRelayed.duration > 3.5, `Expected ~4s WAV duration, got ${audioRelayed.duration}`);
   assert.ok(
     audioRelayed.seekableEnd > 3.5,

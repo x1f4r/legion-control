@@ -2320,7 +2320,8 @@ impl Link {
             .await
     }
 
-    /// Like [`Link::open_content`], aborting the open handshake if `cancel` fires.
+    /// Like [`Link::open_content`], aborting the open handshake and the returned stream if `cancel`
+    /// fires.
     pub async fn open_content_with_cancel(
         &self,
         machine: &str,

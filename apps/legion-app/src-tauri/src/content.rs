@@ -12,7 +12,7 @@
 //! loopback literal `127.0.0.1`, allowing WebView to stream and seek arbitrarily large media with
 //! flat memory while keeping cleartext blocked for every other host.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -318,6 +318,8 @@ impl Drop for ActiveStreamGuard {
 
 struct LinkContentSource {
     backend: Arc<dyn Backend>,
+    tickets: Arc<TicketTable>,
+    ticket_cancels: Arc<Mutex<HashMap<[u8; 32], CancellationToken>>>,
 }
 
 impl ContentSource for LinkContentSource {
@@ -344,9 +346,34 @@ impl ContentSource for LinkContentSource {
                 return Err(OpenRangeError::TicketRevoked);
             }
 
+            let stream_cancel = {
+                let mut map = self
+                    .ticket_cancels
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                map.entry(ticket.key_hash).or_default().child_token()
+            };
+            if !self.tickets.is_live(&ticket.key_hash) {
+                if let Some(token) = self
+                    .ticket_cancels
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&ticket.key_hash)
+                {
+                    token.cancel();
+                }
+                return Err(OpenRangeError::TicketRevoked);
+            }
+
             let stream = target
                 .link
-                .open_content(&target.link_node, &ticket.path, offset, length)
+                .open_content_with_cancel(
+                    &target.link_node,
+                    &ticket.path,
+                    offset,
+                    length,
+                    stream_cancel,
+                )
                 .await
                 .map_err(map_link_open_error)?;
 
@@ -417,6 +444,7 @@ pub struct AppContentServer {
     activity: Arc<Mutex<ActivityState>>,
     request_log: Mutex<VecDeque<ContentRequestLog>>,
     ticket_statuses: Mutex<VecDeque<TicketStatusEntry>>,
+    ticket_cancels: Arc<Mutex<HashMap<[u8; 32], CancellationToken>>>,
 }
 
 impl AppContentServer {
@@ -467,8 +495,12 @@ impl AppContentServer {
         custom_scheme_max_full_bytes: u64,
         custom_scheme_total_memory_budget_bytes: usize,
     ) -> Self {
+        let tickets = Arc::new(TicketTable::with_config(ticket_config));
+        let ticket_cancels = Arc::new(Mutex::new(HashMap::new()));
         let source = Arc::new(LinkContentSource {
             backend: Arc::clone(&backend),
+            tickets: Arc::clone(&tickets),
+            ticket_cancels: Arc::clone(&ticket_cancels),
         });
         let conn_cap = max_loopback_connections.max(1);
         let budget_units = custom_scheme_total_memory_budget_bytes
@@ -477,7 +509,7 @@ impl AppContentServer {
         Self {
             backend,
             mode,
-            tickets: Arc::new(TicketTable::with_config(ticket_config)),
+            tickets,
             limiter: ContentLimiter::default(),
             source,
             allowed_origins,
@@ -496,6 +528,7 @@ impl AppContentServer {
             })),
             request_log: Mutex::new(VecDeque::with_capacity(MAX_REQUEST_LOG)),
             ticket_statuses: Mutex::new(VecDeque::with_capacity(MAX_REQUEST_LOG)),
+            ticket_cancels,
         }
     }
 
@@ -679,6 +712,7 @@ impl AppContentServer {
                 path: path.to_owned(),
             })
             .map_err(AppError::from)?;
+        self.prune_dead_ticket_cancels();
 
         self.touch_activity();
 
@@ -706,15 +740,48 @@ impl AppContentServer {
         })
     }
 
-    /// Revokes the single content ticket identified by `raw_url` immediately (used when the viewer
-    /// closes, switches files, or tears down a media element). Returns `true` if a live ticket was
-    /// removed.
+    fn cancel_ticket_streams(&self, key_hash: &[u8; 32]) {
+        if let Some(token) = self
+            .ticket_cancels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(key_hash)
+        {
+            token.cancel();
+        }
+    }
+
+    fn prune_dead_ticket_cancels(&self) {
+        let dead: Vec<CancellationToken> = {
+            let mut map = self
+                .ticket_cancels
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let dead_keys: Vec<[u8; 32]> = map
+                .keys()
+                .copied()
+                .filter(|h| !self.tickets.contains_hash(h))
+                .collect();
+            dead_keys
+                .into_iter()
+                .filter_map(|h| map.remove(&h))
+                .collect()
+        };
+        for token in dead {
+            token.cancel();
+        }
+    }
+
+    /// Revokes the single content ticket identified by `raw_url` immediately and cancels any
+    /// in-flight or active streams serving it (used when the viewer closes, switches files, or
+    /// tears down a media element). Returns `true` if a live ticket was removed.
     pub fn revoke_url(&self, raw_url: &str) -> bool {
         let Some(ticket_id) = extract_ticket_id_from_url(raw_url) else {
             return false;
         };
         let key_hash = ticket_hash(ticket_id);
         let removed = self.tickets.revoke(ticket_id);
+        self.cancel_ticket_streams(&key_hash);
         if removed {
             let mut statuses = self
                 .ticket_statuses
@@ -730,11 +797,22 @@ impl AppContentServer {
         let _ = self
             .tickets
             .retain_holders(|holder| self.backend.is_pairing_holder_live(holder));
+        self.prune_dead_ticket_cancels();
     }
 
     /// Revokes every issued content ticket (used on store repair and app exit).
     pub fn revoke_all(&self) {
         let _ = self.tickets.retain_holders(|_| false);
+        let tokens: Vec<CancellationToken> = self
+            .ticket_cancels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain()
+            .map(|(_, tok)| tok)
+            .collect();
+        for tok in tokens {
+            tok.cancel();
+        }
     }
 
     /// Revokes every ticket and immediately stops any active loopback listener.
@@ -4474,5 +4552,766 @@ mod tests {
         );
 
         server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn relayed_mid_stream_failure_sets_stream_failed_on_loopback() {
+        let flac_bytes: Vec<u8> = (0..(128 * 1024usize)).map(|i| (i % 251) as u8).collect();
+        let flac_bytes_arc = Arc::new(flac_bytes.clone());
+        let tower_key = legion_link::DeviceKey::from_seed([61u8; 32])
+            .public_key_line("tower")
+            .unwrap();
+        let relay_hits = Arc::new(AtomicUsize::new(0));
+
+        struct TruncatingRelayOpener {
+            payload: Arc<Vec<u8>>,
+            relay_hits: Arc<AtomicUsize>,
+        }
+
+        impl StreamOpener for TruncatingRelayOpener {
+            fn open_stream(
+                &self,
+                _cancel: CancellationToken,
+            ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>>
+            {
+                let payload = Arc::clone(&self.payload);
+                let relay_hits = Arc::clone(&self.relay_hits);
+                Box::pin(async move {
+                    let (client_in, mut server_out) = tokio::io::duplex(64 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(64 * 1024);
+                    let cancel = CancellationToken::new();
+                    tokio::spawn(async move {
+                        let _ = server_out
+                            .write_all(
+                                format!(
+                                    "{}\n",
+                                    json!({
+                                        "protocol": 1,
+                                        "capabilities": [legion_link::CAP_STREAM_RELAY]
+                                    })
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let req: Value = serde_json::from_str(&line).unwrap();
+                        assert_eq!(req["op"], json!("relay"));
+                        assert_eq!(req["on"], json!("studio"));
+                        relay_hits.fetch_add(1, Ordering::SeqCst);
+                        let inner = &req["request"];
+                        let offset = inner["offset"].as_u64().unwrap_or(0) as usize;
+                        let avail = payload.len().saturating_sub(offset);
+                        let len = inner
+                            .get("length")
+                            .and_then(Value::as_u64)
+                            .map_or(avail, |n| (n as usize).min(avail));
+                        let ready = json!({
+                            "size": payload.len(),
+                            "offset": offset,
+                            "length": len,
+                            "mtime": { "secs": 1_700_000_000i64, "nanos": 0u32 },
+                            "file_id": 77u64,
+                        });
+                        let _ = server_out.write_all(format!("{ready}\n").as_bytes()).await;
+                        if len == 0 {
+                            let _ = server_out.shutdown().await;
+                            return;
+                        }
+                        // Deliver only the first 70 KiB (past ContentBody's 64 KiB first frame so
+                        // HTTP 206 headers flush) then drop the relayed stream mid-transfer so
+                        // loopback records `stream_failed: true`.
+                        let cut = len.min(70 * 1024);
+                        let _ = server_out.write_all(&payload[offset..offset + cut]).await;
+                        let _ = server_out.shutdown().await;
+                    });
+                    Ok(RawStream {
+                        reader: Box::new(client_in),
+                        writer: Box::new(client_out),
+                        stderr: None,
+                        cancel,
+                        park: None,
+                        guard: None,
+                    })
+                })
+            }
+        }
+
+        struct RelayedOnlyBackend {
+            link: Link,
+        }
+
+        impl Backend for RelayedOnlyBackend {
+            fn state(&self) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn tools(&self, _on: Option<Value>) -> BoxFuture<'_, Result<Vec<Value>, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn call(
+                &self,
+                _request: CallRequest,
+                _on_event: Option<tauri::ipc::Channel<Value>>,
+            ) -> BoxFuture<'_, Result<Value, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn cancel(&self, _id: CallId) -> BoxFuture<'_, Result<CancelResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn pair(
+                &self,
+                _invite: String,
+                _name: String,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn unpair(&self, _node: String) -> BoxFuture<'_, Result<UnpairResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn select_node(&self, _node: String) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn repair_store(&self) -> BoxFuture<'_, Result<RepairResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn invalidate_sessions(&self) -> BoxFuture<'_, Result<(), AppError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn learn(&self) -> BoxFuture<'_, Result<LearnResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn accept_identity_change(
+                &self,
+                _node: String,
+                _fingerprints: Vec<String>,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn dismiss_identity_change(
+                &self,
+                _node: String,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn content_target(&self, machine: &str) -> Result<ContentTarget, AppError> {
+                Ok(ContentTarget {
+                    link: self.link.clone(),
+                    link_node: machine.to_owned(),
+                    machine: machine.to_owned(),
+                    principal: "device:pixel".to_owned(),
+                    holder: "fleet:1".to_owned(),
+                })
+            }
+            fn is_pairing_holder_live(&self, _holder: &str) -> bool {
+                true
+            }
+        }
+
+        let session_opener: SessionOpener = {
+            let payload = Arc::clone(&flac_bytes_arc);
+            let relay_hits = Arc::clone(&relay_hits);
+            Arc::new(move |entry, _, cancel| {
+                let payload = Arc::clone(&payload);
+                let relay_hits = Arc::clone(&relay_hits);
+                Box::pin(async move {
+                    let node_name = entry.node.clone();
+                    let (client_in, mut server_out) = tokio::io::duplex(16 * 1024);
+                    let (server_in, client_out) = tokio::io::duplex(16 * 1024);
+                    let node_for_rpc = node_name.clone();
+                    tokio::spawn(async move {
+                        let mut reader = BufReader::new(server_in);
+                        let mut line = String::new();
+                        while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                            let req: legion_link::proto::Request =
+                                serde_json::from_str(&line).unwrap();
+                            let reply = ProtoResp::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: node_for_rpc.clone(),
+                                    version: VERSION.to_owned(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".to_owned(),
+                                    arch: "x86_64".to_owned(),
+                                    systems: vec![],
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap(),
+                            );
+                            let _ = server_out
+                                .write_all(
+                                    format!("{}\n", serde_json::to_string(&reply).unwrap())
+                                        .as_bytes(),
+                                )
+                                .await;
+                            line.clear();
+                        }
+                    });
+                    let stream_opener = Arc::new(TruncatingRelayOpener {
+                        payload,
+                        relay_hits,
+                    });
+                    Session::open_transport(
+                        client_in,
+                        client_out,
+                        Box::new(FakeTransport {
+                            opener: stream_opener,
+                        }),
+                        &node_name,
+                        None,
+                        Duration::from_secs(5),
+                        cancel,
+                    )
+                    .await
+                    .map_err(|err| err.into_error())
+                })
+            })
+        };
+
+        let link = Link::with_opener(
+            LinkConfig {
+                device_key: Some("dummy".to_owned()),
+                nodes: vec![NodeLink::ssh(
+                    "tower",
+                    SshTarget {
+                        hosts: vec!["tower.example.net".to_owned()],
+                        port: 22,
+                        user: "me".to_owned(),
+                        host_keys: vec![tower_key],
+                    },
+                    Some("device:pixel".to_owned()),
+                )],
+                ..LinkConfig::default()
+            },
+            LinkOptions::default(),
+            session_opener,
+        );
+        let backend: Arc<dyn Backend> = Arc::new(RelayedOnlyBackend { link: link.clone() });
+        let server = Arc::new(AppContentServer::with_config(
+            backend,
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["http://tauri.localhost".to_owned()],
+        ));
+
+        let minted = server
+            .mint_url("studio", "/home/me/track.flac", false)
+            .await
+            .unwrap();
+        let port = server.loopback_port().unwrap();
+        let path = minted
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{port}"))
+            .unwrap();
+
+        let (status, head, body) = raw_http(
+            port,
+            &format!(
+                "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://tauri.localhost\r\nRange: bytes=0-\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(status, 206, "{head}");
+        assert!(body.len() < flac_bytes.len());
+        assert_eq!(relay_hits.load(Ordering::SeqCst), 2);
+
+        let st = server.content_status_for_url(&minted.url);
+        assert_eq!(st.request_count, 1);
+        assert_eq!(st.status, Some(206));
+        assert_eq!(st.content_type.as_deref(), Some("audio/flac"));
+        assert!(
+            st.stream_failed,
+            "mid-stream relayed failure must set stream_failed=true so the viewer shows the transport sentence"
+        );
+        assert!(st.ticket_live);
+
+        server.shutdown();
+        link.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn content_revoke_terminates_active_relayed_stream_on_relay_and_target() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::{Path, PathBuf};
+        use std::process::{Child, Command, Stdio};
+
+        fn find_tool(name: &str) -> Option<PathBuf> {
+            let path_var = std::env::var_os("PATH")?;
+            for dir in std::env::split_paths(&path_var) {
+                let candidate = dir.join(name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+            None
+        }
+
+        fn find_sshd() -> Option<PathBuf> {
+            find_tool("sshd").or_else(|| {
+                ["/usr/sbin/sshd", "/sbin/sshd", "/usr/local/sbin/sshd"]
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .find(|p| p.is_file())
+            })
+        }
+
+        fn find_legion_bin() -> Option<PathBuf> {
+            if let Some(explicit) = std::env::var_os("LEGION_BIN") {
+                let p = PathBuf::from(explicit);
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+            let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+            let repo_root = manifest_dir.parent()?.parent()?.parent()?;
+            for profile in ["debug", "release"] {
+                let candidate = repo_root.join("target").join(profile).join("legion");
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+            None
+        }
+
+        fn is_legion_pid_alive(pid: u32) -> bool {
+            let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+            if proc_dir.is_dir() {
+                let Ok(stat) = std::fs::read_to_string(proc_dir.join("stat")) else {
+                    return false;
+                };
+                // Process state is the first token after the final ')'. Ignore zombies/dead.
+                let state = stat
+                    .rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().next())
+                    .unwrap_or("");
+                if matches!(state, "Z" | "X" | "x") {
+                    return false;
+                }
+                let Ok(cmdline) = std::fs::read(proc_dir.join("cmdline")) else {
+                    return false;
+                };
+                return cmdline.windows(b"legion".len()).any(|w| w == b"legion");
+            }
+            Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        }
+
+        fn count_live_pids(dir: &Path) -> usize {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return 0;
+            };
+            entries
+                .flatten()
+                .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+                .filter_map(|s| s.trim().parse::<u32>().ok())
+                .filter(|&pid| is_legion_pid_alive(pid))
+                .count()
+        }
+
+        let (Some(sshd_bin), Some(keygen_bin)) = (find_sshd(), find_tool("ssh-keygen")) else {
+            eprintln!("skipping 3-node content_revoke test: sshd/ssh-keygen unavailable");
+            return;
+        };
+        let Some(legion_bin) = find_legion_bin() else {
+            eprintln!(
+                "skipping 3-node content_revoke test: built target/debug/legion not found (build workspace first)"
+            );
+            return;
+        };
+        let user_out = Command::new("id")
+            .arg("-un")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(user_out.status.success());
+        let user = String::from_utf8(user_out.stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+
+        struct SshdGuard(Child);
+        impl Drop for SshdGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let _ = std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700));
+        let tower_home = root.path().join("tower-home");
+        let studio_home = root.path().join("studio-home");
+        let tower_legion = root.path().join("tower-legion");
+        let studio_legion = root.path().join("studio-legion");
+        let tower_pids = root.path().join("tower-pids");
+        let studio_pids = root.path().join("studio-pids");
+        let sshd_dir = root.path().join("sshd-tower");
+        let auth_keys = tower_home.join(".ssh/authorized_keys");
+
+        for d in [
+            tower_home.join(".ssh"),
+            studio_home.join("media"),
+            tower_legion.join("config"),
+            studio_legion.join("config"),
+            tower_pids.clone(),
+            studio_pids.clone(),
+            sshd_dir.clone(),
+        ] {
+            std::fs::create_dir_all(&d).unwrap();
+        }
+        for d in [&tower_home, &tower_home.join(".ssh"), &sshd_dir] {
+            let _ = std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700));
+        }
+
+        // Write a 16 MiB file on `studio` (larger than loopback TCP + SSH window buffers so a
+        // paused loopback client leaves the relayed stream actively open across all 3 nodes).
+        let file_size = 16 * 1024 * 1024usize;
+        let media_path = studio_home.join("media/concert.flac");
+        let media_bytes: Vec<u8> = (0..file_size).map(|i| ((i * 19 + 7) % 251) as u8).collect();
+        std::fs::write(&media_path, &media_bytes).unwrap();
+
+        // Wrapper for `studio` (target): records PID of every `legion stream` process before exec.
+        let studio_wrapper = root.path().join("studio-exec.sh");
+        std::fs::write(
+            &studio_wrapper,
+            format!(
+                "#!/bin/sh\nexport LEGION_HOME='{}'\nexport HOME='{}'\nunset XDG_CONFIG_HOME XDG_STATE_HOME\nif [ \"$1\" = \"stream\" ]; then echo \"$$\" > '{}/stream.'\"$$\"; fi\nexec '{}' \"$@\"\n",
+                studio_legion.display(),
+                studio_home.display(),
+                studio_pids.display(),
+                legion_bin.display(),
+            ),
+        )
+        .unwrap();
+        let _ = std::fs::set_permissions(&studio_wrapper, std::fs::Permissions::from_mode(0o700));
+
+        // Forced-command dispatch wrapper for `tower` (relay): records PID of `legion stream`.
+        let tower_dispatch = root.path().join("tower-dispatch.sh");
+        std::fs::write(
+            &tower_dispatch,
+            format!(
+                "#!/bin/sh\nexport LEGION_HOME='{}'\nexport HOME='{}'\nunset XDG_CONFIG_HOME XDG_STATE_HOME\ncase \"$SSH_ORIGINAL_COMMAND\" in\n  *'legion stream'*)\n    echo \"$$\" > '{}/stream.'\"$$\"\n    exec '{}' stream\n    ;;\n  *'legion rpc'*)\n    exec '{}' rpc\n    ;;\n  *)\n    printf 'unexpected command: %s\\n' \"$SSH_ORIGINAL_COMMAND\" >&2\n    exit 2\n    ;;\nesac\n",
+                tower_legion.display(),
+                tower_home.display(),
+                tower_pids.display(),
+                legion_bin.display(),
+                legion_bin.display(),
+            ),
+        )
+        .unwrap();
+        let _ = std::fs::set_permissions(&tower_dispatch, std::fs::Permissions::from_mode(0o700));
+
+        let toml_lit = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "''"));
+        let policy = "default = \"owner\"\n\n[principals.phone]\nrole = \"owner\"\n";
+        std::fs::write(tower_legion.join("config/policy.toml"), policy).unwrap();
+        std::fs::write(studio_legion.join("config/policy.toml"), policy).unwrap();
+        std::fs::write(tower_legion.join("config/node.toml"), "name = \"tower\"\n").unwrap();
+        std::fs::write(
+            studio_legion.join("config/node.toml"),
+            "name = \"studio\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tower_legion.join("config/fleet.toml"),
+            format!(
+                "[machines.tower]\nssh = \"127.0.0.1\"\n\n[machines.studio]\ncommand = [{}, \"rpc\"]\n",
+                toml_lit(&studio_wrapper),
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            studio_legion.join("config/fleet.toml"),
+            "[machines.studio]\nssh = \"127.0.0.1\"\n",
+        )
+        .unwrap();
+
+        // Generate host key for `tower` sshd and a client device key for the app.
+        let host_key = sshd_dir.join("host_ed25519");
+        let host_key_pub = sshd_dir.join("host_ed25519.pub");
+        let kg = Command::new(&keygen_bin)
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "tower-host"])
+            .arg("-f")
+            .arg(&host_key)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(kg.status.success());
+        let _ = std::fs::set_permissions(&host_key, std::fs::Permissions::from_mode(0o600));
+        let host_key_line = std::fs::read_to_string(&host_key_pub)
+            .unwrap()
+            .trim()
+            .to_owned();
+
+        let device_key = legion_link::DeviceKey::from_seed([91u8; 32]);
+        let device_pub = device_key.public_key_line("phone").unwrap();
+        std::fs::write(
+            &auth_keys,
+            format!(
+                "command=\"{}\",restrict {device_pub}\n",
+                tower_dispatch.display()
+            ),
+        )
+        .unwrap();
+        let _ = std::fs::set_permissions(&auth_keys, std::fs::Permissions::from_mode(0o600));
+
+        let probe_sock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let sshd_port = probe_sock.local_addr().unwrap().port();
+        drop(probe_sock);
+
+        let supports_no_penalties = Command::new(&sshd_bin)
+            .args(["-T", "-f", "/dev/null", "-o", "PerSourcePenalties=no", "-h"])
+            .arg(&host_key)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        let sshd_cfg = sshd_dir.join("sshd_config");
+        let sshd_log = sshd_dir.join("sshd.log");
+        let mut cfg_text = format!(
+            "ListenAddress 127.0.0.1\nPort {sshd_port}\nHostKey {}\nPidFile none\n\
+             AuthorizedKeysFile {}\nAllowUsers {user}\nStrictModes yes\n\
+             PubkeyAuthentication yes\nPasswordAuthentication no\n\
+             KbdInteractiveAuthentication no\nChallengeResponseAuthentication no\n\
+             PermitRootLogin no\nUsePAM no\nAllowAgentForwarding no\n\
+             AllowTcpForwarding no\nX11Forwarding no\nPrintMotd no\n\
+             SetEnv HOME={}\n",
+            host_key.display(),
+            auth_keys.display(),
+            tower_home.display(),
+        );
+        if supports_no_penalties {
+            cfg_text.push_str("PerSourcePenalties no\n");
+        }
+        std::fs::write(&sshd_cfg, &cfg_text).unwrap();
+
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&sshd_log)
+            .unwrap();
+        let mut sshd_child = Command::new(&sshd_bin)
+            .args(["-D", "-e", "-f"])
+            .arg(&sshd_cfg)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log_file))
+            .spawn()
+            .unwrap();
+        let wait_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < wait_deadline {
+            assert!(
+                sshd_child.try_wait().unwrap().is_none(),
+                "sshd exited early:\n{}",
+                std::fs::read_to_string(&sshd_log).unwrap_or_default()
+            );
+            if std::net::TcpStream::connect(("127.0.0.1", sshd_port)).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let _sshd = SshdGuard(sshd_child);
+
+        // Device is paired ONLY with `tower`; `studio` is reached strictly through relay `tower`.
+        let link = Link::new(LinkConfig {
+            device_key: Some(device_key.to_openssh().unwrap()),
+            nodes: vec![NodeLink::ssh(
+                "tower",
+                SshTarget {
+                    hosts: vec!["127.0.0.1".to_owned()],
+                    port: sshd_port,
+                    user,
+                    host_keys: vec![host_key_line],
+                },
+                Some("phone".to_owned()),
+            )],
+            ..LinkConfig::default()
+        });
+
+        struct LiveRelayedBackend {
+            link: Link,
+        }
+        impl Backend for LiveRelayedBackend {
+            fn state(&self) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn tools(&self, _on: Option<Value>) -> BoxFuture<'_, Result<Vec<Value>, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn call(
+                &self,
+                _request: CallRequest,
+                _on_event: Option<tauri::ipc::Channel<Value>>,
+            ) -> BoxFuture<'_, Result<Value, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn cancel(&self, _id: CallId) -> BoxFuture<'_, Result<CancelResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn pair(
+                &self,
+                _invite: String,
+                _name: String,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn unpair(&self, _node: String) -> BoxFuture<'_, Result<UnpairResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn select_node(&self, _node: String) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn repair_store(&self) -> BoxFuture<'_, Result<RepairResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn invalidate_sessions(&self) -> BoxFuture<'_, Result<(), AppError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn learn(&self) -> BoxFuture<'_, Result<LearnResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn accept_identity_change(
+                &self,
+                _node: String,
+                _fingerprints: Vec<String>,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn dismiss_identity_change(
+                &self,
+                _node: String,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn content_target(&self, machine: &str) -> Result<ContentTarget, AppError> {
+                Ok(ContentTarget {
+                    link: self.link.clone(),
+                    link_node: machine.to_owned(),
+                    machine: machine.to_owned(),
+                    principal: "phone".to_owned(),
+                    holder: "fleet:1".to_owned(),
+                })
+            }
+            fn is_pairing_holder_live(&self, _holder: &str) -> bool {
+                true
+            }
+        }
+
+        let server = Arc::new(AppContentServer::with_config(
+            Arc::new(LiveRelayedBackend { link: link.clone() }),
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["http://tauri.localhost".to_owned()],
+        ));
+
+        let minted = server
+            .mint_url("studio", &media_path.to_string_lossy(), false)
+            .await
+            .unwrap();
+        let lb_port = server.loopback_port().unwrap();
+        let req_path = minted
+            .url
+            .strip_prefix(&format!("http://127.0.0.1:{lb_port}"))
+            .unwrap();
+
+        // Open a streaming GET and read headers + 64 KiB, then hold the TCP socket open so the
+        // relayed stream stays active across device, relay `tower`, and target `studio`.
+        let mut sock = TcpStream::connect(("127.0.0.1", lb_port)).await.unwrap();
+        sock.write_all(
+            format!(
+                "GET {req_path} HTTP/1.1\r\nHost: 127.0.0.1:{lb_port}\r\nOrigin: http://tauri.localhost\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let (status, head, mut received) = read_http_head_and_prefix(&mut sock, 64 * 1024).await;
+        assert_eq!(status, 200, "{head}");
+        assert_eq!(received, &media_bytes[..received.len()]);
+
+        // Confirm all three nodes have the active relayed stream running before revoke.
+        assert_eq!(server.active_streams.load(Ordering::Acquire), 1);
+        assert!(
+            count_live_pids(&tower_pids) >= 1,
+            "expected live relay `legion stream` on tower"
+        );
+        assert!(
+            count_live_pids(&studio_pids) >= 1,
+            "expected live target `legion stream` on studio"
+        );
+
+        // Revoke the URL (as viewer close does) BEFORE closing the TCP socket: both relay and
+        // target `legion stream` processes must exit within bounded time.
+        let revoke_started = Instant::now();
+        assert!(server.revoke_url(&minted.url));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if count_live_pids(&tower_pids) == 0 && count_live_pids(&studio_pids) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            count_live_pids(&tower_pids),
+            0,
+            "relay `legion stream` on tower lingered past {:?} after content_revoke",
+            revoke_started.elapsed()
+        );
+        assert_eq!(
+            count_live_pids(&studio_pids),
+            0,
+            "target `legion stream` on studio lingered past {:?} after content_revoke",
+            revoke_started.elapsed()
+        );
+
+        // Draining the still-open loopback socket observes clean truncation before Content-Length
+        // and drops device active_streams to 0.
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let step = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf)).await;
+            assert!(
+                step.is_ok(),
+                "loopback stream did not abort after content_revoke"
+            );
+            match step.unwrap() {
+                Ok(0) | Err(_) => break,
+                Ok(n) => received.extend_from_slice(&buf[..n]),
+            }
+        }
+        assert!(
+            received.len() < media_bytes.len(),
+            "revoked relayed stream must abort strictly before full 16 MiB ({} vs {})",
+            received.len(),
+            media_bytes.len()
+        );
+        drop(sock);
+
+        let dev_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < dev_deadline && server.active_streams.load(Ordering::Acquire) > 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            server.active_streams.load(Ordering::Acquire),
+            0,
+            "device active_streams did not drop to 0 after content_revoke"
+        );
+        assert_eq!(count_live_pids(&tower_pids), 0);
+        assert_eq!(count_live_pids(&studio_pids), 0);
+
+        server.shutdown();
+        link.close().await;
     }
 }
