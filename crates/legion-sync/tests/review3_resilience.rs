@@ -1602,11 +1602,8 @@ fn r9_rebuild_after_damage_carries_unsynced_work() {
     }
 }
 
-/// The person deliberately deletes an old archive of 3,000 files on tower and confirms tower's
-/// brake. They must confirm at most once per batch on pi for both ApplyDeletions and
-/// KeepLocalFiles.
-#[test]
-fn r10_inbound_brake_confirmations_per_page() {
+fn run_r10_inbound_brake(archive_files: usize, keep_files: usize, page_limit: usize) {
+    let fetch_opts = FetchOptions::default();
     for decision in [
         InboundDeletionBrakeDecision::ApplyDeletions,
         InboundDeletionBrakeDecision::KeepLocalFiles,
@@ -1616,17 +1613,22 @@ fn r10_inbound_brake_confirmations_per_page() {
         let all = ["tower", "pi"];
         fs::create_dir_all(t.join("tower/archive")).unwrap();
         fs::create_dir_all(t.join("tower/keep")).unwrap();
-        for i in 0..3000 {
+        for i in 0..archive_files {
             fs::write(t.join(format!("tower/archive/a{i}.txt")), format!("a{i}")).unwrap();
         }
-        for i in 0..200 {
+        for i in 0..keep_files {
             fs::write(t.join(format!("tower/keep/k{i}.txt")), format!("k{i}")).unwrap();
         }
         let mut tower = open_real(&t.join("tower"), &t.join("tower.redb"), "tower", &all);
         let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
         tower.scan(ts(0)).unwrap();
         while pi
-            .pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(1))
+            .pull_from_peer_with_options(
+                &EnginePeer::new(&tower, "pi"),
+                page_limit,
+                &fetch_opts,
+                ts(1),
+            )
             .unwrap()
             .records_seen
             > 0
@@ -1644,7 +1646,12 @@ fn r10_inbound_brake_confirmations_per_page() {
         let mut now = 300;
         loop {
             now += 1;
-            match pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(now)) {
+            match pi.pull_from_peer_with_options(
+                &EnginePeer::new(&tower, "pi"),
+                page_limit,
+                &fetch_opts,
+                ts(now),
+            ) {
                 Err(SyncError::Paused { .. }) => {
                     confirmations += 1;
                     pi.resolve_inbound_deletion_brake("tower", decision, ts(now))
@@ -1668,19 +1675,39 @@ fn r10_inbound_brake_confirmations_per_page() {
                 assert_eq!(left, 0);
             }
             InboundDeletionBrakeDecision::KeepLocalFiles => {
-                assert_eq!(left, 3000);
-                for k in 0..3 {
+                assert_eq!(left, archive_files);
+                for k in 0..4 {
                     tower
-                        .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(now + 10 + k))
+                        .pull_from_peer_with_options(
+                            &EnginePeer::new(&pi, "tower"),
+                            page_limit,
+                            &fetch_opts,
+                            ts(now + 10 + k),
+                        )
                         .unwrap();
                 }
                 let back = fs::read_dir(t.join("tower/archive"))
                     .map(|d| d.count())
                     .unwrap_or(0);
-                assert_eq!(back, 3000);
+                assert_eq!(back, archive_files);
             }
         }
     }
+}
+
+/// The person deliberately deletes an archive spanning multiple sync pages on tower and confirms
+/// tower's brake. They must confirm at most once per batch on pi for both ApplyDeletions and
+/// KeepLocalFiles (default CI runs 300 files across 100-record pages; the 3,000-file default-page
+/// stress test is `r10_inbound_brake_3000_files_default_page`).
+#[test]
+fn r10_inbound_brake_confirmations_per_page() {
+    run_r10_inbound_brake(300, 20, 100);
+}
+
+#[test]
+#[ignore]
+fn r10_inbound_brake_3000_files_default_page() {
+    run_r10_inbound_brake(3_000, 200, legion_sync::DEFAULT_PAGE_LIMIT);
 }
 
 struct LyingPeer<'a> {
