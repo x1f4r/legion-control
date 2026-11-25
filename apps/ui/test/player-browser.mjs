@@ -628,11 +628,19 @@ test('Player: single full-screen owner keeps Rename and Delete from full screen 
     });
     page.on('pageerror', (err) => pageErrors.push(String(err)));
 
-    // 1. Rename from full screen (mock mode sends no native change event):
-    // full screen exits, button immediately reverts to "Full screen", and ONE Back closes the viewer.
+    // 1. Page boot calls immersive(false) and keepScreenOn(false) once to clear any stale native hold.
     await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
       waitUntil: 'domcontentloaded',
     });
+    await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').waitFor();
+    const bootResets = await page.evaluate(() => ({
+      immersive: window.__LEGION_MOCK_IMMERSIVE_CALLS__.map((c) => c.on),
+      keepScreenOn: window.__LEGION_MOCK_KEEP_SCREEN_ON_CALLS__.map((c) => c.on),
+    }));
+    assert.deepEqual(bootResets.immersive, [false]);
+    assert.deepEqual(bootResets.keepScreenOn, [false]);
+
+    // 2. Rename from full screen (mock mode sends no native change event):
     await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').click();
     await page.locator('.viewer video.viewer-video[src]').waitFor();
 

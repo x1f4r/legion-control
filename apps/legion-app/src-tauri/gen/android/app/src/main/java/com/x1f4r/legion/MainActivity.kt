@@ -84,6 +84,9 @@ class MainActivity : TauriActivity() {
     when (msg.optString("type")) {
       "init" -> {
         bridgeReplyProxy = replyProxy
+        runOnUiThread {
+          resetPlayerWindowState()
+        }
         val payload = JSONObject().apply {
           put("type", "init")
           put("insets", latestInsets.toJsonArray())

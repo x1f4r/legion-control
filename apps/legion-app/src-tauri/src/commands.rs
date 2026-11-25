@@ -5,8 +5,6 @@ use std::fs;
 use std::io::Write;
 #[cfg(debug_assertions)]
 use std::path::Path;
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -163,89 +161,19 @@ pub struct ImmersiveResult {
     pub fullscreen: bool,
 }
 
-/// Holds an optional desktop display-idle inhibitor process while video playback requests keeping
-/// the screen awake. Always released when toggled off or when the app exits.
-#[derive(Default)]
-pub struct DesktopKeepScreenOn {
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    inhibitor: Mutex<Option<Child>>,
-}
+pub use crate::keep_screen_on::DesktopKeepScreenOn;
 
-impl DesktopKeepScreenOn {
-    /// Acquires or releases the desktop screen-awake hold (best-effort, silent if unavailable).
-    pub fn set(&self, on: bool) {
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        {
-            let mut guard = self
-                .inhibitor
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if on {
-                if let Some(child) = guard.as_mut()
-                    && child.try_wait().ok().flatten().is_none()
-                {
-                    return;
-                }
-                *guard = spawn_desktop_inhibitor();
-            } else if let Some(mut child) = guard.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-        #[cfg(any(target_os = "android", target_os = "ios"))]
-        {
-            let _ = on;
-        }
+/// Resets desktop immersive state when the page reloads, crashes, or the window closes/hides.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn reset_desktop_immersive(
+    window: Option<&tauri::WebviewWindow>,
+    state: &DesktopImmersiveState,
+) {
+    if let Some(previous) = state.leave()
+        && let Some(win) = window
+    {
+        let _ = win.set_fullscreen(previous);
     }
-
-    /// Releases any active display-idle inhibitor on shutdown.
-    pub fn release(&self) {
-        self.set(false);
-    }
-}
-
-impl Drop for DesktopKeepScreenOn {
-    fn drop(&mut self) {
-        self.release();
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn spawn_desktop_inhibitor() -> Option<Child> {
-    Command::new("systemd-inhibit")
-        .args([
-            "--what=idle",
-            "--who=Legion",
-            "--why=Playing video",
-            "sleep",
-            "86400",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()
-}
-
-#[cfg(target_os = "macos")]
-fn spawn_desktop_inhibitor() -> Option<Child> {
-    let pid = std::process::id().to_string();
-    Command::new("caffeinate")
-        .args(["-d", "-w", &pid])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()
-}
-
-#[cfg(all(
-    not(any(target_os = "android", target_os = "ios")),
-    not(target_os = "linux"),
-    not(target_os = "macos")
-))]
-fn spawn_desktop_inhibitor() -> Option<Child> {
-    None
 }
 
 /// Enters or leaves immersive mode on the main desktop window, restoring its pre-immersive

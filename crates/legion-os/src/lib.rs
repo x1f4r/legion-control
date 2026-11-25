@@ -9,6 +9,7 @@
 pub mod atomic;
 pub mod capped_alloc;
 pub mod detach;
+pub mod display_awake;
 mod error;
 pub mod file_id;
 pub mod hardware;

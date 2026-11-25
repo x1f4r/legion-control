@@ -291,6 +291,12 @@ function App() {
   const folderChanges = useMemo(() => createFolderChangesStore(), []);
   useEffect(() => () => capsStore.dispose(), [capsStore]);
   useEffect(() => () => folderChanges.dispose(), [folderChanges]);
+
+  // Reset any leftover native immersive or screen-on state once on page boot / reload.
+  useEffect(() => {
+    Promise.resolve(link?.immersive?.(false)).catch(() => {});
+    Promise.resolve(link?.keepScreenOn?.(false)).catch(() => {});
+  }, [link]);
   const shellRef = useRef(null);
   const mainRef = useRef(null);
   const refreshAbortRef = useRef(null);

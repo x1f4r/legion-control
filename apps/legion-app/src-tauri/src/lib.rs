@@ -3,6 +3,7 @@
 pub mod backend;
 pub mod commands;
 pub mod content;
+pub mod keep_screen_on;
 pub mod link_backend;
 pub mod store;
 pub mod transfers;
@@ -100,6 +101,16 @@ fn android_files_transfer_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
         .build()
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn reset_desktop_player_state(app: &tauri::AppHandle, window: Option<&tauri::WebviewWindow>) {
+    if let Some(keep) = app.try_state::<commands::DesktopKeepScreenOn>() {
+        keep.release();
+    }
+    if let Some(immersive) = app.try_state::<commands::DesktopImmersiveState>() {
+        commands::reset_desktop_immersive(window, &immersive);
+    }
+}
+
 /// Builds the main Legion WebView window from `tauri.conf.json` with our strict bundled-origin
 /// navigation guard and new-window denial.
 fn build_main_webview_window(app: &tauri::AppHandle) -> tauri::Result<tauri::WebviewWindow> {
@@ -110,10 +121,26 @@ fn build_main_webview_window(app: &tauri::AppHandle) -> tauri::Result<tauri::Web
         .first()
         .cloned()
         .ok_or_else(|| tauri::Error::Io(std::io::Error::other("missing main window config")))?;
-    WebviewWindowBuilder::from_config(app, &window_config)?
+    let window = WebviewWindowBuilder::from_config(app, &window_config)?
         .on_navigation(is_allowed_navigation_url)
         .on_new_window(|_, _| NewWindowResponse::Deny)
-        .build()
+        .build()?;
+
+    #[cfg(target_os = "linux")]
+    {
+        let term_app = app.clone();
+        let term_label = window.label().to_owned();
+        let _ = window.with_webview(move |webview| {
+            use webkit2gtk::WebViewExt;
+            let wv = webview.inner();
+            wv.connect_web_process_terminated(move |_, _| {
+                let win = term_app.get_webview_window(&term_label);
+                reset_desktop_player_state(&term_app, win.as_ref());
+            });
+        });
+    }
+
+    Ok(window)
 }
 
 /// Builds the main Legion WebView window from `tauri.conf.json` with our strict bundled-origin
@@ -148,6 +175,22 @@ pub fn run() {
     );
 
     let builder = tauri::Builder::default();
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let builder = builder.on_page_load(|webview, payload| {
+        if payload.event() == tauri::webview::PageLoadEvent::Started {
+            let app = webview.app_handle();
+            let win = app.get_webview_window(webview.label());
+            reset_desktop_player_state(app, win.as_ref());
+        }
+    });
+
+    #[cfg(target_os = "macos")]
+    let builder = builder.on_web_content_process_terminate(|webview| {
+        let app = webview.app_handle();
+        let win = app.get_webview_window(webview.label());
+        reset_desktop_player_state(app, win.as_ref());
+    });
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -379,16 +422,27 @@ pub fn run() {
             event: WindowEvent::CloseRequested { api, .. },
             ..
         } => {
+            let window = app_handle.get_webview_window(&label);
+            reset_desktop_player_state(app_handle, window.as_ref());
             let transfers = app_handle.state::<SharedTransfers>();
             if transfers.0.has_active_work() {
                 api.prevent_close();
-                if let Some(window) = app_handle.get_webview_window(&label) {
+                if let Some(window) = window {
                     let _ = window.hide();
                 }
                 if let Some(desktop) = app_handle.try_state::<SharedDesktopTransferPlatform>() {
                     desktop.0.mark_hidden_for_drain();
                 }
             }
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        RunEvent::WindowEvent {
+            label,
+            event: WindowEvent::Destroyed,
+            ..
+        } => {
+            let window = app_handle.get_webview_window(&label);
+            reset_desktop_player_state(app_handle, window.as_ref());
         }
         #[cfg(target_os = "macos")]
         RunEvent::Reopen { .. } => {
