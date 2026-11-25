@@ -83,7 +83,7 @@ jobs:
           fi
           for i in $(seq 1 "$REPEAT_COUNT"); do
             echo "=== macOS pipe and stream_relay run $i/$REPEAT_COUNT ==="
-            cargo test -p legion-os --lib pipe:: --locked -- --nocapture
+            cargo test -p legion-os --lib pipe:: --locked
             cargo test -p legion-cli --test stream_relay --locked
           done
 
