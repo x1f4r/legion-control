@@ -1,5 +1,6 @@
 package com.x1f4r.legion
 
+import android.app.Activity
 import android.Manifest
 import android.content.pm.PackageManager
 import android.content.res.Configuration
@@ -19,8 +20,11 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.webkit.JavaScriptReplyProxy
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+import app.tauri.plugin.Plugin
+import app.tauri.plugin.PluginManager
 import org.json.JSONArray
 import org.json.JSONObject
+import java.lang.ref.WeakReference
 
 class MainActivity : TauriActivity() {
   private var attachedWebView: WebView? = null
@@ -190,6 +194,7 @@ class MainActivity : TauriActivity() {
     super.onWebViewCreate(webView)
     attachedWebView = webView
     bridgeReplyProxy = null
+    rebindPluginsIfActivityRecreated(webView)
     applySystemBarStyle(resources.configuration)
 
     // Android 17 WebView reports 0px for CSS env(safe-area-inset-*). Expose insets, device model,
@@ -235,8 +240,30 @@ class MainActivity : TauriActivity() {
     }
   }
 
+  private fun rebindPluginsIfActivityRecreated(webView: WebView) {
+    // When TransferForegroundService keeps the process alive after MainActivity is swiped away,
+    // PluginManager still holds plugin instances bound to the destroyed Activity and WebView
+    // (because PluginManager.onWebViewCreated skips plugins whose `loaded` flag is already true).
+    // Re-registering fresh instances against this live Activity + WebView keeps the file picker,
+    // barcode scanner, and self-updater working after window recreation.
+    val previous = lastPluginActivityRef?.get()
+    if (pluginsInitializedOnce && previous !== this) {
+      PluginManager.activity = this
+      runCatching {
+        val cls = Class.forName("app.tauri.barcodescanner.BarcodeScannerPlugin")
+        val scanner = cls.getConstructor(Activity::class.java).newInstance(this) as Plugin
+        PluginManager.load(webView, "barcode-scanner", scanner, "{}")
+      }
+      PluginManager.load(webView, "app-updater", AppUpdaterPlugin(this), "{}")
+      PluginManager.load(webView, "files-transfer", FilesTransferPlugin(this), "{}")
+    }
+    pluginsInitializedOnce = true
+    lastPluginActivityRef = WeakReference(this)
+  }
+
   override fun onResume() {
     super.onResume()
+    PluginManager.activity = this
     TransferBridge.setActiveActivity(this)
     attachedWebView?.let { syncBackNavigation(it) }
   }
@@ -292,6 +319,11 @@ class MainActivity : TauriActivity() {
   }
 
   companion object {
+    @Volatile
+    private var pluginsInitializedOnce = false
+    @Volatile
+    private var lastPluginActivityRef: WeakReference<MainActivity>? = null
+
     private const val BRIDGE_NAME = "__LEGION_ANDROID_BRIDGE__"
     private val ALLOWED_APP_ORIGINS = setOf(
       "https://tauri.localhost",

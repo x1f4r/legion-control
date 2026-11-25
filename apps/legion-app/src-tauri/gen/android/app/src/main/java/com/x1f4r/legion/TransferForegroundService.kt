@@ -1,11 +1,13 @@
 package com.x1f4r.legion
 
 import android.Manifest
+import android.app.DownloadManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.ClipData
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -50,6 +52,10 @@ class TransferForegroundService : Service() {
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     runningInstance = this
     ensureChannels(this)
+    if (BuildConfig.DEBUG && intent?.action == ACTION_DEBUG_SIMULATE_TIMEOUT) {
+      handleSystemTimeout(startId)
+      return START_NOT_STICKY
+    }
     val summary = latestSummary
     if (summary == null) {
       promoteMinimalAndStop(startId)
@@ -188,6 +194,7 @@ class TransferForegroundService : Service() {
 
   companion object {
     private const val TAG = "legion-transfers"
+    private const val ACTION_DEBUG_SIMULATE_TIMEOUT = "com.x1f4r.legion.DEBUG_SIMULATE_TIMEOUT"
     const val CHANNEL_ONGOING = "legion_transfers_ongoing"
     const val CHANNEL_COMPLETE = "legion_transfers_complete"
     const val ONGOING_NOTIFICATION_ID = 4101
@@ -307,18 +314,32 @@ class TransferForegroundService : Service() {
       val direction = params.optString("direction", "download")
       val name = params.optString("name", "File")
       val localUri = params.optString("localUri", "").trim()
-      val mime = params.optString("mime", "application/octet-stream")
-        .ifBlank { "application/octet-stream" }
 
-      val title = if (direction == "upload") "Upload finished" else "Download finished"
-      val tapIntent: Intent = if (direction == "download" && localUri.startsWith("content://")) {
-        Intent(Intent.ACTION_VIEW).apply {
-          setDataAndType(Uri.parse(localUri), mime)
-          addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+      // Decide notification tap behavior strictly on this device from the sanitized file name:
+      // safe downloads always go through Intent.createChooser with device-derived MIME; refused
+      // executables/installers open the Downloads folder instead of launching an installer.
+      val decision = TransferPathPolicy.decideCompletedNotificationTap(direction, name, localUri)
+      val tapIntent: Intent = when (decision.target) {
+        TransferPathPolicy.NotificationTapTarget.OPEN_WITH_CHOOSER -> {
+          val uri = Uri.parse(localUri)
+          val viewIntent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, decision.mime ?: "application/octet-stream")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+          }
+          Intent.createChooser(viewIntent, "Open with").apply {
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+            clipData = ClipData.newRawUri("", uri)
+          }
         }
-      } else {
-        Intent(context, MainActivity::class.java).apply {
-          addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        TransferPathPolicy.NotificationTapTarget.OPEN_DOWNLOADS -> {
+          Intent(DownloadManager.ACTION_VIEW_DOWNLOADS).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+          }
+        }
+        TransferPathPolicy.NotificationTapTarget.OPEN_APP -> {
+          Intent(context, MainActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+          }
         }
       }
 
@@ -332,8 +353,8 @@ class TransferForegroundService : Service() {
 
       val notification = NotificationCompat.Builder(context, CHANNEL_COMPLETE)
         .setSmallIcon(R.mipmap.ic_launcher)
-        .setContentTitle(title)
-        .setContentText(name)
+        .setContentTitle(decision.title)
+        .setContentText(decision.body)
         .setGroup("legion_complete_$requestCode")
         .setAutoCancel(true)
         .setContentIntent(pending)

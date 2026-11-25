@@ -1,5 +1,6 @@
 package com.x1f4r.legion
 
+import android.app.DownloadManager
 import android.content.ClipData
 import android.content.ContentValues
 import android.content.Context
@@ -42,7 +43,6 @@ import java.util.concurrent.atomic.AtomicLong
 object TransferBridge {
   private const val TAG = "legion-transfers"
   private const val MAX_CHUNK_BYTES = 64 * 1024
-  private const val MAX_OPEN_EXTERNALLY_CACHE_FILES = 24
 
   @Volatile
   private var appContext: Context? = null
@@ -83,6 +83,9 @@ object TransferBridge {
     registerNetworkMonitor(ctx)
 
     workerPool.execute {
+      runCatching {
+        TransferPathPolicy.pruneCacheDirectory(File(ctx.cacheDir, "open-externally"))
+      }
       connectLoop(ctx, socketPath, token)
     }
   }
@@ -244,6 +247,7 @@ object TransferBridge {
         "saveToDownloads" -> saveToDownloads(context, params)
         "stageOpenExternally" -> stageOpenExternally(context, params)
         "openTransferFile" -> openTransferFile(context, params)
+        "showInFolder" -> showInFolder(context)
         "openUriRead" -> openUriRead(context, params)
         "readUriChunk" -> readUriChunk(params)
         "skipUriBytes" -> skipUriBytes(params)
@@ -265,26 +269,15 @@ object TransferBridge {
   }
 
   private fun verifyPartFile(context: Context, rawPath: String): File {
-    val partFile = File(rawPath).canonicalFile
-    val allowedRoot = File(context.dataDir, "transfers/parts").canonicalFile
-    val allowedPrefix = allowedRoot.path.trimEnd(File.separatorChar) + File.separatorChar
-    if (!partFile.path.startsWith(allowedPrefix) || !partFile.isFile) {
-      throw SecurityException("Refusing transfer file outside the app's private parts directory.")
-    }
-    return partFile
-  }
-
-  private fun sanitizeFileName(raw: String): String {
-    val trimmed = raw.trim().replace('/', '_').replace('\\', '_').replace('\u0000', '_')
-    val cleaned = trimmed.trimStart('.')
-    return if (cleaned.isEmpty()) "download" else cleaned.take(180)
+    val allowedRoot = File(context.dataDir, "transfers/parts")
+    return TransferPathPolicy.resolveContainedChild(allowedRoot, File(rawPath), requireExistingFile = true)
   }
 
   private fun saveToDownloads(context: Context, params: JSONObject): JSONObject {
     val tempPath = params.optString("tempPath", "")
-    val fileName = sanitizeFileName(params.optString("fileName", "download"))
-    val mime = params.optString("mime", "application/octet-stream")
-      .ifBlank { "application/octet-stream" }
+    val fileName = TransferPathPolicy.sanitizeFileName(params.optString("fileName", "download"))
+    // Always derive MIME on this device from the sanitized file extension.
+    val mime = TransferPathPolicy.mimeForFileName(fileName)
     val partFile = verifyPartFile(context, tempPath)
 
     val resolver = context.contentResolver
@@ -326,18 +319,21 @@ object TransferBridge {
   }
 
   private fun stageOpenExternally(context: Context, params: JSONObject): JSONObject {
-    val transferId = sanitizeFileName(params.optString("transferId", "item"))
+    val transferId = TransferPathPolicy.sanitizeFileName(params.optString("transferId", "item"))
     val tempPath = params.optString("tempPath", "")
-    val fileName = sanitizeFileName(params.optString("fileName", "file"))
+    val fileName = TransferPathPolicy.sanitizeFileName(params.optString("fileName", "file"))
+    if (TransferPathPolicy.isRefusedOpenFileName(fileName)) {
+      throw SecurityException("Refusing to stage executable or installer file for direct opening.")
+    }
     val partFile = verifyPartFile(context, tempPath)
 
     val cacheDir = File(context.cacheDir, "open-externally")
     if (!cacheDir.exists() && !cacheDir.mkdirs()) {
       throw IllegalStateException("Could not create open-externally cache directory.")
     }
-    pruneOpenExternallyCache(cacheDir)
+    TransferPathPolicy.pruneCacheDirectory(cacheDir)
 
-    val destFile = File(cacheDir, "$transferId-$fileName")
+    val destFile = TransferPathPolicy.resolveNewCacheFile(cacheDir, transferId, fileName)
     FileInputStream(partFile).use { input ->
       FileOutputStream(destFile).use { out ->
         val buf = ByteArray(MAX_CHUNK_BYTES)
@@ -356,35 +352,54 @@ object TransferBridge {
     return JSONObject().put("uri", uri.toString())
   }
 
-  private fun pruneOpenExternallyCache(dir: File) {
-    val files = dir.listFiles()?.filter { it.isFile }?.sortedByDescending { it.lastModified() }
-      ?: return
-    if (files.size > MAX_OPEN_EXTERNALLY_CACHE_FILES) {
-      for (stale in files.drop(MAX_OPEN_EXTERNALLY_CACHE_FILES)) {
-        runCatching { stale.delete() }
+  private fun resolveDisplayNameForUri(context: Context, uri: Uri): String {
+    runCatching {
+      context.contentResolver.query(
+        uri,
+        arrayOf(OpenableColumns.DISPLAY_NAME),
+        null,
+        null,
+        null,
+      )?.use { cursor ->
+        if (cursor.moveToFirst()) {
+          val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+          if (idx >= 0 && !cursor.isNull(idx)) {
+            val queried = cursor.getString(idx)?.trim().orEmpty()
+            if (queried.isNotEmpty()) return queried
+          }
+        }
       }
     }
+    return uri.lastPathSegment?.substringAfterLast('/') ?: "download"
   }
 
   private fun openTransferFile(context: Context, params: JSONObject): JSONObject {
     val uriOrPath = params.optString("uriOrPath", "").trim()
-    val mime = params.optString("mime", "application/octet-stream")
-      .ifBlank { "application/octet-stream" }
     if (uriOrPath.isEmpty()) {
       throw IllegalArgumentException("File URI or path is required.")
     }
 
-    val uri: Uri = if (uriOrPath.startsWith("content://")) {
-      Uri.parse(uriOrPath)
+    val uri: Uri
+    val displayName: String
+    if (uriOrPath.startsWith("content://")) {
+      uri = Uri.parse(uriOrPath)
+      displayName = resolveDisplayNameForUri(context, uri)
     } else {
-      val file = File(uriOrPath).canonicalFile
-      val allowedCache = File(context.cacheDir, "open-externally").canonicalFile
-      val prefix = allowedCache.path.trimEnd(File.separatorChar) + File.separatorChar
-      if (!file.path.startsWith(prefix) || !file.isFile) {
-        throw SecurityException("Refusing to open file outside the open-externally cache.")
-      }
-      FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+      val allowedCache = File(context.cacheDir, "open-externally")
+      val file = TransferPathPolicy.resolveContainedChild(
+        allowedCache,
+        File(uriOrPath),
+        requireExistingFile = true,
+      )
+      displayName = file.name
+      uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
     }
+
+    if (TransferPathPolicy.isRefusedOpenFileName(displayName)) {
+      throw SecurityException("Legion refuses to open executable or installer files directly.")
+    }
+    // Always derive MIME on this device from the saved file's real extension.
+    val mime = TransferPathPolicy.mimeForFileName(displayName)
 
     val viewIntent = Intent(Intent.ACTION_VIEW).apply {
       setDataAndType(uri, mime)
@@ -404,6 +419,21 @@ object TransferBridge {
     } else {
       chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
       context.startActivity(chooser)
+    }
+    return JSONObject().put("ok", true)
+  }
+
+  private fun showInFolder(context: Context): JSONObject {
+    val downloadsIntent = Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)
+    val act = currentActivity()
+    if (act != null) {
+      act.runOnUiThread {
+        runCatching { act.startActivity(downloadsIntent) }
+          .onFailure { e -> Log.w(TAG, "Could not open Downloads folder: ${e.message}") }
+      }
+    } else {
+      downloadsIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      context.startActivity(downloadsIntent)
     }
     return JSONObject().put("ok", true)
   }

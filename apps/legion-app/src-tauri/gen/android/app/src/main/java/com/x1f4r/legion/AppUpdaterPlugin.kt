@@ -37,12 +37,13 @@ class InstallApkArgs {
  */
 @TauriPlugin
 class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
+  private val appContext = activity.applicationContext
   private val ioExecutor = Executors.newSingleThreadExecutor()
 
   private fun currentInstallerPackage(): String? {
     return try {
-      val pm = activity.packageManager
-      val pkg = activity.packageName
+      val pm = appContext.packageManager
+      val pkg = appContext.packageName
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
         pm.getInstallSourceInfo(pkg).installingPackageName
       } else {
@@ -60,7 +61,7 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
       return null
     }
     return try {
-      activity.packageManager.getInstallSourceInfo(activity.packageName).updateOwnerPackageName
+      appContext.packageManager.getInstallSourceInfo(appContext.packageName).updateOwnerPackageName
     } catch (e: Exception) {
       Log.w(TAG, "Could not inspect update owner info: ${e.message}")
       null
@@ -68,15 +69,15 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
   }
 
   private fun capabilitiesPayload(): JSObject {
-    val canInstall = activity.packageManager.canRequestPackageInstalls()
+    val canInstall = appContext.packageManager.canRequestPackageInstalls()
     val installer = currentInstallerPackage()
     val updateOwner = currentUpdateOwnerPackage()
-    val selfInstaller = installer == activity.packageName
+    val selfInstaller = installer == appContext.packageName
     // Android 12+ (API 31+) allows prompt-free self-updates when UPDATE_PACKAGES_WITHOUT_USER_ACTION
     // is declared, Install unknown apps is granted, and no competing update owner holds the package
     // (on API 34+, Android checks updateOwnerPackageName; on API 31-33, installerPackageName).
     val ownerAllowsSilent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-      updateOwner == null || updateOwner == activity.packageName
+      updateOwner == null || updateOwner == appContext.packageName
     } else {
       selfInstaller || installer == null
     }
@@ -99,7 +100,7 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
 
   @Command
   fun requestInstallPermission(invoke: Invoke) {
-    if (activity.packageManager.canRequestPackageInstalls()) {
+    if (appContext.packageManager.canRequestPackageInstalls()) {
       val out = capabilitiesPayload()
       out.put("granted", true)
       invoke.resolve(out)
@@ -107,14 +108,14 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
     }
     val intent = Intent(
       Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-      Uri.parse("package:${activity.packageName}"),
+      Uri.parse("package:${appContext.packageName}"),
     )
     startActivityForResult(invoke, intent, "onUnknownSourcesResult")
   }
 
   @ActivityCallback
   fun onUnknownSourcesResult(invoke: Invoke, _result: ActivityResult) {
-    val granted = activity.packageManager.canRequestPackageInstalls()
+    val granted = appContext.packageManager.canRequestPackageInstalls()
     val out = capabilitiesPayload()
     out.put("granted", granted)
     Log.i(TAG, "onUnknownSourcesResult: granted=$granted")
@@ -130,7 +131,7 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
       return
     }
 
-    if (!activity.packageManager.canRequestPackageInstalls()) {
+    if (!appContext.packageManager.canRequestPackageInstalls()) {
       val out = capabilitiesPayload()
       out.put("status", "needs_permission")
       out.put("prompted", false)
@@ -140,7 +141,7 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     val apkFile = File(rawPath).canonicalFile
-    val allowedRoot = File(activity.dataDir, "updates").canonicalFile
+    val allowedRoot = File(appContext.dataDir, "updates").canonicalFile
     val allowedRootPath = allowedRoot.path.trimEnd(File.separatorChar) + File.separatorChar
     if (!apkFile.path.startsWith(allowedRootPath) || !apkFile.isFile) {
       invoke.reject("Refusing to install APK outside the app's private updates directory.")
@@ -157,9 +158,9 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
       var session: PackageInstaller.Session? = null
       var sessionId = -1
       try {
-        val installer = activity.packageManager.packageInstaller
+        val installer = appContext.packageManager.packageInstaller
         val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL)
-        params.setAppPackageName(activity.packageName)
+        params.setAppPackageName(appContext.packageName)
         params.setSize(apkFile.length())
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
           params.setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED)
@@ -181,14 +182,14 @@ class AppUpdaterPlugin(private val activity: Activity) : Plugin(activity) {
           }
         }
 
-        val callbackIntent = Intent(activity, UpdateInstallReceiver::class.java)
+        val callbackIntent = Intent(appContext, UpdateInstallReceiver::class.java)
         val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
           PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
         } else {
           PendingIntent.FLAG_UPDATE_CURRENT
         }
         val pendingIntent = PendingIntent.getBroadcast(
-          activity,
+          appContext,
           sessionId,
           callbackIntent,
           flags,
