@@ -16,14 +16,18 @@ keep their existing `kind` and omit `category` and `mime`.
   `size`) and `order` (`asc` or `desc`), using natural case-insensitive ordering for `name`
   (`file2.jpg` before `file10.jpg`). Pass `categories` (for example `categories='["image"]'`) to
   keep directories alongside matching files, and `offset` / `limit` to page through results using
-  `total` and `truncated`.
+  `total`, `total_exact`, and `truncated`. Single-level listings (`depth=1`) always report an
+  exact `total`; recursive listings (`depth > 1`) stay on one filesystem and stop counting once
+  past the page cap or time budget, returning a lower bound with `total_exact: false`.
 - **Searching (`fs.find`)**: filters by `name` (all whitespace-separated words must appear in the
   file name, case-insensitive and Unicode-aware), `glob`, `kind`, `categories`, `min_size`,
   `max_size`, `modified_after`, and `modified_before` (RFC 3339 timestamps in the same format
   returned by `fs.stat`). `hidden` is controlled independently of `ignore`, so
-  `ignore=false hidden=false` searches ignored build trees without entering dotfiles. Every search
-  runs inside `budget_ms` (default `10000`, up to `60000`); stopping early sets `truncated: true`
-  and `reason: "time"` or `"limit"`.
+  `ignore=false hidden=false` searches ignored build trees without entering dotfiles. Without
+  `sort`, matches stream in directory-entry order for speed; pass `sort` when deterministic order
+  is needed. Every search runs inside `budget_ms` (default `10000`, up to `60000`), checked across
+  unreadable directories too; stopping early sets `truncated: true` and `reason: "time"` or
+  `"limit"`.
 - **Searching across the fleet (`fs.find --on all`)**: fans out concurrently to this node and every
   machine in `fleet.toml`, returning:
 
@@ -47,13 +51,18 @@ keep their existing `kind` and omit `category` and `mime`.
   Each reachable machine names itself in `machine` inside its `ok` object, and unreachable machines
   appear under their own key with `error.code = "unreachable"` without failing the search.
 - **Thumbnails (`fs.thumb`)**: generates thumbnails on the node for 1 to 32 paths per call (`size`
-  96 to 512, default 256; `fit` `"contain"` or `"cover"`), returning `{"results": [{"path": …,
-  "ok": {"mime", "content", "width", "height"}} | {"path": …, "error": …}]}` in input order.
-  JPEG, PNG, GIF (first frame), WebP, and BMP images are decoded with EXIF orientation applied
-  under hard limits (64 MiB source, 100 megapixels, bounded memory and concurrency), outputting
-  JPEG or PNG when transparent. Video posters use `ffmpeg` when it is on the node's `PATH` and
-  report `unsupported` otherwise. Results are cached in a 256 MiB LRU store under the node's state
-  directory (`thumb-cache/`), inaccessible to non-admin roles through `fs.*`, and every path
+  96 to 512, default 256; `fit` `"contain"` or `"cover"`), returning exactly one result per input
+  path in input order: `{"results": [{"path": …, "ok": {"mime", "content", "width", "height"}} |
+  {"path": …, "error": …}]}`. JPEG, PNG, GIF (first frame), WebP, and BMP images are opened once
+  and decoded with EXIF orientation applied under hard limits (64 MiB source, 25 megapixels per
+  image, 50 megapixels / 8 concurrent decodes across sessions, 10 s decode timeout, and fair
+  per-principal round-robin scheduling with bounded wait returning retryable `busy`), outputting
+  JPEG or PNG when transparent. Video posters run in a separate 2-slot fair pool with `ffmpeg`
+  locked to local container formats (`-protocol_whitelist file`, strict `-format_whitelist`,
+  `-threads 1`, video-only mapping) when it is on the node's `PATH` and report `unsupported`
+  otherwise. Results are cached lock-free on hits in a 256 MiB disk-reconciled LRU store under the
+  node's state directory (`thumb-cache/`), keyed by path, OS file identity, metadata change time,
+  size, mtime, and parameters, inaccessible to non-admin roles through `fs.*`, and every path
   requires the same permission as `fs.read`.
 
 ### Copying and syncing (`legion cp` and `fs.transfer`)

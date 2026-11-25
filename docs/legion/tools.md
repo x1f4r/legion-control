@@ -378,14 +378,14 @@ Compare, push, or pull shared configuration documents (devices.toml, fleet.toml,
 | `fs.find` | `read` | Find files and directories under a path matching optional name words, glob, kind, category, size, modification time and depth filters within a time budget, with optional sorting and separate hidden and .gitignore controls. |
 | `fs.grep` | `read` | Search text files for a regular expression with optional glob filter and context lines, skipping binary files and truncating very long lines. |
 | `fs.hash` | `read` | Stream a file and return its size and BLAKE3 digest as blake3:<hex>. |
-| `fs.list` | `read` | List entries in a directory up to a bounded depth and count, directories first then ordered by name (natural case-insensitive), modified time, or size, with optional category filtering, paging, and symbolic links reported without following them. |
+| `fs.list` | `read` | List entries in a directory up to a bounded depth and count, directories first then ordered by name (natural case-insensitive), modified time, or size, with optional category filtering, paging, total/total_exact counts, staying on one file system for depth > 1, and reporting symbolic links without following them. |
 | `fs.manifest` | `read` | List a directory tree (or one file) the way fs.transfer compares it: each entry's relative path, kind, size, modification time, mode, link target and, with checksum, its BLAKE3 hash. |
 | `fs.mkdir` | `write` | Create a directory and, by default, any missing parent directories. |
 | `fs.move` | `write` | Move or rename a file, symbolic link or directory, falling back to copy-then-remove across file systems. |
 | `fs.read` | `read` | Read up to 1 MiB of a file from an offset as UTF-8 or base64, returning the whole-file BLAKE3 hash when the entire file fit in this reply. |
 | `fs.remove` | `destroy` | Remove a file, symbolic link or directory (with optional recursive and dry_run modes), refusing roots, the home directory and Legion's own directories. |
 | `fs.stat` | `read` | Return metadata for a path (kind, size, modification time, Unix mode, readonly flag, symbolic link target, and file category and MIME type) without following a symbolic link. |
-| `fs.thumb` | `read` | Generate thumbnails for 1 to 32 image or video paths on this node, returning per-path base64 JPEG (or PNG when transparent) thumbnails or per-path errors, cached in an LRU store in the state directory. |
+| `fs.thumb` | `read` | Generate thumbnails for 1 to 32 image or video paths on this node, returning per-path base64 JPEG (or PNG when transparent) thumbnails or per-path errors in input order, cached in a 256 MiB LRU store in the state directory. |
 | `fs.transfer` | `write` | Copy a file or a directory tree between machines, or within one. |
 | `fs.write` | `write` | Write UTF-8 text or base64 bytes to a file atomically, supporting overwrite, create-only and append modes, optional expect_hash conflict checks, parent creation and Unix mode. |
 
@@ -420,7 +420,7 @@ Replace an exact string in a UTF-8 text file atomically while preserving line en
 
 Effect: `read`
 
-Find files and directories under a path matching optional name words, glob, kind, category, size, modification time and depth filters within a time budget, with optional sorting and separate hidden and .gitignore controls. With `on: "all"`, searches every machine in the fleet concurrently and reports unreachable machines per key.
+Find files and directories under a path matching optional name words, glob, kind, category, size, modification time and depth filters within a time budget, with optional sorting and separate hidden and .gitignore controls. Unsorted searches stream in directory-entry order so huge directories cut off promptly within budget_ms; pass `sort` when deterministic ordering is needed. With `on: "all"`, searches every machine in the fleet concurrently and reports unreachable machines per key.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -473,7 +473,7 @@ Stream a file and return its size and BLAKE3 digest as blake3:<hex>.
 
 Effect: `read`
 
-List entries in a directory up to a bounded depth and count, directories first then ordered by name (natural case-insensitive), modified time, or size, with optional category filtering, paging, and symbolic links reported without following them.
+List entries in a directory up to a bounded depth and count, directories first then ordered by name (natural case-insensitive), modified time, or size, with optional category filtering, paging, total/total_exact counts, staying on one file system for depth > 1, and reporting symbolic links without following them.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -561,7 +561,7 @@ Return metadata for a path (kind, size, modification time, Unix mode, readonly f
 
 Effect: `read`
 
-Generate thumbnails for 1 to 32 image or video paths on this node, returning per-path base64 JPEG (or PNG when transparent) thumbnails or per-path errors, cached in an LRU store in the state directory.
+Generate thumbnails for 1 to 32 image or video paths on this node, returning per-path base64 JPEG (or PNG when transparent) thumbnails or per-path errors in input order, cached in a 256 MiB LRU store in the state directory.
 
 | Argument | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
