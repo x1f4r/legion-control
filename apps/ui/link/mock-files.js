@@ -1092,12 +1092,7 @@ export function createMockFilesState({
       for (const t of deviceTransfers) {
         if (t.state !== 'running') continue;
         // Keep the demo row moving gently so screenshots stay near ~25-45% while user-started ones progress clearly.
-        const step =
-          t.id === 'dt-live-1'
-            ? Math.max(1_500_000, Math.floor(t.bytes_total * 0.01))
-            : t.bytes_total < 256_000
-              ? Math.max(1, Math.ceil(t.bytes_total * 0.25))
-              : Math.max(256_000, Math.floor(t.bytes_total * 0.18));
+        const step = t.id === 'dt-live-1' ? Math.max(1_500_000, Math.floor(t.bytes_total * 0.01)) : Math.max(256_000, Math.floor(t.bytes_total * 0.18));
         t.bytes_done = Math.min(t.bytes_total, t.bytes_done + step);
         t.rate = step * 3;
         changed = true;

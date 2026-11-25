@@ -248,4 +248,38 @@ test('transfer job and device transfer formatting uses plain words by default an
   };
   assert.equal(formatDeviceTransferTitle(runningDl, false), 'Downloading Beach.mp4');
   assert.deepEqual(friendlyDeviceTransferState(runningDl, false), { label: '25%', cls: 'running' });
+
+  const cancellingDl = {
+    direction: 'download',
+    name: 'Beach.mp4',
+    state: 'cancelling',
+    error: { code: 'failed', message: 'Could not remove Beach.mp4: file in use.' },
+  };
+  assert.equal(formatDeviceTransferTitle(cancellingDl, false), 'Cancelling Beach.mp4');
+  assert.equal(
+    formatDeviceTransferSubtitle(cancellingDl, { deviceNoun: 'computer', technical: false }),
+    'Could not remove Beach.mp4: file in use.',
+  );
+  assert.deepEqual(friendlyDeviceTransferState(cancellingDl, false), { label: 'Cancelling', cls: 'failed' });
+  assert.deepEqual(friendlyDeviceTransferState({ ...cancellingDl, error: null }, false), {
+    label: 'Cancelling',
+    cls: '',
+  });
+  assert.equal(
+    formatDeviceTransferSubtitle({ ...cancellingDl, error: null }, { deviceNoun: 'phone', technical: false }),
+    'Removing partial files…',
+  );
+  const cancellingProtocolErr = {
+    ...cancellingDl,
+    error: { code: 'unknown_tool', message: 'Unknown tool: fs.remove', machine: 'studio' },
+  };
+  const plainCancelErr = formatDeviceTransferSubtitle(cancellingProtocolErr, {
+    deviceNoun: 'phone',
+    technical: false,
+  });
+  assert.ok(!plainCancelErr.includes('fs.remove'), `Cancelling error must use plain formatting: ${plainCancelErr}`);
+  assert.match(
+    formatDeviceTransferSubtitle(cancellingProtocolErr, { deviceNoun: 'phone', technical: true }),
+    /fs\.remove/,
+  );
 });
