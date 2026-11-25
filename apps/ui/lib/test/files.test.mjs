@@ -11,8 +11,11 @@ import {
   filesFallbackBackRoute,
   filterEntries,
   folderDisplayName,
+  formatFolderTotal,
   formatPathForDisplay,
+  formatShowingCount,
   isHiddenName,
+  isRetryableThumbError,
   isThumbEligible,
   joinFilePath,
   mimeFromName,
@@ -33,10 +36,12 @@ import {
   readRecentDestinations,
   readRecentFiles,
   readSortPreference,
+  readTextWrapPreference,
   recordRecentDestination,
   recordRecentFile,
   writeFolderViewMode,
   writeSortPreference,
+  writeTextWrapPreference,
 } from '../files-store.js';
 
 function memoryStorage() {
@@ -236,9 +241,31 @@ test('filterEntries, shouldDefaultToGrid, and selection helpers behave accuratel
   assert.equal(sum.count, 2);
   assert.equal(sum.fileCount, 2);
   assert.equal(sum.totalBytes, 1204000);
+  assert.equal(sum.allSizesKnown, true);
+
+  // Including a folder makes total size unknown so the UI hides a misleading size line.
+  const selWithDir = toggleSelection(sel, '/a/Raw');
+  const sumWithDir = selectionSummary(entries, selWithDir);
+  assert.equal(sumWithDir.count, 3);
+  assert.equal(sumWithDir.folderCount, 1);
+  assert.equal(sumWithDir.allSizesKnown, false);
+
   sel = toggleSelection(sel, '/a/IMG_1.jpg');
   assert.equal(sel.size, 1);
   assert.equal(selectAllEntries(entries).size, 5);
+
+  assert.equal(formatFolderTotal(5000, true), '5,000 items');
+  assert.equal(formatFolderTotal(5000, false), 'More than 5,000 items');
+  assert.equal(formatFolderTotal(1, true), '1 item');
+  assert.equal(formatShowingCount(120, 5000, true), 'Showing 120 of 5,000');
+  assert.equal(formatShowingCount(120, 5000, false), 'Showing 120 of more than 5,000');
+
+  assert.equal(isRetryableThumbError({ code: 'busy' }), true);
+  assert.equal(isRetryableThumbError({ code: 'rate_limited' }), true);
+  assert.equal(isRetryableThumbError({ code: 'internal', retryable: true }), true);
+  assert.equal(isRetryableThumbError({ code: 'unsupported' }), false);
+  assert.equal(isRetryableThumbError({ code: 'not_found' }), false);
+  assert.equal(isRetryableThumbError(null), false);
 });
 
 test('path helpers, crumbs, and fallback history stepping handle Unix and Windows paths', () => {
@@ -322,4 +349,8 @@ test('thumb cache enforces LRU bounds and files-store persists device preference
 
   writeSortPreference(storage, { sort: 'modified', order: 'desc' });
   assert.deepEqual(readSortPreference(storage), { sort: 'modified', order: 'desc' });
+
+  assert.equal(readTextWrapPreference(storage), true);
+  writeTextWrapPreference(storage, false);
+  assert.equal(readTextWrapPreference(storage), false);
 });

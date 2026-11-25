@@ -156,6 +156,8 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
     await page.getByText('Kept in sync').waitFor();
     await page.locator('.tile', { hasText: 'Photos' }).waitFor();
     await page.locator('.tile', { hasText: 'Passport.pdf' }).waitFor();
+    // Machine dots in Files mean on or off only (no amber busy dot).
+    assert.equal(await page.locator('.dot.busy').count(), 0, 'Files home must not show amber busy dots');
     await assertNoToolNames(page, 'files home');
     await maybeFilesShot(page, '01-files-home', { alsoLight: true });
 
@@ -246,8 +248,8 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
     await page.locator('.viewer-top button[aria-label="Close"]').click();
     await page.locator('.viewer').waitFor({ state: 'hidden' });
 
-    // 8. Unplayable video fallback shows sentence and two buttons.
-    await page.locator('.list a.row', { hasText: 'Concert.mkv' }).click();
+    // 8. Unplayable H.264 video hits the player's real error (not extension) and shows two actions.
+    await page.locator('.list a.row', { hasText: 'Concert (H.264).mp4' }).click();
     await page.locator('.viewer').getByText("This phone can't play this kind of video").waitFor({ timeout: 8000 });
     await page.locator('.viewer').getByRole('button', { name: 'Open in another app' }).waitFor();
     await page.locator('.viewer').getByRole('button', { name: 'Download to this phone' }).waitFor();
@@ -255,8 +257,18 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
     await page.locator('.viewer-top button[aria-label="Close"]').click();
     await page.locator('.viewer').waitFor({ state: 'hidden' });
 
-    // 9. Sample audio playback loads cleanly.
-    await page.locator('.list a.row', { hasText: 'Voice note.m4a' }).click();
+    // 8b. PDF is treated as an "everything else" file (no inline iframe/embed/object).
+    await page.locator('.list a.row', { hasText: 'Tickets.pdf' }).click();
+    await page.locator('.viewer .said strong', { hasText: 'Tickets.pdf' }).waitFor();
+    await page.locator('.viewer .said', { hasText: 'Document · 310 KB' }).waitFor();
+    assert.equal(await page.locator('.viewer iframe, .viewer embed, .viewer object').count(), 0);
+    await page.locator('.viewer').getByRole('button', { name: 'Open in another app' }).waitFor();
+    await page.locator('.viewer').getByRole('button', { name: 'Download to this phone' }).waitFor();
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.viewer').waitFor({ state: 'hidden' });
+
+    // 9. Royalty-free Opus Ogg audio playback loads cleanly.
+    await page.locator('.list a.row', { hasText: 'Voice note.ogg' }).click();
     await page.locator('.viewer audio').waitFor();
     await page.waitForFunction(
       () => {
@@ -269,24 +281,85 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
     await page.locator('.viewer-top button[aria-label="Close"]').click();
     await page.locator('.viewer').waitFor({ state: 'hidden' });
 
-    // 10. Select two files and Send to (non-blocking).
+    // 9b. 123-char no-spaces filename fits cleanly with zero horizontal overflow in list, viewer, and Send to.
+    const longNamePrefix = 'quarterly_photogrammetry_orthomosaic';
+    const longRow = page.locator('.list a.row', { hasText: longNamePrefix });
+    await longRow.scrollIntoViewIfNeeded();
+    const listOverflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+    assert.ok(listOverflow <= 1, `List horizontal overflow with 123-char name: ${listOverflow}px`);
+    await maybeFilesShot(page, '15-long-name-list', { alsoLight: true });
+    await longRow.click();
+    await page.locator('.viewer').waitFor();
+    const viewerBox = await page.evaluate(() => {
+      const more = document.querySelector('.viewer-top button[aria-label="More options"]')?.getBoundingClientRect();
+      return { overflow: document.documentElement.scrollWidth - window.innerWidth, moreRight: more?.right || 0, vw: window.innerWidth };
+    });
+    assert.ok(viewerBox.overflow <= 1, `Viewer overflow with long name: ${viewerBox.overflow}px`);
+    assert.ok(viewerBox.moreRight <= viewerBox.vw + 1, `Viewer More button pushed off screen: ${viewerBox.moreRight} > ${viewerBox.vw}`);
+    // Open Send to from viewer for the 123-char file and verify sheet stacks above viewer with zero overflow.
+    await page.locator('.viewer-bar button', { hasText: 'Send to' }).click();
+    await page.locator('.sheet').waitFor();
+    await page.waitForFunction(() => document.activeElement?.classList?.contains('sheet'), null, { timeout: 3000 });
+    const sheetOverflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+    assert.ok(sheetOverflow <= 1, `Send to sheet overflow with long name: ${sheetOverflow}px`);
+    await page.keyboard.press('Escape');
+    await page.locator('.sheet').waitFor({ state: 'hidden' });
+    // Escape must close only Send to and leave the viewer open behind it.
+    await page.locator('.viewer').waitFor();
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.viewer').waitFor({ state: 'hidden' });
+
+    // 10. Select files + folder: size hidden when a folder is selected, shown when only sized files are selected.
     await page.locator('.dock button[aria-label="More"]').click();
     await page.locator('.sheet button.row', { hasText: 'Select' }).click();
+    await page.locator('.list a.row', { hasText: 'Raw' }).click();
     await page.locator('.list a.row', { hasText: 'Arrival.mp4' }).click();
-    await page.locator('.list a.row', { hasText: 'Beach.mp4' }).click();
     await page.locator('header.top h1', { hasText: '2 selected' }).waitFor();
+    assert.equal(await page.locator('header.top h1 small').count(), 0, 'Total size must hide when a folder is selected');
+    // Unselect Raw, select Beach.mp4 -> size appears.
+    await page.locator('.list a.row', { hasText: 'Raw' }).click();
+    await page.locator('.list a.row', { hasText: 'Beach.mp4' }).click();
+    await page.locator('header.top h1 small', { hasText: '2 GB' }).waitFor();
     await maybeFilesShot(page, '08-folder-selecting', { alsoLight: true });
 
     await page.locator('.dock .bar4 button', { hasText: 'Send to' }).click();
     const sendSheet = page.locator('.sheet');
     await sendSheet.getByRole('heading', { name: 'Send 2 items' }).waitFor();
+    // No amber busy dot in Send to; source machine (`tower`) is last among machines with "Another folder on this machine".
+    assert.equal(await sendSheet.locator('.dot.busy').count(), 0, 'Send to must not show amber busy dots');
+    await sendSheet.getByText('Another folder on this machine').waitFor();
+    const machineTitles = await sendSheet.locator('[role="radiogroup"] .title').allTextContents();
+    assert.ok(
+      machineTitles.indexOf('tower') > machineTitles.indexOf('nas'),
+      `Expected source machine tower after other machines, got ${JSON.stringify(machineTitles)}`,
+    );
     await sendSheet.locator('.title', { hasText: 'Films' }).waitFor();
     await maybeFilesShot(page, '07-sheet-send-to', { alsoLight: true });
+
+    // Wake an off machine (`laptop`) right inside Send to: sheet stays open and laptop becomes selectable!
+    await sendSheet.locator('.row', { hasText: 'laptop' }).getByRole('button', { name: 'Wake' }).click();
+    const wakeConfirm = page.locator('.sheet', { hasText: /Wake laptop\?/i });
+    await wakeConfirm.waitFor();
+    await wakeConfirm.getByRole('button', { name: 'Wake', exact: true }).click();
+    await wakeConfirm.waitFor({ state: 'hidden' });
+    // Send to sheet is still open; laptop transitions to selectable radio button once awake!
+    await sendSheet.locator('button[role="radio"]', { hasText: 'laptop' }).waitFor({ timeout: 5000 });
 
     await sendSheet.getByRole('button', { name: 'Copy to pi' }).click();
     await sendSheet.waitFor({ state: 'hidden' });
     // Non-blocking toast confirms transfer started while user remains free to browse.
     await page.locator('.toast-banner', { hasText: /Copying 2 items to pi/ }).waitFor();
+
+    // 10b. Same-machine Copy uses `fs.copy` instantaneously (no background job).
+    await dispatchSwipe(page, '.swipe-row:has-text("notes.txt")', { startX: 310, startY: 220, endX: 140, endY: 222 });
+    await page.locator('.swipe-row:has-text("notes.txt") .swipe-action', { hasText: 'Send to' }).click();
+    const localSend = page.locator('.sheet');
+    await localSend.locator('button[role="radio"]', { hasText: 'tower' }).click();
+    await localSend.getByRole('button', { name: 'Copy here' }).click();
+    await localSend.waitFor({ state: 'hidden' });
+    await page.locator('.toast-banner', { hasText: /Copied notes\.txt to/ }).waitFor();
+    const lastCall = await page.evaluate(() => window.__LEGION_MOCK_LAST_CALL__);
+    assert.equal(lastCall?.tool, 'fs.copy', 'Same-machine copy must call fs.copy, not fs.transfer');
 
     // 11. Star and Pin via swipe + folder More, then verify on Files first screen.
     await dispatchSwipe(page, '.swipe-row:has-text("Beach.mp4")', { startX: 310, startY: 220, endX: 140, endY: 222 });
@@ -306,9 +379,15 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
     await page.locator('.filters button', { hasText: 'Videos' }).click();
     await page.locator('.list a.row', { hasText: 'Arrival.mp4' }).first().waitFor();
     await page.locator('.list a.row', { hasText: 'Arrival (2016).mkv' }).waitFor();
-    await page.getByText(/laptop .* not searched/i).waitFor();
+    await page.getByText(/nas .* not searched/i).waitFor();
     await assertNoToolNames(page, 'files search');
     await maybeFilesShot(page, '09-search', { alsoLight: true });
+
+    // 12b. Search with nothing found offers Clear filters when filters are active.
+    await page.locator('.dock input[type="search"]').fill('zzzz_nonexistent_query');
+    await page.getByText('Nothing found. Try a shorter word or fewer filters.').waitFor();
+    await page.getByRole('button', { name: 'Clear filters' }).click();
+    assert.equal(await page.locator('.filters button[aria-pressed="true"]').count(), 0);
 
     // 13. Kept in sync folder screen.
     await page.goto(`${server.url}/?mock#/files/@sync/sync-camera`, { waitUntil: 'domcontentloaded' });
@@ -316,13 +395,40 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
     await page.getByText('Getting 3 files · 410 MB left').waitFor();
     await page.getByText('1 file has two versions').waitFor();
     await page.getByText('6 deleted files · kept for 30 days').waitFor();
+    // Only the actively syncing copy (`studio`) has an amber dot.
+    assert.equal(await page.locator('.dot.busy').count(), 1);
     await assertNoToolNames(page, 'sync folder');
     await maybeFilesShot(page, '10-sync-folder', { alsoLight: true });
 
-    // 14. Text viewer with 128 KiB chunk + Load more.
+    // 13b. Single-picture folder has no "1 of 1" in viewer header.
+    await page.goto(`${server.url}/?mock#/files/studio//home/me/Pictures/Camera`, { waitUntil: 'domcontentloaded' });
+    await page.locator('.list a.row', { hasText: 'PXL_1003.jpg' }).click();
+    await page.locator('.viewer-top .name', { hasText: 'PXL_1003.jpg' }).waitFor();
+    const singlePicSub = await page.locator('.viewer-top .name small').innerText();
+    assert.ok(!singlePicSub.includes('1 of 1'), `Viewer must omit "1 of 1", got: ${singlePicSub}`);
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+
+    // 13c. Empty folder & denied folder states with helpful actions.
+    await page.goto(`${server.url}/?mock#/files/tower//home/me/Documents/Empty`, { waitUntil: 'domcontentloaded' });
+    await page.getByText('This folder is empty.').waitFor();
+    await page.getByRole('button', { name: 'New folder' }).waitFor();
+    await page.goto(`${server.url}/?mock#/files/tower//home/me/Private`, { waitUntil: 'domcontentloaded' });
+    await page.getByText("You're not allowed to open this folder.").waitFor();
+    await page.getByRole('button', { name: 'Back to Files' }).waitFor();
+
+    // 14. Text viewer with 128 KiB chunk, "Showing X of Y", remembered "Wrap lines" toggle, and Load more.
     await page.goto(`${server.url}/?mock#/files/tower//home/me/Documents`, { waitUntil: 'domcontentloaded' });
+    // Broken thumbnail stays silently as the kind icon without errors.
+    await page.locator('.list a.row', { hasText: 'broken-preview.jpg' }).waitFor();
     await page.locator('.list a.row', { hasText: 'long-log.txt' }).click();
     await page.locator('.viewer pre.viewer-text').waitFor();
+    await page.locator('.viewer-text-bar', { hasText: /Showing \d+(\.\d+)? [KM]B of/ }).waitFor();
+    const wrapBtn = page.locator('.viewer-text-bar button', { hasText: 'Wrap lines' });
+    assert.equal(await wrapBtn.getAttribute('aria-pressed'), 'true');
+    await maybeFilesShot(page, '16-viewer-text', { alsoLight: true });
+    await wrapBtn.click();
+    assert.equal(await wrapBtn.getAttribute('aria-pressed'), 'false');
+    await page.locator('.viewer pre.viewer-text.nowrap').waitFor();
     const loadMoreBtn = page.locator('.viewer').getByRole('button', { name: 'Load more' });
     await loadMoreBtn.waitFor();
     const lenBefore = await page.locator('.viewer pre.viewer-text').evaluate((el) => el.textContent.length);
@@ -332,6 +438,11 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
       lenBefore,
       { timeout: 5000 },
     );
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    // Reopen and verify Wrap lines preference was remembered.
+    await page.locator('.list a.row', { hasText: 'README.md' }).click();
+    await page.locator('.viewer pre.viewer-text.nowrap').waitFor();
+    await page.locator('.viewer-text-bar button', { hasText: 'Wrap lines' }).click(); // restore default wrap
     await page.locator('.viewer-top button[aria-label="Close"]').click();
 
     // 15. Activity screen with transfers & non-blocking device transfer queue controls (pause/resume/open).
@@ -358,12 +469,12 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
     await page.locator('.viewer-top .name', { hasText: 'Tickets.pdf' }).waitFor();
     await page.locator('.viewer-top button[aria-label="Close"]').click();
 
-    // 16. Large folder (5 000 entries) paging with offset + scroll position restored on Back.
-    await page.goto(`${server.url}/?mock=large#/files/tower//home/me/Archive5000`, { waitUntil: 'domcontentloaded' });
+    // 16. Large folder (5 000 entries, total_exact: false) paging + scroll position restored on Back.
+    await page.goto(`${server.url}/?mock=large,inexact#/files/tower//home/me/Archive5000`, { waitUntil: 'domcontentloaded' });
     await page.locator('header.top h1', { hasText: 'Archive5000' }).waitFor();
-    await page.getByText(/Showing 120 of 5,000|Showing 120/).waitFor();
+    await page.getByText('Showing 120 of more than 5,000').waitFor();
     await page.getByRole('button', { name: 'Show more' }).click();
-    await page.getByText(/Showing 200|Showing 240/).waitFor();
+    await page.getByText(/Showing (200|240) of more than 5,000/).waitFor();
     await page.evaluate(() => {
       const m = document.querySelector('main.main');
       if (m) m.scrollTop = 900;
@@ -378,6 +489,10 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
       null,
       { timeout: 3000 },
     );
+
+    // 16b. Retryable `fs.thumb` error (`busy`) retries quietly with backoff and fills thumbnail.
+    await page.goto(`${server.url}/?mock=thumb-retry#/files/tower//home/me/Videos/Holiday`, { waitUntil: 'domcontentloaded' });
+    await page.locator('.list a.row:has-text("IMG_2042.jpg") img, .grid a.cell[aria-label="IMG_2042.jpg"] img').first().waitFor({ timeout: 5000 });
 
     // 17. Kept in sync section hidden when sync.list does not exist (`?mock=nosync`).
     await page.goto(`${server.url}/?mock=nosync#/files`, { waitUntil: 'domcontentloaded' });

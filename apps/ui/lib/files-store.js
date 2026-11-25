@@ -4,6 +4,7 @@ const RECENT_FILES_KEY = 'legion.files.recent.v1';
 const RECENT_DIRS_KEY = 'legion.files.recentDirs.v1';
 const VIEW_MODE_KEY = 'legion.files.viewMode.v1';
 const SORT_PREF_KEY = 'legion.files.sort.v1';
+const TEXT_WRAP_KEY = 'legion.files.textWrap.v1';
 
 const MAX_RECENT_FILES = 40;
 const MAX_RECENT_DIRS_PER_MACHINE = 8;
@@ -117,4 +118,13 @@ export function writeSortPreference(storage, pref) {
     sort: pref.sort || 'name',
     order: pref.order || 'asc',
   });
+}
+
+export function readTextWrapPreference(storage) {
+  const val = readJson(storage, TEXT_WRAP_KEY, true);
+  return val !== false;
+}
+
+export function writeTextWrapPreference(storage, wrap) {
+  writeJson(storage, TEXT_WRAP_KEY, Boolean(wrap));
 }

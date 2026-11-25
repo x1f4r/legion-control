@@ -38,23 +38,25 @@ export function SendToSheet({
   favourites = [],
   caps,
   allowedSet,
+  wakePendingSet = null,
   deviceNoun = 'phone',
   technical = false,
   link,
   onWakeMachine,
+  onRefreshFleet,
+  onLocalDone,
   onStarted,
   onClose,
 }) {
   const [mode, setMode] = useState('copy'); // 'copy' | 'move'
-  const canMove = Boolean(caps?.hasTransferMove);
   const canWake = allowedSet ? allowedSet.has('power.wake') : false;
 
-  // Order machines: online other machines first, then source machine, then off machines.
+  // Order machines: online other machines first, then off machines, then source machine last.
   const orderedMachines = useMemo(() => {
     const onlineOthers = machines.filter((m) => m.reachable && m.name !== sourceMachine);
-    const sourceOnline = machines.filter((m) => m.reachable && m.name === sourceMachine);
     const offline = machines.filter((m) => !m.reachable);
-    return [...onlineOthers, ...sourceOnline, ...offline];
+    const sourceOnline = machines.filter((m) => m.reachable && m.name === sourceMachine);
+    return [...onlineOthers, ...offline, ...sourceOnline];
   }, [machines, sourceMachine]);
 
   const defaultDest = useMemo(() => {
@@ -73,6 +75,26 @@ export function SendToSheet({
   const [browseDirs, setBrowseDirs] = useState([]);
   const [browseLoading, setBrowseLoading] = useState(false);
   const [browseError, setBrowseError] = useState(null);
+
+  const isSameMachine = dest === sourceMachine;
+  const canMove = isSameMachine
+    ? Boolean(caps?.hasMove || caps?.hasTransferMove)
+    : Boolean(caps?.hasTransferMove);
+
+  // While any offline machine shown in this sheet is waking, poll fleet status so it becomes
+  // selectable in place as soon as it answers.
+  const hasWakingOffMachine = useMemo(
+    () => Boolean(wakePendingSet && machines.some((m) => !m.reachable && wakePendingSet.has(m.name))),
+    [machines, wakePendingSet],
+  );
+
+  useEffect(() => {
+    if (!hasWakingOffMachine || typeof onRefreshFleet !== 'function') return undefined;
+    const timer = window.setInterval(() => {
+      onRefreshFleet({ background: true, forceOffline: true });
+    }, 600);
+    return () => window.clearInterval(timer);
+  }, [hasWakingOffMachine, onRefreshFleet]);
 
   const pinnedDirsForDest = useMemo(() => {
     if (!dest || dest === '__device__') return [];
@@ -136,13 +158,15 @@ export function SendToSheet({
     };
   }, [pickingFolder, dest, browsePath]);
 
-  const totalBytes = items.reduce((sum, it) => sum + (Number.isFinite(it?.size) ? it.size : 0), 0);
+  const allSizesKnown =
+    items.length > 0 && items.every((it) => it && it.kind !== 'dir' && Number.isFinite(it.size));
+  const totalBytes = allSizesKnown ? items.reduce((sum, it) => sum + it.size, 0) : 0;
   const title =
     items.length === 1
       ? `Send ${items[0].name || baseFileName(items[0].path)}`
       : `Send ${items.length} items`;
   const subParts = [
-    totalBytes > 0 ? formatBytes(totalBytes) : null,
+    allSizesKnown ? formatBytes(totalBytes) : null,
     `from ${sourceMachine}`,
   ].filter(Boolean);
 
@@ -150,7 +174,9 @@ export function SendToSheet({
   const effectiveMode = isDeviceDest ? 'copy' : mode;
   const confirmLabel = isDeviceDest
     ? `Download to this ${deviceNoun}`
-    : `${effectiveMode === 'move' ? 'Move' : 'Copy'} to ${dest}`;
+    : dest === sourceMachine
+      ? `${effectiveMode === 'move' ? 'Move' : 'Copy'} here`
+      : `${effectiveMode === 'move' ? 'Move' : 'Copy'} to ${dest}`;
 
   function handleConfirm() {
     if (!dest || items.length === 0) return;
@@ -191,6 +217,34 @@ export function SendToSheet({
 
     recordRecentDestination(safeStorage(), destMachine, targetDir);
 
+    const what =
+      items.length === 1
+        ? items[0].name || baseFileName(items[0].path)
+        : `${items.length} items`;
+
+    // Same-machine Move uses `fs.move` and same-machine Copy uses `fs.copy` — instant, no job.
+    if (destMachine === sourceMachine && ((isMove && caps?.hasMove) || (!isMove && caps?.hasCopy))) {
+      const toolName = isMove ? 'fs.move' : 'fs.copy';
+      const folderName = folderDisplayName(targetDir, { technical });
+      const runLocal = async () => {
+        for (const item of items) {
+          const destPath = buildTransferDestination(targetDir, item.path);
+          if (destPath === item.path) continue;
+          await link.call(toolName, { from: item.path, to: destPath }, { on: sourceMachine }).catch(() => {});
+        }
+        if (onLocalDone) onLocalDone();
+      };
+      runLocal();
+      if (onStarted) {
+        onStarted({
+          kind: isMove ? 'move' : 'copy',
+          local: true,
+          message: `${isMove ? 'Moved' : 'Copied'} ${what} to ${folderName}.`,
+        });
+      }
+      return;
+    }
+
     const runTransfers = async () => {
       for (const item of items) {
         const destPath = buildTransferDestination(targetDir, item.path);
@@ -218,10 +272,6 @@ export function SendToSheet({
     runTransfers();
 
     const verb = isMove ? 'Moving' : 'Copying';
-    const what =
-      items.length === 1
-        ? items[0].name || baseFileName(items[0].path)
-        : `${items.length} items`;
     if (onStarted) {
       onStarted({
         kind: 'transfer',
@@ -367,24 +417,23 @@ export function SendToSheet({
             <div class="list" role="radiogroup" aria-label="Destination">
               ${orderedMachines.map((m) => {
                 if (!m.reachable) {
+                  const waking = Boolean(wakePendingSet?.has(m.name));
                   return html`
                     <div key=${m.name} class="row off">
                       <span class="dot off" aria-hidden="true"></span>
                       <span class="body">
                         <span class="title">${m.name}</span>
-                        <span class="sub">Off · turn it on to send here</span>
+                        <span class="sub">${waking ? 'Waking…' : 'Off · turn it on to send here'}</span>
                       </span>
                       ${m.canWake && canWake && onWakeMachine
                         ? html`
                             <button
                               type="button"
                               class="btn small"
-                              onClick=${() => {
-                                onClose();
-                                onWakeMachine(m);
-                              }}
+                              disabled=${waking}
+                              onClick=${() => onWakeMachine(m)}
                             >
-                              Wake
+                              ${waking ? 'Waking…' : 'Wake'}
                             </button>
                           `
                         : null}
@@ -392,7 +441,8 @@ export function SendToSheet({
                   `;
                 }
                 const picked = dest === m.name;
-                const free = freeDiskPhrase(m);
+                const isSelf = m.name === sourceMachine;
+                const sub = isSelf ? 'Another folder on this machine' : freeDiskPhrase(m) || 'On';
                 return html`
                   <button
                     key=${m.name}
@@ -402,10 +452,10 @@ export function SendToSheet({
                     class=${picked ? 'row picked' : 'row'}
                     onClick=${() => setDest(m.name)}
                   >
-                    <span class=${m.busy ? 'dot busy' : 'dot'} aria-hidden="true"></span>
+                    <span class="dot" aria-hidden="true"></span>
                     <span class="body">
                       <span class="title">${m.name}</span>
-                      <span class="sub">${free || 'On'}</span>
+                      <span class="sub">${sub}</span>
                     </span>
                     <span class="check" aria-hidden="true"></span>
                   </button>

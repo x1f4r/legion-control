@@ -310,6 +310,7 @@ export function detectFileCapabilities({ tools = [], allowedSet = null, link = n
   const hasSync = hasTool('sync.list');
   const hasSyncWrite = hasSync && (hasTool('sync.pause') || hasTool('sync.add'));
   const hasMkdir = hasTool('fs.mkdir');
+  const hasCopy = hasTool('fs.copy');
   const hasMove = hasTool('fs.move');
   const hasRemove = hasTool('fs.remove');
   const hasHash = hasTool('fs.hash');
@@ -345,6 +346,7 @@ export function detectFileCapabilities({ tools = [], allowedSet = null, link = n
     hasSync,
     hasSyncWrite,
     hasMkdir,
+    hasCopy,
     hasMove,
     hasRemove,
     hasHash,
@@ -489,12 +491,15 @@ export function selectionSummary(entries, selectedSet) {
   let totalBytes = 0;
   let fileCount = 0;
   let folderCount = 0;
+  let allSizesKnown = picked.length > 0;
   for (const item of picked) {
     if (item.kind === 'dir') {
       folderCount += 1;
+      allSizesKnown = false;
     } else {
       fileCount += 1;
       if (Number.isFinite(item.size)) totalBytes += item.size;
+      else allSizesKnown = false;
     }
   }
   return {
@@ -502,8 +507,52 @@ export function selectionSummary(entries, selectedSet) {
     fileCount,
     folderCount,
     totalBytes,
+    allSizesKnown,
     items: picked,
   };
+}
+
+/**
+ * Formats a folder's item count, respecting `total_exact === false` as a lower bound.
+ */
+export function formatFolderTotal(total, totalExact = true) {
+  if (!Number.isFinite(total) || total < 0) return '';
+  if (totalExact === false) {
+    return `More than ${total.toLocaleString()} items`;
+  }
+  return total === 1 ? '1 item' : `${total.toLocaleString()} items`;
+}
+
+/**
+ * Formats the folder pager status line, respecting `total_exact === false`.
+ */
+export function formatShowingCount(shown, total, totalExact = true) {
+  const shownText = Number.isFinite(shown) ? shown.toLocaleString() : '0';
+  if (!Number.isFinite(total) || total <= 0) return `Showing ${shownText}`;
+  if (totalExact === false) {
+    return `Showing ${shownText} of more than ${total.toLocaleString()}`;
+  }
+  return `Showing ${shownText} of ${total.toLocaleString()}`;
+}
+
+const RETRYABLE_THUMB_CODES = new Set([
+  'busy',
+  'rate_limited',
+  'temporarily_unavailable',
+  'timeout',
+  'try_again',
+  'overloaded',
+]);
+
+/**
+ * Returns true when an `fs.thumb` per-path error means the node is temporarily busy decoding
+ * and the caller should quietly retry after a short backoff.
+ */
+export function isRetryableThumbError(err) {
+  if (!err || typeof err !== 'object') return false;
+  if (err.retryable === true) return true;
+  const code = typeof err.code === 'string' ? err.code.toLowerCase() : '';
+  return RETRYABLE_THUMB_CODES.has(code);
 }
 
 /**

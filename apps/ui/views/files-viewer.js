@@ -10,10 +10,19 @@ import {
   mimeFromName,
   plainCategoryLabel,
 } from '../lib/files.js';
+import { readTextWrapPreference, writeTextWrapPreference } from '../lib/files-store.js';
 import { formatBytes, formatRelativeTime } from '../lib/format.js';
 import { CopyButton, Notice, Sheet } from './common.js';
 
 const TEXT_CHUNK_BYTES = 131072; // 128 KiB
+
+function safeStorage() {
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+}
 
 function clamp(v, min, max) {
   return Math.max(min, Math.min(max, v));
@@ -54,6 +63,7 @@ export function FilesViewer({
 
   const [chromeHidden, setChromeHidden] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
+  const [wrapLines, setWrapLines] = useState(() => readTextWrapPreference(safeStorage()));
   const [mediaUrl, setMediaUrl] = useState(null);
   const [mediaLoading, setMediaLoading] = useState(false);
   const [mediaError, setMediaError] = useState(null);
@@ -216,7 +226,7 @@ export function FilesViewer({
   // Keyboard navigation inside viewer: Escape closes, Left/Right steps through pictures.
   useEffect(() => {
     function onKeyDown(e) {
-      if (moreOpen) return;
+      if (moreOpen || document.querySelector('.scrim')) return;
       if (e.key === 'Escape') {
         e.preventDefault();
         handleClose();
@@ -562,9 +572,33 @@ export function FilesViewer({
       if (textState.loading && !textState.content) {
         return html`<div class="said"><span>Loading text…</span></div>`;
       }
+      const toggleWrap = () => {
+        setWrapLines((prev) => {
+          const next = !prev;
+          writeTextWrapPreference(safeStorage(), next);
+          return next;
+        });
+      };
+      const showPartial = !textState.eof || textState.size > TEXT_CHUNK_BYTES;
+      const sizeLabel = showPartial
+        ? `Showing ${formatBytes(textState.loaded)} of ${formatBytes(textState.size)}`
+        : textState.size > 0
+          ? formatBytes(textState.size)
+          : '';
       return html`
         <div>
-          <pre class="viewer-text">${textState.content || '(Empty file)'}</pre>
+          <div class="viewer-text-bar">
+            <span>${sizeLabel}</span>
+            <button
+              type="button"
+              class="btn small"
+              aria-pressed=${wrapLines ? 'true' : 'false'}
+              onClick=${toggleWrap}
+            >
+              Wrap lines
+            </button>
+          </div>
+          <pre class=${wrapLines ? 'viewer-text' : 'viewer-text nowrap'}>${textState.content || '(Empty file)'}</pre>
           ${!textState.eof
             ? html`
                 <div class="viewer-text-foot">
@@ -586,12 +620,13 @@ export function FilesViewer({
       `;
     }
 
-    return renderFallbackCard(
-      `${plainCategoryLabel(effectiveEntry)} preview isn't built in`,
-      caps?.hasOpenExternally || caps?.hasDownload
-        ? 'Open it in another app or download it to this ' + deviceNoun + '.'
-        : `${name} (${effectiveEntry.size != null ? formatBytes(effectiveEntry.size) : 'file'}) on ${machine}.`,
-    );
+    const otherMeta = [
+      plainCategoryLabel(effectiveEntry),
+      effectiveEntry.size != null ? formatBytes(effectiveEntry.size) : null,
+    ]
+      .filter(Boolean)
+      .join(' · ');
+    return renderFallbackCard(name, otherMeta || `File on ${machine}`);
   }
 
   const viewerCls = ['viewer', chromeHidden ? 'chrome-hidden' : ''].filter(Boolean).join(' ');

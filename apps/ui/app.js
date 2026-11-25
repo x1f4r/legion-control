@@ -1212,7 +1212,7 @@ function App() {
             </button>
             <h1>
               ${`${sum.count} selected`}
-              ${sum.totalBytes > 0 ? html`<small>${formatBytes(sum.totalBytes)}</small>` : null}
+              ${sum.allSizesKnown ? html`<small>${formatBytes(sum.totalBytes)}</small>` : null}
             </h1>
             <button
               type="button"
@@ -1717,6 +1717,8 @@ function App() {
                               resolvedViewMode: filesResolvedViewMode,
                             }}
                             filesActions=${filesActions}
+                            wakePendingSet=${wakePendingSet}
+                            onRefreshFleet=${(opts) => refreshFleet(nodeInfo, opts)}
                             onWakeMachine=${onWakeMachine}
                             onRequestConfirm=${openConfirm}
                             onToast=${showToast}

@@ -12,7 +12,10 @@ import {
   entryIconName,
   filterEntries,
   folderDisplayName,
+  formatFolderTotal,
   formatPathForDisplay,
+  formatShowingCount,
+  isRetryableThumbError,
   isThumbEligible,
   parentFilePath,
   plainCategoryLabel,
@@ -107,10 +110,15 @@ function joinMemberNames(members) {
 
 // ── Batched lazy thumbnail loader hook ───────────────────────────────────────────────────────
 
+const THUMB_MAX_RETRIES = 3;
+const THUMB_RETRY_BASE_MS = 350;
+
 function useBatchedThumbs({ machine, entries, link, enabled, thumbCache }) {
   const [, setTick] = useState(0);
   const queueRef = useRef(new Set());
   const inFlightRef = useRef(new Set());
+  const retryCountRef = useRef(new Map());
+  const retryTimersRef = useRef(new Set());
   const timerRef = useRef(null);
   const observerRef = useRef(null);
   const entryMapRef = useRef(new Map());
@@ -122,6 +130,34 @@ function useBatchedThumbs({ machine, entries, link, enabled, thumbCache }) {
     }
     entryMapRef.current = map;
   }, [entries]);
+
+  useEffect(() => {
+    retryCountRef.current.clear();
+    return () => {
+      for (const tid of retryTimersRef.current) clearTimeout(tid);
+      retryTimersRef.current.clear();
+    };
+  }, [machine, enabled]);
+
+  const flushRef = useRef(null);
+
+  const scheduleRetry = useCallback((p) => {
+    const attempt = retryCountRef.current.get(p) || 0;
+    if (attempt >= THUMB_MAX_RETRIES) return false;
+    retryCountRef.current.set(p, attempt + 1);
+    const delayMs = THUMB_RETRY_BASE_MS * (2 ** attempt);
+    const tid = window.setTimeout(() => {
+      retryTimersRef.current.delete(tid);
+      if (!inFlightRef.current.has(p)) {
+        queueRef.current.add(p);
+        if (!timerRef.current && flushRef.current) {
+          timerRef.current = window.setTimeout(() => flushRef.current?.(), 24);
+        }
+      }
+    }, delayMs);
+    retryTimersRef.current.add(tid);
+    return true;
+  }, []);
 
   const flush = useCallback(() => {
     timerRef.current = null;
@@ -147,8 +183,12 @@ function useBatchedThumbs({ machine, entries, link, enabled, thumbCache }) {
           const key = thumbCacheKey(machine, p, entry?.mtime || '', 128);
           const item = map[p];
           if (item?.content && item?.mime) {
+            retryCountRef.current.delete(p);
             thumbCache.set(key, { url: `data:${item.mime};base64,${item.content}` });
+          } else if (isRetryableThumbError(item?.error) && scheduleRetry(p)) {
+            // Leave kind icon visible while waiting quietly for backoff retry.
           } else {
+            retryCountRef.current.delete(p);
             thumbCache.set(key, { failed: true });
           }
         }
@@ -157,15 +197,19 @@ function useBatchedThumbs({ machine, entries, link, enabled, thumbCache }) {
           timerRef.current = window.setTimeout(flush, 30);
         }
       })
-      .catch(() => {
+      .catch((err) => {
+        const retryable = isRetryableThumbError(err);
         for (const p of batch) {
           inFlightRef.current.delete(p);
+          if (retryable && scheduleRetry(p)) continue;
           const entry = entryMapRef.current.get(p);
           const key = thumbCacheKey(machine, p, entry?.mtime || '', 128);
           thumbCache.set(key, { failed: true });
         }
       });
-  }, [enabled, machine, link, thumbCache]);
+  }, [enabled, machine, link, thumbCache, scheduleRetry]);
+
+  flushRef.current = flush;
 
   const requestPath = useCallback(
     (entry) => {
@@ -450,7 +494,7 @@ export function FilesHome({
                 onNavigate(href);
               }}
             >
-              <span class=${m.busy ? 'dot busy' : 'dot'} aria-hidden="true"></span>
+              <span class="dot" aria-hidden="true"></span>
               <span class="body">
                 <span class="title">${m.name}</span>
                 <span class="sub">${freeSpaceSub(m)}</span>
@@ -533,6 +577,11 @@ export function FolderBrowser({
   onToggleStar,
   onSendTo,
   onWakeMachine,
+  wakePendingSet = null,
+  onRefreshFleet,
+  onNewFolder,
+  onUpload,
+  onGoHome,
   onOpenSearch,
   onOpenSort,
   onToggleView,
@@ -544,6 +593,7 @@ export function FolderBrowser({
   const [resolvedPath, setResolvedPath] = useState(path || '~');
   const [rawEntries, setRawEntries] = useState([]);
   const [totalCount, setTotalCount] = useState(null);
+  const [totalExact, setTotalExact] = useState(true);
   const [hasMorePages, setHasMorePages] = useState(false);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -566,7 +616,19 @@ export function FolderBrowser({
   }, [favourites, machine]);
 
   const reachable = machineObj ? machineObj.reachable : true;
+  const isWaking = Boolean(machine && wakePendingSet?.has(machine));
   const canWake = allowedSet ? allowedSet.has('power.wake') : false;
+
+  // Poll fleet status while waking this offline machine so the folder reopens at the same path.
+  useEffect(() => {
+    if ((reachable && error?.code !== 'unreachable') || !isWaking || typeof onRefreshFleet !== 'function') {
+      return undefined;
+    }
+    const timer = window.setInterval(() => {
+      onRefreshFleet({ background: true, forceOffline: true });
+    }, 600);
+    return () => window.clearInterval(timer);
+  }, [reachable, error?.code, isWaking, onRefreshFleet]);
 
   // Load initial page of directory.
   useEffect(() => {
@@ -607,6 +669,7 @@ export function FolderBrowser({
         setResolvedPath(actualPath);
         setRawEntries(list);
         setTotalCount(typeof res?.total === 'number' ? res.total : list.length);
+        setTotalExact(res?.total_exact !== false);
         setHasMorePages(Boolean(res?.truncated && caps?.hasListOffset));
         offsetRef.current = list.length;
         setLoading(false);
@@ -711,18 +774,27 @@ export function FolderBrowser({
     thumbCache,
   });
 
-  if (!reachable) {
+  if (!reachable || error?.code === 'unreachable') {
     return html`
       <div>
         <div class="notice">
           <strong>${machine} is off.</strong>
-          <span>${offlineMachineSub(machineObj || { name: machine })}</span>
+          <span>
+            ${isWaking
+              ? `Waking ${machine}… This folder will reopen here when it answers.`
+              : offlineMachineSub(machineObj || { name: machine })}
+          </span>
         </div>
         ${machineObj?.canWake && canWake && onWakeMachine
           ? html`
               <div class="actions">
-                <button type="button" class="btn primary" onClick=${() => onWakeMachine(machineObj)}>
-                  Wake ${machine}
+                <button
+                  type="button"
+                  class="btn primary"
+                  disabled=${isWaking}
+                  onClick=${() => onWakeMachine(machineObj)}
+                >
+                  ${isWaking ? `Waking ${machine}…` : `Wake ${machine}`}
                 </button>
               </div>
             `
@@ -938,7 +1010,7 @@ export function FolderBrowser({
             <div class="files-wide-head">
               <h2>${folderDisplayName(resolvedPath, { technical })}</h2>
               ${totalCount != null && totalCount > 0
-                ? html`<span class="dim">${totalCount.toLocaleString()} items</span>`
+                ? html`<span class="dim">${formatFolderTotal(totalCount, totalExact)}</span>`
                 : null}
             </div>
           `
@@ -1006,23 +1078,69 @@ export function FolderBrowser({
         })}
       </nav>
 
-      ${error ? html`<${Notice} error=${error} />` : null}
+      ${error?.code === 'denied'
+        ? html`
+            <div class="empty">
+              <p>You're not allowed to open this folder.</p>
+              ${onGoHome
+                ? html`
+                    <div class="empty-actions">
+                      <button type="button" class="btn small" onClick=${onGoHome}>Back to Files</button>
+                    </div>
+                  `
+                : null}
+            </div>
+          `
+        : error
+          ? html`<${Notice} error=${error} />`
+          : null}
 
-      ${loading && rawEntries.length === 0
-        ? html`<div class="empty">Loading folder…</div>`
-        : entries.length === 0
-          ? html`<div class="empty">This folder is empty.</div>`
-          : effectiveMode === 'grid'
-            ? renderGrid()
-            : html`<div class="list">${visibleEntries.map(renderListRow)}</div>`}
+      ${error?.code === 'denied'
+        ? null
+        : loading && rawEntries.length === 0
+          ? html`<div class="empty">Loading folder…</div>`
+          : entries.length === 0 && !error
+            ? html`
+                <div class="empty">
+                  <p>This folder is empty.</p>
+                  ${(caps?.hasMkdir && onNewFolder) || (caps?.hasUpload && onUpload)
+                    ? html`
+                        <div class="empty-actions">
+                          ${caps?.hasMkdir && onNewFolder
+                            ? html`
+                                <button
+                                  type="button"
+                                  class="btn small"
+                                  onClick=${() => onNewFolder(machine, resolvedPath)}
+                                >
+                                  New folder
+                                </button>
+                              `
+                            : null}
+                          ${caps?.hasUpload && onUpload
+                            ? html`
+                                <button
+                                  type="button"
+                                  class="btn small"
+                                  onClick=${() => onUpload(machine, resolvedPath)}
+                                >
+                                  Add from this ${deviceNoun}
+                                </button>
+                              `
+                            : null}
+                        </div>
+                      `
+                    : null}
+                </div>
+              `
+            : effectiveMode === 'grid'
+              ? renderGrid()
+              : html`<div class="list">${visibleEntries.map(renderListRow)}</div>`}
 
       ${hasMoreToRender || hasMorePages
         ? html`
             <div ref=${pagerRef} class="folder-pager">
-              <span>
-                Showing ${visibleEntries.length.toLocaleString()}
-                ${totalCount ? ` of ${totalCount.toLocaleString()}` : ''}
-              </span>
+              <span>${formatShowingCount(visibleEntries.length, totalCount, totalExact)}</span>
               <button
                 type="button"
                 class="btn small"
@@ -1054,6 +1172,7 @@ export function FilesSearchView({
   onNavigateFolder,
   onOpenFile,
   onResultCountChange,
+  onClearFilters,
 }) {
   const scopeMachine = route.machine || null;
   const scopePath = route.path || null;
@@ -1263,13 +1382,28 @@ export function FilesSearchView({
   );
   const anyPending = machineOrder.some((mName) => resultsByMachine[mName] === undefined);
 
+  const hasActiveFilters = kinds.length > 0 || Boolean(size) || Boolean(changed);
+
   return html`
     <div>
       ${error ? html`<${Notice} error=${error} />` : null}
       ${searching && Object.keys(resultsByMachine).length === 0
         ? html`<div class="empty">Searching…</div>`
         : !searching && !anyPending && totalMatches === 0
-          ? html`<div class="empty">Nothing found.</div>`
+          ? html`
+              <div class="empty">
+                <p>Nothing found. Try a shorter word or fewer filters.</p>
+                ${hasActiveFilters && onClearFilters
+                  ? html`
+                      <div class="empty-actions">
+                        <button type="button" class="btn small" onClick=${onClearFilters}>
+                          Clear filters
+                        </button>
+                      </div>
+                    `
+                  : null}
+              </div>
+            `
           : machineOrder.map((mName) => {
               const items = resultsByMachine[mName];
               if (items === undefined) {
@@ -1694,6 +1828,8 @@ export function FilesView({
   thumbCache,
   filesState,
   filesActions,
+  wakePendingSet = null,
+  onRefreshFleet,
   onWakeMachine,
   onRequestConfirm,
   onToast,
@@ -2000,6 +2136,11 @@ export function FilesView({
           onToggleStar=${toggleStar}
           onSendTo=${(m, items) => filesActions.openSheet({ kind: 'send', sourceMachine: m, items })}
           onWakeMachine=${onWakeMachine}
+          wakePendingSet=${wakePendingSet}
+          onRefreshFleet=${onRefreshFleet}
+          onNewFolder=${(m, p) => filesActions.openSheet({ kind: 'mkdir', machine: m, parentPath: p })}
+          onUpload=${startUpload}
+          onGoHome=${() => navigateHref('#/files')}
           onOpenSearch=${(q, m, p) =>
             navigateHref(
               routeHref({
@@ -2037,6 +2178,14 @@ export function FilesView({
           onNavigateFolder=${navigateFolder}
           onOpenFile=${openFile}
           onResultCountChange=${filesActions.setSearchSummary}
+          onClearFilters=${() => {
+            const href = routeHref({
+              ...route,
+              query: { q: route.query?.q || '', kinds: [], size: '', changed: '' },
+            });
+            window.history.replaceState(window.history.state, '', href);
+            window.dispatchEvent(new HashChangeEvent('hashchange'));
+          }}
         />
       `;
     }
@@ -2204,14 +2353,20 @@ export function FilesView({
               favourites=${favourites}
               caps=${caps}
               allowedSet=${allowedSet}
+              wakePendingSet=${wakePendingSet}
               deviceNoun=${deviceNoun}
               technical=${technical}
               link=${link}
               onWakeMachine=${onWakeMachine}
+              onRefreshFleet=${onRefreshFleet}
+              onLocalDone=${() => setReloadToken((n) => n + 1)}
               onStarted=${(info) => {
                 filesActions.finishBulkAction();
                 if (onToast) {
-                  onToast(info.message, { actionLabel: 'Activity', actionHref: '#/activity' });
+                  onToast(
+                    info.message,
+                    info.local ? {} : { actionLabel: 'Activity', actionHref: '#/activity' },
+                  );
                 }
               }}
               onClose=${filesActions.closeSheet}

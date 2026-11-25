@@ -735,10 +735,17 @@ button.row:active {
 }
 
 .row .title {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 550;
+}
+
+.row .title:has(> .chip) {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-weight: 550;
 }
 
 .row .title.mono {
@@ -816,6 +823,8 @@ button.row:active {
 }
 
 .swipe-row > .row {
+  flex: 1;
+  min-width: 0;
   border-top: 0;
 }
 
@@ -1651,7 +1660,7 @@ button.row:active {
 .scrim {
   position: absolute;
   inset: 0;
-  z-index: 30;
+  z-index: 50;
   display: grid;
   align-items: end;
   background: rgb(0 0 0 / 0.55);
@@ -1840,8 +1849,10 @@ button.row:active {
   place-items: center;
   align-content: center;
   gap: 6px;
+  min-width: 0;
   width: 100%;
   height: 100%;
+  overflow: hidden;
   padding: 8px;
   font-size: var(--text-small);
   text-align: center;
@@ -2038,15 +2049,49 @@ button.row:active {
   inset: 0;
   z-index: 40;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto minmax(0, 1fr) auto;
+  overflow: hidden;
   background: #000;
   color: #fff;
+}
+
+/* Keep dark-surface accent contrast inside the always-black viewer even when light theme is active. */
+:root[data-theme="light"] .viewer {
+  --accent: #b6f24a;
+  --accent-ink: #11160a;
+}
+
+:root[data-theme="light"][data-accent="blue"] .viewer {
+  --accent: #6fc7ff;
+  --accent-ink: #081722;
+}
+
+:root[data-theme="light"][data-accent="violet"] .viewer {
+  --accent: #b79cf7;
+  --accent-ink: #160e26;
+}
+
+:root[data-theme="light"][data-accent="amber"] .viewer {
+  --accent: #ffb057;
+  --accent-ink: #1f1305;
+}
+
+:root[data-theme="light"][data-accent="rose"] .viewer {
+  --accent: #ff7a9e;
+  --accent-ink: #220912;
+}
+
+:root[data-theme="light"][data-accent="neutral"] .viewer {
+  --accent: #eceef0;
+  --accent-ink: #0d0e10;
 }
 
 .viewer-top {
   display: flex;
   align-items: center;
   gap: 4px;
+  min-width: 0;
   padding: calc(var(--safe-top) + 10px) 8px 8px;
   background: linear-gradient(rgb(0 0 0 / 0.72), transparent);
   transition: opacity 0.16s;
@@ -2076,6 +2121,7 @@ button.row:active {
 
 .viewer-stage {
   position: relative;
+  min-width: 0;
   min-height: 0;
   display: grid;
   place-items: center;
@@ -2134,8 +2180,34 @@ button.row:active {
   stroke-linejoin: round;
 }
 
+.viewer-audio strong {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
 .viewer-audio audio {
   width: 100%;
+}
+
+.viewer-text-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+  color: #aaa;
+  font-size: var(--text-sub);
+}
+
+.viewer-text-bar .btn {
+  color: #fff;
+  border-color: #444;
+}
+
+.viewer-text-bar .btn[aria-pressed="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
 }
 
 .viewer-text {
@@ -2148,6 +2220,12 @@ button.row:active {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   tab-size: 4;
+}
+
+.viewer-text.nowrap {
+  white-space: pre;
+  overflow-x: auto;
+  overflow-wrap: normal;
 }
 
 .viewer-text-foot {
@@ -2166,10 +2244,11 @@ button.row:active {
 }
 
 .viewer-stage .said {
-  max-width: 300px;
+  max-width: min(320px, 100%);
   padding: 0 16px;
   text-align: center;
   color: #ccc;
+  overflow-wrap: anywhere;
 }
 
 .viewer-stage .said strong {
@@ -2212,6 +2291,7 @@ button.row:active {
 }
 
 .viewer-bar {
+  min-width: 0;
   padding: 6px 10px calc(var(--safe-bottom) + 8px);
   background: linear-gradient(transparent, rgb(0 0 0 / 0.72));
   transition: opacity 0.16s;
@@ -2315,6 +2395,18 @@ button.row:active {
 .sheet-sub {
   margin: 0 0 12px;
   color: var(--dim);
+}
+
+.sheet h2 {
+  overflow-wrap: anywhere;
+}
+
+.empty-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 14px;
 }
 
 .sheet .seg + .label {
