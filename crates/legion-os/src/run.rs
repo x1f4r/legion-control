@@ -1007,12 +1007,9 @@ mod tests {
 
     #[tokio::test]
     async fn run_exit_107_without_memory_limit_is_not_killed_for_memory() {
-        let cmd = if cfg!(windows) {
-            CommandSpec::shell("exit /b 107")
-        } else {
-            CommandSpec::shell("exit 107")
-        };
-        let out = run(RunOptions::new(cmd)).await.unwrap();
+        let out = run(RunOptions::new(CommandSpec::shell("exit 107")))
+            .await
+            .unwrap();
         assert_eq!(
             out.exit_code,
             Some(crate::capped_alloc::CAP_EXCEEDED_EXIT_CODE)
