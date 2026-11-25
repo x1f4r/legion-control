@@ -1,0 +1,1087 @@
+// Sheets for Files: Send to (with destination folder picker), Sort, Folder More, New folder,
+// Rename, Search More filters, and Sync folder actions.
+
+import { html, useEffect, useMemo, useState } from '../vendor/preact-htm.js';
+import { Icon } from '../icons.js';
+import {
+  baseFileName,
+  buildTransferDestination,
+  folderDisplayName,
+  formatPathForDisplay,
+  joinFilePath,
+  parentFilePath,
+} from '../lib/files.js';
+import { readRecentDestinations, recordRecentDestination } from '../lib/files-store.js';
+import { formatBytes, formatRelativeTime, primaryDisk } from '../lib/format.js';
+import { Notice, Sheet } from './common.js';
+
+function safeStorage() {
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
+function freeDiskPhrase(machine) {
+  const disk = primaryDisk(machine?.sys?.disks);
+  if (!disk?.disk?.available) return '';
+  return `${formatBytes(disk.disk.available)} free`;
+}
+
+// ── Send to sheet ────────────────────────────────────────────────────────────────────────────
+
+export function SendToSheet({
+  sourceMachine,
+  items = [],
+  machines = [],
+  favourites = [],
+  caps,
+  allowedSet,
+  wakePendingSet = null,
+  deviceNoun = 'phone',
+  technical = false,
+  link,
+  onWakeMachine,
+  onRefreshFleet,
+  onLocalDone,
+  onStarted,
+  onClose,
+}) {
+  const [mode, setMode] = useState('copy'); // 'copy' | 'move'
+  const canWake = allowedSet ? allowedSet.has('power.wake') : false;
+
+  // Order machines: online other machines first, then off machines, then source machine last.
+  const orderedMachines = useMemo(() => {
+    const onlineOthers = machines.filter((m) => m.reachable && m.name !== sourceMachine);
+    const offline = machines.filter((m) => !m.reachable);
+    const sourceOnline = machines.filter((m) => m.reachable && m.name === sourceMachine);
+    return [...onlineOthers, ...offline, ...sourceOnline];
+  }, [machines, sourceMachine]);
+
+  const defaultDest = useMemo(() => {
+    const firstOnlineOther = orderedMachines.find((m) => m.reachable && m.name !== sourceMachine);
+    if (firstOnlineOther) return firstOnlineOther.name;
+    const firstOnline = orderedMachines.find((m) => m.reachable);
+    if (firstOnline) return firstOnline.name;
+    if (caps?.hasDownload) return '__device__';
+    return '';
+  }, [orderedMachines, sourceMachine, caps?.hasDownload]);
+
+  const [dest, setDest] = useState(defaultDest);
+  const [destDirByMachine, setDestDirByMachine] = useState({});
+  const [pickingFolder, setPickingFolder] = useState(false);
+  const [browsePath, setBrowsePath] = useState('~');
+  const [browseDirs, setBrowseDirs] = useState([]);
+  const [browseLoading, setBrowseLoading] = useState(false);
+  const [browseError, setBrowseError] = useState(null);
+
+  const isSameMachine = dest === sourceMachine;
+  const canMove = isSameMachine
+    ? Boolean(caps?.hasMove || caps?.hasTransferMove)
+    : Boolean(caps?.hasTransferMove);
+
+  // While any offline machine shown in this sheet is waking, poll fleet status so it becomes
+  // selectable in place as soon as it answers.
+  const hasWakingOffMachine = useMemo(
+    () => Boolean(wakePendingSet && machines.some((m) => !m.reachable && wakePendingSet.has(m.name))),
+    [machines, wakePendingSet],
+  );
+
+  useEffect(() => {
+    if (!hasWakingOffMachine || typeof onRefreshFleet !== 'function') return undefined;
+    const timer = window.setInterval(() => {
+      onRefreshFleet({ background: true, forceOffline: true });
+    }, 600);
+    return () => window.clearInterval(timer);
+  }, [hasWakingOffMachine, onRefreshFleet]);
+
+  const pinnedDirsForDest = useMemo(() => {
+    if (!dest || dest === '__device__') return [];
+    return (favourites || []).filter((f) => f.machine === dest && f.kind === 'dir' && f.pinned);
+  }, [favourites, dest]);
+
+  const recentDirsForDest = useMemo(() => {
+    if (!dest || dest === '__device__') return [];
+    return readRecentDestinations(safeStorage(), dest);
+  }, [dest]);
+
+  const chosenDir = useMemo(() => {
+    if (!dest || dest === '__device__') return '';
+    if (destDirByMachine[dest]) return destDirByMachine[dest];
+    if (pinnedDirsForDest.length > 0) return pinnedDirsForDest[0].path;
+    if (recentDirsForDest.length > 0) return recentDirsForDest[0];
+    return '/home/me';
+  }, [dest, destDirByMachine, pinnedDirsForDest, recentDirsForDest]);
+
+  const chosenDirMeta = useMemo(() => {
+    const pinned = pinnedDirsForDest.find((p) => p.path === chosenDir);
+    if (pinned) {
+      return {
+        label: pinned.label || folderDisplayName(chosenDir, { technical }),
+        sub: `Pinned · ${formatPathForDisplay(chosenDir, { technical })}`,
+      };
+    }
+    if (recentDirsForDest.includes(chosenDir)) {
+      return {
+        label: folderDisplayName(chosenDir, { technical }),
+        sub: `Recent · ${formatPathForDisplay(chosenDir, { technical })}`,
+      };
+    }
+    return {
+      label: folderDisplayName(chosenDir, { technical }),
+      sub: formatPathForDisplay(chosenDir, { technical }),
+    };
+  }, [chosenDir, pinnedDirsForDest, recentDirsForDest, technical]);
+
+  useEffect(() => {
+    if (!pickingFolder || !dest || dest === '__device__') return;
+    let alive = true;
+    setBrowseLoading(true);
+    setBrowseError(null);
+    link
+      .call('fs.list', { path: browsePath, depth: 1, hidden: false }, { on: dest })
+      .then((res) => {
+        if (!alive) return;
+        const resolved = res?.path || browsePath;
+        if (resolved !== browsePath) setBrowsePath(resolved);
+        setBrowseDirs((res?.entries || []).filter((e) => e.kind === 'dir'));
+        setBrowseLoading(false);
+      })
+      .catch((err) => {
+        if (!alive) return;
+        setBrowseError(err);
+        setBrowseLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [pickingFolder, dest, browsePath]);
+
+  const allSizesKnown =
+    items.length > 0 && items.every((it) => it && it.kind !== 'dir' && Number.isFinite(it.size));
+  const totalBytes = allSizesKnown ? items.reduce((sum, it) => sum + it.size, 0) : 0;
+  const title =
+    items.length === 1
+      ? `Send ${items[0].name || baseFileName(items[0].path)}`
+      : `Send ${items.length} items`;
+  const subParts = [
+    allSizesKnown ? formatBytes(totalBytes) : null,
+    `from ${sourceMachine}`,
+  ].filter(Boolean);
+
+  const isDeviceDest = dest === '__device__';
+  const effectiveMode = isDeviceDest ? 'copy' : mode;
+  const confirmLabel = isDeviceDest
+    ? `Download to this ${deviceNoun}`
+    : dest === sourceMachine
+      ? `${effectiveMode === 'move' ? 'Move' : 'Copy'} here`
+      : `${effectiveMode === 'move' ? 'Move' : 'Copy'} to ${dest}`;
+
+  function handleConfirm() {
+    if (!dest || items.length === 0) return;
+    // Close sheet immediately so nothing blocks the user.
+    const destMachine = dest;
+    const targetDir = chosenDir;
+    const isMove = effectiveMode === 'move';
+    if (!onStarted) onClose();
+
+    if (destMachine === '__device__') {
+      const startedNames = [];
+      for (const item of items) {
+        if (item.kind === 'dir') continue;
+        startedNames.push(item.name || baseFileName(item.path));
+        if (typeof link?.download === 'function') {
+          link
+            .download({
+              machine: sourceMachine,
+              path: item.path,
+              name: item.name || baseFileName(item.path),
+              size: item.size,
+              mime: item.mime,
+            })
+            .catch(() => {});
+        }
+      }
+      if (onStarted) {
+        onStarted({
+          kind: 'download',
+          message:
+            startedNames.length === 1
+              ? `Downloading ${startedNames[0]} — watch progress in Activity.`
+              : `Downloading ${startedNames.length} items — watch progress in Activity.`,
+        });
+      }
+      return;
+    }
+
+    recordRecentDestination(safeStorage(), destMachine, targetDir);
+
+    const what =
+      items.length === 1
+        ? items[0].name || baseFileName(items[0].path)
+        : `${items.length} items`;
+
+    // Same-machine Move uses `fs.move` and same-machine Copy uses `fs.copy` — instant, no job.
+    if (destMachine === sourceMachine && ((isMove && caps?.hasMove) || (!isMove && caps?.hasCopy))) {
+      const toolName = isMove ? 'fs.move' : 'fs.copy';
+      const folderName = folderDisplayName(targetDir, { technical });
+      const runLocal = async () => {
+        for (const item of items) {
+          const destPath = buildTransferDestination(targetDir, item.path);
+          if (destPath === item.path) continue;
+          await link.call(toolName, { from: item.path, to: destPath }, { on: sourceMachine }).catch(() => {});
+        }
+        if (onLocalDone) onLocalDone();
+      };
+      runLocal();
+      if (onStarted) {
+        onStarted({
+          kind: isMove ? 'move' : 'copy',
+          local: true,
+          message: `${isMove ? 'Moved' : 'Copied'} ${what} to ${folderName}.`,
+        });
+      }
+      return;
+    }
+
+    const runTransfers = async () => {
+      for (const item of items) {
+        const destPath = buildTransferDestination(targetDir, item.path);
+        const baseArgs = {
+          from: item.path,
+          to: `${destMachine}:${destPath}`,
+        };
+        if (caps?.hasTransferBg) baseArgs.background = true;
+        if (caps?.hasTransferIfExists) baseArgs.if_exists = 'rename';
+        if (isMove && caps?.hasTransferMove) baseArgs.move = true;
+
+        try {
+          await link.call('fs.transfer', baseArgs, { on: sourceMachine });
+        } catch {
+          // Fall back to starting the transfer on the destination when the source cannot reach it.
+          const fallbackArgs = {
+            ...baseArgs,
+            from: `${sourceMachine}:${item.path}`,
+            to: destPath,
+          };
+          await link.call('fs.transfer', fallbackArgs, { on: destMachine }).catch(() => {});
+        }
+      }
+    };
+    runTransfers();
+
+    const verb = isMove ? 'Moving' : 'Copying';
+    if (onStarted) {
+      onStarted({
+        kind: 'transfer',
+        message: `${verb} ${what} to ${destMachine} — watch progress in Activity.`,
+      });
+    }
+  }
+
+  return html`
+    <${Sheet} title=${title} onClose=${onClose}>
+      <p class="sheet-sub">${subParts.join(' · ')}</p>
+
+      ${!isDeviceDest
+        ? html`
+            <div class="seg" role="group" aria-label="Copy or move">
+              <button
+                type="button"
+                aria-pressed=${mode === 'copy' ? 'true' : 'false'}
+                onClick=${() => setMode('copy')}
+              >
+                Copy
+              </button>
+              <button
+                type="button"
+                aria-pressed=${mode === 'move' ? 'true' : 'false'}
+                disabled=${!canMove}
+                onClick=${() => setMode('move')}
+              >
+                Move
+              </button>
+            </div>
+          `
+        : null}
+
+      ${pickingFolder && dest && !isDeviceDest
+        ? html`
+            <p class="label">Choose folder on ${dest}</p>
+            ${pinnedDirsForDest.length > 0
+              ? html`
+                  <div class="list">
+                    ${pinnedDirsForDest.map(
+                      (p) => html`
+                        <button
+                          key=${p.id}
+                          type="button"
+                          class=${chosenDir === p.path ? 'row picked' : 'row'}
+                          onClick=${() => {
+                            setDestDirByMachine((prev) => ({ ...prev, [dest]: p.path }));
+                            setPickingFolder(false);
+                          }}
+                        >
+                          <span class="thumb folder"><${Icon} name="files" /></span>
+                          <span class="body">
+                            <span class="title">${p.label || baseFileName(p.path)}</span>
+                            <span class="sub">Pinned · ${formatPathForDisplay(p.path, { technical })}</span>
+                          </span>
+                          <span class="check" aria-hidden="true"></span>
+                        </button>
+                      `,
+                    )}
+                  </div>
+                `
+              : null}
+
+            ${recentDirsForDest.length > 0
+              ? html`
+                  <p class="label">Last used on ${dest}</p>
+                  <div class="list">
+                    ${recentDirsForDest.map(
+                      (dir) => html`
+                        <button
+                          key=${dir}
+                          type="button"
+                          class=${chosenDir === dir ? 'row picked' : 'row'}
+                          onClick=${() => {
+                            setDestDirByMachine((prev) => ({ ...prev, [dest]: dir }));
+                            setPickingFolder(false);
+                          }}
+                        >
+                          <span class="thumb folder"><${Icon} name="files" /></span>
+                          <span class="body">
+                            <span class="title">${folderDisplayName(dir, { technical })}</span>
+                            <span class="sub">${formatPathForDisplay(dir, { technical })}</span>
+                          </span>
+                          <span class="check" aria-hidden="true"></span>
+                        </button>
+                      `,
+                    )}
+                  </div>
+                `
+              : null}
+
+            <p class="label">Browse ${formatPathForDisplay(browsePath, { technical })}</p>
+            ${browseError ? html`<${Notice} error=${browseError} />` : null}
+            <div class="list">
+              ${parentFilePath(browsePath)
+                ? html`
+                    <button
+                      type="button"
+                      class="row"
+                      onClick=${() => setBrowsePath(parentFilePath(browsePath))}
+                    >
+                      <span class="thumb folder"><${Icon} name="back" /></span>
+                      <span class="body"><span class="title">Up a folder</span></span>
+                    </button>
+                  `
+                : null}
+              ${browseLoading
+                ? html`<div class="row"><span class="body"><span class="sub">Loading folders…</span></span></div>`
+                : browseDirs.length === 0
+                  ? html`<div class="row"><span class="body"><span class="sub">No subfolders here.</span></span></div>`
+                  : browseDirs.map(
+                      (d) => html`
+                        <button
+                          key=${d.path}
+                          type="button"
+                          class="row"
+                          onClick=${() => setBrowsePath(d.path)}
+                        >
+                          <span class="thumb folder"><${Icon} name="files" /></span>
+                          <span class="body"><span class="title">${d.name}</span></span>
+                          <span class="chev" aria-hidden="true">›</span>
+                        </button>
+                      `,
+                    )}
+            </div>
+            <div class="actions">
+              <button type="button" class="btn" onClick=${() => setPickingFolder(false)}>Back</button>
+              <button
+                type="button"
+                class="btn primary"
+                onClick=${() => {
+                  setDestDirByMachine((prev) => ({ ...prev, [dest]: browsePath }));
+                  setPickingFolder(false);
+                }}
+              >
+                Use ${folderDisplayName(browsePath, { technical })}
+              </button>
+            </div>
+          `
+        : html`
+            <p class="label">To</p>
+            <div class="list" role="radiogroup" aria-label="Destination">
+              ${orderedMachines.map((m) => {
+                if (!m.reachable) {
+                  const waking = Boolean(wakePendingSet?.has(m.name));
+                  return html`
+                    <div key=${m.name} class="row off">
+                      <span class="dot off" aria-hidden="true"></span>
+                      <span class="body">
+                        <span class="title">${m.name}</span>
+                        <span class="sub">${waking ? 'Waking…' : 'Off · turn it on to send here'}</span>
+                      </span>
+                      ${m.canWake && canWake && onWakeMachine
+                        ? html`
+                            <button
+                              type="button"
+                              class="btn small"
+                              disabled=${waking}
+                              onClick=${() => onWakeMachine(m)}
+                            >
+                              ${waking ? 'Waking…' : 'Wake'}
+                            </button>
+                          `
+                        : null}
+                    </div>
+                  `;
+                }
+                const picked = dest === m.name;
+                const isSelf = m.name === sourceMachine;
+                const sub = isSelf ? 'Another folder on this machine' : freeDiskPhrase(m) || 'On';
+                return html`
+                  <button
+                    key=${m.name}
+                    type="button"
+                    role="radio"
+                    aria-checked=${picked ? 'true' : 'false'}
+                    class=${picked ? 'row picked' : 'row'}
+                    onClick=${() => setDest(m.name)}
+                  >
+                    <span class="dot" aria-hidden="true"></span>
+                    <span class="body">
+                      <span class="title">${m.name}</span>
+                      <span class="sub">${sub}</span>
+                    </span>
+                    <span class="check" aria-hidden="true"></span>
+                  </button>
+                `;
+              })}
+              ${caps?.hasDownload && mode !== 'move'
+                ? html`
+                    <button
+                      type="button"
+                      role="radio"
+                      aria-checked=${isDeviceDest ? 'true' : 'false'}
+                      class=${isDeviceDest ? 'row picked' : 'row'}
+                      onClick=${() => setDest('__device__')}
+                    >
+                      <span class="body">
+                        <span class="title">This ${deviceNoun}</span>
+                        <span class="sub">Downloads</span>
+                      </span>
+                      <span class="check" aria-hidden="true"></span>
+                    </button>
+                  `
+                : null}
+            </div>
+
+            ${dest && !isDeviceDest
+              ? html`
+                  <p class="label">Folder on ${dest}</p>
+                  <div class="list">
+                    <button
+                      type="button"
+                      class="row"
+                      onClick=${() => {
+                        setBrowsePath(chosenDir || '~');
+                        setPickingFolder(true);
+                      }}
+                    >
+                      <span class="thumb folder"><${Icon} name="files" /></span>
+                      <span class="body">
+                        <span class="title">${chosenDirMeta.label}</span>
+                        <span class="sub">${chosenDirMeta.sub}</span>
+                      </span>
+                      <span class="chev word">Change</span>
+                    </button>
+                  </div>
+                `
+              : null}
+
+            <div class="sheet-cta">
+              <button
+                type="button"
+                class="btn primary"
+                disabled=${!dest}
+                onClick=${handleConfirm}
+              >
+                ${confirmLabel}
+              </button>
+            </div>
+          `}
+    <//>
+  `;
+}
+
+// ── Sort sheet ───────────────────────────────────────────────────────────────────────────────
+
+export function SortSheet({ sortPref, onChange, onClose }) {
+  const options = [
+    { sort: 'name', order: 'asc', label: 'Name (A–Z)' },
+    { sort: 'name', order: 'desc', label: 'Name (Z–A)' },
+    { sort: 'modified', order: 'desc', label: 'Newest first' },
+    { sort: 'modified', order: 'asc', label: 'Oldest first' },
+    { sort: 'size', order: 'desc', label: 'Largest first' },
+    { sort: 'size', order: 'asc', label: 'Smallest first' },
+  ];
+
+  return html`
+    <${Sheet} title="Sort" onClose=${onClose}>
+      <div class="list" role="radiogroup" aria-label="Sort order">
+        ${options.map((opt) => {
+          const picked = sortPref.sort === opt.sort && sortPref.order === opt.order;
+          return html`
+            <button
+              key=${`${opt.sort}-${opt.order}`}
+              type="button"
+              role="radio"
+              aria-checked=${picked ? 'true' : 'false'}
+              class=${picked ? 'row picked' : 'row'}
+              onClick=${() => {
+                onChange({ sort: opt.sort, order: opt.order });
+                onClose();
+              }}
+            >
+              <span class="body"><span class="title">${opt.label}</span></span>
+              <span class="check" aria-hidden="true"></span>
+            </button>
+          `;
+        })}
+      </div>
+    <//>
+  `;
+}
+
+// ── Folder More sheet ────────────────────────────────────────────────────────────────────────
+
+export function FolderMoreSheet({
+  machine,
+  path,
+  caps,
+  deviceNoun = 'phone',
+  showHidden,
+  isStarred,
+  isPinned,
+  onStartSelect,
+  onNewFolder,
+  onUpload,
+  onToggleStarFolder,
+  onTogglePinFolder,
+  onToggleHidden,
+  onClose,
+}) {
+  return html`
+    <${Sheet} title=${folderDisplayName(path)} onClose=${onClose}>
+      <div class="list">
+        <button
+          type="button"
+          class="row"
+          onClick=${() => {
+            if (onStartSelect) onStartSelect();
+            else onClose();
+          }}
+        >
+          <span class="body">
+            <span class="title">Select</span>
+            <span class="sub">Pick files to send, download, or delete</span>
+          </span>
+        </button>
+
+        ${caps?.hasMkdir
+          ? html`
+              <button
+                type="button"
+                class="row"
+                onClick=${() => {
+                  if (onNewFolder) onNewFolder();
+                  else onClose();
+                }}
+              >
+                <span class="body">
+                  <span class="title">New folder</span>
+                  <span class="sub">Create a subfolder here</span>
+                </span>
+              </button>
+            `
+          : null}
+
+        ${caps?.hasUpload
+          ? html`
+              <button
+                type="button"
+                class="row"
+                onClick=${() => {
+                  onClose();
+                  if (onUpload) onUpload();
+                }}
+              >
+                <span class="body">
+                  <span class="title">Add from this ${deviceNoun}</span>
+                  <span class="sub">Upload files into this folder</span>
+                </span>
+              </button>
+            `
+          : null}
+
+        ${caps?.hasFavWrite
+          ? html`
+              <button
+                type="button"
+                class="row"
+                onClick=${() => {
+                  onClose();
+                  if (onToggleStarFolder) onToggleStarFolder();
+                }}
+              >
+                <span class="body">
+                  <span class="title">${isStarred ? 'Remove star' : 'Star this folder'}</span>
+                  <span class="sub">Keep it in Favourites across your fleet</span>
+                </span>
+              </button>
+              <button
+                type="button"
+                class="row"
+                onClick=${() => {
+                  onClose();
+                  if (onTogglePinFolder) onTogglePinFolder();
+                }}
+              >
+                <span class="body">
+                  <span class="title">${isPinned ? 'Unpin from Files' : 'Pin to Files'}</span>
+                  <span class="sub">Show as a tile at the top of Files</span>
+                </span>
+              </button>
+            `
+          : null}
+
+        <label class="row">
+          <span class="body">
+            <span class="title">Show hidden files</span>
+            <span class="sub">Files starting with a dot</span>
+          </span>
+          <span class="switch row-switch">
+            <input
+              type="checkbox"
+              checked=${showHidden}
+              onChange=${(e) => onToggleHidden && onToggleHidden(e.target.checked)}
+            />
+          </span>
+        </label>
+
+        <div class="row">
+          <span class="body">
+            <span class="title">Copy path</span>
+            <span class="sub mono">${machine}:${path}</span>
+          </span>
+          <button
+            type="button"
+            class="btn small"
+            onClick=${async () => {
+              try {
+                await navigator.clipboard.writeText(path);
+              } catch {
+                // Ignore clipboard refusal.
+              }
+              onClose();
+            }}
+          >
+            Copy
+          </button>
+        </div>
+      </div>
+    <//>
+  `;
+}
+
+// ── New folder & Rename sheets ───────────────────────────────────────────────────────────────
+
+export function NewFolderSheet({ machine, parentPath, link, onCreated, onClose }) {
+  const [name, setName] = useState('');
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  async function submit(e) {
+    e.preventDefault();
+    const trimmed = name.trim();
+    if (!trimmed || trimmed.includes('/') || trimmed.includes('\\')) {
+      setError({ message: 'Enter a folder name without slashes.' });
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const target = joinFilePath(parentPath, trimmed);
+      await link.call('fs.mkdir', { path: target, parents: false }, { on: machine });
+      onClose();
+      if (onCreated) onCreated(target);
+    } catch (err) {
+      setError(err);
+      setBusy(false);
+    }
+  }
+
+  return html`
+    <${Sheet} title="New folder" onClose=${onClose}>
+      <form onSubmit=${submit}>
+        <label class="field">
+          <span>Folder name</span>
+          <input
+            class="input plain"
+            type="text"
+            value=${name}
+            onInput=${(e) => setName(e.target.value)}
+            placeholder="Holiday 2026"
+            autocomplete="off"
+          />
+        </label>
+        ${error ? html`<${Notice} error=${error} />` : null}
+        <div class="actions">
+          <button type="button" class="btn" onClick=${onClose}>Cancel</button>
+          <button type="submit" class="btn primary" disabled=${busy || !name.trim()}>
+            ${busy ? 'Creating…' : 'Create'}
+          </button>
+        </div>
+      </form>
+    <//>
+  `;
+}
+
+export function RenameSheet({ machine, entry, link, onRenamed, onClose }) {
+  const [name, setName] = useState(entry?.name || baseFileName(entry?.path || ''));
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  async function submit(e) {
+    e.preventDefault();
+    const trimmed = name.trim();
+    if (!trimmed || trimmed.includes('/') || trimmed.includes('\\')) {
+      setError({ message: 'Enter a name without slashes.' });
+      return;
+    }
+    const parent = parentFilePath(entry.path);
+    const nextPath = joinFilePath(parent, trimmed);
+    if (nextPath === entry.path) {
+      onClose();
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await link.call('fs.move', { from: entry.path, to: nextPath, overwrite: false }, { on: machine });
+      onClose();
+      if (onRenamed) onRenamed(nextPath, trimmed);
+    } catch (err) {
+      setError(err);
+      setBusy(false);
+    }
+  }
+
+  return html`
+    <${Sheet} title="Rename" onClose=${onClose}>
+      <form onSubmit=${submit}>
+        <label class="field">
+          <span>New name</span>
+          <input
+            class="input plain"
+            type="text"
+            value=${name}
+            onInput=${(e) => setName(e.target.value)}
+            autocomplete="off"
+          />
+        </label>
+        ${error ? html`<${Notice} error=${error} />` : null}
+        <div class="actions">
+          <button type="button" class="btn" onClick=${onClose}>Cancel</button>
+          <button type="submit" class="btn primary" disabled=${busy || !name.trim()}>
+            ${busy ? 'Renaming…' : 'Rename'}
+          </button>
+        </div>
+      </form>
+    <//>
+  `;
+}
+
+// ── Search More filters sheet ────────────────────────────────────────────────────────────────
+
+export function SearchFiltersSheet({ size, changed, onApply, onClose }) {
+  const [nextSize, setNextSize] = useState(size || '');
+  const [nextChanged, setNextChanged] = useState(changed || '');
+
+  const sizeOptions = [
+    { id: '', label: 'Any size' },
+    { id: 'small', label: 'Under 1 MB' },
+    { id: 'medium', label: '1 MB – 100 MB' },
+    { id: 'large', label: 'Over 100 MB' },
+  ];
+  const changedOptions = [
+    { id: '', label: 'Any time' },
+    { id: 'day', label: 'Past 24 hours' },
+    { id: 'week', label: 'Past week' },
+    { id: 'month', label: 'Past month' },
+    { id: 'year', label: 'Past year' },
+  ];
+
+  return html`
+    <${Sheet} title="More filters" onClose=${onClose}>
+      <p class="label">Size</p>
+      <div class="chips" role="group" aria-label="File size">
+        ${sizeOptions.map(
+          (opt) => html`
+            <button
+              key=${opt.id || 'any'}
+              type="button"
+              class="chip-btn"
+              aria-pressed=${nextSize === opt.id ? 'true' : 'false'}
+              onClick=${() => setNextSize(opt.id)}
+            >
+              ${opt.label}
+            </button>
+          `,
+        )}
+      </div>
+
+      <p class="label">Changed</p>
+      <div class="chips" role="group" aria-label="Changed date">
+        ${changedOptions.map(
+          (opt) => html`
+            <button
+              key=${opt.id || 'any'}
+              type="button"
+              class="chip-btn"
+              aria-pressed=${nextChanged === opt.id ? 'true' : 'false'}
+              onClick=${() => setNextChanged(opt.id)}
+            >
+              ${opt.label}
+            </button>
+          `,
+        )}
+      </div>
+
+      <div class="actions">
+        <button
+          type="button"
+          class="btn"
+          onClick=${() => {
+            onApply({ size: '', changed: '' });
+            onClose();
+          }}
+        >
+          Clear
+        </button>
+        <button
+          type="button"
+          class="btn primary"
+          onClick=${() => {
+            onApply({ size: nextSize, changed: nextChanged });
+            onClose();
+          }}
+        >
+          Apply
+        </button>
+      </div>
+    <//>
+  `;
+}
+
+// ── Sync folder action sheets ────────────────────────────────────────────────────────────────
+
+export function SyncConflictsSheet({ syncFolder, link, onChanged, onClose }) {
+  const [conflicts, setConflicts] = useState(syncFolder?.conflicts || []);
+  const [busyPath, setBusyPath] = useState('');
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    let alive = true;
+    link
+      .call('sync.conflicts', { id: syncFolder.id })
+      .then((res) => {
+        if (alive && Array.isArray(res?.conflicts)) setConflicts(res.conflicts);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [syncFolder.id]);
+
+  async function resolve(c, keep) {
+    setBusyPath(c.path);
+    setError(null);
+    try {
+      await link.call('sync.resolve', { id: syncFolder.id, path: c.path, keep });
+      setConflicts((prev) => prev.filter((item) => item.path !== c.path));
+      if (onChanged) onChanged();
+    } catch (err) {
+      setError(err);
+    } finally {
+      setBusyPath('');
+    }
+  }
+
+  return html`
+    <${Sheet} title="Files with two versions" onClose=${onClose}>
+      ${error ? html`<${Notice} error=${error} />` : null}
+      ${conflicts.length === 0
+        ? html`<div class="empty">No files have two versions right now.</div>`
+        : html`
+            <div class="list">
+              ${conflicts.map(
+                (c) => html`
+                  <div class="row" key=${c.path}>
+                    <div class="body">
+                      <span class="title">${c.path}</span>
+                      <span class="sub wrap">${c.summary || 'Both versions are kept.'}</span>
+                      <div class="row-actions">
+                        <button
+                          type="button"
+                          class="btn small primary"
+                          disabled=${busyPath === c.path}
+                          onClick=${() => resolve(c, 'newer')}
+                        >
+                          Keep newer
+                        </button>
+                        <button
+                          type="button"
+                          class="btn small"
+                          disabled=${busyPath === c.path}
+                          onClick=${() => resolve(c, 'both')}
+                        >
+                          Keep both
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                `,
+              )}
+            </div>
+          `}
+    <//>
+  `;
+}
+
+export function SyncBinSheet({ syncFolder, link, onChanged, onClose }) {
+  const [entries, setEntries] = useState(syncFolder?.bin || []);
+  const [busyPath, setBusyPath] = useState('');
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    let alive = true;
+    link
+      .call('sync.bin', { id: syncFolder.id })
+      .then((res) => {
+        if (alive && Array.isArray(res?.entries)) setEntries(res.entries);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [syncFolder.id]);
+
+  async function restore(item) {
+    setBusyPath(item.path);
+    setError(null);
+    try {
+      await link.call('sync.restore', { id: syncFolder.id, path: item.path });
+      setEntries((prev) => prev.filter((e) => e.path !== item.path));
+      if (onChanged) onChanged();
+    } catch (err) {
+      setError(err);
+    } finally {
+      setBusyPath('');
+    }
+  }
+
+  return html`
+    <${Sheet} title="Bin" onClose=${onClose}>
+      <p class="sheet-sub">Deleted files stay here for 30 days so nothing is lost quietly.</p>
+      ${error ? html`<${Notice} error=${error} />` : null}
+      ${entries.length === 0
+        ? html`<div class="empty">The bin is empty.</div>`
+        : html`
+            <div class="list">
+              ${entries.map(
+                (item) => html`
+                  <div class="row" key=${item.path}>
+                    <span class="body">
+                      <span class="title">${item.path}</span>
+                      <span class="sub">
+                        ${formatBytes(item.size)} · deleted ${formatRelativeTime(item.deleted_at)}
+                      </span>
+                    </span>
+                    <button
+                      type="button"
+                      class="btn small"
+                      disabled=${busyPath === item.path}
+                      onClick=${() => restore(item)}
+                    >
+                      ${busyPath === item.path ? 'Restoring…' : 'Restore'}
+                    </button>
+                  </div>
+                `,
+              )}
+            </div>
+          `}
+    <//>
+  `;
+}
+
+export function SyncAddMachineSheet({ syncFolder, machines, link, onChanged, onClose }) {
+  const existing = new Set((syncFolder?.members || []).map((m) => m.machine));
+  const candidates = (machines || []).filter((m) => !existing.has(m.name));
+  const [machine, setMachine] = useState(candidates[0]?.name || '');
+  const [path, setPath] = useState(`/home/me/${syncFolder?.name || 'Synced'}`);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+
+  async function submit(e) {
+    e.preventDefault();
+    if (!machine || !path.trim()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await link.call('sync.add', { id: syncFolder.id, machine, path: path.trim() });
+      if (onChanged) onChanged();
+      onClose();
+    } catch (err) {
+      setError(err);
+      setBusy(false);
+    }
+  }
+
+  return html`
+    <${Sheet} title="Add a machine" onClose=${onClose}>
+      ${candidates.length === 0
+        ? html`<div class="empty">Every machine in your fleet is already in ${syncFolder?.name}.</div>`
+        : html`
+            <form onSubmit=${submit}>
+              <label class="field">
+                <span>Machine</span>
+                <select value=${machine} onChange=${(e) => setMachine(e.target.value)}>
+                  ${candidates.map((m) => html`<option key=${m.name} value=${m.name}>${m.name}</option>`)}
+                </select>
+              </label>
+              <label class="field">
+                <span>Folder path on ${machine}</span>
+                <input
+                  class="input"
+                  type="text"
+                  value=${path}
+                  onInput=${(e) => setPath(e.target.value)}
+                />
+              </label>
+              ${error ? html`<${Notice} error=${error} />` : null}
+              <div class="actions">
+                <button type="button" class="btn" onClick=${onClose}>Cancel</button>
+                <button type="submit" class="btn primary" disabled=${busy}>
+                  ${busy ? 'Adding…' : `Add ${machine}`}
+                </button>
+              </div>
+            </form>
+          `}
+    <//>
+  `;
+}
