@@ -93,12 +93,15 @@ export function MachinesView({
   wide,
   route,
   link,
+  capsStore = null,
   nodeInfo,
   tools,
   allowedSet,
   settings,
   deviceNoun,
   thumbCache,
+  filesState = null,
+  filesActions = null,
   wakePendingSet,
   onWakeMachine,
   onWakeSent,
@@ -249,12 +252,15 @@ export function MachinesView({
                   jobId=${route.jobId || null}
                   wide=${true}
                   link=${link}
+                  capsStore=${capsStore}
                   nodeInfo=${nodeInfo}
                   tools=${tools}
                   allowedSet=${allowedSet}
                   settings=${settings}
                   deviceNoun=${deviceNoun}
                   thumbCache=${thumbCache}
+                  filesState=${filesState}
+                  filesActions=${filesActions}
                   wakePending=${Boolean(wakePendingSet?.has(selectedMachine.name))}
                   onWakeMachine=${onWakeMachine}
                   onWakeSent=${onWakeSent}
@@ -278,12 +284,15 @@ export function MachinesView({
         jobId=${route.jobId || null}
         wide=${false}
         link=${link}
+        capsStore=${capsStore}
         nodeInfo=${nodeInfo}
         tools=${tools}
         allowedSet=${allowedSet}
         settings=${settings}
         deviceNoun=${deviceNoun}
         thumbCache=${thumbCache}
+        filesState=${filesState}
+        filesActions=${filesActions}
         wakePending=${Boolean(wakePendingSet?.has(selectedMachine.name))}
         onWakeMachine=${onWakeMachine}
         onWakeSent=${onWakeSent}

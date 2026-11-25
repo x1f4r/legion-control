@@ -1,7 +1,7 @@
 // One machine screen: Overview, Files, Power, More, Command, Services, Projects, and Activity.
 
 import { html, useEffect, useRef, useState } from '../vendor/preact-htm.js';
-import { Meter, Notice } from './common.js';
+import { Meter, Notice, OlderMachineNote } from './common.js';
 import { ActivityDetail, ActivityGroups, ActivityRow } from './activity.js';
 import { MachineFilesBrowser } from './files.js';
 import { plainDenyReason } from '../lib/actions.js';
@@ -40,7 +40,15 @@ function targetFor(machineName, nodeName) {
 
 // ── Overview tab ─────────────────────────────────────────────────────────────────────────────
 
-function OverviewTab({ machine, allowedSet, technical, wakePending, onWake, onStopJob }) {
+function OverviewTab({ machine, allowedSet, technical, wakePending, capsStore = null, onWake, onStopJob }) {
+  const [, setCapsRev] = useState(0);
+  useEffect(() => {
+    if (!capsStore || !machine?.reachable || !machine?.name) return undefined;
+    const unsub = capsStore.subscribe(() => setCapsRev((n) => n + 1));
+    capsStore.ensure(machine.name).catch(() => {});
+    return unsub;
+  }, [capsStore, machine?.name, machine?.reachable]);
+
   if (machine.status === 'asking' || machine.asking) {
     return html`<div class="empty">Checking ${machine.name}…</div>`;
   }
@@ -115,8 +123,22 @@ function OverviewTab({ machine, allowedSet, technical, wakePending, onWake, onSt
     .join(' ')
     .replace(' ·', ' ·');
 
+  const capsEntry = capsStore && machine?.name ? capsStore.get(machine.name) : null;
+  const missingFeatures = capsStore && machine?.name ? capsStore.missingFeatures(machine.name) : [];
+
   return html`
     <div>
+      ${missingFeatures.length > 0
+        ? html`
+            <${OlderMachineNote}
+              machine=${machine.name}
+              version=${capsEntry?.version || machine.version || null}
+              build=${capsEntry?.build || machine.build || null}
+              missing=${missingFeatures}
+              technical=${technical}
+            />
+          `
+        : null}
       ${runningJobs.length > 0
         ? html`
             <p class="label">Running now</p>
@@ -1257,12 +1279,15 @@ export function MachineDetail({
   jobId,
   wide,
   link,
+  capsStore = null,
   nodeInfo,
   tools,
   allowedSet,
   settings,
   deviceNoun,
   thumbCache,
+  filesState = null,
+  filesActions = null,
   wakePending,
   onWakeMachine,
   onWakeSent,
@@ -1351,6 +1376,7 @@ export function MachineDetail({
               allowedSet=${allowedSet}
               technical=${technical}
               wakePending=${wakePending}
+              capsStore=${capsStore}
               onWake=${onWakeMachine || (() => selectTab('power'))}
               onStopJob=${handleStopJob}
             />
@@ -1397,9 +1423,13 @@ export function MachineDetail({
                     tools=${tools}
                     allowedSet=${allowedSet}
                     link=${link}
+                    capsStore=${capsStore}
                     settings=${settings}
                     deviceNoun=${deviceNoun}
                     thumbCache=${thumbCache}
+                    wide=${wide}
+                    filesState=${filesState}
+                    filesActions=${filesActions}
                     onWakeMachine=${onWakeMachine}
                   />
                 `
