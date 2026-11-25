@@ -1826,13 +1826,15 @@ fn is_stat_unchanged(rec: &IndexRecord, disk: &FsMeta) -> bool {
             if rec.size != disk.size {
                 return false;
             }
-            if let (Some(a), Some(b)) = (rec.disk_change_id, disk.change_id)
-                && a != b
-            {
-                return false;
+            match (rec.disk_change_id, disk.change_id) {
+                (Some(a), Some(b)) if a != b => return false,
+                (None, Some(_)) => return false,
+                _ => {}
             }
-            let mtime_matches = rec.disk_mtime == Some(disk.mtime) || rec.mtime == disk.mtime;
-            mtime_matches && !mode_changed(rec.mode, disk.mode)
+            let Some(dm) = rec.disk_mtime else {
+                return false;
+            };
+            dm == disk.mtime && !mode_changed(rec.mode, disk.mode)
         }
     }
 }

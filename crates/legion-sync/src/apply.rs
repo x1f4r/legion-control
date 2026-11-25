@@ -1399,6 +1399,19 @@ pub fn apply_decision<F: SyncFs, S: IndexStore>(
                     return handle_local_changed(fs, store, &p, now);
                 }
                 record_disk_stat(fs, &p, &mut record)?;
+            } else if !record.deleted {
+                if let Some(ref ex) = existing {
+                    if record.disk_mtime.is_none() {
+                        record.disk_mtime = ex.disk_mtime;
+                    }
+                    if record.disk_change_id.is_none() {
+                        record.disk_change_id = ex.disk_change_id;
+                    }
+                }
+                if record.disk_mtime.is_none() {
+                    let p = record.path.clone();
+                    record_disk_stat(fs, &p, &mut record)?;
+                }
             }
             let path = record.path.clone();
             commit_records_and_clear_pending(

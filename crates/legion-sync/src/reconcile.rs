@@ -899,6 +899,8 @@ fn reconcile_concurrent(
         if local.from_join && !remote.from_join {
             let mut adopted = sanitize_remote(remote, clean_path, meta);
             adopted.version = remote.version.pruned(&meta.pruned_incarnations);
+            adopted.disk_mtime = local.disk_mtime;
+            adopted.disk_change_id = local.disk_change_id;
             adopted.from_join = false;
             adopted.conflict_of = derive_conflict_of(&adopted, meta);
             let update_disk_metadata = local.mtime != adopted.mtime || local.mode != adopted.mode;
