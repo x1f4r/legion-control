@@ -158,6 +158,7 @@ export function ToolDetail({
   link,
   technical = true,
   onRequestConfirm,
+  onEnsureAwake,
 }) {
   const fields = useMemo(() => describeSchema(tool.input_schema), [tool.name]);
   const descParts = useMemo(() => splitFirstSentence(tool.description), [tool.description]);
@@ -248,7 +249,53 @@ export function ToolDetail({
     return built.args;
   }
 
+  function findOfflineMachineForCall(args, explicitOn) {
+    if (tool.name === 'power.wake') return null;
+    const byName = new Map(machineList.map((m) => [m.name, m]));
+    if (typeof explicitOn === 'string' && explicitOn !== 'all') {
+      const targetM = byName.get(explicitOn);
+      if (targetM && !targetM.reachable) {
+        return { machine: targetM, kind: 'action', label: `run ${tool.name}` };
+      }
+    }
+    if (tool.name === 'fs.transfer' && args && typeof args === 'object') {
+      const fromVal = typeof args.from === 'string' ? args.from : '';
+      const rawPath = fromVal.includes(':') ? fromVal.slice(fromVal.indexOf(':') + 1) : fromVal;
+      const baseName = rawPath.replace(/\/+$/, '').split('/').pop() || 'files';
+      const verb = args.move ? 'move' : 'send';
+      for (const key of ['from', 'to']) {
+        const val = typeof args[key] === 'string' ? args[key] : '';
+        const colon = val.indexOf(':');
+        if (colon > 0) {
+          const m = byName.get(val.slice(0, colon));
+          if (m && !m.reachable) {
+            const prep = key === 'to' ? 'to' : 'from';
+            return { machine: m, kind: 'transfer', label: `${verb} ${baseName} ${prep} ${m.name}` };
+          }
+        }
+      }
+    }
+    return null;
+  }
+
   async function executeCall(args, explicitOn) {
+    const on = explicitOn !== undefined ? explicitOn : currentTarget().on;
+    const offline = onEnsureAwake ? findOfflineMachineForCall(args, on) : null;
+    if (offline) {
+      const wakeRes = await onEnsureAwake(offline.machine, {
+        kind: offline.kind,
+        label: offline.label || `run ${tool.name}`,
+        onContinue: () => executeCallDirect(args, on),
+      });
+      if (wakeRes?.awake || wakeRes?.cancelled || wakeRes?.forgotten) {
+        return null;
+      }
+      // Machine cannot be woken or device lacks permission -> fall through to today's plain error.
+    }
+    return executeCallDirect(args, on);
+  }
+
+  async function executeCallDirect(args, on) {
     if (abortRef.current) abortRef.current.abort();
     const ctrl = new AbortController();
     abortRef.current = ctrl;
@@ -258,7 +305,6 @@ export function ToolDetail({
     setEvents([]);
 
     try {
-      const on = explicitOn !== undefined ? explicitOn : currentTarget().on;
       const out = await link.call(tool.name, args, {
         on,
         signal: ctrl.signal,
@@ -553,6 +599,7 @@ export function ToolsView({
   wide,
   technical = true,
   onRequestConfirm,
+  onEnsureAwake,
 }) {
   const [query, setQuery] = useState('');
   const allowedList = useMemo(
@@ -647,6 +694,7 @@ export function ToolsView({
                   link=${link}
                   technical=${technical}
                   onRequestConfirm=${onRequestConfirm}
+                  onEnsureAwake=${onEnsureAwake}
                 />
               `
             : html`<div class="empty">Select a tool to run it.</div>`}
@@ -667,6 +715,7 @@ export function ToolsView({
         link=${link}
         technical=${technical}
         onRequestConfirm=${onRequestConfirm}
+        onEnsureAwake=${onEnsureAwake}
       />
     `;
   }

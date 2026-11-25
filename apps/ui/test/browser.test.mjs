@@ -12,6 +12,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
 import './files-browser.mjs';
+import './machine-browser.mjs';
 
 const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(TEST_DIR, '..', '..', '..');
@@ -258,7 +259,7 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
     await page.getByLabel('Token', { exact: true }).fill(fleet.token);
     await page.getByRole('button', { name: 'Connect' }).click();
 
-    // Machines appear with labelled Processor / Memory / Disk, no wordmark/role chip/refresh button.
+    // Machines appear with labelled Processor / Memory / Storage, no wordmark/role chip/refresh button.
     await page.getByText('2 are on').waitFor({ timeout: 15_000 });
     assert.equal(await page.locator('.wordmark').count(), 0);
     assert.equal(await page.locator('header.top .chip').count(), 0);
@@ -270,7 +271,7 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
     await towerCard.waitFor();
     await towerCard.getByText('Processor').waitFor();
     await towerCard.getByText('Memory').waitFor();
-    await towerCard.getByText('Disk').waitFor();
+    await towerCard.getByText('Storage').waitFor();
 
     const piCard = page.locator('a.machine', { hasText: 'pi' });
     await piCard.waitFor();
@@ -600,17 +601,14 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
         await setTheme(p, 'dark');
       }
 
-      // Offline Wake button opens plain confirm sheet; confirming shows pending-wake feedback.
+      // Offline Wake button opens the shared wake sheet directly in the waking state.
       await laptopRow.getByRole('button', { name: 'Wake' }).click();
       const wakeDialog = p.getByRole('dialog');
       await wakeDialog.waitFor();
-      await wakeDialog.getByRole('heading', { name: 'Wake laptop?' }).waitFor();
-      await wakeDialog.getByText('Send a wake signal to laptop.').waitFor();
-      await wakeDialog.getByRole('button', { name: 'Try it (dry run)' }).click();
-      await wakeDialog.locator('.notice.neutral', { hasText: 'A wake signal would be sent to laptop.' }).waitFor();
-      assert.equal(await wakeDialog.locator('pre.out').count(), 0, 'Plain Wake dry run must not show raw WoL details');
-      await assertNoToolNames(p, `mock ${label} wake confirm sheet`);
-      await wakeDialog.getByRole('button', { name: 'Wake', exact: true }).click();
+      await wakeDialog.getByRole('heading', { name: 'Waking laptop…' }).waitFor();
+      await wakeDialog.getByText('The wake signal has already been sent.').waitFor();
+      await assertNoToolNames(p, `mock ${label} wake sheet`);
+      await wakeDialog.getByRole('button', { name: 'Stop waiting', exact: true }).click();
       await wakeDialog.waitFor({ state: 'hidden' });
       await p.locator('.machine.off', { hasText: 'laptop' }).getByText('Wake sent · waiting for it to answer').waitFor();
       assert.equal(
