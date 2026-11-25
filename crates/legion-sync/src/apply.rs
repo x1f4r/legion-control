@@ -21,16 +21,16 @@ use crate::model::{
     random_hex_token,
 };
 use crate::path::{
-    IgnoreMatcher, ancestors, conflict_copy_path, is_descendant_of, is_legion_inflight_name,
-    is_os_litter_name, parent_path, restore_copy_path, validate_sync_path,
+    IgnoreMatcher, ancestors, check_symlink_target_contained, conflict_copy_path,
+    is_legion_inflight_name, is_os_litter_name, parent_path, restore_copy_path, validate_sync_path,
 };
 use crate::reconcile::{
     LocalIndexView, ReconcileDecision, check_local_representable, choose_conflict_path,
     derive_conflict_of,
 };
 use crate::scan::{
-    SingleRescanOutcome, disk_matches_index, disk_stat_matches_index, rescan_single_path,
-    rescan_single_path_with_force,
+    SingleRescanOutcome, dir_holds_only_local_non_synced_files, disk_matches_index,
+    disk_stat_matches_index, rescan_single_path, rescan_single_path_with_force,
 };
 use crate::traits::{FsMeta, IndexStore, Peer, StoreBatch, SyncFs, SyncWrite};
 use crate::version::VersionVector;
@@ -2596,12 +2596,6 @@ fn apply_delete<F: SyncFs, S: IndexStore>(
             Err(err) => return Err(err),
         };
         if !children.is_empty() {
-            let held_back_paths: BTreeSet<String> = store
-                .list_held_back()?
-                .into_iter()
-                .map(|h| h.record.path)
-                .collect();
-
             let mut litter_files: Vec<(String, FsMeta)> = Vec::new();
             let mut has_local_only = false;
             let mut unscanned_synced = Vec::new();
@@ -2612,6 +2606,14 @@ fn apply_delete<F: SyncFs, S: IndexStore>(
                 let is_dir = child_meta
                     .as_ref()
                     .is_some_and(|m| m.kind == EntryKind::Dir);
+                let is_unsupported_symlink = child_meta.as_ref().is_some_and(|m| {
+                    m.kind == EntryKind::Symlink
+                        && check_symlink_target_contained(
+                            &child_rel,
+                            m.link_target.as_deref().unwrap_or_default(),
+                        )
+                        .is_err()
+                });
 
                 if is_os_litter_name(&name)
                     && let Some(cm) = child_meta.filter(|m| m.kind == EntryKind::File)
@@ -2619,10 +2621,8 @@ fn apply_delete<F: SyncFs, S: IndexStore>(
                     litter_files.push((child_rel, cm));
                 } else if ignore.is_custom_ignored(&child_rel, &name, is_dir)
                     || is_legion_inflight_name(&name)
-                    || held_back_paths.contains(&child_rel)
-                    || held_back_paths
-                        .iter()
-                        .any(|p| is_descendant_of(p, &child_rel))
+                    || is_unsupported_symlink
+                    || (is_dir && dir_holds_only_local_non_synced_files(fs, &child_rel, ignore)?)
                 {
                     has_local_only = true;
                 } else {

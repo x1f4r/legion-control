@@ -240,16 +240,6 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
         });
     }
 
-    let held_back_paths: BTreeSet<String> = if store.held_back_count()? > 0 {
-        store
-            .list_held_back()?
-            .into_iter()
-            .map(|h| h.record.path)
-            .collect()
-    } else {
-        BTreeSet::new()
-    };
-
     let mut report = ScanReport {
         skipped_errors: walk_skipped.clone(),
         ..ScanReport::default()
@@ -267,8 +257,7 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
             let entry = &disk_entries[disk_idx];
             if entry.meta.kind == EntryKind::Dir && meta.kept_deleted_dirs.contains(&entry.path) {
                 kept_dirs_seen.insert(entry.path.clone());
-                if dir_holds_only_local_non_synced_files(fs, &entry.path, ignore, &held_back_paths)?
-                {
+                if dir_holds_only_local_non_synced_files(fs, &entry.path, ignore)? {
                     report.unchanged += 1;
                     disk_idx += 1;
                     continue;
@@ -295,12 +284,7 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
             let entry = &disk_entries[disk_idx];
             if entry.meta.kind == EntryKind::Dir && meta.kept_deleted_dirs.contains(&entry.path) {
                 kept_dirs_seen.insert(entry.path.clone());
-                if !dir_holds_only_local_non_synced_files(
-                    fs,
-                    &entry.path,
-                    ignore,
-                    &held_back_paths,
-                )? {
+                if !dir_holds_only_local_non_synced_files(fs, &entry.path, ignore)? {
                     kept_dirs_revived.insert(entry.path.clone());
                 }
             }
@@ -310,7 +294,6 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
                 entry,
                 rec,
                 ignore,
-                &held_back_paths,
                 force_hash,
                 tracker,
                 &mut still_tracking,
@@ -347,7 +330,7 @@ fn scan_walk_against_store<F: SyncFs, S: IndexStore>(
         let entry = &disk_entries[disk_idx];
         if entry.meta.kind == EntryKind::Dir && meta.kept_deleted_dirs.contains(&entry.path) {
             kept_dirs_seen.insert(entry.path.clone());
-            if dir_holds_only_local_non_synced_files(fs, &entry.path, ignore, &held_back_paths)? {
+            if dir_holds_only_local_non_synced_files(fs, &entry.path, ignore)? {
                 report.unchanged += 1;
                 disk_idx += 1;
                 continue;
@@ -1615,7 +1598,6 @@ fn handle_existing_disk_entry<F: SyncFs>(
     entry: &FsWalkEntry,
     rec: IndexRecord,
     ignore: &IgnoreMatcher,
-    held_back_paths: &BTreeSet<String>,
     force_hash: bool,
     tracker: &mut PendingStabilityTracker,
     still_tracking: &mut BTreeSet<String>,
@@ -1639,10 +1621,11 @@ fn handle_existing_disk_entry<F: SyncFs>(
         return Ok(true);
     }
     // Item H: a directory that was deleted elsewhere and intentionally kept on disk only because
-    // it still contains ignored or held-back files must NOT be revived as a new directory on scan.
+    // it still contains local non-synced entries (ignored files or unsupported local symlinks)
+    // must NOT be revived as a new directory on scan.
     if rec.deleted
         && entry.meta.kind == EntryKind::Dir
-        && dir_holds_only_local_non_synced_files(fs, &entry.path, ignore, held_back_paths)?
+        && dir_holds_only_local_non_synced_files(fs, &entry.path, ignore)?
     {
         report.unchanged += 1;
         return Ok(true);
@@ -1706,15 +1689,31 @@ fn handle_existing_disk_entry<F: SyncFs>(
     Ok(true)
 }
 
-/// Returns `true` when `dir_path` is non-empty on disk AND every entry inside it is excluded from
-/// syncing (ignored by custom/fixed rules or held back), meaning the directory only remains on
-/// disk to house local-only files.
-fn dir_holds_only_local_non_synced_files<F: SyncFs>(
+/// Returns `true` when `dir_path` is non-empty on disk AND every entry inside it is a local
+/// non-synced entry (ignored by custom/fixed rules, in-flight temporary, an unsupported escaping
+/// local symlink, or a non-empty subdirectory of such entries).
+///
+/// Remote records held back in the index (for example because a peer's file failed `NoSpace` or
+/// `PermissionDenied` earlier) are intentionally NOT counted here: a normal synced file created on
+/// local disk at the same path WILL be indexed by scan, so its parent directory must revive with
+/// it rather than remaining a tombstone.
+pub(crate) fn dir_holds_only_local_non_synced_files<F: SyncFs>(
     fs: &F,
     dir_path: &str,
     ignore: &IgnoreMatcher,
-    held_back_paths: &BTreeSet<String>,
 ) -> Result<bool> {
+    dir_holds_only_local_non_synced_files_depth(fs, dir_path, ignore, 0)
+}
+
+fn dir_holds_only_local_non_synced_files_depth<F: SyncFs>(
+    fs: &F,
+    dir_path: &str,
+    ignore: &IgnoreMatcher,
+    depth: usize,
+) -> Result<bool> {
+    if depth >= 64 {
+        return Ok(false);
+    }
     let children = match fs.list_dir_live(dir_path) {
         Ok(c) => c,
         Err(err) if err.is_crash() => return Err(err),
@@ -1725,19 +1724,24 @@ fn dir_holds_only_local_non_synced_files<F: SyncFs>(
     }
     for name in children {
         let child_rel = format!("{dir_path}/{name}");
-        let is_dir = fs
-            .stat_live(&child_rel)
-            .ok()
-            .flatten()
+        let child_meta = fs.stat_live(&child_rel).ok().flatten();
+        let is_dir = child_meta
+            .as_ref()
             .is_some_and(|m| m.kind == EntryKind::Dir);
         let ignored = ignore.is_ignored(&child_rel, &name, is_dir)
             || is_os_litter_name(&name)
             || is_legion_inflight_name(&name);
-        let held = held_back_paths.contains(&child_rel)
-            || held_back_paths
-                .iter()
-                .any(|p| is_descendant_of(p, &child_rel));
-        if !ignored && !held {
+        let unsupported_symlink = child_meta.as_ref().is_some_and(|m| {
+            m.kind == EntryKind::Symlink
+                && check_symlink_target_contained(
+                    &child_rel,
+                    m.link_target.as_deref().unwrap_or_default(),
+                )
+                .is_err()
+        });
+        let local_only_subdir = is_dir
+            && dir_holds_only_local_non_synced_files_depth(fs, &child_rel, ignore, depth + 1)?;
+        if !ignored && !unsupported_symlink && !local_only_subdir {
             return Ok(false);
         }
     }
