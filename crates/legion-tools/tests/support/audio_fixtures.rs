@@ -910,11 +910,19 @@ pub fn build_hostile_text_mp3() -> Vec<u8> {
     mp3
 }
 
-/// Builds an MP3 ID3v2.3 file with `count` tiny frames (used to exceed `MAX_ID3_FRAMES`).
+/// Builds an MP3 ID3v2.3 file with `count` tiny `TXXX` frames surrounded by `TIT2` and `TPE1`.
 pub fn build_mp3_many_id3_frames(count: usize) -> Vec<u8> {
-    let mut frames = Vec::with_capacity(64 + count * 12);
+    build_mp3_exact_id3_frames(count + 2)
+}
+
+/// Builds an MP3 ID3v2.3 file with an exact total of `total_frames` frames (`TIT2`,
+/// `total_frames - 2` `TXXX` frames, and `TPE1`).
+pub fn build_mp3_exact_id3_frames(total_frames: usize) -> Vec<u8> {
+    assert!(total_frames >= 2);
+    let inner = total_frames - 2;
+    let mut frames = Vec::with_capacity(64 + inner * 12);
     frames.extend_from_slice(&make_id3v23_text_frame(b"TIT2", 3, "Before frame cap"));
-    for _ in 0..count {
+    for _ in 0..inner {
         frames.extend_from_slice(b"TXXX");
         frames.extend_from_slice(&2u32.to_be_bytes());
         frames.extend_from_slice(&[0, 0, 3, 0]);
@@ -923,6 +931,35 @@ pub fn build_mp3_many_id3_frames(count: usize) -> Vec<u8> {
     let mut mp3 = wrap_id3v23(&frames, false, false);
     mp3.extend_from_slice(&silent_mp3_frame());
     mp3
+}
+
+/// Builds a WAV file with a `LIST/INFO` chunk containing an exact total of `total_entries`
+/// entries (`total_entries - 1` `ICMT` entries followed by `INAM="Info song"`).
+pub fn build_wav_exact_info_entries(total_entries: usize) -> Vec<u8> {
+    assert!(total_entries >= 1);
+    let mut info = b"INFO".to_vec();
+    for _ in 0..(total_entries - 1) {
+        info.extend_from_slice(b"ICMT\x02\x00\x00\x00x\x00");
+    }
+    info.extend_from_slice(b"INAM\x0a\x00\x00\x00Info song\x00");
+    let mut body = Vec::with_capacity(4 + 24 + 8 + info.len());
+    body.extend_from_slice(b"WAVE");
+    body.extend_from_slice(b"fmt ");
+    body.extend_from_slice(&16u32.to_le_bytes());
+    body.extend_from_slice(&1u16.to_le_bytes());
+    body.extend_from_slice(&1u16.to_le_bytes());
+    body.extend_from_slice(&8000u32.to_le_bytes());
+    body.extend_from_slice(&16_000u32.to_le_bytes());
+    body.extend_from_slice(&2u16.to_le_bytes());
+    body.extend_from_slice(&16u16.to_le_bytes());
+    body.extend_from_slice(b"LIST");
+    body.extend_from_slice(&(info.len() as u32).to_le_bytes());
+    body.extend_from_slice(&info);
+    let mut wav = Vec::with_capacity(8 + body.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    wav.extend_from_slice(&body);
+    wav
 }
 
 /// Builds a WAV file with `count` empty `JUNK` chunks (used to exceed `MAX_CONTAINER_CHUNKS`).
@@ -988,18 +1025,26 @@ pub fn build_flac_many_blocks(count: usize) -> Vec<u8> {
     flac
 }
 
-/// Builds a FLAC file whose `VORBIS_COMMENT` block contains `count` tiny entries (exceeds
-/// `MAX_VORBIS_COMMENTS`).
+/// Builds a FLAC file whose `VORBIS_COMMENT` block contains `count + 1` entries (`TITLE` plus
+/// `count` `X=1` entries).
 pub fn build_flac_many_vorbis_comments(count: usize) -> Vec<u8> {
-    let mut vc = Vec::with_capacity(32 + count * 7);
+    build_flac_exact_vorbis_comments(count + 1)
+}
+
+/// Builds a FLAC file whose `VORBIS_COMMENT` block contains an exact total of `total_comments`
+/// entries (`TITLE=Many comments` plus `total_comments - 1` `X=1` entries).
+pub fn build_flac_exact_vorbis_comments(total_comments: usize) -> Vec<u8> {
+    assert!(total_comments >= 1);
+    let extra = total_comments - 1;
+    let mut vc = Vec::with_capacity(32 + extra * 7);
     let vendor = b"legion-test";
     vc.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
     vc.extend_from_slice(vendor);
-    vc.extend_from_slice(&((count + 1) as u32).to_le_bytes());
+    vc.extend_from_slice(&(total_comments as u32).to_le_bytes());
     let title = b"TITLE=Many comments";
     vc.extend_from_slice(&(title.len() as u32).to_le_bytes());
     vc.extend_from_slice(title);
-    for _ in 0..count {
+    for _ in 0..extra {
         vc.extend_from_slice(&3u32.to_le_bytes());
         vc.extend_from_slice(b"X=1");
     }
@@ -1032,6 +1077,82 @@ pub fn build_ogg_many_scan_pages(count: usize) -> Vec<u8> {
         let mut seq = 0u32;
         push_ogg_packet_pages(&mut out, 100 + i as u32, &mut seq, 0x02, 0, b"NOTAUDIO");
     }
+    out
+}
+
+/// Builds an Ogg file with `dummy_pages` non-audio BOS pages followed by a valid `OpusHead` BOS
+/// page (page `dummy_pages + 1`) and `OpusTags` carrying `TITLE=After scan pages`.
+pub fn build_ogg_scan_pages_before_opus(dummy_pages: usize) -> Vec<u8> {
+    let mut out = build_ogg_many_scan_pages(dummy_pages);
+    let serial = 0x7777_8888u32;
+    let mut seq = 0u32;
+    let mut head = b"OpusHead".to_vec();
+    head.push(1);
+    head.push(2);
+    head.extend_from_slice(&312u16.to_le_bytes());
+    head.extend_from_slice(&48_000u32.to_le_bytes());
+    head.extend_from_slice(&0u16.to_le_bytes());
+    head.push(0);
+    push_ogg_packet_pages(&mut out, serial, &mut seq, 0x02, 0, &head);
+
+    let mut tags_pkt = b"OpusTags".to_vec();
+    tags_pkt.extend_from_slice(&build_vorbis_comment_payload(
+        &[("TITLE", "After scan pages")],
+        &[],
+    ));
+    push_ogg_packet_pages(&mut out, serial, &mut seq, 0x00, 0, &tags_pkt);
+    out
+}
+
+/// Builds a valid Ogg Opus file whose `OpusTags` comment packet (carrying `TITLE=Split comment`)
+/// spans an exact total of `page_count` pages (255-byte continuation pages plus a 100-byte
+/// terminating page).
+pub fn build_ogg_valid_comment_pages(page_count: usize) -> Vec<u8> {
+    assert!(page_count >= 1);
+    let serial = 0x2468_1358u32;
+    let mut seq = 0u32;
+    let final_len = 100usize;
+    let total_pkt_len = (page_count - 1) * 255 + final_len;
+    let title_entry = b"TITLE=Split comment";
+    let fixed_overhead = 8 + 4 + 4 + 4 + title_entry.len();
+    let vendor_len = total_pkt_len - fixed_overhead;
+    let mut pkt = Vec::with_capacity(total_pkt_len);
+    pkt.extend_from_slice(b"OpusTags");
+    pkt.extend_from_slice(&(vendor_len as u32).to_le_bytes());
+    pkt.resize(pkt.len() + vendor_len, b'v');
+    pkt.extend_from_slice(&1u32.to_le_bytes());
+    pkt.extend_from_slice(&(title_entry.len() as u32).to_le_bytes());
+    pkt.extend_from_slice(title_entry);
+    assert_eq!(pkt.len(), total_pkt_len);
+
+    let mut out = Vec::with_capacity(128 + page_count * (28 + 255));
+    let mut head = b"OpusHead".to_vec();
+    head.push(1);
+    head.push(2);
+    head.extend_from_slice(&312u16.to_le_bytes());
+    head.extend_from_slice(&48_000u32.to_le_bytes());
+    head.extend_from_slice(&0u16.to_le_bytes());
+    head.push(0);
+    push_ogg_packet_pages(&mut out, serial, &mut seq, 0x02, 0, &head);
+
+    let mut off = 0usize;
+    for page_idx in 0..page_count {
+        let is_last = page_idx + 1 == page_count;
+        let seg_len = if is_last { final_len } else { 255 };
+        out.extend_from_slice(b"OggS");
+        out.push(0);
+        out.push(if page_idx == 0 { 0x00 } else { 0x01 });
+        out.extend_from_slice(&if is_last { 0u64 } else { u64::MAX }.to_le_bytes());
+        out.extend_from_slice(&serial.to_le_bytes());
+        out.extend_from_slice(&seq.to_le_bytes());
+        seq += 1;
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.push(1);
+        out.push(seg_len as u8);
+        out.extend_from_slice(&pkt[off..off + seg_len]);
+        off += seg_len;
+    }
+    assert_eq!(off, pkt.len());
     out
 }
 

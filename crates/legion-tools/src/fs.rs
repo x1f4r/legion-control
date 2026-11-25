@@ -18,6 +18,7 @@ mod thumb_probe;
 mod thumb_worker;
 mod write;
 
+pub use tags::set_audio_tags_heap_cap_for_test;
 pub use thumb_worker::{
     THUMB_WORKER_MODE, enable_thumb_worker_self, measured_worker_baseline_bytes_for_test,
     peak_worker_rss_for_test, reset_peak_worker_rss_for_test, set_thumb_decode_timeout_for_test,

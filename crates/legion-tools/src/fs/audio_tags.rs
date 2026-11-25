@@ -55,6 +55,7 @@ const OGG_TAIL_SCAN_BYTES: u64 = 65_536;
 const MP3_SYNC_SCAN_BYTES: usize = 64 * 1024;
 const COVER_MAGIC_PEEK_BYTES: usize = 64;
 const MAX_WAV_INFO_BYTES: u64 = 256 * 1024;
+const MAX_WAV_INFO_ENTRIES: usize = 256;
 
 /// Audio container family selected from a file's extension.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -780,6 +781,21 @@ impl CoverSlot {
     }
 }
 
+fn limit_error(display_path: &Path, reason: &'static str, limit: usize, detail: &str) -> ErrorBody {
+    ErrorBody::new(
+        ErrorCode::Failed,
+        format!(
+            "Metadata in {} exceeds parser limit ({detail}, limit {limit}).",
+            display_path.display()
+        ),
+    )
+    .with_hint("Legion caps metadata counts and nesting depth to bound parser work.")
+    .with_details(json!({
+        "reason": reason,
+        "limit": limit,
+    }))
+}
+
 /// Bounded seekable stream enforcing `MAX_AUDIO_TAG_BYTES` cumulative tag reads and never trusting
 /// declared lengths past EOF or the remaining tag budget.
 struct BoundedStream<'a, R: Read + Seek> {
@@ -814,6 +830,10 @@ impl<'a, R: Read + Seek> BoundedStream<'a, R> {
             ),
         )
         .with_hint("The audio file may be truncated or carry malformed metadata.")
+    }
+
+    fn limit_exceeded(&self, reason: &'static str, limit: usize, detail: &str) -> ErrorBody {
+        limit_error(self.display_path, reason, limit, detail)
     }
 
     fn tag_too_large(&self, detail: &str) -> ErrorBody {
@@ -1376,12 +1396,11 @@ fn parse_id3v2_body(
     let mut frames_seen = 0usize;
     let frame_hdr_len = if major == 2 { 6usize } else { 10usize };
 
-    while pos + frame_hdr_len <= body.len() && frames_seen < MAX_ID3_FRAMES {
+    while pos + frame_hdr_len <= body.len() {
         if body[pos] == 0 {
             // Reached zero-padding at the end of the ID3v2 tag.
             break;
         }
-        frames_seen += 1;
 
         let (id_bytes, frame_size, flags_lo) = if major == 2 {
             let id = &body[pos..pos + 3];
@@ -1411,6 +1430,16 @@ fn parse_id3v2_body(
             };
             (id, sz, body[pos + 9])
         };
+
+        if frames_seen >= MAX_ID3_FRAMES {
+            return Err(limit_error(
+                display_path,
+                "too_many_id3_frames",
+                MAX_ID3_FRAMES,
+                "too many ID3v2 frames",
+            ));
+        }
+        frames_seen += 1;
 
         if frame_size == 0 {
             return Err(bad("zero-length ID3v2 frame"));
@@ -1786,7 +1815,14 @@ fn parse_wav<R: Read + Seek>(
     let mut info_fallback = ParsedAudioTags::default();
     let mut chunks = 0usize;
 
-    while stream.remaining_file() >= 8 && chunks < MAX_CONTAINER_CHUNKS {
+    while stream.remaining_file() >= 8 {
+        if chunks >= MAX_CONTAINER_CHUNKS {
+            return Err(stream.limit_exceeded(
+                "too_many_container_chunks",
+                MAX_CONTAINER_CHUNKS,
+                "too many WAV chunks",
+            ));
+        }
         chunks += 1;
         let ch = stream.read_fixed::<8>()?;
         let fourcc = [ch[0], ch[1], ch[2], ch[3]];
@@ -1842,7 +1878,7 @@ fn parse_wav<R: Read + Seek>(
                 let list_type = stream.read_fixed::<4>()?;
                 if &list_type == b"INFO" {
                     let raw = stream.read_tag_bytes(chunk_size - 4)?;
-                    parse_riff_info(&raw, &mut info_fallback);
+                    parse_riff_info(&raw, &mut info_fallback, stream.display_path)?;
                 }
             }
             _ => {}
@@ -1858,10 +1894,22 @@ fn parse_wav<R: Read + Seek>(
     Ok(())
 }
 
-fn parse_riff_info(raw: &[u8], out: &mut ParsedAudioTags) {
+fn parse_riff_info(
+    raw: &[u8],
+    out: &mut ParsedAudioTags,
+    display_path: &Path,
+) -> Result<(), ErrorBody> {
     let mut pos = 0usize;
     let mut count = 0usize;
-    while pos + 8 <= raw.len() && count < 256 {
+    while pos + 8 <= raw.len() {
+        if count >= MAX_WAV_INFO_ENTRIES {
+            return Err(limit_error(
+                display_path,
+                "too_many_riff_info_entries",
+                MAX_WAV_INFO_ENTRIES,
+                "too many RIFF INFO entries",
+            ));
+        }
         count += 1;
         let id = &raw[pos..pos + 4];
         let len =
@@ -1893,6 +1941,7 @@ fn parse_riff_info(raw: &[u8], out: &mut ParsedAudioTags) {
         };
         pos = next;
     }
+    Ok(())
 }
 
 fn merge_fallback_tags(dst: &mut ParsedAudioTags, fallback: ParsedAudioTags) {
@@ -1955,7 +2004,14 @@ fn parse_aiff<R: Read + Seek>(
     let mut ssnd_bytes = 0u64;
     let mut chunks = 0usize;
 
-    while stream.remaining_file() >= 8 && chunks < MAX_CONTAINER_CHUNKS {
+    while stream.remaining_file() >= 8 {
+        if chunks >= MAX_CONTAINER_CHUNKS {
+            return Err(stream.limit_exceeded(
+                "too_many_container_chunks",
+                MAX_CONTAINER_CHUNKS,
+                "too many AIFF chunks",
+            ));
+        }
         chunks += 1;
         let ch = stream.read_fixed::<8>()?;
         let fourcc = [ch[0], ch[1], ch[2], ch[3]];
@@ -2053,7 +2109,11 @@ fn parse_flac<R: Read + Seek>(
     let mut blocks = 0usize;
     loop {
         if blocks >= MAX_CONTAINER_CHUNKS {
-            return Err(stream.malformed("too many FLAC metadata blocks"));
+            return Err(stream.limit_exceeded(
+                "too_many_container_chunks",
+                MAX_CONTAINER_CHUNKS,
+                "too many FLAC metadata blocks",
+            ));
         }
         blocks += 1;
 
@@ -2454,7 +2514,12 @@ fn parse_vorbis_comments(
         raw[count_off + 3],
     ]);
     if comment_count > MAX_VORBIS_COMMENTS {
-        return Err(bad("too many Vorbis comment entries"));
+        return Err(limit_error(
+            display_path,
+            "too_many_vorbis_comments",
+            MAX_VORBIS_COMMENTS as usize,
+            "too many Vorbis comment entries",
+        ));
     }
 
     for _ in 0..comment_count {
@@ -2588,10 +2653,16 @@ fn parse_ogg<R: Read + Seek>(
 
     // 1. Locate the first Vorbis or Opus BOS identification page.
     let mut found: Option<(u32, OggCodec, Vec<u8>, bool)> = None;
-    for _ in 0..MAX_OGG_SCAN_PAGES {
-        if stream.remaining_file() < 27 {
-            break;
+    let mut scan_pages = 0usize;
+    while stream.remaining_file() >= 27 {
+        if scan_pages >= MAX_OGG_SCAN_PAGES {
+            return Err(stream.limit_exceeded(
+                "too_many_ogg_scan_pages",
+                MAX_OGG_SCAN_PAGES,
+                "too many Ogg pages before audio stream header",
+            ));
         }
+        scan_pages += 1;
         let page = read_ogg_page_header(stream)?;
         let is_bos = (page.header_type & 0x02) != 0;
         let page_end = stream.pos.saturating_add(page.body_len as u64);
@@ -2664,7 +2735,14 @@ fn parse_ogg<R: Read + Seek>(
     //    comment packet never triggers a 32 MiB Vec doubling spike.
     let mut pages_read = 0usize;
     let mut page_buf = Vec::new();
-    while !comment_done && stream.remaining_file() >= 27 && pages_read < MAX_OGG_COMMENT_PAGES {
+    while !comment_done && stream.remaining_file() >= 27 {
+        if pages_read >= MAX_OGG_COMMENT_PAGES {
+            return Err(stream.limit_exceeded(
+                "too_many_ogg_comment_pages",
+                MAX_OGG_COMMENT_PAGES,
+                "too many Ogg comment header pages",
+            ));
+        }
         pages_read += 1;
         let page = read_ogg_page_header(stream)?;
         let page_end = stream.pos.saturating_add(page.body_len as u64);
@@ -2796,7 +2874,14 @@ fn parse_mp4<R: Read + Seek>(
     let mut pos = 0u64;
     let end = stream.file_len;
 
-    while pos + 8 <= end && visited < MAX_CONTAINER_CHUNKS {
+    while pos + 8 <= end {
+        if visited >= MAX_CONTAINER_CHUNKS {
+            return Err(stream.limit_exceeded(
+                "too_many_container_chunks",
+                MAX_CONTAINER_CHUNKS,
+                "too many MP4 boxes",
+            ));
+        }
         visited += 1;
         let (box_type, payload_start, box_end) = read_mp4_box_header(stream, pos, end)?;
         if matches!(
@@ -2870,10 +2955,21 @@ fn parse_mp4_moov<R: Read + Seek>(
     cover: &mut CoverSlot,
 ) -> Result<(), ErrorBody> {
     if depth > MAX_MP4_DEPTH {
-        return Ok(());
+        return Err(stream.limit_exceeded(
+            "mp4_nesting_too_deep",
+            MAX_MP4_DEPTH,
+            "MP4 box nesting too deep",
+        ));
     }
     let mut pos = start;
-    while pos + 8 <= end && *visited < MAX_CONTAINER_CHUNKS {
+    while pos + 8 <= end {
+        if *visited >= MAX_CONTAINER_CHUNKS {
+            return Err(stream.limit_exceeded(
+                "too_many_container_chunks",
+                MAX_CONTAINER_CHUNKS,
+                "too many MP4 boxes",
+            ));
+        }
         *visited += 1;
         let (box_type, payload_start, box_end) = read_mp4_box_header(stream, pos, end)?;
         match &box_type {
@@ -2975,7 +3071,14 @@ fn parse_mp4_ilst<R: Read + Seek>(
     cover: &mut CoverSlot,
 ) -> Result<(), ErrorBody> {
     let mut pos = start;
-    while pos + 8 <= end && *visited < MAX_CONTAINER_CHUNKS {
+    while pos + 8 <= end {
+        if *visited >= MAX_CONTAINER_CHUNKS {
+            return Err(stream.limit_exceeded(
+                "too_many_container_chunks",
+                MAX_CONTAINER_CHUNKS,
+                "too many MP4 boxes",
+            ));
+        }
         *visited += 1;
         let (item_type, item_payload_start, item_end) = read_mp4_box_header(stream, pos, end)?;
         let is_known = matches!(
@@ -3018,7 +3121,14 @@ fn parse_mp4_item_data_boxes<R: Read + Seek>(
     cover: &mut CoverSlot,
 ) -> Result<(), ErrorBody> {
     let mut pos = start;
-    while pos + 8 <= end && *visited < MAX_CONTAINER_CHUNKS {
+    while pos + 8 <= end {
+        if *visited >= MAX_CONTAINER_CHUNKS {
+            return Err(stream.limit_exceeded(
+                "too_many_container_chunks",
+                MAX_CONTAINER_CHUNKS,
+                "too many MP4 boxes",
+            ));
+        }
         *visited += 1;
         let (sub_type, sub_start, sub_end) = read_mp4_box_header(stream, pos, end)?;
         if &sub_type == b"data" && sub_end.saturating_sub(sub_start) >= 8 {
@@ -4003,6 +4113,400 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(15),
             "audio parser property suite exceeded 15 s time bound: {elapsed:?} ({cases} cases)"
+        );
+    }
+
+    #[test]
+    fn iteration_and_size_caps_accept_just_under_and_refuse_just_over_with_specific_reasons() {
+        let label = Path::new("/cap_boundary.bin");
+        let parse = |fmt: AudioFormat, data: &[u8]| {
+            let mut cur = Cursor::new(data);
+            parse_audio(
+                &mut cur,
+                data.len() as u64,
+                fmt,
+                CoverExtractMode::CheckOnly,
+                label,
+            )
+        };
+        let assert_limit_err = |res: Result<ExtractedAudio, ErrorBody>,
+                                expected_reason: &str,
+                                expected_key: &str,
+                                expected_val: usize| {
+            let err = res.expect_err(&format!(
+                "expected refusal with reason {expected_reason}, got Ok"
+            ));
+            assert_eq!(err.code, ErrorCode::Failed, "err: {err:?}");
+            let details = err.details.as_ref().expect("limit error must set details");
+            assert_eq!(
+                details.get("reason"),
+                Some(&json!(expected_reason)),
+                "wrong reason: {err:?}"
+            );
+            assert_eq!(
+                details.get(expected_key),
+                Some(&json!(expected_val)),
+                "wrong {expected_key}: {err:?}"
+            );
+        };
+
+        // 1. MAX_ID3_FRAMES (4096): TIT2 + (n - 2) TXXX + TPE1
+        let make_mp3_frames = |total_frames: usize| -> Vec<u8> {
+            let mut body = Vec::with_capacity(64 + total_frames * 12);
+            body.extend_from_slice(b"TIT2\x00\x00\x00\x0c\x00\x00\x03Start title");
+            for _ in 0..(total_frames - 2) {
+                body.extend_from_slice(b"TXXX\x00\x00\x00\x02\x00\x00\x03\x00");
+            }
+            body.extend_from_slice(b"TPE1\x00\x00\x00\x0b\x00\x00\x03End artist");
+            let sz = body.len() as u32;
+            let mut f = vec![
+                b'I',
+                b'D',
+                b'3',
+                3,
+                0,
+                0,
+                ((sz >> 21) & 0x7F) as u8,
+                ((sz >> 14) & 0x7F) as u8,
+                ((sz >> 7) & 0x7F) as u8,
+                (sz & 0x7F) as u8,
+            ];
+            f.extend_from_slice(&body);
+            f
+        };
+        let ok_id3 = parse(AudioFormat::Mp3, &make_mp3_frames(MAX_ID3_FRAMES)).unwrap();
+        assert_eq!(ok_id3.tags.title.as_deref(), Some("Start title"));
+        assert_eq!(ok_id3.tags.artist.as_deref(), Some("End artist"));
+        assert_limit_err(
+            parse(AudioFormat::Mp3, &make_mp3_frames(MAX_ID3_FRAMES + 1)),
+            "too_many_id3_frames",
+            "limit",
+            MAX_ID3_FRAMES,
+        );
+
+        // 2. MAX_CONTAINER_CHUNKS (4096) in WAV: fmt + (n - 1) JUNK
+        let make_wav_chunks = |total_chunks: usize| -> Vec<u8> {
+            let junk = total_chunks - 1;
+            let body_len = (4 + 24 + junk * 8) as u32;
+            let mut f = Vec::with_capacity(8 + body_len as usize);
+            f.extend_from_slice(b"RIFF");
+            f.extend_from_slice(&body_len.to_le_bytes());
+            f.extend_from_slice(b"WAVE");
+            f.extend_from_slice(b"fmt \x10\x00\x00\x00\x01\x00\x01\x00\x40\x1F\x00\x00\x80\x3E\x00\x00\x02\x00\x10\x00");
+            for _ in 0..junk {
+                f.extend_from_slice(b"JUNK\x00\x00\x00\x00");
+            }
+            f
+        };
+        assert!(parse(AudioFormat::Wav, &make_wav_chunks(MAX_CONTAINER_CHUNKS)).is_ok());
+        assert_limit_err(
+            parse(AudioFormat::Wav, &make_wav_chunks(MAX_CONTAINER_CHUNKS + 1)),
+            "too_many_container_chunks",
+            "limit",
+            MAX_CONTAINER_CHUNKS,
+        );
+
+        // 3. MAX_WAV_INFO_ENTRIES (256) in WAV LIST/INFO
+        let make_wav_info = |total_entries: usize| -> Vec<u8> {
+            let mut info = b"INFO".to_vec();
+            for _ in 0..(total_entries - 1) {
+                info.extend_from_slice(b"ICMT\x02\x00\x00\x00x\x00");
+            }
+            info.extend_from_slice(b"INAM\x0a\x00\x00\x00Info song\x00");
+            let body_len = (4 + 8 + info.len()) as u32;
+            let mut f = Vec::with_capacity(8 + body_len as usize);
+            f.extend_from_slice(b"RIFF");
+            f.extend_from_slice(&body_len.to_le_bytes());
+            f.extend_from_slice(b"WAVE");
+            f.extend_from_slice(b"LIST");
+            f.extend_from_slice(&(info.len() as u32).to_le_bytes());
+            f.extend_from_slice(&info);
+            f
+        };
+        let ok_info = parse(AudioFormat::Wav, &make_wav_info(MAX_WAV_INFO_ENTRIES)).unwrap();
+        assert_eq!(ok_info.tags.title.as_deref(), Some("Info song"));
+        assert_limit_err(
+            parse(AudioFormat::Wav, &make_wav_info(MAX_WAV_INFO_ENTRIES + 1)),
+            "too_many_riff_info_entries",
+            "limit",
+            MAX_WAV_INFO_ENTRIES,
+        );
+
+        // 4. MAX_CONTAINER_CHUNKS (4096) in AIFF: COMM + (n - 1) JUNK
+        let make_aiff_chunks = |total_chunks: usize| -> Vec<u8> {
+            let junk = total_chunks - 1;
+            let body_len = (4 + 26 + junk * 8) as u32;
+            let mut f = Vec::with_capacity(8 + body_len as usize);
+            f.extend_from_slice(b"FORM");
+            f.extend_from_slice(&body_len.to_be_bytes());
+            f.extend_from_slice(b"AIFF");
+            f.extend_from_slice(b"COMM\x00\x00\x00\x12\x00\x01\x00\x00\xAC\x44\x00\x10\x40\x0E\xAC\x44\x00\x00\x00\x00\x00\x00");
+            for _ in 0..junk {
+                f.extend_from_slice(b"JUNK\x00\x00\x00\x00");
+            }
+            f
+        };
+        let ok_aiff = parse(AudioFormat::Aiff, &make_aiff_chunks(MAX_CONTAINER_CHUNKS)).unwrap();
+        assert!((ok_aiff.tags.duration_s.unwrap() - 1.0).abs() < 0.01);
+        assert_limit_err(
+            parse(
+                AudioFormat::Aiff,
+                &make_aiff_chunks(MAX_CONTAINER_CHUNKS + 1),
+            ),
+            "too_many_container_chunks",
+            "limit",
+            MAX_CONTAINER_CHUNKS,
+        );
+
+        // 5. MAX_CONTAINER_CHUNKS (4096) in FLAC: STREAMINFO + (n - 1) PADDING
+        let make_flac_blocks = |total_blocks: usize| -> Vec<u8> {
+            let pad = total_blocks - 1;
+            let mut f = Vec::with_capacity(4 + 38 + pad * 4);
+            f.extend_from_slice(b"fLaC\x00\x00\x00\x22");
+            let mut si = [0u8; 34];
+            si[10] = 0x0A;
+            si[11] = 0xC4;
+            si[12] = 0x42;
+            si[13] = 0xF0;
+            si[14..18].copy_from_slice(&44_100u32.to_be_bytes());
+            f.extend_from_slice(&si);
+            for i in 0..pad {
+                f.extend_from_slice(&[if i + 1 == pad { 0x81 } else { 0x01 }, 0, 0, 0]);
+            }
+            f
+        };
+        let ok_flac = parse(AudioFormat::Flac, &make_flac_blocks(MAX_CONTAINER_CHUNKS)).unwrap();
+        assert!((ok_flac.tags.duration_s.unwrap() - 1.0).abs() < 0.01);
+        assert_limit_err(
+            parse(
+                AudioFormat::Flac,
+                &make_flac_blocks(MAX_CONTAINER_CHUNKS + 1),
+            ),
+            "too_many_container_chunks",
+            "limit",
+            MAX_CONTAINER_CHUNKS,
+        );
+
+        // 6. MAX_CONTAINER_CHUNKS (4096) in MP4: ftyp + (n - 1) free
+        let make_mp4_boxes = |total_boxes: usize| -> Vec<u8> {
+            let free = total_boxes - 1;
+            let mut f = Vec::with_capacity(20 + free * 8);
+            f.extend_from_slice(b"\x00\x00\x00\x14ftypM4A \x00\x00\x00\x00M4A ");
+            for _ in 0..free {
+                f.extend_from_slice(b"\x00\x00\x00\x08free");
+            }
+            f
+        };
+        assert!(parse(AudioFormat::Mp4, &make_mp4_boxes(MAX_CONTAINER_CHUNKS)).is_ok());
+        assert_limit_err(
+            parse(AudioFormat::Mp4, &make_mp4_boxes(MAX_CONTAINER_CHUNKS + 1)),
+            "too_many_container_chunks",
+            "limit",
+            MAX_CONTAINER_CHUNKS,
+        );
+
+        // 7. MAX_VORBIS_COMMENTS (65536) in FLAC
+        let make_flac_comments = |total_comments: usize| -> Vec<u8> {
+            let mut vc = Vec::with_capacity(32 + total_comments * 7);
+            vc.extend_from_slice(&4u32.to_le_bytes());
+            vc.extend_from_slice(b"test");
+            vc.extend_from_slice(&(total_comments as u32).to_le_bytes());
+            let title = b"TITLE=Many comments";
+            vc.extend_from_slice(&(title.len() as u32).to_le_bytes());
+            vc.extend_from_slice(title);
+            for _ in 0..(total_comments - 1) {
+                vc.extend_from_slice(&3u32.to_le_bytes());
+                vc.extend_from_slice(b"X=1");
+            }
+            let mut f = Vec::with_capacity(4 + 38 + 4 + vc.len());
+            f.extend_from_slice(b"fLaC\x00\x00\x00\x22");
+            f.extend_from_slice(&[0u8; 34]);
+            let len = vc.len() as u32;
+            f.extend_from_slice(&[
+                0x84,
+                ((len >> 16) & 0xFF) as u8,
+                ((len >> 8) & 0xFF) as u8,
+                (len & 0xFF) as u8,
+            ]);
+            f.extend_from_slice(&vc);
+            f
+        };
+        let ok_vc = parse(
+            AudioFormat::Flac,
+            &make_flac_comments(MAX_VORBIS_COMMENTS as usize),
+        )
+        .unwrap();
+        assert_eq!(ok_vc.tags.title.as_deref(), Some("Many comments"));
+        assert_limit_err(
+            parse(
+                AudioFormat::Flac,
+                &make_flac_comments((MAX_VORBIS_COMMENTS as usize) + 1),
+            ),
+            "too_many_vorbis_comments",
+            "limit",
+            MAX_VORBIS_COMMENTS as usize,
+        );
+
+        // 8. MAX_MP4_DEPTH (8): moov (depth 1) + udta_layers * udta + meta (depth = udta_layers + 2)
+        let make_mp4_depth = |udta_layers: usize| -> Vec<u8> {
+            let wrap = |tag: &[u8; 4], payload: &[u8]| -> Vec<u8> {
+                let mut out = Vec::with_capacity(8 + payload.len());
+                out.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
+                out.extend_from_slice(tag);
+                out.extend_from_slice(payload);
+                out
+            };
+            let mut data_payload = Vec::new();
+            data_payload.extend_from_slice(&1u32.to_be_bytes());
+            data_payload.extend_from_slice(&0u32.to_be_bytes());
+            data_payload.extend_from_slice(b"Deep title");
+            let nam = wrap(b"\xA9nam", &wrap(b"data", &data_payload));
+            let ilst = wrap(b"ilst", &nam);
+            let mut meta_body = vec![0u8; 4];
+            meta_body.extend_from_slice(&ilst);
+            let mut inner = wrap(b"meta", &meta_body);
+            for _ in 0..udta_layers {
+                inner = wrap(b"udta", &inner);
+            }
+            let mut f = b"\x00\x00\x00\x14ftypM4A \x00\x00\x00\x00M4A ".to_vec();
+            f.extend_from_slice(&wrap(b"moov", &inner));
+            f
+        };
+        let ok_depth = parse(AudioFormat::Mp4, &make_mp4_depth(MAX_MP4_DEPTH - 2)).unwrap();
+        assert_eq!(ok_depth.tags.title.as_deref(), Some("Deep title"));
+        assert_limit_err(
+            parse(AudioFormat::Mp4, &make_mp4_depth(MAX_MP4_DEPTH - 1)),
+            "mp4_nesting_too_deep",
+            "limit",
+            MAX_MP4_DEPTH,
+        );
+
+        // 9. MAX_OGG_SCAN_PAGES (64): dummy non-audio BOS pages before a valid OpusHead BOS page
+        let make_ogg_scan = |dummy_pages: usize| -> Vec<u8> {
+            let mut f = Vec::with_capacity((dummy_pages + 2) * 48);
+            for i in 0..dummy_pages {
+                f.extend_from_slice(b"OggS\x00\x02");
+                f.extend_from_slice(&0u64.to_le_bytes());
+                f.extend_from_slice(&(100 + i as u32).to_le_bytes());
+                f.extend_from_slice(&0u32.to_le_bytes());
+                f.extend_from_slice(&0u32.to_le_bytes());
+                f.extend_from_slice(&[1, 8]);
+                f.extend_from_slice(b"NOTAUDIO");
+            }
+            let head = b"OpusHead\x01\x02\x38\x01\x80\xBB\x00\x00\x00\x00\x00";
+            f.extend_from_slice(b"OggS\x00\x02");
+            f.extend_from_slice(&0u64.to_le_bytes());
+            f.extend_from_slice(&999u32.to_le_bytes());
+            f.extend_from_slice(&0u32.to_le_bytes());
+            f.extend_from_slice(&0u32.to_le_bytes());
+            f.extend_from_slice(&[1, head.len() as u8]);
+            f.extend_from_slice(head);
+            let tags_pkt =
+                b"OpusTags\x04\x00\x00\x00test\x01\x00\x00\x00\x16\x00\x00\x00TITLE=After scan pages";
+            f.extend_from_slice(b"OggS\x00\x00");
+            f.extend_from_slice(&48_000u64.to_le_bytes());
+            f.extend_from_slice(&999u32.to_le_bytes());
+            f.extend_from_slice(&1u32.to_le_bytes());
+            f.extend_from_slice(&0u32.to_le_bytes());
+            f.extend_from_slice(&[1, tags_pkt.len() as u8]);
+            f.extend_from_slice(tags_pkt);
+            f
+        };
+        let ok_scan = parse(AudioFormat::Ogg, &make_ogg_scan(MAX_OGG_SCAN_PAGES - 1)).unwrap();
+        assert_eq!(ok_scan.tags.title.as_deref(), Some("After scan pages"));
+        assert_limit_err(
+            parse(AudioFormat::Ogg, &make_ogg_scan(MAX_OGG_SCAN_PAGES)),
+            "too_many_ogg_scan_pages",
+            "limit",
+            MAX_OGG_SCAN_PAGES,
+        );
+
+        // 10. MAX_OGG_COMMENT_PAGES (2048): valid OpusTags packet split across exact N pages
+        let make_ogg_comment_pages = |page_count: usize| -> Vec<u8> {
+            let final_len = 100usize;
+            let total_pkt_len = (page_count - 1) * 255 + final_len;
+            let title_entry = b"TITLE=Split comment";
+            let fixed_overhead = 8 + 4 + 4 + 4 + title_entry.len();
+            let vendor_len = total_pkt_len - fixed_overhead;
+            let mut pkt = Vec::with_capacity(total_pkt_len);
+            pkt.extend_from_slice(b"OpusTags");
+            pkt.extend_from_slice(&(vendor_len as u32).to_le_bytes());
+            pkt.resize(pkt.len() + vendor_len, b'v');
+            pkt.extend_from_slice(&1u32.to_le_bytes());
+            pkt.extend_from_slice(&(title_entry.len() as u32).to_le_bytes());
+            pkt.extend_from_slice(title_entry);
+            assert_eq!(pkt.len(), total_pkt_len);
+
+            let mut f = Vec::with_capacity(64 + page_count * (28 + 255));
+            let head = b"OpusHead\x01\x02\x38\x01\x80\xBB\x00\x00\x00\x00\x00";
+            f.extend_from_slice(b"OggS\x00\x02");
+            f.extend_from_slice(&0u64.to_le_bytes());
+            f.extend_from_slice(&77u32.to_le_bytes());
+            f.extend_from_slice(&0u32.to_le_bytes());
+            f.extend_from_slice(&0u32.to_le_bytes());
+            f.extend_from_slice(&[1, head.len() as u8]);
+            f.extend_from_slice(head);
+
+            let mut off = 0usize;
+            for page_idx in 0..page_count {
+                let is_last = page_idx + 1 == page_count;
+                let seg_len = if is_last { final_len } else { 255 };
+                f.extend_from_slice(b"OggS\x00");
+                f.push(if page_idx == 0 { 0x00 } else { 0x01 });
+                f.extend_from_slice(&if is_last { 0u64 } else { u64::MAX }.to_le_bytes());
+                f.extend_from_slice(&77u32.to_le_bytes());
+                f.extend_from_slice(&((page_idx + 1) as u32).to_le_bytes());
+                f.extend_from_slice(&0u32.to_le_bytes());
+                f.extend_from_slice(&[1, seg_len as u8]);
+                f.extend_from_slice(&pkt[off..off + seg_len]);
+                off += seg_len;
+            }
+            assert_eq!(off, pkt.len());
+            f
+        };
+        let ok_cp = parse(
+            AudioFormat::Ogg,
+            &make_ogg_comment_pages(MAX_OGG_COMMENT_PAGES),
+        )
+        .unwrap();
+        assert_eq!(ok_cp.tags.title.as_deref(), Some("Split comment"));
+        assert_limit_err(
+            parse(
+                AudioFormat::Ogg,
+                &make_ogg_comment_pages(MAX_OGG_COMMENT_PAGES + 1),
+            ),
+            "too_many_ogg_comment_pages",
+            "limit",
+            MAX_OGG_COMMENT_PAGES,
+        );
+
+        // 11. MAX_AUDIO_TAG_BYTES (16 MiB): exact 16 MiB succeeds, 16 MiB + 1 refuses
+        let make_sized_mp3 = |body_len: usize| -> Vec<u8> {
+            let title = b"TIT2\x00\x00\x00\x0a\x00\x00\x03Exact 16M";
+            let priv_payload = body_len - title.len() - 10;
+            let sz = body_len as u32;
+            let mut f = Vec::with_capacity(10 + body_len);
+            f.extend_from_slice(b"ID3\x03\x00\x00");
+            f.extend_from_slice(&[
+                ((sz >> 21) & 0x7F) as u8,
+                ((sz >> 14) & 0x7F) as u8,
+                ((sz >> 7) & 0x7F) as u8,
+                (sz & 0x7F) as u8,
+            ]);
+            f.extend_from_slice(title);
+            f.extend_from_slice(b"PRIV");
+            f.extend_from_slice(&(priv_payload as u32).to_be_bytes());
+            f.extend_from_slice(&[0, 0]);
+            f.resize(10 + body_len, b'A');
+            f
+        };
+        let ok_size = parse(AudioFormat::Mp3, &make_sized_mp3(MAX_AUDIO_TAG_BYTES)).unwrap();
+        assert_eq!(ok_size.tags.title.as_deref(), Some("Exact 16M"));
+        assert_limit_err(
+            parse(AudioFormat::Mp3, &make_sized_mp3(MAX_AUDIO_TAG_BYTES + 1)),
+            "tag_too_large",
+            "limit_bytes",
+            MAX_AUDIO_TAG_BYTES,
         );
     }
 }

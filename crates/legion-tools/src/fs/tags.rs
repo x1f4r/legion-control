@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use legion_core::proto::{Effect, ErrorBody, ErrorCode};
 use legion_core::{Access, CancellationToken, Ctx, Grant, Registry, ToolError};
@@ -40,7 +40,7 @@ use super::thumb::{
 use super::thumb_cache::{ThumbCache, tags_bad_cache_key, tags_cache_key};
 use super::thumb_limit::AcquireError;
 use super::thumb_worker::{
-    AudioTagsWorkerOutcome, MIN_IMAGE_HEAP_CAP_BYTES, compute_worker_limits,
+    AudioTagsWorkerOutcome, MIN_IMAGE_HEAP_CAP_BYTES, backstop_margin_bytes, compute_worker_limits,
     effective_decode_timeout, run_audio_tags_worker, worker_baseline_rss_bytes, worker_enabled,
 };
 use super::{
@@ -54,6 +54,15 @@ use super::{
 /// streaming pass without copying or decoding the full picture).
 const AUDIO_TAGS_LARGE_HEAP_CAP_BYTES: u64 = 48 * 1024 * 1024;
 const SMALL_AUDIO_FILE_THRESHOLD_BYTES: u64 = 4 * 1024 * 1024;
+
+static TEST_AUDIO_TAGS_HEAP_CAP_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Test-only override for the `--audio-tags` worker's live-heap cap (`None` restores the
+/// production 16 MiB / 48 MiB sizing).
+#[doc(hidden)]
+pub fn set_audio_tags_heap_cap_for_test(cap_bytes: Option<u64>) {
+    TEST_AUDIO_TAGS_HEAP_CAP_BYTES.store(cap_bytes.unwrap_or(0), Ordering::Release);
+}
 
 const FOLDER_COVER_STEMS: [&str; 4] = ["cover", "folder", "front", "album"];
 const FOLDER_COVER_EXTS: [&str; 4] = ["jpg", "jpeg", "png", "webp"];
@@ -434,15 +443,27 @@ fn prepare_tags_open_once(path: &Path, cache: &ThumbCache) -> Result<TagsPrep, E
         return Ok(TagsPrep::CachedBad(bad));
     }
 
-    let requested_heap_cap = if open_stamp.size <= SMALL_AUDIO_FILE_THRESHOLD_BYTES {
-        MIN_IMAGE_HEAP_CAP_BYTES
-    } else {
-        AUDIO_TAGS_LARGE_HEAP_CAP_BYTES
-    };
     let budget = machine_in_flight_image_budget();
     let baseline = worker_baseline_rss_bytes();
     let (heap_cap_bytes, rss_limit_bytes, baseline_rss_bytes) =
-        compute_worker_limits(requested_heap_cap, budget, baseline);
+        match TEST_AUDIO_TAGS_HEAP_CAP_BYTES.load(Ordering::Acquire) {
+            0 => {
+                let requested_heap_cap = if open_stamp.size <= SMALL_AUDIO_FILE_THRESHOLD_BYTES {
+                    MIN_IMAGE_HEAP_CAP_BYTES
+                } else {
+                    AUDIO_TAGS_LARGE_HEAP_CAP_BYTES
+                };
+                compute_worker_limits(requested_heap_cap, budget, baseline)
+            }
+            override_cap => {
+                let heap_cap = override_cap.min(budget);
+                let rss_limit = baseline
+                    .saturating_add(heap_cap)
+                    .saturating_add(backstop_margin_bytes(heap_cap))
+                    .min(budget);
+                (heap_cap, rss_limit, baseline)
+            }
+        };
 
     Ok(TagsPrep::Ready {
         tags_key,

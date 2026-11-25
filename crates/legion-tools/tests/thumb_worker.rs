@@ -2256,9 +2256,10 @@ async fn test_audio_tags_and_covers_through_real_worker_and_benchmarks() {
         tags_peak_rss,
         tags_peak_rss as f64 / (1024.0 * 1024.0)
     );
+    let baseline = legion_tools::fs::measured_worker_baseline_bytes_for_test();
     assert!(
-        tags_peak_rss > 0 && tags_peak_rss < 128 * 1024 * 1024,
-        "unexpected peak worker RSS for fs.tags: {tags_peak_rss} bytes"
+        tags_peak_rss > 0 && tags_peak_rss <= baseline + 32 * 1024 * 1024,
+        "unexpected peak worker RSS for fs.tags: {tags_peak_rss} bytes (baseline={baseline})"
     );
 
     // 4. Benchmark: `fs.thumb` at size=1024 on an audio file with a real ~10 MiB embedded cover.
@@ -2613,7 +2614,12 @@ async fn test_in_budget_large_base64_picture_and_invalid_utf8_succeed_under_48mi
     drop(invalid_utf8);
 
     // Run each ~15.9 MiB in-budget hostile file individually through the real `--audio-tags` worker
-    // under its 48 MiB CappedAlloc limit so we capture exact per-input worker peak RSS.
+    // under its real 48 MiB CappedAlloc limit, verifying exact per-input peak RSS stays with at
+    // least 16 MiB headroom below the 48 MiB live-heap cap (`worker_rss <= baseline + 32 MiB`).
+    let baseline = legion_tools::fs::measured_worker_baseline_bytes_for_test();
+    const TAGS_HEAP_CAP: u64 = 48 * 1024 * 1024;
+    const REQUIRED_MARGIN: u64 = 16 * 1024 * 1024;
+    let max_allowed_rss = baseline + (TAGS_HEAP_CAP - REQUIRED_MARGIN);
     let single_cases: [(&str, &std::path::Path); 4] = [
         ("15.9 MiB wrapped base64 pic (Opus)", &opus_wrapped_pic),
         ("15.9 MiB invalid UTF-8 (Opus)", &opus_invalid_utf8),
@@ -2631,9 +2637,23 @@ async fn test_in_budget_large_base64_picture_and_invalid_utf8_succeed_under_48mi
             ))
             .await
             .unwrap();
-        let worker_rss_mib =
-            legion_tools::fs::peak_worker_rss_for_test() as f64 / (1024.0 * 1024.0);
-        eprintln!("WORKER_TAGS_RSS {label:<36} | worker_peak_rss={worker_rss_mib:.2} MiB");
+        let worker_rss = legion_tools::fs::peak_worker_rss_for_test();
+        let delta = worker_rss.saturating_sub(baseline);
+        let margin = TAGS_HEAP_CAP.saturating_sub(delta);
+        eprintln!(
+            "WORKER_TAGS_RSS {label:<36} | worker_peak_rss={:.2} MiB (baseline={:.2} MiB, delta={:.2} MiB, margin_below_48MiB={:.2} MiB)",
+            worker_rss as f64 / (1024.0 * 1024.0),
+            baseline as f64 / (1024.0 * 1024.0),
+            delta as f64 / (1024.0 * 1024.0),
+            margin as f64 / (1024.0 * 1024.0),
+        );
+        assert!(
+            worker_rss > 0 && worker_rss <= max_allowed_rss,
+            "{label} peaked at {:.2} MiB (baseline={:.2} MiB, max_allowed={:.2} MiB for >=16 MiB margin below 48 MiB cap)",
+            worker_rss as f64 / (1024.0 * 1024.0),
+            baseline as f64 / (1024.0 * 1024.0),
+            max_allowed_rss as f64 / (1024.0 * 1024.0),
+        );
         results_vec.push(res["results"][0].clone());
     }
     let arr = &results_vec;
@@ -2661,6 +2681,82 @@ async fn test_in_budget_large_base64_picture_and_invalid_utf8_succeed_under_48mi
             "{label} should contain 512 U+FFFD chars"
         );
         assert_eq!(ok["artist"], json!("Someone"), "{label}: {ok}");
+    }
+
+    // Prove the `--audio-tags` worker's live-heap cap actively stops an input that needs more
+    // memory than its cap (both directly at the worker exit code and end-to-end through `fs.tags`):
+    // `opus_wrapped_pic` needs ~16 MiB to reassemble its comment packet, so a 12 MiB cap must trip
+    // `CappedAlloc` (`CAP_EXCEEDED_EXIT_CODE == 107`, `enforced_by == "allocator_cap"`).
+    {
+        const TIGHT_CAP_BYTES: u64 = 12 * 1024 * 1024;
+        let exe = std::env::current_exe().expect("current exe");
+        let stdin_file = fs::File::open(&opus_wrapped_pic).unwrap();
+        let direct = std::process::Command::new(&exe)
+            .args([
+                "__thumb-worker",
+                "--audio-tags",
+                "ogg",
+                &TIGHT_CAP_BYTES.to_string(),
+                "/wrapped_15_9mib_pic.opus",
+            ])
+            .stdin(Stdio::from(stdin_file))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn direct __thumb-worker --audio-tags");
+        assert_eq!(
+            direct.status.code(),
+            Some(legion_os::capped_alloc::CAP_EXCEEDED_EXIT_CODE),
+            "direct --audio-tags worker with 12 MiB cap on 15.9 MiB Opus must exit 107, got {:?}",
+            direct.status
+        );
+
+        struct TagsHeapCapGuard;
+        impl Drop for TagsHeapCapGuard {
+            fn drop(&mut self) {
+                legion_tools::fs::set_audio_tags_heap_cap_for_test(None);
+            }
+        }
+        let cap_dir = tempfile::tempdir().unwrap();
+        let cap_home = cap_dir.path().join("home");
+        fs::create_dir_all(&cap_home).unwrap();
+        let cap_node = Node::new(
+            Paths::under(cap_dir.path()).with_home(&cap_home),
+            legion_tools::registry(),
+        );
+        let cap_opus = cap_home.join("exceeds_tight_cap.opus");
+        fs::copy(&opus_wrapped_pic, &cap_opus).unwrap();
+        let cap_sibling = cap_home.join("valid_sibling.mp3");
+        fs::write(&cap_sibling, af::build_mp3_id3v23(&[], false, false)).unwrap();
+
+        legion_tools::fs::set_audio_tags_heap_cap_for_test(Some(TIGHT_CAP_BYTES));
+        let _cap_guard = TagsHeapCapGuard;
+        let cap_res = cap_node
+            .call(Call::new(
+                Door::Cli,
+                "fs.tags",
+                json!({"paths": [cap_opus.to_string_lossy(), cap_sibling.to_string_lossy()]}),
+            ))
+            .await
+            .unwrap();
+        let r0 = &cap_res["results"][0];
+        assert_eq!(r0["error"]["code"], json!("failed"), "cap kill: {r0}");
+        assert_eq!(
+            r0["error"]["details"]["killed_for_memory"],
+            json!(true),
+            "cap kill must report killed_for_memory=true: {r0}"
+        );
+        assert_eq!(
+            r0["error"]["details"]["enforced_by"],
+            json!("allocator_cap"),
+            "cap kill must report enforced_by=allocator_cap: {r0}"
+        );
+        assert_eq!(
+            cap_res["results"][1]["ok"]["title"],
+            json!("First song"),
+            "valid sibling must succeed in the same fs.tags batch: {}",
+            cap_res["results"][1]
+        );
     }
 
     // Also verify `fs.thumb` extracts the 15.9 MiB line-wrapped base64 picture cleanly via the
@@ -2932,66 +3028,157 @@ async fn test_property_hostile_bounds_through_real_worker() {
         legion_tools::registry(),
     );
 
-    // 1. All 6 iteration-cap hostile fixtures + near-16 MiB and over-16 MiB fixtures through the
-    //    real `--audio-tags` worker under CappedAlloc.
-    let cap_and_budget: Vec<(&str, &str, Vec<u8>, Option<&str>)> = vec![
+    // 1. Every iteration cap and the 16 MiB tag-size cap tested with an exact just-under input
+    //    (must return Ok) and an exact just-over input (must refuse with its specific reason)
+    //    through the real `--audio-tags` worker under CappedAlloc.
+    enum CapExpect {
+        OkTitle(Option<&'static str>),
+        ErrReason(&'static str),
+    }
+    let cap_and_budget: Vec<(&str, &str, Vec<u8>, CapExpect)> = vec![
         (
-            "mp3_frames",
+            "mp3_frames_ok",
             "mp3",
-            af::build_mp3_many_id3_frames(4160),
-            None,
+            af::build_mp3_exact_id3_frames(4096),
+            CapExpect::OkTitle(Some("Before frame cap")),
         ),
-        ("wav_chunks", "wav", af::build_wav_many_chunks(4160), None),
         (
-            "aiff_chunks",
+            "mp3_frames_over",
+            "mp3",
+            af::build_mp3_exact_id3_frames(4097),
+            CapExpect::ErrReason("too_many_id3_frames"),
+        ),
+        (
+            "wav_chunks_ok",
+            "wav",
+            af::build_wav_many_chunks(4095),
+            CapExpect::OkTitle(None),
+        ),
+        (
+            "wav_chunks_over",
+            "wav",
+            af::build_wav_many_chunks(4096),
+            CapExpect::ErrReason("too_many_container_chunks"),
+        ),
+        (
+            "wav_info_ok",
+            "wav",
+            af::build_wav_exact_info_entries(256),
+            CapExpect::OkTitle(Some("Info song")),
+        ),
+        (
+            "wav_info_over",
+            "wav",
+            af::build_wav_exact_info_entries(257),
+            CapExpect::ErrReason("too_many_riff_info_entries"),
+        ),
+        (
+            "aiff_chunks_ok",
             "aiff",
-            af::build_aiff_many_chunks(4160),
-            None,
+            af::build_aiff_many_chunks(4095),
+            CapExpect::OkTitle(None),
         ),
         (
-            "flac_blocks",
+            "aiff_chunks_over",
+            "aiff",
+            af::build_aiff_many_chunks(4096),
+            CapExpect::ErrReason("too_many_container_chunks"),
+        ),
+        (
+            "flac_blocks_ok",
             "flac",
-            af::build_flac_many_blocks(4160),
-            None,
+            af::build_flac_many_blocks(4095),
+            CapExpect::OkTitle(None),
         ),
         (
-            "flac_vorbis",
+            "flac_blocks_over",
             "flac",
-            af::build_flac_many_vorbis_comments(65_664),
-            None,
+            af::build_flac_many_blocks(4096),
+            CapExpect::ErrReason("too_many_container_chunks"),
         ),
-        ("ogg_scan", "ogg", af::build_ogg_many_scan_pages(80), None),
         (
-            "opus_comment_pages",
+            "flac_vorbis_ok",
+            "flac",
+            af::build_flac_exact_vorbis_comments(65_536),
+            CapExpect::OkTitle(Some("Many comments")),
+        ),
+        (
+            "flac_vorbis_over",
+            "flac",
+            af::build_flac_exact_vorbis_comments(65_537),
+            CapExpect::ErrReason("too_many_vorbis_comments"),
+        ),
+        (
+            "ogg_scan_ok",
+            "ogg",
+            af::build_ogg_scan_pages_before_opus(63),
+            CapExpect::OkTitle(Some("After scan pages")),
+        ),
+        (
+            "ogg_scan_over",
+            "ogg",
+            af::build_ogg_scan_pages_before_opus(64),
+            CapExpect::ErrReason("too_many_ogg_scan_pages"),
+        ),
+        (
+            "opus_comment_pages_ok",
             "opus",
-            af::build_ogg_many_comment_pages(2080),
-            None,
+            af::build_ogg_valid_comment_pages(2048),
+            CapExpect::OkTitle(Some("Split comment")),
         ),
-        ("mp4_depth", "m4a", af::build_mp4_deep_udta(14), None),
-        ("mp4_boxes", "m4a", af::build_mp4_many_boxes(4160), None),
+        (
+            "opus_comment_pages_over",
+            "opus",
+            af::build_ogg_valid_comment_pages(2049),
+            CapExpect::ErrReason("too_many_ogg_comment_pages"),
+        ),
+        (
+            "mp4_depth_ok",
+            "m4a",
+            af::build_mp4_deep_udta(6),
+            CapExpect::OkTitle(Some("Deep title")),
+        ),
+        (
+            "mp4_depth_over",
+            "m4a",
+            af::build_mp4_deep_udta(7),
+            CapExpect::ErrReason("mp4_nesting_too_deep"),
+        ),
+        (
+            "mp4_boxes_ok",
+            "m4a",
+            af::build_mp4_many_boxes(4095),
+            CapExpect::OkTitle(None),
+        ),
+        (
+            "mp4_boxes_over",
+            "m4a",
+            af::build_mp4_many_boxes(4096),
+            CapExpect::ErrReason("too_many_container_chunks"),
+        ),
         (
             "mp3_unsync_near16m",
             "mp3",
             af::build_mp3_global_unsync_sized(15_800_000),
-            None,
+            CapExpect::OkTitle(Some("Sized unsync song")),
         ),
         (
             "mp3_unsync_over16m",
             "mp3",
             af::build_mp3_global_unsync_sized(16 * 1024 * 1024 + 512 * 1024),
-            Some("tag_too_large"),
+            CapExpect::ErrReason("tag_too_large"),
         ),
         (
             "flac_pics_over16m",
             "flac",
             af::build_flac_cumulative_pictures(4, 4_200_000),
-            Some("tag_too_large"),
+            CapExpect::ErrReason("tag_too_large"),
         ),
         (
             "mp4_covr_over16m",
             "m4a",
             af::build_mp4_sized_covr(16 * 1024 * 1024 + 512 * 1024),
-            Some("tag_too_large"),
+            CapExpect::ErrReason("tag_too_large"),
         ),
     ];
 
@@ -3002,6 +3189,7 @@ async fn test_property_hostile_bounds_through_real_worker() {
         cap_paths.push(p.to_string_lossy().into_owned());
     }
 
+    let baseline = legion_tools::fs::measured_worker_baseline_bytes_for_test();
     legion_tools::fs::reset_peak_worker_rss_for_test();
     let cap_res = node
         .call(Call::new(Door::Cli, "fs.tags", json!({"paths": cap_paths})))
@@ -3010,21 +3198,38 @@ async fn test_property_hostile_bounds_through_real_worker() {
     let cap_rss = legion_tools::fs::peak_worker_rss_for_test();
     let cap_arr = cap_res["results"].as_array().unwrap();
     assert_eq!(cap_arr.len(), cap_and_budget.len());
-    for (idx, (name, _, _, expected_err_reason)) in cap_and_budget.iter().enumerate() {
+    for (idx, (name, _, _, expected)) in cap_and_budget.iter().enumerate() {
         af::assert_clean_tags_item(&cap_arr[idx]);
-        if let Some(reason) = expected_err_reason {
-            assert_eq!(
-                cap_arr[idx]["error"]["details"]["reason"],
-                json!(reason),
-                "worker cap fixture {name}: {}",
-                cap_arr[idx]
-            );
+        match expected {
+            CapExpect::OkTitle(expected_title) => {
+                let ok = cap_arr[idx].get("ok").unwrap_or_else(|| {
+                    panic!("just-under cap fixture {name} failed: {}", cap_arr[idx])
+                });
+                if let Some(title) = expected_title {
+                    assert_eq!(ok["title"], json!(title), "fixture {name}: {ok}");
+                }
+            }
+            CapExpect::ErrReason(reason) => {
+                assert_eq!(
+                    cap_arr[idx]["error"]["code"],
+                    json!("failed"),
+                    "just-over cap fixture {name} must fail: {}",
+                    cap_arr[idx]
+                );
+                assert_eq!(
+                    cap_arr[idx]["error"]["details"]["reason"],
+                    json!(reason),
+                    "just-over cap fixture {name} wrong reason: {}",
+                    cap_arr[idx]
+                );
+            }
         }
     }
     assert!(
-        cap_rss < 128 * 1024 * 1024,
-        "real --audio-tags worker RSS exceeded 128 MiB on cap+16MiB fixtures: {:.2} MiB",
-        cap_rss as f64 / (1024.0 * 1024.0)
+        cap_rss <= baseline + 32 * 1024 * 1024,
+        "real --audio-tags worker RSS exceeded baseline+32 MiB on cap+16MiB fixtures: {:.2} MiB (baseline={:.2} MiB)",
+        cap_rss as f64 / (1024.0 * 1024.0),
+        baseline as f64 / (1024.0 * 1024.0),
     );
 
     // 2. Reach the real `--audio-cover` worker's CappedAlloc heap cap using an MP3 whose embedded
@@ -3177,9 +3382,10 @@ async fn test_property_hostile_bounds_through_real_worker() {
     }
     let tags_fuzz_rss = legion_tools::fs::peak_worker_rss_for_test();
     assert!(
-        tags_fuzz_rss < 128 * 1024 * 1024,
-        "worker fuzz fs.tags RSS exceeded 128 MiB: {:.2} MiB",
-        tags_fuzz_rss as f64 / (1024.0 * 1024.0)
+        tags_fuzz_rss <= baseline + 32 * 1024 * 1024,
+        "worker fuzz fs.tags RSS exceeded baseline+32 MiB: {:.2} MiB (baseline={:.2} MiB)",
+        tags_fuzz_rss as f64 / (1024.0 * 1024.0),
+        baseline as f64 / (1024.0 * 1024.0),
     );
 
     legion_tools::fs::reset_peak_worker_rss_for_test();
