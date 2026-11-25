@@ -15,10 +15,12 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::fmt;
+use std::fs::File;
 use std::io;
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use process_wrap::tokio::{ChildWrapper, CommandWrap};
@@ -68,6 +70,13 @@ pub struct OutputChunk {
 /// Callback invoked synchronously from the stream reader task as output chunks arrive.
 pub type ChunkCallback = Arc<dyn Fn(OutputChunk) + Send + Sync>;
 
+/// Default virtual-address-space headroom added above `memory_limit` for Linux `RLIMIT_AS`
+/// (192 MiB covers binary + libc + thread stack mappings while blocking multi-hundred-MiB bombs).
+pub const DEFAULT_RLIMIT_AS_HEADROOM: u64 = 192 * 1024 * 1024;
+
+/// Default RSS watchdog sampling interval when `memory_limit` is set.
+pub const DEFAULT_RSS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 /// Input configuration for [`run`].
 pub struct RunOptions {
     /// Exact argv or shell string to execute.
@@ -80,12 +89,25 @@ pub struct RunOptions {
     pub env_remove: Vec<OsString>,
     /// Optional bytes written to the child's stdin before closing it; null stdin when `None`.
     pub stdin: Option<Vec<u8>>,
+    /// Optional already-opened [`File`] attached directly as the child's stdin (supersedes
+    /// [`Self::stdin`]), allowing a worker child to read an open file handle without opening paths.
+    pub stdin_file: Option<File>,
     /// Optional wall-clock timeout; exceeding it terminates the entire process tree.
     pub timeout: Option<Duration>,
+    /// Optional hard resident memory limit in bytes, enforced by platform OS limits (`RLIMIT_AS`
+    /// on Linux, Job Object memory limits on Windows) and a cross-platform RSS watchdog.
+    pub memory_limit: Option<u64>,
+    /// Extra virtual-address-space headroom added to `memory_limit` for Linux `RLIMIT_AS`.
+    pub rlimit_as_headroom: u64,
+    /// Polling interval for the RSS watchdog when [`Self::memory_limit`] is set.
+    pub rss_poll_interval: Duration,
     /// Grace period between `SIGTERM` and `SIGKILL` on Unix during timeout or cancellation.
     pub kill_grace: Duration,
     /// Maximum number of raw bytes kept per stream (head + tail combined).
     pub capture_limit: usize,
+    /// When `true`, captures exact raw stdout bytes (up to [`Self::capture_limit`]) into
+    /// [`RunOutput::stdout_bytes`] for binary worker framing.
+    pub raw_stdout: bool,
     /// Cooperative cancellation token; cancelling stops the entire process tree.
     pub cancel: CancellationToken,
     /// Optional callback receiving raw stdout/stderr chunks as they arrive.
@@ -100,9 +122,13 @@ impl fmt::Debug for RunOptions {
             .field("env_keys", &self.env.keys().collect::<Vec<_>>())
             .field("env_remove", &self.env_remove)
             .field("stdin_len", &self.stdin.as_ref().map(Vec::len))
+            .field("has_stdin_file", &self.stdin_file.is_some())
             .field("timeout", &self.timeout)
+            .field("memory_limit", &self.memory_limit)
+            .field("rlimit_as_headroom", &self.rlimit_as_headroom)
             .field("kill_grace", &self.kill_grace)
             .field("capture_limit", &self.capture_limit)
+            .field("raw_stdout", &self.raw_stdout)
             .field("cancelled", &self.cancel.is_cancelled())
             .field("has_on_output", &self.on_output.is_some())
             .finish()
@@ -111,7 +137,7 @@ impl fmt::Debug for RunOptions {
 
 impl RunOptions {
     /// Create run options for `command` with sensible defaults (1 MiB capture limit per stream,
-    /// 2 s kill grace, no timeout, no cancellation).
+    /// 2 s kill grace, no timeout, no memory limit, no cancellation).
     pub fn new(command: CommandSpec) -> Self {
         Self {
             command,
@@ -119,9 +145,14 @@ impl RunOptions {
             env: BTreeMap::new(),
             env_remove: Vec::new(),
             stdin: None,
+            stdin_file: None,
             timeout: None,
+            memory_limit: None,
+            rlimit_as_headroom: DEFAULT_RLIMIT_AS_HEADROOM,
+            rss_poll_interval: DEFAULT_RSS_POLL_INTERVAL,
             kill_grace: DEFAULT_KILL_GRACE,
             capture_limit: DEFAULT_CAPTURE_LIMIT,
+            raw_stdout: false,
             cancel: CancellationToken::new(),
             on_output: None,
         }
@@ -180,9 +211,33 @@ impl RunOptions {
         self
     }
 
+    /// Attach an already-opened [`File`] directly to the child's stdin.
+    pub fn stdin_file(mut self, file: File) -> Self {
+        self.stdin_file = Some(file);
+        self
+    }
+
     /// Set a wall-clock timeout for the command.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    /// Enforce a hard resident memory limit in bytes on the child process.
+    pub fn memory_limit(mut self, bytes: u64) -> Self {
+        self.memory_limit = Some(bytes);
+        self
+    }
+
+    /// Override the Linux `RLIMIT_AS` headroom added above `memory_limit`.
+    pub fn rlimit_as_headroom(mut self, bytes: u64) -> Self {
+        self.rlimit_as_headroom = bytes;
+        self
+    }
+
+    /// Capture exact raw stdout bytes into [`RunOutput::stdout_bytes`] (up to `capture_limit`).
+    pub fn raw_stdout(mut self, enable: bool) -> Self {
+        self.raw_stdout = enable;
         self
     }
 
@@ -232,20 +287,28 @@ pub struct RunOutput {
     pub signal: Option<i32>,
     /// Captured standard output.
     pub stdout: CapturedOutput,
+    /// Exact raw standard output bytes when [`RunOptions::raw_stdout`] is `true` (bounded by
+    /// `capture_limit`); empty otherwise.
+    pub stdout_bytes: Vec<u8>,
     /// Captured standard error.
     pub stderr: CapturedOutput,
     /// `true` if the command exceeded its timeout and its process tree was terminated.
     pub timed_out: bool,
     /// `true` if the cancellation token fired and its process tree was terminated.
     pub cancelled: bool,
+    /// `true` if the process was terminated for exceeding [`RunOptions::memory_limit`].
+    pub killed_for_memory: bool,
+    /// Peak resident memory (RSS) in bytes observed for the child while it ran (when sampled).
+    pub peak_rss_bytes: u64,
     /// Elapsed wall-clock duration of the call.
     pub duration: Duration,
 }
 
 impl RunOutput {
-    /// Return `true` when the command exited with code 0 without timing out or being cancelled.
+    /// Return `true` when the command exited with code 0 without timing out, being cancelled, or
+    /// exceeding its memory limit.
     pub fn success(&self) -> bool {
-        !self.timed_out && !self.cancelled && self.exit_code == Some(0)
+        !self.timed_out && !self.cancelled && !self.killed_for_memory && self.exit_code == Some(0)
     }
 }
 
@@ -283,14 +346,21 @@ pub async fn run(options: RunOptions) -> Result<RunOutput> {
             exit_code: None,
             signal: None,
             stdout: CapturedOutput::default(),
+            stdout_bytes: Vec::new(),
             stderr: CapturedOutput::default(),
             timed_out: false,
             cancelled: true,
+            killed_for_memory: false,
+            peak_rss_bytes: 0,
             duration: started.elapsed(),
         });
     }
 
     let program_display = resolved.program_display();
+    let mut stdin_file = options.stdin_file;
+    let has_stdin_bytes = stdin_file.is_none() && options.stdin.is_some();
+    let memory_limit = options.memory_limit;
+    let rlimit_as_headroom = options.rlimit_as_headroom;
     let mut wrapped = CommandWrap::with_new(&resolved.program, |cmd| {
         cmd.args(&resolved.args);
         for key in &resolved.env_remove {
@@ -305,13 +375,16 @@ pub async fn run(options: RunOptions) -> Result<RunOutput> {
         if let Some(ref cwd) = options.cwd {
             cmd.current_dir(cwd);
         }
-        if options.stdin.is_some() {
+        if let Some(file) = stdin_file.take() {
+            cmd.stdin(Stdio::from(file));
+        } else if has_stdin_bytes {
             cmd.stdin(Stdio::piped());
         } else {
             cmd.stdin(Stdio::null());
         }
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+        configure_pre_exec_memory_limit(cmd, memory_limit, rlimit_as_headroom);
     });
     configure_containment(&mut wrapped)?;
 
@@ -319,18 +392,23 @@ pub async fn run(options: RunOptions) -> Result<RunOutput> {
         .spawn()
         .map_err(|err| OsError::from_spawn_io(program_display, err))?;
     let child_pid = child.id();
-    let mut tree_guard = create_drop_guard(child_pid);
+    let mut tree_guard = create_drop_guard(child_pid, memory_limit);
 
-    let stdin_task = match (child.stdin().take(), options.stdin) {
-        (Some(mut stdin_pipe), Some(bytes)) => Some(tokio::spawn(async move {
-            let _ = stdin_pipe.write_all(&bytes).await;
-            let _ = stdin_pipe.shutdown().await;
-        })),
-        _ => None,
+    let stdin_task = if has_stdin_bytes {
+        match (child.stdin().take(), options.stdin) {
+            (Some(mut stdin_pipe), Some(bytes)) => Some(tokio::spawn(async move {
+                let _ = stdin_pipe.write_all(&bytes).await;
+                let _ = stdin_pipe.shutdown().await;
+            })),
+            _ => None,
+        }
+    } else {
+        None
     };
 
     let drain_stop = CancellationToken::new();
     let _drain_guard = drain_stop.clone().drop_guard();
+    let raw_stdout = options.raw_stdout;
     let mut stdout_task = child.stdout().take().map(|pipe| {
         tokio::spawn(read_bounded_stream(
             pipe,
@@ -338,6 +416,7 @@ pub async fn run(options: RunOptions) -> Result<RunOutput> {
             OutputStream::Stdout,
             options.on_output.clone(),
             drain_stop.clone(),
+            raw_stdout,
         ))
     });
     let mut stderr_task = child.stderr().take().map(|pipe| {
@@ -347,16 +426,19 @@ pub async fn run(options: RunOptions) -> Result<RunOutput> {
             OutputStream::Stderr,
             options.on_output.clone(),
             drain_stop.clone(),
+            false,
         ))
     });
 
     let deadline = options.timeout.map(|d| tokio::time::Instant::now() + d);
+    let peak_rss = Arc::new(AtomicU64::new(0));
     let mut exit_status: Option<ExitStatus> = None;
     let mut timed_out = false;
     let mut cancelled = false;
+    let mut killed_for_memory = false;
 
     // Phase 1: wait for the DIRECT child to exit (never blocking on grandchildren in a Job Object
-    // or process group), or for timeout / cancellation.
+    // or process group), or for timeout / cancellation / RSS watchdog breach.
     tokio::select! {
         status_res = child.inner_mut().wait() => {
             exit_status = Some(status_res.map_err(|err| OsError::from_io("failed waiting for child process", err))?);
@@ -367,14 +449,23 @@ pub async fn run(options: RunOptions) -> Result<RunOutput> {
         () = options.cancel.cancelled() => {
             cancelled = true;
         }
+        () = watch_memory_limit(child_pid, memory_limit, options.rss_poll_interval, Arc::clone(&peak_rss)) => {
+            killed_for_memory = true;
+        }
     }
 
-    let mut stdout_captured: Option<CapturedOutput> = None;
-    let mut stderr_captured: Option<CapturedOutput> = None;
+    let mut stdout_captured: Option<(CapturedOutput, Vec<u8>)> = None;
+    let mut stderr_captured: Option<(CapturedOutput, Vec<u8>)> = None;
 
     // Phase 2: stop any surviving processes in the group/job under one consistent rule on every
-    // platform—whether the direct child exited normally or we hit timeout/cancellation.
-    if timed_out || cancelled {
+    // platform—whether the direct child exited normally or we hit timeout/cancellation/OOM.
+    if killed_for_memory {
+        // Immediate kill with zero grace so a runaway allocator stops at once.
+        let kill_status = terminate_tree(&mut child, child_pid, Duration::ZERO).await;
+        if exit_status.is_none() {
+            exit_status = kill_status;
+        }
+    } else if timed_out || cancelled {
         let kill_status = terminate_tree(&mut child, child_pid, options.kill_grace).await;
         if exit_status.is_none() {
             exit_status = kill_status;
@@ -412,15 +503,61 @@ pub async fn run(options: RunOptions) -> Result<RunOutput> {
     drop(child);
 
     let (exit_code, signal) = exit_status.map_or((None, None), extract_status);
+    let (stdout, stdout_bytes) = stdout_captured.unwrap_or_default();
+    let (stderr, _) = stderr_captured.unwrap_or_default();
+
+    // Detect OS-enforced OOM kills (e.g. Linux RLIMIT_AS causing Rust's `memory allocation of ...
+    // failed` + SIGABRT, or kernel SIGKILL / Windows ERROR_NOT_ENOUGH_MEMORY) as memory-limit kills.
+    if memory_limit.is_some()
+        && !killed_for_memory
+        && !timed_out
+        && !cancelled
+        && exit_code != Some(0)
+    {
+        let err_lower = stderr.text.to_ascii_lowercase();
+        if err_lower.contains("memory allocation of")
+            || err_lower.contains("out of memory")
+            || err_lower.contains("cannot allocate memory")
+            || signal == Some(9)
+        {
+            killed_for_memory = true;
+        }
+    }
+
     Ok(RunOutput {
         exit_code,
         signal,
-        stdout: stdout_captured.unwrap_or_default(),
-        stderr: stderr_captured.unwrap_or_default(),
+        stdout,
+        stdout_bytes,
+        stderr,
         timed_out,
         cancelled,
+        killed_for_memory,
+        peak_rss_bytes: peak_rss.load(Ordering::Relaxed),
         duration: started.elapsed(),
     })
+}
+
+async fn watch_memory_limit(
+    child_pid: Option<u32>,
+    memory_limit: Option<u64>,
+    poll_interval: Duration,
+    peak_rss: Arc<AtomicU64>,
+) {
+    let (Some(pid), Some(limit)) = (child_pid, memory_limit) else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    let step = poll_interval.max(Duration::from_millis(5));
+    loop {
+        if let Some(rss) = crate::mem_limit::process_rss_bytes(pid) {
+            peak_rss.fetch_max(rss, Ordering::Relaxed);
+            if rss > limit {
+                return;
+            }
+        }
+        tokio::time::sleep(step).await;
+    }
 }
 
 async fn wait_deadline(deadline: Option<tokio::time::Instant>) {
@@ -431,10 +568,10 @@ async fn wait_deadline(deadline: Option<tokio::time::Instant>) {
 }
 
 async fn drain_pipes(
-    stdout_task: &mut Option<JoinHandle<CapturedOutput>>,
-    stderr_task: &mut Option<JoinHandle<CapturedOutput>>,
-    stdout_captured: &mut Option<CapturedOutput>,
-    stderr_captured: &mut Option<CapturedOutput>,
+    stdout_task: &mut Option<JoinHandle<(CapturedOutput, Vec<u8>)>>,
+    stderr_task: &mut Option<JoinHandle<(CapturedOutput, Vec<u8>)>>,
+    stdout_captured: &mut Option<(CapturedOutput, Vec<u8>)>,
+    stderr_captured: &mut Option<(CapturedOutput, Vec<u8>)>,
 ) {
     while stdout_task.is_some() || stderr_task.is_some() {
         match (stdout_task.as_mut(), stderr_task.as_mut()) {
@@ -477,11 +614,13 @@ async fn read_bounded_stream<R>(
     stream: OutputStream,
     on_output: Option<ChunkCallback>,
     stop: CancellationToken,
-) -> CapturedOutput
+    keep_raw: bool,
+) -> (CapturedOutput, Vec<u8>)
 where
     R: AsyncRead + Unpin,
 {
     let mut capture = BoundedCapture::new(limit);
+    let mut raw = Vec::new();
     let mut buf = [0u8; 8192];
 
     loop {
@@ -493,7 +632,18 @@ where
                     Ok(0) => break,
                     Ok(n) => {
                         let chunk = &buf[..n];
-                        capture.push(chunk);
+                        if keep_raw {
+                            let room = limit.saturating_sub(raw.len());
+                            if room > 0 {
+                                raw.extend_from_slice(&chunk[..room.min(chunk.len())]);
+                            }
+                            capture.total_bytes = capture.total_bytes.saturating_add(chunk.len() as u64);
+                            if chunk.len() > room {
+                                capture.truncated = true;
+                            }
+                        } else {
+                            capture.push(chunk);
+                        }
                         if let Some(ref cb) = on_output {
                             cb(OutputChunk {
                                 stream,
@@ -507,7 +657,7 @@ where
         }
     }
 
-    capture.finish()
+    (capture.finish(), raw)
 }
 
 /// Memory-bounded head-and-tail byte accumulator for one output stream.
@@ -615,8 +765,8 @@ impl BoundedCapture {
 }
 
 #[cfg(any(unix, windows))]
-fn create_drop_guard(child_pid: Option<u32>) -> platform::TreeDropGuard {
-    platform::TreeDropGuard::new(child_pid)
+fn create_drop_guard(child_pid: Option<u32>, memory_limit: Option<u64>) -> platform::TreeDropGuard {
+    platform::TreeDropGuard::new(child_pid, memory_limit)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -628,8 +778,25 @@ impl FallbackDropGuard {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn create_drop_guard(_child_pid: Option<u32>) -> FallbackDropGuard {
+fn create_drop_guard(_child_pid: Option<u32>, _memory_limit: Option<u64>) -> FallbackDropGuard {
     FallbackDropGuard
+}
+
+#[cfg(any(unix, windows))]
+fn configure_pre_exec_memory_limit(
+    cmd: &mut tokio::process::Command,
+    memory_limit: Option<u64>,
+    rlimit_as_headroom: u64,
+) {
+    platform::configure_pre_exec_memory_limit(cmd, memory_limit, rlimit_as_headroom);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_pre_exec_memory_limit(
+    _cmd: &mut tokio::process::Command,
+    _memory_limit: Option<u64>,
+    _rlimit_as_headroom: u64,
+) {
 }
 
 #[cfg(any(unix, windows))]

@@ -5,6 +5,7 @@ use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
 /// Sentinel threshold above which cgroup v1 `memory.limit_in_bytes` means "unlimited"
 /// (kernels report `PAGE_COUNTER_MAX` ~ `9.22e18` bytes).
+#[cfg(any(target_os = "linux", test))]
 const CGROUP_UNLIMITED_THRESHOLD: u64 = 1u64 << 60;
 
 /// Returns the effective memory available to this process in bytes: the minimum of the host's
@@ -40,6 +41,7 @@ fn container_or_job_memory_limit() -> Option<u64> {
 }
 
 /// Parses a cgroup v2 `memory.max` file (`"max"` or decimal byte count).
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn parse_cgroup_v2_memory_max(text: &str) -> Option<u64> {
     let trimmed = text.trim();
     if trimmed.is_empty() || trimmed == "max" {
@@ -50,6 +52,7 @@ pub(crate) fn parse_cgroup_v2_memory_max(text: &str) -> Option<u64> {
 }
 
 /// Parses a cgroup v1 `memory.limit_in_bytes` file, ignoring kernel "unlimited" sentinels.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn parse_cgroup_v1_limit(text: &str) -> Option<u64> {
     let bytes: u64 = text.trim().parse().ok()?;
     (bytes > 0 && bytes < CGROUP_UNLIMITED_THRESHOLD).then_some(bytes)
@@ -57,6 +60,7 @@ pub(crate) fn parse_cgroup_v1_limit(text: &str) -> Option<u64> {
 
 /// Extracts the cgroup v2 unified hierarchy relative path from `/proc/self/cgroup` content
 /// (the `0::/<path>` line).
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn parse_proc_cgroup_v2_path(text: &str) -> Option<String> {
     for line in text.lines() {
         let mut parts = line.splitn(3, ':');
@@ -71,6 +75,7 @@ pub(crate) fn parse_proc_cgroup_v2_path(text: &str) -> Option<String> {
 }
 
 /// Extracts the cgroup v1 `memory` controller relative path from `/proc/self/cgroup` content.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn parse_proc_cgroup_v1_memory_path(text: &str) -> Option<String> {
     for line in text.lines() {
         let mut parts = line.splitn(3, ':');
