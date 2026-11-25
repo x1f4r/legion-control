@@ -29,6 +29,7 @@ import {
 import { readSortPreference, writeSortPreference } from './lib/files-store.js';
 import { createFolderChangesStore } from './lib/folder-changes.js';
 import { formatBytes, formatRelativeTime } from './lib/format.js';
+import { createForegroundResumeController } from './lib/resume.js';
 import { createThumbCache } from './lib/thumb-cache.js';
 import {
   classifyHorizontalSwipe,
@@ -1295,12 +1296,11 @@ function App() {
   // Poll on the user's configured interval while visible and refresh on resume/focus.
   useEffect(() => {
     if (!linkState?.ready || !nodeInfo) return;
-    let wasHidden = document.visibilityState === 'hidden';
-    let resuming = false;
 
-    const onVisibilityChange = async () => {
-      if (document.visibilityState === 'hidden') {
-        wasHidden = true;
+    const resumeController = createForegroundResumeController({
+      invalidateSessions:
+        typeof link.invalidateSessions === 'function' ? () => link.invalidateSessions() : null,
+      onBackground: () => {
         if (
           typeof link.maybeAutoInstall === 'function' &&
           isSafeForAutoInstall({
@@ -1317,30 +1317,38 @@ function App() {
         ) {
           link.maybeAutoInstall('background').catch(() => {});
         }
-        return;
-      }
-      if (document.visibilityState !== 'visible') return;
-      if (wasHidden && typeof link.invalidateSessions === 'function') {
-        wasHidden = false;
-        resuming = true;
-        try {
-          await link.invalidateSessions();
-          capsStore.invalidate();
-        } finally {
-          resuming = false;
+      },
+      onInvalidate: () => {
+        capsStore.invalidate();
+      },
+      onRefresh: () => {
+        refreshFleet(nodeInfo, { background: true });
+      },
+      onCheckUpdates: () => {
+        if (shouldCheckOnResume(updateStateRef.current?.last_checked_at)) {
+          checkUpdatesQuietly();
         }
-        refreshFleet(nodeInfo, { background: true });
-      } else {
-        wasHidden = false;
-        refreshFleet(nodeInfo, { background: true });
-      }
-      if (shouldCheckOnResume(updateStateRef.current?.last_checked_at)) {
-        checkUpdatesQuietly();
-      }
+      },
+    });
+
+    const onVisibilityChange = () => {
+      resumeController.handleVisibilityChange().catch(() => {});
     };
 
+    const unsubNativeResume =
+      typeof link.onAppResume === 'function'
+        ? link.onAppResume(() => {
+            resumeController.handleNativeResume().catch(() => {});
+          })
+        : () => {};
+
     const onFocus = () => {
-      if (document.visibilityState === 'visible' && !wasHidden && !resuming && settings.refreshSeconds > 0) {
+      if (
+        document.visibilityState === 'visible' &&
+        !resumeController.isHidden() &&
+        !resumeController.isResuming() &&
+        settings.refreshSeconds > 0
+      ) {
         refreshFleet(nodeInfo, { background: true });
       }
     };
@@ -1348,7 +1356,7 @@ function App() {
     const timer =
       settings.refreshSeconds > 0
         ? window.setInterval(() => {
-            if (document.visibilityState === 'visible' && !resuming) {
+            if (document.visibilityState === 'visible' && !resumeController.isResuming()) {
               refreshFleet(nodeInfo, { background: true });
             }
           }, settings.refreshSeconds * 1000)
@@ -1358,6 +1366,7 @@ function App() {
     document.addEventListener('visibilitychange', onVisibilityChange);
     return () => {
       if (timer !== null) window.clearInterval(timer);
+      unsubNativeResume();
       window.removeEventListener('focus', onFocus);
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };

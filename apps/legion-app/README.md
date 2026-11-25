@@ -20,8 +20,11 @@ an internal `Backend` trait.
   with caller-scoped cancellation. Machine calls always name their target machine; only door-level
   discovery reads may omit `on` and fall back to another directly paired node when a request never
   left this device (`details.sent == false`), caching an expiring in-memory relay preference hint
-  without persisting or changing any machine target. On mobile resume from background, cached
-  sessions are closed before refreshing.
+  without persisting or changing any machine target. On mobile resume from background, Tauri's
+  native `WindowEvent::Resumed` (`tauri://resumed`, plus `tauri://suspended` -> `tauri://focus` on
+  iOS inactive returns) triggers loopback listener probing in Rust and session invalidation +
+  refresh in the interface even when the web view never saw `visibilityState === 'hidden'`, with
+  DOM `visibilitychange` kept as a second trigger.
 - **State safety, revocation, and unpairing:** If `legion-app.json` is damaged or written by a
   newer schema version, the app enters repair mode, refuses writes, and offers an explicit repair
   action that moves the file aside to `legion-app.json.damaged-<timestamp>` without deleting it. If

@@ -12,6 +12,14 @@ function tauriCore() {
   return tauri.core;
 }
 
+function tauriEvent() {
+  const tauri = typeof window !== 'undefined' ? window.__TAURI__ : null;
+  if (!tauri || !tauri.event || typeof tauri.event.listen !== 'function') {
+    return null;
+  }
+  return tauri.event;
+}
+
 function invoke(command, payload) {
   const core = tauriCore();
   if (!core) {
@@ -101,6 +109,92 @@ export function createAppLink() {
   const iosPlatform = isIosPlatform();
   const unsupportedContentMachines = new Set();
   const contentSupportListeners = new Set();
+  const appResumeListeners = new Set();
+  let nativeResumeUnlistens = null;
+  let nativeResumeReady = null;
+  let nativeResumeToken = null;
+  let sawNativeSuspend = false;
+
+  function notifyAppResume(source) {
+    for (const listener of appResumeListeners) {
+      try {
+        listener({ source });
+      } catch {
+        // Keep notifying remaining listeners.
+      }
+    }
+  }
+
+  function ensureNativeResumeSubscription() {
+    if (nativeResumeReady) return nativeResumeReady;
+    const ev = tauriEvent();
+    if (!ev) return Promise.resolve(false);
+    const token = {};
+    nativeResumeToken = token;
+    const onResumed = () => {
+      sawNativeSuspend = false;
+      notifyAppResume('tauri://resumed');
+    };
+    const onSuspended = () => {
+      sawNativeSuspend = true;
+    };
+    const onFocus = () => {
+      if (!sawNativeSuspend) return;
+      sawNativeSuspend = false;
+      notifyAppResume('tauri://focus');
+    };
+    nativeResumeReady = Promise.all([
+      Promise.resolve(ev.listen('tauri://resumed', onResumed)).catch(() => null),
+      Promise.resolve(ev.listen('tauri://suspended', onSuspended)).catch(() => null),
+      Promise.resolve(ev.listen('tauri://focus', onFocus)).catch(() => null),
+    ]).then((unlistens) => {
+      const active = unlistens.filter((fn) => typeof fn === 'function');
+      if (nativeResumeToken !== token || appResumeListeners.size === 0) {
+        for (const fn of active) {
+          try {
+            const res = fn();
+            if (res && typeof res.catch === 'function') res.catch(() => {});
+          } catch {
+            // Best-effort cleanup.
+          }
+        }
+        return false;
+      }
+      nativeResumeUnlistens = active;
+      return active.length > 0;
+    });
+    return nativeResumeReady;
+  }
+
+  function teardownNativeResumeSubscription() {
+    nativeResumeToken = null;
+    nativeResumeReady = null;
+    sawNativeSuspend = false;
+    const active = nativeResumeUnlistens;
+    nativeResumeUnlistens = null;
+    if (Array.isArray(active)) {
+      for (const fn of active) {
+        try {
+          const res = fn();
+          if (res && typeof res.catch === 'function') res.catch(() => {});
+        } catch {
+          // Best-effort cleanup.
+        }
+      }
+    }
+  }
+
+  function onAppResume(listener) {
+    if (typeof listener !== 'function') return () => {};
+    appResumeListeners.add(listener);
+    ensureNativeResumeSubscription().catch(() => {});
+    return () => {
+      appResumeListeners.delete(listener);
+      if (appResumeListeners.size === 0) {
+        teardownNativeResumeSubscription();
+      }
+    };
+  }
 
   function machineKey(machine) {
     return typeof machine === 'string' ? machine.trim() : '';
@@ -469,46 +563,81 @@ export function createAppLink() {
       }
     };
 
-    const waitForAppResume = () =>
-      new Promise((resolve, reject) => {
-        let sawBackground = false;
-        const cleanup = () => {
+    const createAppResumeWaiter = () => {
+      let settled = false;
+      let sawBackground = false;
+      let resolvePromise = null;
+      let rejectPromise = null;
+      let unsubNative = null;
+      let timer = null;
+
+      const cleanup = () => {
+        if (timer !== null) {
           window.clearTimeout(timer);
-          document.removeEventListener('visibilitychange', onVis);
-          window.removeEventListener('pagehide', onBg);
-          window.removeEventListener('blur', onBg);
-          window.removeEventListener('focus', onFg);
-          window.removeEventListener('pageshow', onFg);
-        };
-        // Cold-launching com.apple.Preferences and switching back on a busy CI simulator runner
-        // can take over two minutes (observed 121s on macos-latest); give the transition 3 minutes.
-        const timer = window.setTimeout(() => {
-          cleanup();
-          reject(new Error('Timed out waiting for app suspend/resume cycle'));
-        }, 180000);
-        const onBg = () => {
+          timer = null;
+        }
+        if (typeof unsubNative === 'function') {
+          unsubNative();
+          unsubNative = null;
+        }
+        document.removeEventListener('visibilitychange', onVis);
+        window.removeEventListener('pagehide', onBg);
+        window.removeEventListener('blur', onBg);
+        window.removeEventListener('focus', onFg);
+        window.removeEventListener('pageshow', onFg);
+      };
+
+      const trigger = (source) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolvePromise(source);
+      };
+
+      const onBg = () => {
+        sawBackground = true;
+      };
+      const onFg = () => {
+        if (sawBackground && document.visibilityState !== 'hidden') {
+          trigger('dom-foreground');
+        }
+      };
+      const onVis = () => {
+        if (document.visibilityState === 'hidden') {
           sawBackground = true;
-        };
-        const onFg = () => {
-          if (sawBackground && document.visibilityState !== 'hidden') {
-            cleanup();
-            resolve();
-          }
-        };
-        const onVis = () => {
-          if (document.visibilityState === 'hidden') {
-            sawBackground = true;
-          } else if (sawBackground) {
-            cleanup();
-            resolve();
-          }
-        };
-        document.addEventListener('visibilitychange', onVis);
-        window.addEventListener('pagehide', onBg);
-        window.addEventListener('blur', onBg);
-        window.addEventListener('focus', onFg);
-        window.addEventListener('pageshow', onFg);
+        } else if (sawBackground) {
+          trigger('dom-visibility');
+        }
+      };
+
+      const promise = new Promise((resolve, reject) => {
+        resolvePromise = resolve;
+        rejectPromise = reject;
       });
+
+      // Native mobile lifecycle resume (`tauri://resumed`, or `tauri://suspended` -> `tauri://focus`)
+      // resolves directly even if the web view never saw `visibilityState === 'hidden'`.
+      unsubNative = onAppResume((ev) => {
+        trigger(ev?.source || 'tauri://resumed');
+      });
+      const ready = ensureNativeResumeSubscription().catch(() => false);
+
+      document.addEventListener('visibilitychange', onVis);
+      window.addEventListener('pagehide', onBg);
+      window.addEventListener('blur', onBg);
+      window.addEventListener('focus', onFg);
+      window.addEventListener('pageshow', onFg);
+
+      // Leave room for up to three simulator retry cycles before timing out inside JS.
+      timer = window.setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        rejectPromise(new Error('Timed out waiting for app suspend/resume cycle'));
+      }, 180000);
+
+      return { ready, promise };
+    };
 
     const report = {
       ok: false,
@@ -521,6 +650,7 @@ export function createAppLink() {
       video_origin: '',
       ipc_isolation_ok: null,
       resume_ok: spec.verify_resume ? false : null,
+      resume_trigger: null,
       error: null,
     };
 
@@ -580,13 +710,14 @@ export function createAppLink() {
       report.ok = mediaPass;
 
       if (spec.verify_resume && mediaPass) {
-        // Register resume listeners before signaling the simulator harness so a fast
-        // background/foreground switch cannot race ahead of listener attachment.
-        const resumePromise = waitForAppResume();
+        // Register both native (`tauri://resumed`) and DOM resume listeners and await Tauri
+        // listener registration before signaling the simulator harness.
+        const resumeWaiter = createAppResumeWaiter();
+        await resumeWaiter.ready;
         // Emit intermediate report so the simulator harness knows initial playback succeeded and
         // can now background and foreground the app.
         await invoke('media_check_report', { report: { ...report, resume_ok: false } }).catch(() => {});
-        await resumePromise;
+        report.resume_trigger = await resumeWaiter.promise;
         // Mint immediately on resume: content_url probes and recovers the loopback listener
         // synchronously under its lock without relying on an arbitrary sleep.
         const [imgAfter, vidAfter] = await Promise.all([
@@ -1257,6 +1388,7 @@ export function createAppLink() {
     dismissIdentityChange,
     repairStore,
     invalidateSessions,
+    onAppResume,
     scanInvite,
     updateState,
     watchUpdates,
