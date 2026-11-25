@@ -367,6 +367,31 @@ mod tests {
     }
 
     #[test]
+    fn no_ssh_invocation_contains_control_options() {
+        for os in [RemoteOs::Unix, RemoteOs::Windows] {
+            for subcommand in [Subcommand::Rpc, Subcommand::Stream] {
+                for program in [None, Some("/opt/legion/legion")] {
+                    let remote_cmd = remote_command(os, subcommand, program).unwrap();
+                    let args = ssh_args("me@tower.example", 10, &remote_cmd).unwrap();
+                    // Check every option flag and `-o` value before the target and remote command.
+                    for arg in &args[..args.len() - 2] {
+                        let lower = arg.to_ascii_lowercase();
+                        assert!(
+                            !lower.contains("controlmaster")
+                                && !lower.contains("controlpath")
+                                && !lower.contains("controlpersist")
+                                && arg != "-M"
+                                && arg != "-S"
+                                && arg != "-O",
+                            "unexpected control option {arg:?} in {args:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn command_subcommand_derivation_swaps_trailing_rpc_for_stream() {
         let base = vec![
             "docker".to_owned(),

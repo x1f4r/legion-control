@@ -13,10 +13,12 @@ http-body.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 jiff.workspace = true
+legion-content.workspace = true
 legion-core.workspace = true
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
-serde.workspace = true
-serde_json.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+socket2 = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 # rt for the task tracker that lets a session wait for its cancelled calls to reach the audit log.
 tokio-util = { workspace = true, features = ["rt"] }

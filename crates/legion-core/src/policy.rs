@@ -4477,4 +4477,50 @@ device = "0123456789abcdef0123456789abcdef"
             "two principals claiming the same pairing id must be rejected"
         );
     }
+
+    #[test]
+    fn validate_platform_path_rules_for_content_special_filenames() {
+        // Filenames valid on both Unix and Windows.
+        for name in [
+            "100%.txt",
+            "a%41.txt",
+            "hash#1.txt",
+            "hello world.txt",
+            "café 日本.txt",
+        ] {
+            let unix = format!("/home/me/projects/special/{name}");
+            assert!(
+                validate_platform_path(unix.as_bytes(), Path::new(&unix), Platform::Unix).is_ok(),
+                "unix should accept {name}"
+            );
+            let win = format!(r"C:\Users\me\projects\special\{name}");
+            assert!(
+                validate_platform_path(win.as_bytes(), Path::new(&win), Platform::Windows).is_ok(),
+                "windows should accept {name}"
+            );
+        }
+
+        // Names accepted on Unix but refused with InvalidArgs on Windows.
+        for name in [
+            "trailing.",
+            "trailing ",
+            "CON.txt",
+            "NUL",
+            "file.txt:stream",
+        ] {
+            let unix = format!("/home/me/projects/special/{name}");
+            assert!(
+                validate_platform_path(unix.as_bytes(), Path::new(&unix), Platform::Unix).is_ok(),
+                "unix should accept {name}"
+            );
+            let win = format!(r"C:\Users\me\projects\special\{name}");
+            let err = validate_platform_path(win.as_bytes(), Path::new(&win), Platform::Windows)
+                .unwrap_err();
+            assert_eq!(
+                err.code,
+                ErrorCode::InvalidArgs,
+                "windows must reject {name} with InvalidArgs: {err:?}"
+            );
+        }
+    }
 }

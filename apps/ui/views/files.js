@@ -1837,10 +1837,17 @@ export function FilesView({
   const machines = snapshot?.machines || [];
   const technical = Boolean(settings?.technical);
   const localNode = nodeInfo?.node || machines.find((m) => m.reachable)?.name || null;
+  const activeMachine = route.viewer?.machine || route.machine || localNode;
+
+  const [contentSupportRev, setContentSupportRev] = useState(0);
+  useEffect(() => {
+    if (typeof link?.onContentSupportChange !== 'function') return undefined;
+    return link.onContentSupportChange(() => setContentSupportRev((n) => n + 1));
+  }, [link]);
 
   const caps = useMemo(
-    () => detectFileCapabilities({ tools, allowedSet, link }),
-    [tools, allowedSet, link],
+    () => detectFileCapabilities({ tools, allowedSet, link, machine: activeMachine }),
+    [tools, allowedSet, link, activeMachine, contentSupportRev],
   );
 
   const [favourites, setFavourites] = useState([]);
@@ -2524,9 +2531,15 @@ export function MachineFilesBrowser({
   thumbCache,
   onWakeMachine,
 }) {
+  const [contentSupportRev, setContentSupportRev] = useState(0);
+  useEffect(() => {
+    if (typeof link?.onContentSupportChange !== 'function') return undefined;
+    return link.onContentSupportChange(() => setContentSupportRev((n) => n + 1));
+  }, [link]);
+
   const caps = useMemo(
-    () => detectFileCapabilities({ tools, allowedSet, link }),
-    [tools, allowedSet, link],
+    () => detectFileCapabilities({ tools, allowedSet, link, machine: machine?.name || null }),
+    [tools, allowedSet, link, machine?.name, contentSupportRev],
   );
   const technical = Boolean(settings?.technical);
   const [sortPref, setSortPref] = useState({ sort: 'name', order: 'asc' });
