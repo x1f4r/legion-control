@@ -403,6 +403,7 @@ export function VideoPlayer({
   fullscreenSourceRef.current = fullscreenSource;
   const turnWatcherRef = useRef(null);
   const prevIsFullscreenRef = useRef(isFullscreen);
+  const prevFsInFlightRef = useRef(Boolean(fsState.inFlight));
   const activeSeekSeqRef = useRef(0);
   const resumedAppliedRef = useRef(false);
   const lastKeyNavRef = useRef(false);
@@ -596,6 +597,15 @@ export function VideoPlayer({
     }
     prevIsFullscreenRef.current = isFullscreen;
   }, [isFullscreen]);
+
+  // Re-evaluate pending orientation readings as soon as an in-flight full-screen transition finishes.
+  useEffect(() => {
+    const inFlight = Boolean(fsState.inFlight);
+    if (prevFsInFlightRef.current && !inFlight) {
+      turnWatcherRef.current?.notifySettled();
+    }
+    prevFsInFlightRef.current = inFlight;
+  }, [fsState.inFlight]);
 
   // Report iOS Safari `<video>` webkitendfullscreen back to the single controller.
   useEffect(() => {

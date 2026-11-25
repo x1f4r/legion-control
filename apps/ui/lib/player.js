@@ -1079,11 +1079,24 @@ export function createTurnWatcher({
   let guardUntil = 0;
   let settleTimer = null;
   let pendingOp = false;
+  let recheckAfterOp = false;
 
   function clearSettleTimer() {
     if (settleTimer != null) {
       clock.clearTimeout(settleTimer);
       settleTimer = null;
+    }
+  }
+
+  function afterOpSettled() {
+    if (disposed || pendingOp || isInFlight()) return;
+    if (recheckAfterOp) {
+      recheckAfterOp = false;
+      evaluate(false);
+      return;
+    }
+    if (settleTimer == null && !Boolean(isLandscape()) && isFullscreen() && getFullscreenSource() === 'rotation') {
+      evaluate(false);
     }
   }
 
@@ -1094,31 +1107,36 @@ export function createTurnWatcher({
       res = fn();
     } catch {
       pendingOp = false;
+      afterOpSettled();
       return;
     }
     if (res && typeof res.then === 'function') {
       res.then(
         () => {
           pendingOp = false;
+          afterOpSettled();
         },
         () => {
           pendingOp = false;
+          afterOpSettled();
         },
       );
     } else {
       pendingOp = false;
+      afterOpSettled();
     }
   }
 
   function evaluate(initial = false) {
     if (disposed) return;
+    if (pendingOp || isInFlight()) {
+      recheckAfterOp = true;
+      return;
+    }
     const landscape = Boolean(isLandscape());
     const turnedToLandscape = initial ? landscape : !wasLandscape && landscape;
     wasLandscape = landscape;
 
-    if (pendingOp || isInFlight()) {
-      return;
-    }
     if (!initial && clock.now() < guardUntil) {
       return;
     }
@@ -1152,14 +1170,20 @@ export function createTurnWatcher({
     scheduleEvaluation();
   }
 
+  function notifySettled() {
+    afterOpSettled();
+  }
+
   function noteLeave() {
     if (disposed) return;
     clearSettleTimer();
+    recheckAfterOp = false;
     guardUntil = clock.now() + leaveGuardMs;
   }
 
   function dispose() {
     disposed = true;
+    recheckAfterOp = false;
     clearSettleTimer();
   }
 
@@ -1167,6 +1191,7 @@ export function createTurnWatcher({
     start,
     onOrientationEvent,
     onResize,
+    notifySettled,
     noteLeave,
     dispose,
   };

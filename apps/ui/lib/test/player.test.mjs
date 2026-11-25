@@ -971,6 +971,81 @@ test('createTurnWatcher uses orientation events on injectable clock, guards post
   watcher.dispose();
 });
 
+test('createTurnWatcher re-reads orientation when an in-flight entry finishes after turning back to portrait', async () => {
+  const clock = createFakeClock();
+  let landscape = false;
+  let fullscreen = false;
+  let source = null;
+  let externalInFlight = false;
+  let enterCount = 0;
+  let leaveCount = 0;
+  let resolveEnter = null;
+
+  const watcher = createTurnWatcher({
+    clock,
+    hasOrientationEvent: true,
+    isLandscape: () => landscape,
+    isFullscreen: () => fullscreen,
+    getFullscreenSource: () => source,
+    isInFlight: () => externalInFlight,
+    onEnterRotation: () => {
+      enterCount += 1;
+      return new Promise((resolve) => {
+        resolveEnter = () => {
+          fullscreen = true;
+          source = 'rotation';
+          resolve();
+        };
+      });
+    },
+    onLeaveRotation: () => {
+      leaveCount += 1;
+      fullscreen = false;
+      source = null;
+    },
+  });
+
+  watcher.start();
+
+  // 1. Turn to landscape -> rotation entry starts and stays in flight.
+  landscape = true;
+  watcher.onOrientationEvent();
+  clock.advance(TURN_SETTLE_MS);
+  assert.equal(enterCount, 1);
+  assert.equal(leaveCount, 0);
+
+  // 2. Turn back to portrait BEFORE the entry resolves -> reading arrives while pendingOp is true.
+  landscape = false;
+  watcher.onOrientationEvent();
+  clock.advance(TURN_SETTLE_MS);
+  assert.equal(leaveCount, 0);
+
+  // 3. Entry finishes -> watcher must immediately re-read orientation (portrait) and leave rotation fullscreen!
+  resolveEnter();
+  await Promise.resolve();
+  assert.equal(leaveCount, 1);
+  assert.equal(fullscreen, false);
+  assert.equal(source, null);
+
+  // 4. External in-flight op blocking an orientation reading -> re-evaluates once notifySettled() fires.
+  clock.advance(TURN_LEAVE_GUARD_MS);
+  externalInFlight = true;
+  landscape = true;
+  watcher.onOrientationEvent();
+  clock.advance(TURN_SETTLE_MS);
+  assert.equal(enterCount, 1);
+
+  externalInFlight = false;
+  watcher.notifySettled();
+  assert.equal(enterCount, 2);
+  resolveEnter();
+  await Promise.resolve();
+  assert.equal(fullscreen, true);
+  assert.equal(leaveCount, 1);
+
+  watcher.dispose();
+});
+
 test('iOS/iPadOS bridge attaches at WKWebView creation, fixes requestGeometryUpdate, resets on load/termination, and hides button when absent', async () => {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../..');
   const swiftSrc = fs.readFileSync(
