@@ -23,10 +23,17 @@ class UpdateInstallReceiver : BroadcastReceiver() {
     val background = intent.getBooleanExtra(AppUpdaterPlugin.EXTRA_BACKGROUND, false) ||
       AppUpdaterPlugin.isBackgroundSession(sessionId)
 
-    Log.i(
-      TAG,
-      "PackageInstaller callback: session=$sessionId status=$status background=$background message=$message",
-    )
+    if (BuildConfig.DEBUG) {
+      Log.i(
+        TAG,
+        "PackageInstaller callback: session=$sessionId status=$status background=$background message=$message",
+      )
+    } else {
+      Log.i(
+        TAG,
+        "PackageInstaller callback: session=$sessionId status=$status background=$background",
+      )
+    }
 
     when (status) {
       PackageInstaller.STATUS_PENDING_USER_ACTION -> {
@@ -55,7 +62,11 @@ class UpdateInstallReceiver : BroadcastReceiver() {
           try {
             context.startActivity(confirmIntent)
           } catch (e: Exception) {
-            Log.e(TAG, "Could not launch PackageInstaller confirmation activity", e)
+            if (BuildConfig.DEBUG) {
+              Log.e(TAG, "Could not launch PackageInstaller confirmation activity", e)
+            } else {
+              Log.e(TAG, "Could not launch PackageInstaller confirmation activity (${e.javaClass.simpleName})")
+            }
             AppUpdaterPlugin.onInstallFinished(
               sessionId = sessionId,
               status = "failed",

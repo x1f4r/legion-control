@@ -1974,27 +1974,39 @@ export function FilesView({
   );
 
   const startDownload = useCallback(
-    (machine, items) => {
+    async (machine, items) => {
       if (!caps.hasDownload || typeof link?.download !== 'function') return;
       const list = Array.isArray(items) ? items.filter((i) => i.kind !== 'dir') : [items];
       if (list.length === 0) return;
-      for (const item of list) {
-        link
-          .download({
-            machine,
-            path: item.path,
-            name: item.name || baseFileName(item.path),
-            size: item.size,
-            mime: item.mime,
-          })
-          .catch(() => {});
-      }
+      let firstError = null;
+      const results = await Promise.all(
+        list.map((item) =>
+          link
+            .download({
+              machine,
+              path: item.path,
+              name: item.name || baseFileName(item.path),
+              size: item.size,
+              mime: item.mime,
+            })
+            .catch((err) => {
+              if (!firstError) firstError = err;
+              return null;
+            }),
+        ),
+      );
+      const started = results.filter(Boolean);
+      const transferIds = started.map((r) => r?.id).filter(Boolean);
       if (onToast) {
+        if (started.length === 0 && firstError) {
+          onToast(firstError?.message || 'Could not start download.', { tone: 'error' });
+          return;
+        }
         onToast(
           list.length === 1
-            ? `Downloading ${list[0].name || baseFileName(list[0].path)} — watch progress in Activity.`
-            : `Downloading ${list.length} items — watch progress in Activity.`,
-          { actionLabel: 'Activity', actionHref: '#/activity' },
+            ? `Downloading ${list[0].name || baseFileName(list[0].path)}. Watch progress in Activity.`
+            : `Downloading ${list.length} items. Watch progress in Activity.`,
+          { actionLabel: 'Activity', actionHref: '#/activity', transferIds },
         );
       }
     },
@@ -2009,14 +2021,25 @@ export function FilesView({
         .then((res) => {
           if (!res) return;
           setReloadToken((n) => n + 1);
+          const transferIds =
+            Array.isArray(res.ids) && res.ids.length > 0
+              ? res.ids.filter(Boolean)
+              : res.id
+                ? [res.id]
+                : [];
           if (onToast) {
-            onToast('Uploading to ' + machine + ' — watch progress in Activity.', {
+            onToast(`Uploading to ${machine}. Watch progress in Activity.`, {
               actionLabel: 'Activity',
               actionHref: '#/activity',
+              transferIds,
             });
           }
         })
-        .catch(() => {});
+        .catch((err) => {
+          if (onToast && err?.code !== 'cancelled') {
+            onToast(err?.message || `Could not upload to ${machine}.`, { tone: 'error' });
+          }
+        });
     },
     [caps.hasUpload, link, onToast],
   );
@@ -2372,7 +2395,15 @@ export function FilesView({
                 if (onToast) {
                   onToast(
                     info.message,
-                    info.local ? {} : { actionLabel: 'Activity', actionHref: '#/activity' },
+                    info.local
+                      ? {}
+                      : {
+                          actionLabel: 'Activity',
+                          actionHref: '#/activity',
+                          transferIds: info.transferIds,
+                          transferIdsPromise: info.transferIdsPromise,
+                          transferJobsPromise: info.transferJobsPromise,
+                        },
                   );
                 }
               }}

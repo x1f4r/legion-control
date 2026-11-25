@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Expose only files explicitly staged for "Open in another app". Never expose app dataDir,
+         pairing keys, store files, or in-progress transfer parts. -->
+    <cache-path
+        name="open_externally"
+        path="open-externally/" />
+</paths>
