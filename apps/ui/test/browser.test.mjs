@@ -54,11 +54,18 @@ function runLegion(args, legionHome, userHome) {
   return execFileSync(LEGION_BIN, args, { env, encoding: 'utf8' });
 }
 
-async function startServer(legionHome, userHome) {
-  const env = { ...process.env, LEGION_HOME: legionHome, HOME: userHome, USERPROFILE: userHome };
+async function startServer(legionHome, userHome, options = {}) {
+  const { listen = '127.0.0.1:0', envExtra = {} } = options;
+  const env = {
+    ...process.env,
+    ...envExtra,
+    LEGION_HOME: legionHome,
+    HOME: userHome,
+    USERPROFILE: userHome,
+  };
   delete env.XDG_CONFIG_HOME;
   delete env.XDG_STATE_HOME;
-  const child = spawn(LEGION_BIN, ['serve', '--listen', '127.0.0.1:0'], {
+  const child = spawn(LEGION_BIN, ['serve', '--listen', listen], {
     env,
     stdio: ['ignore', 'ignore', 'pipe'],
   });
@@ -1746,6 +1753,508 @@ test('real Files tab opens pictures and plays/seeks video on local and remote no
     assert.deepEqual(unexpectedConsole, [], `Unexpected console/CSP errors: ${unexpectedConsole.join('\n')}`);
     assert.deepEqual(pageErrors, [], `Unexpected page errors: ${pageErrors.join('\n')}`);
 
+    await ctx.close();
+  } finally {
+    await browser.close();
+    await server.stop();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function ebmlReadVint(buf, off, keepMarker) {
+  const first = buf[off];
+  let len = 1;
+  while (len <= 8 && !(first & (0x80 >> (len - 1)))) len += 1;
+  let val = keepMarker ? first : first & ((0x80 >> (len - 1)) - 1);
+  for (let i = 1; i < len; i += 1) val = val * 256 + buf[off + i];
+  return { val, len };
+}
+
+function ebmlSize8(n) {
+  const out = Buffer.alloc(8);
+  out.writeBigUInt64BE(BigInt(n) | 0x0100000000000000n);
+  return out;
+}
+
+function ebmlUint(n) {
+  if (n === 0) return Buffer.from([0]);
+  const bytes = [];
+  let v = BigInt(n);
+  while (v > 0n) {
+    bytes.unshift(Number(v & 0xffn));
+    v >>= 8n;
+  }
+  return Buffer.from(bytes);
+}
+
+function ebmlElem(idBytes, payload) {
+  const id = Buffer.from(idBytes);
+  const len = payload.length;
+  let sizeBuf;
+  if (len < 0x7f) {
+    sizeBuf = Buffer.from([0x80 | len]);
+  } else if (len < 0x3fff) {
+    sizeBuf = Buffer.from([0x40 | (len >> 8), len & 0xff]);
+  } else {
+    sizeBuf = ebmlSize8(len);
+  }
+  return Buffer.concat([id, sizeBuf, payload]);
+}
+
+// Re-muxes `sample.webm` into a 60-second seekable WebM with 1 MiB Matroska Void gaps between
+// 1-second clusters and fresh SeekHead/Cues (~60 MiB total). Chromium buffers only the first ~11s
+// and must send real HTTP Range GETs for later clusters, exercising true 404 recovery on ticket
+// expiry and door restart.
+function buildLongWebm(sampleBuf, repeatCount = 20, voidBytesPerGap = 1024 * 1024) {
+  const ebmlId = ebmlReadVint(sampleBuf, 0, true);
+  const ebmlSz = ebmlReadVint(sampleBuf, ebmlId.len, false);
+  const ebmlEnd = ebmlId.len + ebmlSz.len + ebmlSz.val;
+  const ebmlHeader = sampleBuf.subarray(0, ebmlEnd);
+
+  const segId = ebmlReadVint(sampleBuf, ebmlEnd, true);
+  const segSz = ebmlReadVint(sampleBuf, ebmlEnd + segId.len, false);
+  let pos = ebmlEnd + segId.len + segSz.len;
+  const segEnd = Math.min(sampleBuf.length, pos + segSz.val);
+
+  let tracks = null;
+  const baseClusters = [];
+
+  while (pos < segEnd) {
+    const id = ebmlReadVint(sampleBuf, pos, true);
+    const sz = ebmlReadVint(sampleBuf, pos + id.len, false);
+    const elemEnd = pos + id.len + sz.len + sz.val;
+    const raw = sampleBuf.subarray(pos, elemEnd);
+    if (id.val === 0x1654ae6b) tracks = Buffer.from(raw);
+    else if (id.val === 0x1f43b675) {
+      const inner = sampleBuf.subarray(pos + id.len + sz.len, elemEnd);
+      const tcId = ebmlReadVint(inner, 0, true);
+      const tcSz = ebmlReadVint(inner, tcId.len, false);
+      baseClusters.push(inner.subarray(tcId.len + tcSz.len + tcSz.val));
+    }
+    pos = elemEnd;
+  }
+  assert.ok(tracks && baseClusters.length >= 2, 'expected Tracks and >=2 Clusters in sample.webm');
+
+  const totalSec = baseClusters.length * repeatCount;
+  const durBuf = Buffer.alloc(8);
+  durBuf.writeDoubleBE(totalSec * 1000);
+  const info = ebmlElem(
+    [0x15, 0x49, 0xa9, 0x66],
+    Buffer.concat([
+      ebmlElem([0x2a, 0xd7, 0xb1], ebmlUint(1_000_000)),
+      ebmlElem([0x44, 0x89], durBuf),
+    ]),
+  );
+
+  const voidElem = Buffer.concat([
+    Buffer.from([0xec]),
+    ebmlSize8(voidBytesPerGap),
+    Buffer.alloc(voidBytesPerGap),
+  ]);
+
+  const makeSeekEntry = (targetIdBytes, offset) =>
+    ebmlElem(
+      [0x4d, 0xbb],
+      Buffer.concat([
+        ebmlElem([0x53, 0xab], Buffer.from(targetIdBytes)),
+        ebmlElem([0x53, 0xac], ebmlUint(offset)),
+      ]),
+    );
+
+  // Reserve a fixed-size SeekHead + Void header block (128 bytes) so offsets stay deterministic.
+  const SEEK_BLOCK_BYTES = 128;
+  const infoOff = SEEK_BLOCK_BYTES;
+  const tracksOff = infoOff + info.length;
+  let cursor = tracksOff + tracks.length;
+
+  const clusterPositions = [];
+  const bodyParts = [];
+  for (let i = 0; i < totalSec; i += 1) {
+    const timecode = i * 1000;
+    const rest = baseClusters[i % baseClusters.length];
+    const cluster = ebmlElem(
+      [0x1f, 0x43, 0xb6, 0x75],
+      Buffer.concat([ebmlElem([0xe7], ebmlUint(timecode)), rest]),
+    );
+    clusterPositions.push({ timecode, offset: cursor });
+    bodyParts.push(cluster);
+    cursor += cluster.length;
+    if (i + 1 < totalSec) {
+      bodyParts.push(voidElem);
+      cursor += voidElem.length;
+    }
+  }
+
+  const cuesOff = cursor;
+  const cuePoints = clusterPositions.map(({ timecode, offset }) =>
+    ebmlElem(
+      [0xbb],
+      Buffer.concat([
+        ebmlElem([0xb3], ebmlUint(timecode)),
+        ebmlElem(
+          [0xb7],
+          Buffer.concat([
+            ebmlElem([0xf7], Buffer.from([1])),
+            ebmlElem([0xf1], ebmlUint(offset)),
+          ]),
+        ),
+      ]),
+    ),
+  );
+  const cues = ebmlElem([0x1c, 0x53, 0xbb, 0x6b], Buffer.concat(cuePoints));
+  cursor += cues.length;
+
+  const seekHead = ebmlElem(
+    [0x11, 0x4d, 0x9b, 0x74],
+    Buffer.concat([
+      makeSeekEntry([0x15, 0x49, 0xa9, 0x66], infoOff),
+      makeSeekEntry([0x16, 0x54, 0xae, 0x6b], tracksOff),
+      makeSeekEntry([0x1c, 0x53, 0xbb, 0x6b], cuesOff),
+    ]),
+  );
+  assert.ok(seekHead.length + 2 <= SEEK_BLOCK_BYTES, `SeekHead too large: ${seekHead.length}`);
+  const padLen = SEEK_BLOCK_BYTES - seekHead.length - 2;
+  const seekPad = Buffer.concat([Buffer.from([0xec, 0x80 | padLen]), Buffer.alloc(padLen)]);
+
+  const segHeader = Buffer.concat([Buffer.from([0x18, 0x53, 0x80, 0x67]), ebmlSize8(cursor)]);
+  return Buffer.concat([ebmlHeader, segHeader, seekHead, seekPad, info, tracks, ...bodyParts, cues]);
+}
+
+test('Files viewer recovers expired and door-restarted video playback, reports honest errors, and switches cleanly to a picture', async () => {
+  assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
+  const sampleWebm = fs.readFileSync(path.join(TEST_DIR, 'fixtures', 'sample.webm'));
+  const samplePng = fs.readFileSync(path.join(REPO_ROOT, 'apps', 'ui', 'icons', 'icon-512.png'));
+  const paddedWebm = buildLongWebm(sampleWebm, 20, 1024 * 1024);
+
+  const root = makeWorkRoot();
+  const fleet = setupFleet(root);
+  const mediaDir = path.join(fleet.towerUser, 'media');
+  fs.mkdirSync(mediaDir, { recursive: true });
+  fs.writeFileSync(path.join(mediaDir, 'padded.webm'), paddedWebm);
+  fs.writeFileSync(path.join(mediaDir, 'sample.webm'), sampleWebm);
+  fs.writeFileSync(path.join(mediaDir, 'icon.png'), samplePng);
+  fs.writeFileSync(path.join(mediaDir, 'broken.webm'), Buffer.alloc(4096, 0x5a));
+
+  let server = await startServer(fleet.towerHome, fleet.towerUser, {
+    envExtra: {
+      LEGION_CONTENT_TICKET_SLIDING_MS: '1200',
+      LEGION_CONTENT_TICKET_ABSOLUTE_MS: '3000',
+    },
+  });
+  const browser = await chromium.launch({
+    executablePath: findBrowser(),
+    headless: true,
+    args: ['--no-sandbox', '--disable-gpu', '--autoplay-policy=no-user-gesture-required'],
+  });
+
+  try {
+    const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, colorScheme: 'dark' });
+    const page = await ctx.newPage();
+    const pageErrors = [];
+    page.on('pageerror', (err) => pageErrors.push(String(err)));
+
+    const contentPosts = [];
+    const contentGetStatuses = [];
+    page.on('request', (req) => {
+      if (req.method() === 'POST' && new URL(req.url()).pathname === '/v1/content') {
+        try {
+          contentPosts.push(JSON.parse(req.postData() || '{}'));
+        } catch {
+          contentPosts.push({});
+        }
+      }
+    });
+    page.on('response', (res) => {
+      const p = new URL(res.url()).pathname;
+      if (res.request().method() === 'GET' && p.startsWith('/v1/content/')) {
+        contentGetStatuses.push({ path: p, status: res.status() });
+      }
+    });
+
+    await page.goto(`${server.url}/#token=${encodeURIComponent(fleet.token)}`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await page.getByText('2 are on').waitFor({ timeout: 15_000 });
+
+    const viewerHashFor = (fileName) =>
+      `#/files/tower/~/media?view=${encodeURIComponent(`~/media/${fileName}`)}`;
+    const paddedHash = `${server.url}/${viewerHashFor('padded.webm')}`;
+
+    // Helper: open padded.webm, play until >=0.4s, pause, and record recovery timestamps.
+    async function openPlayAndPause() {
+      await page.goto(paddedHash, { waitUntil: 'domcontentloaded' });
+      const video = page.locator('.viewer video.viewer-video');
+      await video.waitFor({ timeout: 10_000 });
+      const state = await video.evaluate(async (el) => {
+        el.muted = true;
+        await new Promise((resolve, reject) => {
+          if (el.readyState >= 2) return resolve();
+          const t = setTimeout(() => reject(new Error('timed out waiting for loadeddata')), 10_000);
+          el.addEventListener('loadeddata', () => { clearTimeout(t); resolve(); }, { once: true });
+          el.addEventListener('error', () => { clearTimeout(t); reject(new Error(`initial video error ${el.error?.code}`)); }, { once: true });
+        });
+        await el.play();
+        await new Promise((resolve, reject) => {
+          const t = setTimeout(() => reject(new Error(`video did not advance past 0.4s (at ${el.currentTime})`)), 10_000);
+          const check = () => {
+            if (el.currentTime >= 0.4) {
+              clearTimeout(t);
+              el.removeEventListener('timeupdate', check);
+              resolve();
+            }
+          };
+          el.addEventListener('timeupdate', check);
+          check();
+        });
+        el.pause();
+        window.__recoveryAudit = { timeAtError: null, timeAtSwap: null };
+        el.addEventListener(
+          'error',
+          () => {
+            window.__recoveryAudit.timeAtError = el.currentTime;
+          },
+          { once: true },
+        );
+        return {
+          src: el.getAttribute('src') || '',
+          pausedAt: el.currentTime,
+          bufferedEnd: el.buffered.length > 0 ? el.buffered.end(0) : 0,
+        };
+      });
+      assert.ok(state.src.startsWith('/v1/content/'), `expected /v1/content src, got ${state.src}`);
+      assert.ok(state.pausedAt >= 0.4 && state.pausedAt < 5.0, `unexpected pausedAt: ${state.pausedAt}`);
+      assert.ok(state.bufferedEnd < 30, `expected partial buffering on 60s video, got ${state.bufferedEnd}s`);
+      return state;
+    }
+
+    // Helper: resume paused video (at 8x so it quickly reaches the unbuffered boundary and hits
+    // the 404 on the stale ticket), then verify silent single-shot recovery and continued playback
+    // from the exact position where playback stopped.
+    async function playAndAssertSilentRecovery(initialState, label) {
+      contentGetStatuses.length = 0;
+      const postsBefore = contentPosts.length;
+      await page.locator('.viewer video.viewer-video').evaluate((el) => {
+        el.playbackRate = 8;
+        el.play().catch(() => {});
+      });
+
+      // Wait until src swaps to a fresh ticket and playback is actively continuing with no error.
+      await page.waitForFunction(
+        ({ oldSrc }) => {
+          const v = document.querySelector('.viewer video.viewer-video');
+          if (!v) return false;
+          const src = v.getAttribute('src') || '';
+          const swapped = src !== oldSrc && src.startsWith('/v1/content/');
+          if (swapped && window.__recoveryAudit && window.__recoveryAudit.timeAtSwap === null && v.currentTime > 0.5) {
+            window.__recoveryAudit.timeAtSwap = v.currentTime;
+          }
+          return swapped && !v.paused && v.error === null && v.readyState >= 2 && v.currentTime > 1.0;
+        },
+        { oldSrc: initialState.src },
+        { timeout: 15_000 },
+      );
+
+      const tAfterSwap = await page.locator('.viewer video.viewer-video').evaluate((el) => el.currentTime);
+      await page.waitForFunction(
+        (minTime) => {
+          const v = document.querySelector('.viewer video.viewer-video');
+          return Boolean(v && !v.paused && v.error === null && v.currentTime >= minTime);
+        },
+        tAfterSwap + 0.5,
+        { timeout: 10_000 },
+      );
+      const audit = await page.evaluate(() => window.__recoveryAudit);
+      assert.equal(await page.locator('.viewer .said').count(), 0, `${label}: recovery must show no error UI`);
+      assert.ok(
+        contentGetStatuses.some((r) => r.path === initialState.src && r.status === 404),
+        `${label}: expected player to hit 404 on stale ticket ${initialState.src}, saw ${JSON.stringify(contentGetStatuses)}`,
+      );
+      assert.equal(
+        contentPosts.length - postsBefore,
+        1,
+        `${label}: recovery must mint exactly one fresh address`,
+      );
+      if (audit?.timeAtError > 1.0 && audit?.timeAtSwap != null) {
+        assert.ok(
+          Math.abs(audit.timeAtSwap - audit.timeAtError) <= 1.5,
+          `${label}: expected playback to resume near ${audit.timeAtError}s, got ${audit.timeAtSwap}s`,
+        );
+      }
+      await page.locator('.viewer video.viewer-video').evaluate((el) => el.pause());
+    }
+
+    // ── Part A: Pause video, let short-lived ticket expire, press play -> silent recovery ─────
+    const openedAt = Date.now();
+    const expState = await openPlayAndPause();
+    // Wait past the 3.0s absolute ticket lifetime so expiry is deterministic even if Chromium
+    // holds a paused Range connection open.
+    const remainingMs = 3300 - (Date.now() - openedAt);
+    if (remainingMs > 0) await page.waitForTimeout(remainingMs);
+    const headStatus = await page.evaluate(async (url) => {
+      const res = await fetch(url, { method: 'HEAD' });
+      return res.status;
+    }, expState.src);
+    assert.equal(headStatus, 404, 'expected initial ticket to be expired (404) before pressing Play');
+    await playAndAssertSilentRecovery(expState, 'expired ticket');
+
+    // Close the viewer and restart server with normal 15-minute TTL on a fixed port for Part B.
+    await page.locator('.viewer-top button[aria-label="Close"]').click();
+    await page.locator('.viewer').waitFor({ state: 'hidden' });
+    const fixedPort = Number(new URL(server.url).port);
+    await server.stop();
+    server = await startServer(fleet.towerHome, fleet.towerUser, {
+      listen: `127.0.0.1:${fixedPort}`,
+    });
+
+    // ── Part B: Restart the door during a pause, press play -> silent recovery ────────────────
+    const restartState = await openPlayAndPause();
+    await server.stop();
+    server = await startServer(fleet.towerHome, fleet.towerUser, {
+      listen: `127.0.0.1:${fixedPort}`,
+    });
+    await playAndAssertSilentRecovery(restartState, 'door restart');
+
+    // ── Part C1: Corrupt video reachable with HTTP 200 -> 1 recovery, no loop, honest decode msg
+    const postsBeforeBroken = contentPosts.length;
+    const brokenHash = `${server.url}/${viewerHashFor('broken.webm')}`;
+    await page.goto(brokenHash, { waitUntil: 'domcontentloaded' });
+    await page.locator('.viewer .said', { hasText: "This browser can't play this kind of video" }).waitFor({ timeout: 10_000 });
+    await page.waitForTimeout(300);
+    assert.equal(
+      contentPosts.length - postsBeforeBroken,
+      2,
+      'corrupt video must mint initial address plus at most one fresh recovery address (never loop)',
+    );
+
+    // ── Part C2: Deleted/unreachable file -> honest "Couldn't reach this file" + Try again ───
+    const vanishedPath = path.join(mediaDir, 'vanished.webm');
+    fs.writeFileSync(vanishedPath, paddedWebm);
+    const vanishedHash = `${server.url}/${viewerHashFor('vanished.webm')}`;
+    await page.goto(vanishedHash, { waitUntil: 'domcontentloaded' });
+    await page.locator('.viewer video.viewer-video').waitFor({ timeout: 10_000 });
+    await page.locator('.viewer video.viewer-video').evaluate(async (el) => {
+      el.muted = true;
+      await new Promise((resolve) => {
+        if (el.readyState >= 2) return resolve();
+        el.addEventListener('loadeddata', resolve, { once: true });
+      });
+      await el.play();
+      await new Promise((resolve) => {
+        const check = () => {
+          if (el.currentTime >= 0.4) {
+            el.removeEventListener('timeupdate', check);
+            resolve();
+          }
+        };
+        el.addEventListener('timeupdate', check);
+        check();
+      });
+      el.pause();
+    });
+
+    // Remove the file and restart the door so both the old ticket and fresh mint fail.
+    fs.unlinkSync(vanishedPath);
+    await server.stop();
+    server = await startServer(fleet.towerHome, fleet.towerUser, {
+      listen: `127.0.0.1:${fixedPort}`,
+    });
+
+    const postsBeforeVanished = contentPosts.length;
+    await page.locator('.viewer video.viewer-video').evaluate((el) => {
+      el.playbackRate = 8;
+      el.play().catch(() => {});
+    });
+    await page.locator('.viewer .said', { hasText: "Couldn't reach this file" }).waitFor({ timeout: 15_000 });
+    assert.equal(
+      await page.locator('.viewer .said', { hasText: "can't play this kind of video" }).count(),
+      0,
+      'unreachable/missing file must not blame video codec',
+    );
+    await page.locator('.viewer').getByRole('button', { name: 'Try again' }).waitFor();
+    assert.equal(
+      contentPosts.length - postsBeforeVanished,
+      1,
+      'unreachable file recovery must attempt at most one fresh address',
+    );
+
+    // Restore file on disk and click Try again -> video loads cleanly.
+    fs.writeFileSync(vanishedPath, paddedWebm);
+    await page.locator('.viewer').getByRole('button', { name: 'Try again' }).click();
+    await page.locator('.viewer video.viewer-video').waitFor({ timeout: 10_000 });
+    await page.waitForFunction(
+      () => {
+        const v = document.querySelector('.viewer video.viewer-video');
+        return Boolean(v && v.readyState >= 1 && v.videoWidth === 64 && v.error === null);
+      },
+      null,
+      { timeout: 10_000 },
+    );
+
+    // ── Part D: Switch mounted viewer from video to picture via hash change ──────────────────
+    const videoHash = `${server.url}/${viewerHashFor('sample.webm')}`;
+    const picHash = viewerHashFor('icon.png');
+    await page.goto(videoHash, { waitUntil: 'domcontentloaded' });
+    await page.locator('.viewer video.viewer-video').waitFor({ timeout: 10_000 });
+    await page.waitForFunction(
+      () => {
+        const v = document.querySelector('.viewer video.viewer-video');
+        return Boolean(v && v.readyState >= 1 && v.videoWidth === 64);
+      },
+      null,
+      { timeout: 10_000 },
+    );
+
+    // Watch every <img> src rendered inside .viewer during the hash switch.
+    await page.evaluate(() => {
+      window.__seenImgSrcs = [];
+      const record = (node) => {
+        if (node && node.nodeType === 1) {
+          if (node.tagName === 'IMG' && node.getAttribute('src')) {
+            window.__seenImgSrcs.push(node.getAttribute('src'));
+          }
+          if (node.querySelectorAll) {
+            for (const img of node.querySelectorAll('img')) {
+              if (img.getAttribute('src')) window.__seenImgSrcs.push(img.getAttribute('src'));
+            }
+          }
+        }
+      };
+      const viewer = document.querySelector('.viewer');
+      const obs = new MutationObserver((mutations) => {
+        for (const m of mutations) {
+          if (m.type === 'attributes' && m.target.tagName === 'IMG') {
+            record(m.target);
+          }
+          for (const n of m.addedNodes) record(n);
+        }
+      });
+      if (viewer) obs.observe(viewer, { subtree: true, childList: true, attributes: true, attributeFilter: ['src'] });
+      window.__imgObs = obs;
+    });
+
+    await page.evaluate((nextHash) => {
+      window.location.hash = nextHash;
+    }, picHash);
+
+    await page.waitForFunction(
+      () => {
+        const img = document.querySelector('.viewer img.viewer-img');
+        return Boolean(img && img.complete && img.naturalWidth === 512 && img.naturalHeight === 512);
+      },
+      null,
+      { timeout: 10_000 },
+    );
+    const seenImgSrcs = await page.evaluate(() => {
+      window.__imgObs?.disconnect();
+      return window.__seenImgSrcs || [];
+    });
+    assert.equal(await page.locator('.viewer .said').count(), 0, 'switching from video to picture must show no error');
+    assert.ok(
+      seenImgSrcs.every((s) => !s.endsWith('/sample.webm')),
+      `<img> must never receive the previous video address even for one frame: ${JSON.stringify(seenImgSrcs)}`,
+    );
+
+    assert.deepEqual(pageErrors, [], `Unexpected page errors: ${pageErrors.join('\n')}`);
     await ctx.close();
   } finally {
     await browser.close();

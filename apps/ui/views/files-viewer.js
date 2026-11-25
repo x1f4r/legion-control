@@ -15,6 +15,21 @@ import { formatBytes, formatRelativeTime } from '../lib/format.js';
 import { CopyButton, Notice, Sheet } from './common.js';
 
 const TEXT_CHUNK_BYTES = 131072; // 128 KiB
+const MEDIA_RECOVERY_WINDOW_MS = 10_000;
+
+function isLocalMediaUrl(url) {
+  return typeof url === 'string' && (url.startsWith('data:') || url.startsWith('blob:'));
+}
+
+function classifyMintError(err) {
+  if (err?.code === 'unsupported') {
+    return { code: 'unsupported', message: err.message || '' };
+  }
+  if (err?.code === 'denied') {
+    return { code: 'denied', message: err.message || "You're not allowed to open this file." };
+  }
+  return { code: 'unreachable', message: err?.message || '' };
+}
 
 function safeStorage() {
   try {
@@ -60,20 +75,72 @@ export function FilesViewer({
   const effectiveEntry = entry || { name, path, kind: 'file' };
   const category = entryCategory(effectiveEntry);
   const mime = effectiveEntry.mime || mimeFromName(name);
+  const fileKey = `${machine || ''}\0${path || ''}`;
+  const hasContentUrl = Boolean(caps?.hasContentUrl);
 
   const [chromeHidden, setChromeHidden] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
   const [wrapLines, setWrapLines] = useState(() => readTextWrapPreference(safeStorage()));
-  const [mediaUrl, setMediaUrl] = useState(null);
-  const [mediaLoading, setMediaLoading] = useState(false);
-  const [mediaError, setMediaError] = useState(null);
-  const [textState, setTextState] = useState({ content: '', size: 0, loaded: 0, eof: true, binary: false, loading: false, error: null });
-  const [hashInfo, setHashInfo] = useState(null);
+  const [retryNonce, setRetryNonce] = useState(0);
+  const [mediaState, setMediaState] = useState(() => ({
+    key: fileKey,
+    url: null,
+    loading: false,
+    error: null,
+    isFreshAddress: false,
+  }));
+  const [textState, setTextState] = useState(() => ({
+    key: fileKey,
+    content: '',
+    size: 0,
+    loaded: 0,
+    eof: true,
+    binary: false,
+    loading: false,
+    error: null,
+  }));
+  const [hashInfo, setHashInfo] = useState(() => ({ key: fileKey, value: null }));
+
+  // Key media, text, and hash state synchronously to the active file so switching a mounted
+  // viewer (for example from a video to a picture) never renders a previous file's address or
+  // error for even one frame.
+  const activeMedia =
+    mediaState.key === fileKey
+      ? mediaState
+      : { key: fileKey, url: null, loading: false, error: null, isFreshAddress: false };
+  const mediaUrl = activeMedia.url;
+  const mediaLoading = activeMedia.loading;
+  const mediaError = activeMedia.error;
+
+  const activeText =
+    textState.key === fileKey
+      ? textState
+      : {
+          key: fileKey,
+          content: '',
+          size: 0,
+          loaded: 0,
+          eof: true,
+          binary: false,
+          loading: false,
+          error: null,
+        };
+  const activeHash = hashInfo.key === fileKey ? hashInfo.value : null;
 
   const imgRef = useRef(null);
   const videoRef = useRef(null);
   const audioRef = useRef(null);
   const abortRef = useRef(null);
+  const activeFileKeyRef = useRef(fileKey);
+  activeFileKeyRef.current = fileKey;
+  const activeMediaUrlRef = useRef(mediaUrl);
+  activeMediaUrlRef.current = mediaUrl;
+  const mediaStateRef = useRef(activeMedia);
+  mediaStateRef.current = activeMedia;
+  const playbackRef = useRef({ key: fileKey, time: 0, wantPlay: false });
+  const pendingResumeRef = useRef(null);
+  const recoveryRef = useRef({ key: fileKey, lastAttemptAt: 0, inFlight: false });
+  const prevHasContentRef = useRef(hasContentUrl);
 
   // Gesture state for picture zoom/pan/swipe.
   const gestureRef = useRef({
@@ -139,30 +206,79 @@ export function FilesViewer({
     if (onClose) onClose();
   }
 
+  // If content support flips from unsupported to supported while this viewer is sitting on an
+  // unsupported fallback (for example after capabilities refresh), reload automatically.
+  useEffect(() => {
+    const prev = prevHasContentRef.current;
+    prevHasContentRef.current = hasContentUrl;
+    if (
+      !prev &&
+      hasContentUrl &&
+      mediaStateRef.current.key === fileKey &&
+      mediaStateRef.current.error?.code === 'unsupported'
+    ) {
+      setRetryNonce((n) => n + 1);
+    }
+  }, [hasContentUrl, fileKey]);
+
   // Load media URL or text content whenever machine/path changes; abort immediately on close/switch.
   useEffect(() => {
     if (abortRef.current) abortRef.current.abort();
     const ctrl = new AbortController();
     abortRef.current = ctrl;
+    const targetKey = fileKey;
 
     resetZoom();
-    setMediaUrl(null);
-    setMediaError(null);
-    setMediaLoading(false);
-    setHashInfo(null);
-    setTextState({ content: '', size: 0, loaded: 0, eof: true, binary: false, loading: false, error: null });
+    playbackRef.current = { key: targetKey, time: 0, wantPlay: false };
+    pendingResumeRef.current = null;
+    recoveryRef.current = { key: targetKey, lastAttemptAt: 0, inFlight: false };
+    setMediaState({ key: targetKey, url: null, loading: false, error: null, isFreshAddress: false });
+    setHashInfo({ key: targetKey, value: null });
+    setTextState({
+      key: targetKey,
+      content: '',
+      size: 0,
+      loaded: 0,
+      eof: true,
+      binary: false,
+      loading: false,
+      error: null,
+    });
 
     if (category === 'text') {
-      setTextState((prev) => ({ ...prev, loading: true, error: null }));
+      setTextState((prev) =>
+        prev.key === targetKey
+          ? { ...prev, loading: true, error: null }
+          : {
+              key: targetKey,
+              content: '',
+              size: 0,
+              loaded: 0,
+              eof: true,
+              binary: false,
+              loading: true,
+              error: null,
+            },
+      );
       link
         .call('fs.read', { path, offset: 0, length: TEXT_CHUNK_BYTES }, { on: machine, signal: ctrl.signal })
         .then((res) => {
-          if (ctrl.signal.aborted) return;
+          if (ctrl.signal.aborted || activeFileKeyRef.current !== targetKey) return;
           if (res?.encoding === 'base64') {
-            setTextState({ content: '', size: res.size || 0, loaded: 0, eof: true, binary: true, loading: false, error: null });
+            setTextState({
+              key: targetKey,
+              content: '',
+              size: res.size || 0,
+              loaded: 0,
+              eof: true,
+              binary: true,
+              loading: false,
+              error: null,
+            });
           } else {
             const content = String(res?.content ?? '');
             setTextState({
+              key: targetKey,
               content,
               size: res?.size ?? content.length,
               loaded: (res?.offset || 0) + (res?.length ?? content.length),
@@ -174,46 +290,87 @@ export function FilesViewer({
           }
         })
         .catch((err) => {
-          if (ctrl.signal.aborted) return;
-          setTextState((prev) => ({ ...prev, loading: false, error: err }));
+          if (ctrl.signal.aborted || activeFileKeyRef.current !== targetKey) return;
+          setTextState((prev) => ({ ...prev, key: targetKey, loading: false, error: err }));
         });
     } else if (category === 'image' || category === 'video' || category === 'audio') {
       if (caps?.hasContentUrl && typeof link?.contentUrl === 'function') {
-        setMediaLoading(true);
+        setMediaState({ key: targetKey, url: null, loading: true, error: null, isFreshAddress: false });
         link
           .contentUrl({ machine, path, signal: ctrl.signal })
           .then((res) => {
-            if (ctrl.signal.aborted) return;
-            setMediaUrl(res?.url || null);
-            setMediaLoading(false);
-            if (!res?.url) setMediaError({ code: 'unsupported', message: 'Preview is not available.' });
+            if (ctrl.signal.aborted || activeFileKeyRef.current !== targetKey) return;
+            if (!res?.url) {
+              setMediaState({
+                key: targetKey,
+                url: null,
+                loading: false,
+                error: { code: 'unreachable', message: 'Preview is not available.' },
+                isFreshAddress: false,
+              });
+              return;
+            }
+            setMediaState({
+              key: targetKey,
+              url: res.url,
+              loading: false,
+              error: null,
+              isFreshAddress: false,
+            });
           })
           .catch((err) => {
-            if (ctrl.signal.aborted) return;
-            setMediaLoading(false);
-            setMediaError(err);
+            if (ctrl.signal.aborted || activeFileKeyRef.current !== targetKey) return;
+            setMediaState({
+              key: targetKey,
+              url: null,
+              loading: false,
+              error: classifyMintError(err),
+              isFreshAddress: false,
+            });
           });
       } else if (category === 'image' && caps?.hasThumb) {
-        setMediaLoading(true);
+        setMediaState({ key: targetKey, url: null, loading: true, error: null, isFreshAddress: false });
         link
           .call('fs.thumb', { paths: [path], size: 512, fit: 'contain' }, { on: machine, signal: ctrl.signal })
           .then((res) => {
-            if (ctrl.signal.aborted) return;
+            if (ctrl.signal.aborted || activeFileKeyRef.current !== targetKey) return;
             const t = res?.thumbnails?.[path];
             if (t?.content && t?.mime) {
-              setMediaUrl(`data:${t.mime};base64,${t.content}`);
+              setMediaState({
+                key: targetKey,
+                url: `data:${t.mime};base64,${t.content}`,
+                loading: false,
+                error: null,
+                isFreshAddress: false,
+              });
             } else {
-              setMediaError({ code: 'unsupported', message: 'Preview is not available.' });
+              setMediaState({
+                key: targetKey,
+                url: null,
+                loading: false,
+                error: { code: 'unsupported', message: 'Preview is not available.' },
+                isFreshAddress: false,
+              });
             }
-            setMediaLoading(false);
           })
           .catch((err) => {
-            if (ctrl.signal.aborted) return;
-            setMediaLoading(false);
-            setMediaError(err);
+            if (ctrl.signal.aborted || activeFileKeyRef.current !== targetKey) return;
+            setMediaState({
+              key: targetKey,
+              url: null,
+              loading: false,
+              error: classifyMintError(err),
+              isFreshAddress: false,
+            });
           });
       } else {
-        setMediaError({ code: 'unsupported', message: 'Preview is not available on this machine yet.' });
+        setMediaState({
+          key: targetKey,
+          url: null,
+          loading: false,
+          error: { code: 'unsupported', message: 'Preview is not available on this machine yet.' },
+          isFreshAddress: false,
+        });
       }
     }
 
@@ -221,7 +378,7 @@ export function FilesViewer({
       ctrl.abort();
       stopMediaElements();
     };
-  }, [machine, path, category]);
+  }, [machine, path, category, retryNonce]);
 
   // Keyboard navigation inside viewer: Escape closes, Left/Right steps through pictures.
   useEffect(() => {
@@ -244,31 +401,37 @@ export function FilesViewer({
 
   // Load BLAKE3 hash when details sheet opens in technical mode.
   useEffect(() => {
-    if (!moreOpen || !technical || !caps?.hasHash || hashInfo) return;
+    if (!moreOpen || !technical || !caps?.hasHash || activeHash) return;
     let alive = true;
+    const targetKey = fileKey;
     link
       .call('fs.hash', { path }, { on: machine })
       .then((res) => {
-        if (alive && res?.hash) setHashInfo(res.hash);
+        if (alive && res?.hash && activeFileKeyRef.current === targetKey) {
+          setHashInfo({ key: targetKey, value: res.hash });
+        }
       })
       .catch(() => {});
     return () => {
       alive = false;
     };
-  }, [moreOpen, technical, caps?.hasHash, machine, path, hashInfo]);
+  }, [moreOpen, technical, caps?.hasHash, machine, path, fileKey, activeHash]);
 
   async function loadMoreText() {
-    if (textState.loading || textState.eof) return;
-    setTextState((prev) => ({ ...prev, loading: true, error: null }));
+    if (activeText.loading || activeText.eof) return;
+    const targetKey = fileKey;
+    setTextState((prev) => ({ ...prev, key: targetKey, loading: true, error: null }));
     try {
       const res = await link.call(
         'fs.read',
-        { path, offset: textState.loaded, length: TEXT_CHUNK_BYTES },
+        { path, offset: activeText.loaded, length: TEXT_CHUNK_BYTES },
         { on: machine, signal: abortRef.current?.signal },
       );
+      if (activeFileKeyRef.current !== targetKey) return;
       const chunk = String(res?.content ?? '');
       setTextState((prev) => ({
         ...prev,
+        key: targetKey,
         content: prev.content + chunk,
         size: res?.size ?? prev.size,
         loaded: (res?.offset ?? prev.loaded) + (res?.length ?? chunk.length),
@@ -276,10 +439,189 @@ export function FilesViewer({
         loading: false,
       }));
     } catch (err) {
-      if (err?.code !== 'cancelled') {
-        setTextState((prev) => ({ ...prev, loading: false, error: err }));
+      if (err?.code !== 'cancelled' && activeFileKeyRef.current === targetKey) {
+        setTextState((prev) => ({ ...prev, key: targetKey, loading: false, error: err }));
       }
     }
+  }
+
+  function handleRetryMedia() {
+    recoveryRef.current = { key: fileKey, lastAttemptAt: 0, inFlight: false };
+    pendingResumeRef.current = null;
+    setRetryNonce((n) => n + 1);
+  }
+
+  function noteMediaTime(expectedKey, el) {
+    if (!el || activeFileKeyRef.current !== expectedKey) return;
+    if (pendingResumeRef.current && pendingResumeRef.current.key === expectedKey) return;
+    if (typeof el.currentTime === 'number' && Number.isFinite(el.currentTime) && !el.error) {
+      if (playbackRef.current.key !== expectedKey) {
+        playbackRef.current = { key: expectedKey, time: el.currentTime, wantPlay: !el.paused };
+      } else {
+        playbackRef.current.time = el.currentTime;
+      }
+    }
+  }
+
+  function noteMediaPlay(expectedKey, el) {
+    if (!el || activeFileKeyRef.current !== expectedKey) return;
+    if (playbackRef.current.key !== expectedKey) {
+      playbackRef.current = { key: expectedKey, time: el.currentTime || 0, wantPlay: true };
+    } else {
+      playbackRef.current.wantPlay = true;
+      if (!pendingResumeRef.current && Number.isFinite(el.currentTime) && el.currentTime > 0) {
+        playbackRef.current.time = el.currentTime;
+      }
+    }
+  }
+
+  function noteMediaPause(expectedKey, el) {
+    if (!el || activeFileKeyRef.current !== expectedKey) return;
+    // Ignore pause events triggered as part of an error teardown or source swap.
+    if (el.error || pendingResumeRef.current?.key === expectedKey) return;
+    if (playbackRef.current.key === expectedKey) {
+      playbackRef.current.wantPlay = false;
+      if (!el.ended && Number.isFinite(el.currentTime)) {
+        playbackRef.current.time = el.currentTime;
+      }
+    }
+  }
+
+  function applyPendingResume(expectedKey, expectedUrl, el) {
+    const resume = pendingResumeRef.current;
+    if (!resume || resume.key !== expectedKey || resume.url !== expectedUrl || !el) return;
+    pendingResumeRef.current = null;
+    const duration = Number.isFinite(el.duration) && el.duration > 0 ? el.duration : null;
+    const targetTime =
+      resume.time > 0
+        ? duration !== null
+          ? Math.min(resume.time, Math.max(0, duration - 0.05))
+          : resume.time
+        : 0;
+    playbackRef.current = { key: expectedKey, time: targetTime, wantPlay: Boolean(resume.play) };
+    if (targetTime > 0 && Math.abs(el.currentTime - targetTime) > 0.05) {
+      try {
+        el.currentTime = targetTime;
+      } catch {
+        // Ignore seek failures on unseekable streams.
+      }
+    }
+    if (resume.play) {
+      const p = el.play();
+      if (p && typeof p.catch === 'function') p.catch(() => {});
+    }
+  }
+
+  async function handleMediaElementError(kind, expectedKey, expectedUrl, el) {
+    if (activeFileKeyRef.current !== expectedKey || activeMediaUrlRef.current !== expectedUrl) {
+      return;
+    }
+
+    if (isLocalMediaUrl(expectedUrl)) {
+      setMediaState({
+        key: expectedKey,
+        url: null,
+        loading: false,
+        error: { code: 'decode' },
+        isFreshAddress: false,
+      });
+      return;
+    }
+
+    const now = Date.now();
+    const rec = recoveryRef.current;
+    const sameFile = rec.key === expectedKey;
+    if (sameFile && rec.inFlight) return;
+    const recentlyTried =
+      sameFile && rec.lastAttemptAt > 0 && now - rec.lastAttemptAt < MEDIA_RECOVERY_WINDOW_MS;
+    const canRefresh = Boolean(caps?.hasContentUrl && typeof link?.contentUrl === 'function');
+    const signal = abortRef.current?.signal;
+
+    // On a first failure outside the 10-second loop guard, silently request ONE fresh content
+    // address, swap `src`, seek back to where playback stopped, and resume if it was playing.
+    if (!recentlyTried && canRefresh) {
+      const savedTime =
+        el && typeof el.currentTime === 'number' && Number.isFinite(el.currentTime) && el.currentTime > 0
+          ? el.currentTime
+          : playbackRef.current.key === expectedKey
+            ? playbackRef.current.time
+            : 0;
+      const savedPlay =
+        kind !== 'image' &&
+        Boolean(
+          (playbackRef.current.key === expectedKey && playbackRef.current.wantPlay) ||
+            (el && !el.paused && !el.ended),
+        );
+
+      recoveryRef.current = { key: expectedKey, lastAttemptAt: now, inFlight: true };
+      try {
+        const res = await link.contentUrl({ machine, path, signal });
+        if (signal?.aborted || activeFileKeyRef.current !== expectedKey) return;
+        recoveryRef.current.inFlight = false;
+        if (!res?.url) {
+          setMediaState({
+            key: expectedKey,
+            url: null,
+            loading: false,
+            error: { code: 'unreachable' },
+            isFreshAddress: false,
+          });
+          return;
+        }
+        if (kind !== 'image') {
+          pendingResumeRef.current = {
+            key: expectedKey,
+            url: res.url,
+            time: savedTime,
+            play: savedPlay,
+          };
+        }
+        setMediaState({
+          key: expectedKey,
+          url: res.url,
+          loading: false,
+          error: null,
+          isFreshAddress: true,
+        });
+      } catch (err) {
+        if (err?.code === 'cancelled' || signal?.aborted || activeFileKeyRef.current !== expectedKey) {
+          return;
+        }
+        recoveryRef.current.inFlight = false;
+        setMediaState({
+          key: expectedKey,
+          url: null,
+          loading: false,
+          error: classifyMintError(err),
+          isFreshAddress: false,
+        });
+      }
+      return;
+    }
+
+    // Second failure within 10 seconds (or no refresh capability): never loop. Probe the fresh
+    // address with HEAD so only an HTTP-reachable file reports a decode error.
+    let code = 'unreachable';
+    try {
+      const probe = await fetch(expectedUrl, { method: 'HEAD', signal });
+      if (signal?.aborted || activeFileKeyRef.current !== expectedKey) return;
+      if (probe.ok) {
+        code = 'decode';
+      }
+    } catch {
+      if (signal?.aborted || activeFileKeyRef.current !== expectedKey) return;
+      code = 'unreachable';
+    }
+    if (activeFileKeyRef.current !== expectedKey || activeMediaUrlRef.current !== expectedUrl) {
+      return;
+    }
+    setMediaState({
+      key: expectedKey,
+      url: null,
+      loading: false,
+      error: { code },
+      isFreshAddress: false,
+    });
   }
 
   // Pointer handlers for picture stage: pinch zoom, double-tap zoom, pan, swipe neighbours, swipe down close, tap chrome.
@@ -430,7 +772,9 @@ export function FilesViewer({
     topSub = parts.join(' · ');
   }
 
-  function renderFallbackCard(heading, body) {
+  function renderFallbackCard(heading, body, { showRetry = false, hideActions = false } = {}) {
+    const showExternal = !hideActions && !showRetry && Boolean(caps?.hasOpenExternally);
+    const showDownload = !hideActions && !showRetry && Boolean(caps?.hasDownload);
     return html`
       <div class="said">
         <div class="viewer-said-icon" aria-hidden="true">
@@ -438,10 +782,17 @@ export function FilesViewer({
         </div>
         <strong>${heading}</strong>
         <span>${body}</span>
-        ${caps?.hasOpenExternally || caps?.hasDownload
+        ${showRetry || showExternal || showDownload
           ? html`
               <div class="viewer-said-actions">
-                ${caps?.hasOpenExternally
+                ${showRetry
+                  ? html`
+                      <button type="button" class="btn primary" onClick=${handleRetryMedia}>
+                        Try again
+                      </button>
+                    `
+                  : null}
+                ${showExternal
                   ? html`
                       <button
                         type="button"
@@ -452,11 +803,11 @@ export function FilesViewer({
                       </button>
                     `
                   : null}
-                ${caps?.hasDownload
+                ${showDownload
                   ? html`
                       <button
                         type="button"
-                        class=${caps?.hasOpenExternally ? 'btn' : 'btn primary'}
+                        class=${showExternal ? 'btn' : 'btn primary'}
                         onClick=${() => onDownload && onDownload(effectiveEntry)}
                       >
                         Download to this ${deviceNoun}
@@ -473,28 +824,61 @@ export function FilesViewer({
   function renderStage() {
     if (category === 'image') {
       if (mediaError) {
+        if (mediaError.code === 'unreachable') {
+          return renderFallbackCard(
+            "Couldn't reach this file",
+            `${machine} may be off, or the file may have moved or changed.`,
+            { showRetry: true },
+          );
+        }
+        if (mediaError.code === 'denied') {
+          return renderFallbackCard(
+            "Can't open this file",
+            mediaError.message || "You're not allowed to open this file.",
+            { hideActions: true },
+          );
+        }
         const msg =
           mediaError.code === 'unsupported'
             ? `This version of Legion on ${machine} doesn't serve picture previews yet.`
-            : mediaError.message || 'Could not load this picture.';
+            : caps?.hasOpenExternally || caps?.hasDownload
+              ? 'Open it in another app that can, or download it first.'
+              : `This ${deviceNoun} can't show this kind of picture.`;
         return renderFallbackCard("Can't show this picture here", msg);
       }
       if (!mediaUrl) {
         return html`<div class="said"><span>${mediaLoading ? 'Loading picture…' : 'Preparing picture…'}</span></div>`;
       }
+      const expectedKey = fileKey;
+      const expectedUrl = mediaUrl;
       return html`
         <img
+          key=${expectedKey}
           ref=${imgRef}
           class="viewer-img"
-          src=${mediaUrl}
+          src=${expectedUrl}
           alt=${name}
-          onError=${() => setMediaError({ code: 'decode', message: 'Could not display this picture.' })}
+          onError=${(e) => handleMediaElementError('image', expectedKey, expectedUrl, e.currentTarget)}
         />
       `;
     }
 
     if (category === 'video') {
       if (mediaError) {
+        if (mediaError.code === 'unreachable') {
+          return renderFallbackCard(
+            "Couldn't reach this file",
+            `${machine} may be off, or the file may have moved or changed.`,
+            { showRetry: true },
+          );
+        }
+        if (mediaError.code === 'denied') {
+          return renderFallbackCard(
+            "Can't open this file",
+            mediaError.message || "You're not allowed to open this file.",
+            { hideActions: true },
+          );
+        }
         const heading =
           mediaError.code === 'unsupported'
             ? `Video playback isn't available from ${machine} yet`
@@ -508,23 +892,46 @@ export function FilesViewer({
       if (!mediaUrl) {
         return html`<div class="said"><span>${mediaLoading ? 'Starting video…' : 'Preparing video…'}</span></div>`;
       }
+      const expectedKey = fileKey;
+      const expectedUrl = mediaUrl;
       return html`
         <video
+          key=${expectedKey}
           ref=${videoRef}
           class="viewer-video"
-          src=${mediaUrl}
+          src=${expectedUrl}
           controls
           playsinline
           preload="metadata"
           aria-label=${name}
-          onError=${() =>
-            setMediaError({ code: 'decode', message: `This ${deviceNoun} can't play this kind of video.` })}
+          onLoadedMetadata=${(e) => applyPendingResume(expectedKey, expectedUrl, e.currentTarget)}
+          onTimeUpdate=${(e) => noteMediaTime(expectedKey, e.currentTarget)}
+          onSeeked=${(e) => noteMediaTime(expectedKey, e.currentTarget)}
+          onPlay=${(e) => noteMediaPlay(expectedKey, e.currentTarget)}
+          onPlaying=${(e) => noteMediaPlay(expectedKey, e.currentTarget)}
+          onPause=${(e) => noteMediaPause(expectedKey, e.currentTarget)}
+          onEnded=${(e) => noteMediaPause(expectedKey, e.currentTarget)}
+          onError=${(e) => handleMediaElementError('video', expectedKey, expectedUrl, e.currentTarget)}
         />
       `;
     }
 
     if (category === 'audio') {
       if (mediaError) {
+        if (mediaError.code === 'unreachable') {
+          return renderFallbackCard(
+            "Couldn't reach this file",
+            `${machine} may be off, or the file may have moved or changed.`,
+            { showRetry: true },
+          );
+        }
+        if (mediaError.code === 'denied') {
+          return renderFallbackCard(
+            "Can't open this file",
+            mediaError.message || "You're not allowed to open this file.",
+            { hideActions: true },
+          );
+        }
         const heading =
           mediaError.code === 'unsupported'
             ? `Audio playback isn't available from ${machine} yet`
@@ -538,6 +945,8 @@ export function FilesViewer({
       if (!mediaUrl) {
         return html`<div class="said"><span>${mediaLoading ? 'Starting audio…' : 'Preparing audio…'}</span></div>`;
       }
+      const expectedKey = fileKey;
+      const expectedUrl = mediaUrl;
       return html`
         <div class="viewer-audio">
           <div class="viewer-audio-art" aria-hidden="true">
@@ -545,23 +954,30 @@ export function FilesViewer({
           </div>
           <strong>${name}</strong>
           <audio
+            key=${expectedKey}
             ref=${audioRef}
-            src=${mediaUrl}
+            src=${expectedUrl}
             controls
             preload="metadata"
             aria-label=${name}
-            onError=${() =>
-              setMediaError({ code: 'decode', message: `This ${deviceNoun} can't play this audio file.` })}
+            onLoadedMetadata=${(e) => applyPendingResume(expectedKey, expectedUrl, e.currentTarget)}
+            onTimeUpdate=${(e) => noteMediaTime(expectedKey, e.currentTarget)}
+            onSeeked=${(e) => noteMediaTime(expectedKey, e.currentTarget)}
+            onPlay=${(e) => noteMediaPlay(expectedKey, e.currentTarget)}
+            onPlaying=${(e) => noteMediaPlay(expectedKey, e.currentTarget)}
+            onPause=${(e) => noteMediaPause(expectedKey, e.currentTarget)}
+            onEnded=${(e) => noteMediaPause(expectedKey, e.currentTarget)}
+            onError=${(e) => handleMediaElementError('audio', expectedKey, expectedUrl, e.currentTarget)}
           />
         </div>
       `;
     }
 
     if (category === 'text') {
-      if (textState.error) {
-        return html`<div class="said"><${Notice} error=${textState.error} /></div>`;
+      if (activeText.error) {
+        return html`<div class="said"><${Notice} error=${activeText.error} /></div>`;
       }
-      if (textState.binary) {
+      if (activeText.binary) {
         return renderFallbackCard(
           "Can't show this file as text",
           caps?.hasOpenExternally || caps?.hasDownload
@@ -569,7 +985,7 @@ export function FilesViewer({
             : 'This file is not plain text.',
         );
       }
-      if (textState.loading && !textState.content) {
+      if (activeText.loading && !activeText.content) {
         return html`<div class="said"><span>Loading text…</span></div>`;
       }
       const toggleWrap = () => {
@@ -579,11 +995,11 @@ export function FilesViewer({
           return next;
         });
       };
-      const showPartial = !textState.eof || textState.size > TEXT_CHUNK_BYTES;
+      const showPartial = !activeText.eof || activeText.size > TEXT_CHUNK_BYTES;
       const sizeLabel = showPartial
-        ? `Showing ${formatBytes(textState.loaded)} of ${formatBytes(textState.size)}`
-        : textState.size > 0
-          ? formatBytes(textState.size)
+        ? `Showing ${formatBytes(activeText.loaded)} of ${formatBytes(activeText.size)}`
+        : activeText.size > 0
+          ? formatBytes(activeText.size)
           : '';
       return html`
         <div>
@@ -598,20 +1014,20 @@ export function FilesViewer({
               Wrap lines
             </button>
           </div>
-          <pre class=${wrapLines ? 'viewer-text' : 'viewer-text nowrap'}>${textState.content || '(Empty file)'}</pre>
-          ${!textState.eof
+          <pre class=${wrapLines ? 'viewer-text' : 'viewer-text nowrap'}>${activeText.content || '(Empty file)'}</pre>
+          ${!activeText.eof
             ? html`
                 <div class="viewer-text-foot">
                   <span>
-                    Showing ${formatBytes(textState.loaded)} of ${formatBytes(textState.size)}
+                    Showing ${formatBytes(activeText.loaded)} of ${formatBytes(activeText.size)}
                   </span>
                   <button
                     type="button"
                     class="btn small"
-                    disabled=${textState.loading}
+                    disabled=${activeText.loading}
                     onClick=${loadMoreText}
                   >
-                    ${textState.loading ? 'Loading…' : 'Load more'}
+                    ${activeText.loading ? 'Loading…' : 'Load more'}
                   </button>
                 </div>
               `
@@ -731,10 +1147,10 @@ export function FilesViewer({
                         <dd>${path}</dd>
                       `
                     : null}
-                  ${technical && hashInfo
+                  ${technical && activeHash
                     ? html`
                         <dt>hash</dt>
-                        <dd>${hashInfo}</dd>
+                        <dd>${activeHash}</dd>
                       `
                     : null}
                 </dl>

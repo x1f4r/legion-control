@@ -52,7 +52,9 @@ use axum::middleware::{self, Next};
 use axum::routing::{any, get, post};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
-use legion_content::{ConcurrencyLimits, ContentLimiter, TicketTable};
+use legion_content::{
+    ABSOLUTE_TTL, ConcurrencyLimits, ContentLimiter, SLIDING_TTL, TicketConfig, TicketTable,
+};
 use legion_core::config::NodeFile;
 use legion_core::proto::{ErrorBody, ErrorCode};
 use legion_core::tokens::Tokens;
@@ -147,11 +149,14 @@ pub fn listen_address(text: &str) -> Result<SocketAddr, ErrorBody> {
     Ok(address)
 }
 
-/// Concurrency, slow-reader, and audit-coalescing limits for `/v1/content/{ticket}/{name}` streams.
+/// Concurrency, slow-reader, ticket-lifetime, and audit-coalescing limits for
+/// `/v1/content/{ticket}/{name}` streams.
 #[derive(Clone, Copy, Debug)]
 pub struct ContentStreamLimits {
     /// Per-ticket, per-holder, and global concurrent stream caps.
     pub concurrency: ConcurrencyLimits,
+    /// Ticket table lifetimes and per-holder/global ticket caps.
+    pub ticket_config: TicketConfig,
     /// Maximum duration a content stream write may stall without draining any bytes.
     pub write_idle_timeout: Duration,
     /// Window over which minimum sustained write progress is checked while streaming.
@@ -171,6 +176,7 @@ impl Default for ContentStreamLimits {
     fn default() -> Self {
         Self {
             concurrency: ConcurrencyLimits::default(),
+            ticket_config: TicketConfig::default(),
             write_idle_timeout: Duration::from_secs(15),
             min_rate_window: Duration::from_secs(10),
             min_rate_bytes: 40 * 1024,
@@ -178,6 +184,36 @@ impl Default for ContentStreamLimits {
             sweep_interval: SWEEP,
             liveness_check_interval: Duration::from_secs(1),
         }
+    }
+}
+
+impl ContentStreamLimits {
+    /// Shortens content ticket sliding and/or absolute lifetimes (clamped to never exceed the
+    /// production defaults) and tightens the sweep interval to keep pace. Useful for end-to-end
+    /// tests exercising ticket expiry without waiting 15 minutes.
+    pub fn with_shortened_ticket_ttls(
+        mut self,
+        sliding_ttl: Option<Duration>,
+        absolute_ttl: Option<Duration>,
+    ) -> Self {
+        if let Some(ttl) = sliding_ttl
+            && !ttl.is_zero()
+        {
+            self.ticket_config.sliding_ttl = ttl.min(SLIDING_TTL);
+        }
+        if let Some(ttl) = absolute_ttl
+            && !ttl.is_zero()
+        {
+            self.ticket_config.absolute_ttl = ttl.min(ABSOLUTE_TTL);
+        }
+        let shortest = self
+            .ticket_config
+            .sliding_ttl
+            .min(self.ticket_config.absolute_ttl);
+        if shortest < self.sweep_interval {
+            self.sweep_interval = shortest.max(Duration::from_millis(100));
+        }
+        self
     }
 }
 
@@ -306,7 +342,7 @@ impl HttpDoor {
             mcp_compact,
             managers: [managers_full, managers_compact],
             sessions: Sessions::default(),
-            content_tickets: Arc::new(TicketTable::new()),
+            content_tickets: Arc::new(TicketTable::with_config(content_limits.ticket_config)),
             content_limiter: ContentLimiter::with_limits(content_limits.concurrency),
             content_audit: ContentAuditCoalescer::with_window(content_limits.audit_coalesce_window),
             content_liveness_interval: content_limits.liveness_check_interval,

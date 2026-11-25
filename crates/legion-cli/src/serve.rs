@@ -3,11 +3,24 @@
 use std::io::{self, Write};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use legion_core::{CancellationToken, Node, Router};
-use legion_doors::http::{self, HttpDoor};
+use legion_doors::http::{self, ContentStreamLimits, HttpDoor};
 
 use crate::render;
+
+fn parse_env_duration_ms(name: &str) -> Option<Duration> {
+    let raw = std::env::var(name).ok()?;
+    let ms = raw.trim().parse::<u64>().ok()?;
+    (ms > 0).then(|| Duration::from_millis(ms))
+}
+
+fn content_limits_from_env() -> ContentStreamLimits {
+    let sliding = parse_env_duration_ms("LEGION_CONTENT_TICKET_SLIDING_MS");
+    let absolute = parse_env_duration_ms("LEGION_CONTENT_TICKET_ABSOLUTE_MS");
+    ContentStreamLimits::default().with_shortened_ticket_ttls(sliding, absolute)
+}
 
 /// What `legion serve --help` prints.
 pub const HELP: &str = "\
@@ -49,7 +62,7 @@ pub async fn run(
         }
     };
     let door = match HttpDoor::new(node, Arc::clone(&router)) {
-        Ok(door) => door,
+        Ok(door) => door.with_content_limits(content_limits_from_env()),
         Err(error) => {
             router.shutdown().await;
             return failed(render::error(&error));
