@@ -470,5 +470,14 @@ test('capabilities store exposes hasTags, hasAudioThumb, and thumbMaxSize and tr
   assert.equal(limitedCaps.hasAudioThumb, true);
   assert.equal(limitedCaps.thumbMaxSize, 1024);
 
+  // Resolving a local placeholder name to the node's own name preserves audio capability flags.
+  store.seed('local', { tools: NEW_TOOLS });
+  assert.equal(store.renameMachine('local', 'tower'), true);
+  assert.equal(store.isKnown('local'), false);
+  const renamedCaps = store.fileCapabilities('tower');
+  assert.equal(renamedCaps.hasTags, true);
+  assert.equal(renamedCaps.hasAudioThumb, true);
+  assert.equal(renamedCaps.thumbMaxSize, 1024);
+
   store.dispose();
 });

@@ -105,7 +105,11 @@ test('categoryFromName and entryCategory map all design categories case-insensit
   assert.equal(entryIconName({ kind: 'file', name: 'a.mp3' }), 'music');
   assert.equal(isThumbEligible({ kind: 'file', name: 'a.jpg' }), true);
   assert.equal(isThumbEligible({ kind: 'file', name: 'a.mp4' }), true);
+  assert.equal(isThumbEligible({ kind: 'file', name: 'song.mp3' }), false);
+  assert.equal(isThumbEligible({ kind: 'file', name: 'song.mp3' }, { allowAudio: true }), true);
+  assert.equal(isThumbEligible({ kind: 'file', name: 'track.flac' }, { allowAudio: true }), true);
   assert.equal(isThumbEligible({ kind: 'file', name: 'a.pdf' }), false);
+  assert.equal(isThumbEligible({ kind: 'file', name: 'a.pdf' }, { allowAudio: true }), false);
   assert.equal(isThumbEligible({ kind: 'dir', name: 'Photos' }), false);
   assert.equal(mimeFromName('Arrival.mp4'), 'video/mp4');
   assert.equal(isHiddenName('.env'), true);
@@ -777,4 +781,124 @@ test('createThumbQueue batches at most 32 paths and retries busy errors with exp
   assert.equal(updates3, 1);
   assert.equal(cache3.get(thumbCacheKey('pi', '/home/me/late.png', '', 128))?.url, 'data:image/png;base64,T0s=');
   q3.dispose();
+
+  // Audio covers go through createThumbQueue on nodes with hasAudioThumb, retry busy covers,
+  // cache not_found cleanly, and are skipped on older nodes without hasAudioThumb while pictures
+  // in the same batch still load.
+  const audioCalls = [];
+  const audioAttempts = new Map();
+  const makeCapsStore = (hasAudioThumb) => ({
+    isKnown: () => true,
+    hasTool: (_m, tool) => tool === 'fs.thumb' || (hasAudioThumb && tool === 'fs.tags'),
+    fileCapabilities: () => ({ hasThumb: true, hasAudioThumb }),
+    async ensure() {
+      return { status: 'known' };
+    },
+    async call(tool, args, opts) {
+      assert.equal(tool, 'fs.thumb');
+      audioCalls.push({ machine: opts.on, paths: [...args.paths] });
+      return {
+        value: {
+          results: args.paths.map((p) => {
+            if (p.endsWith('busy.mp3')) {
+              const tries = audioAttempts.get(p) || 0;
+              audioAttempts.set(p, tries + 1);
+              if (tries === 0) {
+                return { path: p, error: { code: 'busy', message: 'Reply budget exceeded.' } };
+              }
+            }
+            if (p.endsWith('nocover.flac')) {
+              return { path: p, error: { code: 'not_found', message: 'No cover.' } };
+            }
+            return { path: p, ok: { mime: 'image/jpeg', content: 'Q09WRVI=', width: 128, height: 128 } };
+          }),
+        },
+      };
+    },
+  });
+
+  const audioCache = createThumbCache();
+  let audioUpdates = 0;
+  const qAudio = createThumbQueue({
+    machine: 'tower',
+    link: null,
+    capsStore: makeCapsStore(true),
+    thumbCache: audioCache,
+    onUpdate: () => {
+      audioUpdates += 1;
+    },
+    schedule,
+    cancel,
+  });
+  qAudio.enqueue({ path: '/home/me/Music/track.mp3', mtime: '1' });
+  qAudio.enqueue({ path: '/home/me/Music/busy.mp3', mtime: '1' });
+  qAudio.enqueue({ path: '/home/me/Music/nocover.flac', mtime: '1' });
+  await runAllTimers(); // initial batch
+  await runAllTimers(); // retry timer fires -> re-enqueues busy.mp3
+  await runAllTimers(); // retry batch completes
+  assert.equal(audioCalls.length, 2);
+  assert.deepEqual(audioCalls[0].paths, [
+    '/home/me/Music/track.mp3',
+    '/home/me/Music/busy.mp3',
+    '/home/me/Music/nocover.flac',
+  ]);
+  assert.deepEqual(audioCalls[1].paths, ['/home/me/Music/busy.mp3']);
+  assert.equal(audioUpdates, 2);
+  assert.equal(
+    audioCache.get(thumbCacheKey('tower', '/home/me/Music/track.mp3', '1', 128))?.url,
+    'data:image/jpeg;base64,Q09WRVI=',
+  );
+  assert.equal(
+    audioCache.get(thumbCacheKey('tower', '/home/me/Music/busy.mp3', '1', 128))?.url,
+    'data:image/jpeg;base64,Q09WRVI=',
+  );
+  assert.deepEqual(audioCache.get(thumbCacheKey('tower', '/home/me/Music/nocover.flac', '1', 128)), {
+    failed: true,
+  });
+  qAudio.dispose();
+
+  // Pre-audio-thumb machine: skips audio paths even if queued before capabilities arrive, while
+  // still fetching picture thumbnails in the same batch.
+  let oldKnown = false;
+  const oldAudioCalls = [];
+  const oldCapsStore = {
+    isKnown: () => oldKnown,
+    hasTool: (_m, tool) => oldKnown && tool === 'fs.thumb',
+    fileCapabilities: () => ({ hasThumb: oldKnown, hasAudioThumb: false }),
+    async ensure() {
+      oldKnown = true;
+      return { status: 'known' };
+    },
+    async call(tool, args) {
+      assert.equal(tool, 'fs.thumb');
+      oldAudioCalls.push([...args.paths]);
+      return {
+        value: {
+          results: args.paths.map((p) => ({
+            path: p,
+            ok: { mime: 'image/jpeg', content: 'UEhPVE8=', width: 128, height: 128 },
+          })),
+        },
+      };
+    },
+  };
+  const oldCache = createThumbCache();
+  const qOldAudio = createThumbQueue({
+    machine: 'pretags',
+    link: null,
+    capsStore: oldCapsStore,
+    thumbCache: oldCache,
+    schedule,
+    cancel,
+  });
+  qOldAudio.enqueue({ path: '/home/me/Music/track.mp3', mtime: '1' });
+  qOldAudio.enqueue({ path: '/home/me/Photos/pic.jpg', mtime: '1' });
+  await runAllTimers();
+  assert.deepEqual(oldAudioCalls, [['/home/me/Photos/pic.jpg']]);
+  assert.equal(oldCache.get(thumbCacheKey('pretags', '/home/me/Music/track.mp3', '1', 128)), null);
+  assert.equal(
+    oldCache.get(thumbCacheKey('pretags', '/home/me/Photos/pic.jpg', '1', 128))?.url,
+    'data:image/jpeg;base64,UEhPVE8=',
+  );
+  qOldAudio.dispose();
 });
