@@ -243,7 +243,7 @@ pub use link::{
     NodeLink, NodeOrigin, PendingIdentityChange, Route, RoutedValue, SessionOpener,
     parse_optional_target, public_key_fingerprint,
 };
-pub use put::{CAP_PUT_NO_REPLACE, PutRequest, PutResult, PutStream};
+pub use put::{CAP_IF_EXISTS, PutIfExists, PutRequest, PutResult, PutStream};
 pub use session::{
     CallError, OpenError, Session, SessionInfo, TransportHandle, cancel_reply_timeout,
 };

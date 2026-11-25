@@ -428,9 +428,10 @@ The interface's content security policy grows by exactly what this needs: `img-s
   (`ACTION_OPEN_DOCUMENT` with persistable read URI grants released on completion/failure/cancel on
   Android; native file dialog on desktop) and issues session-only opaque upload handles so the web
   view can never name an arbitrary device file. Pre-selected local upload paths exist only behind
-  the debug compile-time flag `test-upload-paths`. Files are hashed in 64 KiB chunks, checked with
-  `fs.stat` to choose a non-colliding `name (2).ext` remote target before starting, and uploaded
-  over the bulk pipe's `put` through `Link::open_put` with remote `.legion-part` resume and BLAKE3
+  the debug compile-time flag `test-upload-paths`. Files are hashed in 64 KiB chunks and uploaded
+  over the bulk pipe's `put` through `Link::open_put` with `"if_exists": "fail"` (stepping to a
+  numbered `name (2).ext` sibling on `exists` when the node advertises `if_exists`, and keeping an
+  `fs.stat` pre-check for older nodes that do not), remote `.legion-part` resume and BLAKE3
   verification.
 
 Nothing here makes a person wait. Starting a download, an upload or a transfer returns at once;

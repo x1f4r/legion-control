@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use legion_content::extract_file_name;
-use legion_link::{CAP_PUT_NO_REPLACE, ContentTime, PutRequest};
+use legion_link::{CAP_IF_EXISTS, ContentTime, PutIfExists, PutRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tauri::ipc::Channel as IpcChannel;
@@ -3561,24 +3561,26 @@ impl TransferManager {
         let base_name = sanitize_file_name(&initial.transfer.name);
 
         // Choose the remote destination path without overwriting existing files:
-        // - When the machine is already known to support `put.no_replace`, skip `fs.stat` and rely
-        //   on `put` with `"no_replace": true`, stepping to the next numbered sibling on `Exists`.
-        // - When the machine is older (`Some(false)`), keep `fs.stat`-then-`put` without
-        //   `no_replace`.
-        // - Before the first stream greeting (`None`), probe with `fs.stat` (so older machines
-        //   never overwrite even on 0-byte uploads) and still send `"no_replace": true` so newer
-        //   machines enforce atomic no-replace on the very first upload and cache their capability.
+        // - When the machine is already known to support `if_exists`, skip `fs.stat` and rely on
+        //   `put` with `"if_exists": "fail"`, stepping to the next numbered sibling on `Exists`.
+        // - When the machine is older (`Some(false)`), keep `fs.stat`-then-`put` without sending
+        //   `if_exists`.
+        // - Before the first direct stream greeting (`None`, including relayed targets where the
+        //   target has no direct session), probe with `fs.stat` (so older machines never overwrite
+        //   even on 0-byte uploads) and still send `"if_exists": "fail"` so current machines
+        //   enforce atomic refusal on the very first upload (catching races between `fs.stat` and
+        //   `put`, or before final commit) and cache their capability on direct channels.
         let initial_target: ContentTarget = self
             .backend
             .content_target(&initial.transfer.machine)
             .map_err(WorkerStop::Failed)?;
-        let initial_supports_no_replace = initial_target
+        let initial_supports_if_exists = initial_target
             .link
-            .stream_supports(&initial_target.link_node, CAP_PUT_NO_REPLACE);
+            .stream_supports(&initial_target.link_node, CAP_IF_EXISTS);
 
         let (mut remote_path, mut candidate_n) = if initial.remote_path_resolved {
             (initial.transfer.path.clone(), 1u32)
-        } else if initial_supports_no_replace == Some(true) {
+        } else if initial_supports_if_exists == Some(true) {
             let candidate_path = join_remote_with_sep(&dir_prefix, sep, &base_name);
             self.lock_resolved_upload_path(id, &candidate_path, &base_name);
             (candidate_path, 1u32)
@@ -3634,9 +3636,9 @@ impl TransferManager {
                 .content_target(&initial.transfer.machine)
                 .map_err(WorkerStop::Failed)?;
 
-            let use_no_replace = target
+            let use_if_exists_fail = target
                 .link
-                .stream_supports(&target.link_node, CAP_PUT_NO_REPLACE)
+                .stream_supports(&target.link_node, CAP_IF_EXISTS)
                 != Some(false);
 
             let req = PutRequest {
@@ -3645,7 +3647,11 @@ impl TransferManager {
                 hash: local_hash.clone(),
                 mode: Some(0o644),
                 mtime: local_file_mtime(local_path),
-                no_replace: use_no_replace,
+                if_exists: if use_if_exists_fail {
+                    PutIfExists::Fail
+                } else {
+                    PutIfExists::Replace
+                },
             };
 
             let mut put = match target
@@ -3655,7 +3661,7 @@ impl TransferManager {
             {
                 Ok(put) => put,
                 Err(err) => {
-                    if use_no_replace
+                    if use_if_exists_fail
                         && err.code == legion_link::proto::ErrorCode::Exists
                         && let Some((next_path, next_name)) = advance_upload_candidate(
                             &dir_prefix,
@@ -3854,7 +3860,7 @@ impl TransferManager {
                     if cancel.is_cancelled() {
                         return Err(WorkerStop::Interrupted);
                     }
-                    if use_no_replace
+                    if use_if_exists_fail
                         && err.code == legion_link::proto::ErrorCode::Exists
                         && let Some((next_path, next_name)) = advance_upload_candidate(
                             &dir_prefix,
@@ -4648,8 +4654,8 @@ mod tests {
         fail_first_gets: usize,
         stall_get: bool,
         stall_put: bool,
-        advertise_cap_no_replace: bool,
-        reply_no_replace: bool,
+        advertise_cap_if_exists: bool,
+        race_create_after_stat: std::collections::HashSet<String>,
         race_create_on_put_finish: std::collections::HashSet<String>,
         cancel_after_put_commit: bool,
         cancel_mid_put_once: bool,
@@ -4691,12 +4697,9 @@ mod tests {
                         return;
                     }
                     let mut req: Value = serde_json::from_str(&line).unwrap();
-                    let (advertise_cap, reply_no_replace) = {
-                        let st = remote.lock().unwrap();
-                        (st.advertise_cap_no_replace, st.reply_no_replace)
-                    };
+                    let advertise_cap = remote.lock().unwrap().advertise_cap_if_exists;
                     let greeting = if advertise_cap {
-                        json!({ "protocol": 1, "capabilities": [CAP_PUT_NO_REPLACE] })
+                        json!({ "protocol": 1, "capabilities": [CAP_IF_EXISTS] })
                     } else {
                         json!({ "protocol": 1 })
                     };
@@ -4856,9 +4859,9 @@ mod tests {
                         let path = req["path"].as_str().unwrap_or("").to_owned();
                         let size = req["size"].as_u64().unwrap() as usize;
                         let expected_hash = req["hash"].as_str().unwrap_or("").to_owned();
-                        let wants_no_replace = req.get("no_replace").and_then(Value::as_bool)
-                            == Some(true)
-                            && (advertise_cap || reply_no_replace);
+                        let fail_if_exists = req.get("if_exists").and_then(Value::as_str)
+                            == Some("fail")
+                            && advertise_cap;
                         let (mut existing, stall_put, already_exists) = {
                             let st = remote.lock().unwrap();
                             st.put_requests.lock().unwrap().push(req.clone());
@@ -4870,9 +4873,15 @@ mod tests {
                                 exists,
                             )
                         };
-                        if wants_no_replace && already_exists {
+                        if fail_if_exists && already_exists {
                             let err = json!({
-                                "error": ErrorBody::new(ProtoCode::Exists, "destination file already exists")
+                                "error": ErrorBody::new(
+                                    ProtoCode::Exists,
+                                    format!("{path} already exists."),
+                                )
+                                .with_hint(
+                                    "Pass if_exists=\"replace\", \"skip\", or \"rename\", or choose another path.",
+                                )
                             });
                             let _ = server_out.write_all(format!("{err}\n").as_bytes()).await;
                             let _ = server_out.shutdown().await;
@@ -4882,10 +4891,7 @@ mod tests {
                             existing.clear();
                         }
                         let resume_off = existing.len();
-                        let mut ready = json!({ "offset": resume_off });
-                        if wants_no_replace && reply_no_replace {
-                            ready["no_replace"] = json!(true);
-                        }
+                        let ready = json!({ "offset": resume_off });
                         let _ = server_out.write_all(format!("{ready}\n").as_bytes()).await;
                         if stall_put {
                             // Stop reading from the upload duplex so the writer back-pressures
@@ -4947,7 +4953,7 @@ mod tests {
                         }
                         let raced_exists = {
                             let mut st = remote.lock().unwrap();
-                            if wants_no_replace {
+                            if fail_if_exists {
                                 if st.race_create_on_put_finish.remove(&path) {
                                     st.files
                                         .insert(path.clone(), b"concurrent-device-file".to_vec());
@@ -5062,7 +5068,7 @@ mod tests {
                                     .pointer("/args/path")
                                     .and_then(Value::as_str)
                                     .unwrap_or("");
-                                let st = remote.lock().unwrap();
+                                let mut st = remote.lock().unwrap();
                                 if tool == "fs.stat" {
                                     st.stat_calls.fetch_add(1, Ordering::SeqCst);
                                     if let Some(data) =
@@ -5073,6 +5079,12 @@ mod tests {
                                             json!({ "kind": "file", "size": data.len() }),
                                         )
                                     } else {
+                                        if st.race_create_after_stat.remove(path) {
+                                            st.files.insert(
+                                                path.to_owned(),
+                                                b"created-between-stat-and-put".to_vec(),
+                                            );
+                                        }
                                         ProtoResp::error(
                                             req.id,
                                             legion_link::proto::RpcError::new(
@@ -7586,10 +7598,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_uses_atomic_no_replace_when_machine_supports_it_and_skips_stat() {
+    async fn upload_uses_atomic_if_exists_fail_when_machine_supports_it_and_skips_stat() {
         let dir = tempfile::tempdir().unwrap();
-        let bytes1 = b"first-upload-concurrent-race".to_vec();
-        let bytes2 = b"second-upload-skips-stat".to_vec();
+        let bytes1 = b"first-upload-raced-between-stat-and-put".to_vec();
+        let bytes2 = b"second-upload-skips-stat-and-catches-commit-race".to_vec();
         let src1 = dir.path().join("notes.txt");
         let src2 = dir.path().join("report.pdf");
         fs::write(&src1, &bytes1).unwrap();
@@ -7598,17 +7610,19 @@ mod tests {
         let remote = Arc::new(Mutex::new(MockRemoteState::default()));
         {
             let mut st = remote.lock().unwrap();
-            st.advertise_cap_no_replace = true;
-            st.reply_no_replace = true;
-            // Simulate a concurrent second device creating `/home/me/uploads/notes.txt` after
-            // `fs.stat` and `PutReady` succeeded, right before final commit (`PutDone`).
-            st.race_create_on_put_finish
+            st.advertise_cap_if_exists = true;
+            // Upload #1: simulate a file created *between `fs.stat` and `put`*, so the fallback
+            // `fs.stat` sees NotFound and only `"if_exists": "fail"` catches it atomically.
+            st.race_create_after_stat
                 .insert("/home/me/uploads/notes.txt".into());
-            // Pre-existing file for upload #2 so `PutReady` rejects with `Exists`.
+            // Upload #2: pre-existing file refused on `PutReady`, and numbered sibling #2 raced
+            // right before final commit (`PutDone`), landing cleanly at `report (3).pdf`.
             st.files.insert(
                 "/home/me/uploads/report.pdf".into(),
                 b"original-pdf".to_vec(),
             );
+            st.race_create_on_put_finish
+                .insert("/home/me/uploads/report (2).pdf".into());
         }
 
         let backend: Arc<dyn Backend> = Arc::new(MockBackend::new(Arc::clone(&remote)));
@@ -7621,9 +7635,9 @@ mod tests {
             Duration::from_secs(2),
         );
 
-        // Upload #1 (before any stream greeting): probes `fs.stat`, still sends `no_replace: true`,
-        // catches the concurrent race at `PutDone` (`ErrorCode::Exists`), and retries cleanly as
-        // `notes (2).txt` without overwriting the concurrent device's file.
+        // Upload #1 (before any stream greeting): probes `fs.stat`, sees NotFound, another writer
+        // creates `notes.txt` before `put`, `"if_exists": "fail"` refuses atomically with
+        // `ErrorCode::Exists`, leaves the raced file untouched, and succeeds at `notes (2).txt`.
         platform
             .picked_files
             .lock()
@@ -7651,7 +7665,7 @@ mod tests {
             let st = remote.lock().unwrap();
             assert_eq!(
                 st.files.get("/home/me/uploads/notes.txt").unwrap(),
-                b"concurrent-device-file"
+                b"created-between-stat-and-put"
             );
             assert_eq!(
                 st.uploaded.get("/home/me/uploads/notes (2).txt").unwrap(),
@@ -7663,8 +7677,9 @@ mod tests {
             );
         }
 
-        // Upload #2: capability `put.no_replace` is now cached -> makes ZERO `fs.stat` calls,
-        // hits `Exists` at `PutReady` for `report.pdf`, and succeeds at `report (2).pdf`.
+        // Upload #2: capability `if_exists` is now cached -> makes ZERO `fs.stat` calls, hits
+        // `Exists` on `PutReady` for `report.pdf`, hits `Exists` at `PutDone` for `report (2).pdf`,
+        // and succeeds at `report (3).pdf`.
         remote.lock().unwrap().stat_calls.store(0, Ordering::SeqCst);
         {
             let mut picked = platform.picked_files.lock().unwrap();
@@ -7687,118 +7702,37 @@ mod tests {
             .unwrap()
             .unwrap();
         let done2 = wait_for_state(&mgr, &up2.id, |s| s == TransferState::Done).await;
-        assert_eq!(done2.path, "/home/me/uploads/report (2).pdf");
-        assert_eq!(done2.name, "report (2).pdf");
+        assert_eq!(done2.path, "/home/me/uploads/report (3).pdf");
+        assert_eq!(done2.name, "report (3).pdf");
         {
             let st = remote.lock().unwrap();
             assert_eq!(
                 st.stat_calls.load(Ordering::SeqCst),
                 0,
-                "upload must skip fs.stat once machine advertised put.no_replace"
+                "upload must skip fs.stat once machine advertised if_exists"
             );
             assert_eq!(
                 st.files.get("/home/me/uploads/report.pdf").unwrap(),
                 b"original-pdf"
             );
             assert_eq!(
-                st.uploaded.get("/home/me/uploads/report (2).pdf").unwrap(),
+                st.files.get("/home/me/uploads/report (2).pdf").unwrap(),
+                b"concurrent-device-file"
+            );
+            assert_eq!(
+                st.uploaded.get("/home/me/uploads/report (3).pdf").unwrap(),
                 &bytes2
             );
             let reqs = st.put_requests.lock().unwrap();
-            assert!(reqs.iter().all(|r| r["no_replace"] == Value::Bool(true)));
+            assert!(reqs.iter().all(|r| r["if_exists"] == json!("fail")));
         }
         mgr.shutdown();
     }
 
     #[tokio::test]
-    async fn upload_detects_no_replace_from_put_ready_reply_and_falls_back_on_older_machine() {
-        // Subcase A: Machine advertises `no_replace: true` only on PutReady (no greeting caps).
-        {
-            let dir = tempfile::tempdir().unwrap();
-            let src1 = dir.path().join("first.txt");
-            let src2 = dir.path().join("second.txt");
-            fs::write(&src1, b"one").unwrap();
-            fs::write(&src2, b"two").unwrap();
-
-            let remote = Arc::new(Mutex::new(MockRemoteState::default()));
-            {
-                let mut st = remote.lock().unwrap();
-                st.advertise_cap_no_replace = false;
-                st.reply_no_replace = true;
-                st.files
-                    .insert("/home/me/uploads/second.txt".into(), b"keep-me".to_vec());
-            }
-            let backend: Arc<dyn Backend> = Arc::new(MockBackend::new(Arc::clone(&remote)));
-            let platform = Arc::new(MockPlatform::new(dir.path()));
-            let mgr = TransferManager::with_options(
-                dir.path(),
-                backend,
-                platform.clone(),
-                2,
-                Duration::from_secs(2),
-            );
-
-            platform
-                .picked_files
-                .lock()
-                .unwrap()
-                .push(PickedUploadFile {
-                    local_path: src1.to_string_lossy().into_owned(),
-                    name: "first.txt".into(),
-                    size: 3,
-                    mime: None,
-                });
-            let p1 = mgr.pick_uploads().await.unwrap();
-            let u1 = mgr
-                .enqueue_upload(
-                    "tower".into(),
-                    "/home/me/uploads".into(),
-                    Some(vec![p1[0].handle.clone()]),
-                )
-                .await
-                .unwrap()
-                .unwrap();
-            let _ = wait_for_state(&mgr, &u1.id, |s| s == TransferState::Done).await;
-
-            // Upload #2 skips `fs.stat` because PutReady confirmed `no_replace: true`.
-            remote.lock().unwrap().stat_calls.store(0, Ordering::SeqCst);
-            {
-                let mut picked = platform.picked_files.lock().unwrap();
-                picked.clear();
-                picked.push(PickedUploadFile {
-                    local_path: src2.to_string_lossy().into_owned(),
-                    name: "second.txt".into(),
-                    size: 3,
-                    mime: None,
-                });
-            }
-            let p2 = mgr.pick_uploads().await.unwrap();
-            let u2 = mgr
-                .enqueue_upload(
-                    "tower".into(),
-                    "/home/me/uploads".into(),
-                    Some(vec![p2[0].handle.clone()]),
-                )
-                .await
-                .unwrap()
-                .unwrap();
-            let d2 = wait_for_state(&mgr, &u2.id, |s| s == TransferState::Done).await;
-            assert_eq!(d2.path, "/home/me/uploads/second (2).txt");
-            let st = remote.lock().unwrap();
-            assert_eq!(st.stat_calls.load(Ordering::SeqCst), 0);
-            assert_eq!(
-                st.files.get("/home/me/uploads/second.txt").unwrap(),
-                b"keep-me"
-            );
-            assert_eq!(
-                st.uploaded.get("/home/me/uploads/second (2).txt").unwrap(),
-                b"two"
-            );
-            mgr.shutdown();
-        }
-
-        // Subcase B: Older machine (no greeting caps and no PutReady.no_replace) keeps
-        // fs.stat-then-put and stops sending `no_replace` once detected.
+    async fn upload_falls_back_to_stat_on_older_machine_and_uses_if_exists_fail_over_relay() {
+        // Subcase A: Older machine omitting `if_exists` in its stream greeting keeps
+        // fs.stat-then-put and stops sending `if_exists` once lack of support is cached.
         {
             let dir = tempfile::tempdir().unwrap();
             let src1 = dir.path().join("a.txt");
@@ -7879,9 +7813,384 @@ mod tests {
             );
             let reqs = st.put_requests.lock().unwrap();
             assert!(
-                reqs.last().unwrap().get("no_replace").is_none(),
-                "older machine must not receive no_replace once lack of support is known"
+                reqs.last().unwrap().get("if_exists").is_none(),
+                "older machine must not receive if_exists once lack of support is known"
             );
+            mgr.shutdown();
+        }
+
+        // Subcase B: Relayed upload onto `studio` via `tower` where a file appears on `studio`
+        // *between `fs.stat` and `put`*: relayed `put` carries `"if_exists": "fail"`, `studio`
+        // refuses atomically with `Exists`, leaves the raced file untouched, and the app lands
+        // the upload at `raced (2).txt`.
+        {
+            use legion_link::CAP_STREAM_RELAY;
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("raced.txt");
+            let payload = b"relayed-upload-after-race".to_vec();
+            fs::write(&src, &payload).unwrap();
+
+            let studio_files: Arc<Mutex<HashMap<String, Vec<u8>>>> =
+                Arc::new(Mutex::new(HashMap::new()));
+            let studio_uploaded: Arc<Mutex<HashMap<String, Vec<u8>>>> =
+                Arc::new(Mutex::new(HashMap::new()));
+            let race_after_stat = Arc::new(AtomicBool::new(true));
+            let seen_inner_puts: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+            let tower_key =
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITowerKeyRelayedIfExists00000000000000000000";
+
+            struct RelayIfExistsOpener {
+                files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+                uploaded: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+                seen: Arc<Mutex<Vec<Value>>>,
+            }
+
+            impl StreamOpener for RelayIfExistsOpener {
+                fn open_stream(
+                    &self,
+                    _cancel: CancellationToken,
+                ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send>>
+                {
+                    let files = Arc::clone(&self.files);
+                    let uploaded = Arc::clone(&self.uploaded);
+                    let seen = Arc::clone(&self.seen);
+                    Box::pin(async move {
+                        let (client_in, mut server_out) = tokio::io::duplex(64 * 1024);
+                        let (server_in, client_out) = tokio::io::duplex(64 * 1024);
+                        let stream_cancel = CancellationToken::new();
+                        tokio::spawn(async move {
+                            let greeting = json!({
+                                "protocol": 1,
+                                "capabilities": [CAP_IF_EXISTS, CAP_STREAM_RELAY],
+                            });
+                            let _ = server_out
+                                .write_all(format!("{greeting}\n").as_bytes())
+                                .await;
+                            let mut reader = BufReader::new(server_in);
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                                return;
+                            }
+                            let outer: Value = serde_json::from_str(&line).unwrap();
+                            assert_eq!(outer["op"], json!("relay"));
+                            assert_eq!(outer["on"], json!("studio"));
+                            let req = outer["request"].clone();
+                            assert_eq!(req["op"], json!("put"));
+                            seen.lock().unwrap().push(req.clone());
+
+                            let path = req["path"].as_str().unwrap().to_owned();
+                            let size = req["size"].as_u64().unwrap() as usize;
+                            let fail_if_exists =
+                                req.get("if_exists").and_then(Value::as_str) == Some("fail");
+                            let exists = files.lock().unwrap().contains_key(&path)
+                                || uploaded.lock().unwrap().contains_key(&path);
+                            if fail_if_exists && exists {
+                                let err = json!({
+                                    "error": ErrorBody::new(
+                                        ProtoCode::Exists,
+                                        format!("{path} already exists."),
+                                    )
+                                    .with_machine("studio")
+                                });
+                                let _ = server_out.write_all(format!("{err}\n").as_bytes()).await;
+                                let _ = server_out.shutdown().await;
+                                return;
+                            }
+                            let ready = json!({ "offset": 0 });
+                            let _ = server_out.write_all(format!("{ready}\n").as_bytes()).await;
+                            let mut got = Vec::new();
+                            let _ = reader.read_to_end(&mut got).await;
+                            assert_eq!(got.len(), size);
+                            let hash = format!("blake3:{}", blake3::hash(&got).to_hex());
+                            uploaded.lock().unwrap().insert(path, got);
+                            let done = json!({ "ok": true, "size": size, "hash": hash });
+                            let _ = server_out.write_all(format!("{done}\n").as_bytes()).await;
+                            let _ = server_out.shutdown().await;
+                        });
+                        Ok(RawStream {
+                            reader: Box::new(client_in),
+                            writer: Box::new(client_out),
+                            stderr: None,
+                            cancel: stream_cancel,
+                            park: None,
+                            guard: None,
+                        })
+                    })
+                }
+            }
+
+            let opener: SessionOpener = {
+                let files = Arc::clone(&studio_files);
+                let uploaded = Arc::clone(&studio_uploaded);
+                let race_after_stat = Arc::clone(&race_after_stat);
+                let seen = Arc::clone(&seen_inner_puts);
+                Arc::new(move |entry, _, cancel| {
+                    let files = Arc::clone(&files);
+                    let uploaded = Arc::clone(&uploaded);
+                    let race_after_stat = Arc::clone(&race_after_stat);
+                    let seen = Arc::clone(&seen);
+                    Box::pin(async move {
+                        let (client_in, mut server_out) = tokio::io::duplex(16 * 1024);
+                        let (server_in, client_out) = tokio::io::duplex(16 * 1024);
+                        let files_rpc = Arc::clone(&files);
+                        let uploaded_rpc = Arc::clone(&uploaded);
+                        tokio::spawn(async move {
+                            let mut reader = BufReader::new(server_in);
+                            let mut line = String::new();
+                            while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                                let req: legion_link::proto::Request =
+                                    serde_json::from_str(&line).unwrap();
+                                let reply = if req.method == "hello" {
+                                    ProtoResp::ok(
+                                        req.id,
+                                        serde_json::to_value(HelloResult {
+                                            node: "tower".to_owned(),
+                                            version: VERSION.to_owned(),
+                                            build: None,
+                                            protocol: PROTOCOL,
+                                            os: "linux".to_owned(),
+                                            arch: "x86_64".to_owned(),
+                                            systems: vec![],
+                                            system: None,
+                                            boot_id: None,
+                                        })
+                                        .unwrap(),
+                                    )
+                                } else if req.method == "call" {
+                                    let tool = req
+                                        .params
+                                        .get("tool")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("");
+                                    let path = req
+                                        .params
+                                        .pointer("/args/path")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("");
+                                    if tool == "fs.stat" {
+                                        let found = files_rpc
+                                            .lock()
+                                            .unwrap()
+                                            .get(path)
+                                            .map(Vec::len)
+                                            .or_else(|| {
+                                                uploaded_rpc.lock().unwrap().get(path).map(Vec::len)
+                                            });
+                                        if let Some(len) = found {
+                                            ProtoResp::ok(
+                                                req.id,
+                                                json!({ "kind": "file", "size": len }),
+                                            )
+                                        } else {
+                                            // Create the colliding file right after fs.stat returns NotFound!
+                                            if path == "/home/me/Uploads/raced.txt"
+                                                && race_after_stat.swap(false, Ordering::SeqCst)
+                                            {
+                                                files_rpc.lock().unwrap().insert(
+                                                    path.to_owned(),
+                                                    b"raced-on-studio-between-stat-and-put"
+                                                        .to_vec(),
+                                                );
+                                            }
+                                            ProtoResp::error(
+                                                req.id,
+                                                legion_link::proto::RpcError::new(
+                                                    -32000,
+                                                    ErrorBody::new(
+                                                        ProtoCode::NotFound,
+                                                        "not found",
+                                                    )
+                                                    .with_machine("studio"),
+                                                ),
+                                            )
+                                        }
+                                    } else {
+                                        ProtoResp::ok(req.id, json!({}))
+                                    }
+                                } else {
+                                    ProtoResp::ok(req.id, json!({}))
+                                };
+                                let _ = server_out
+                                    .write_all(
+                                        format!("{}\n", serde_json::to_string(&reply).unwrap())
+                                            .as_bytes(),
+                                    )
+                                    .await;
+                                line.clear();
+                            }
+                        });
+                        Session::open_transport(
+                            client_in,
+                            client_out,
+                            Box::new(FakeTransport {
+                                opener: Arc::new(RelayIfExistsOpener {
+                                    files,
+                                    uploaded,
+                                    seen,
+                                }),
+                            }),
+                            &entry.node,
+                            None,
+                            Duration::from_secs(5),
+                            cancel,
+                        )
+                        .await
+                        .map_err(|err| err.into_error())
+                    })
+                })
+            };
+
+            let link = Link::with_opener(
+                LinkConfig {
+                    nodes: vec![NodeLink::ssh(
+                        "tower",
+                        SshTarget {
+                            hosts: vec!["192.0.2.21".to_owned()],
+                            port: 22,
+                            user: "me".to_owned(),
+                            host_keys: vec![tower_key.to_owned()],
+                        },
+                        Some("device:pixel".to_owned()),
+                    )],
+                    ..LinkConfig::default()
+                },
+                LinkOptions::default(),
+                opener,
+            );
+            struct RelayedTargetBackend {
+                link: Link,
+            }
+            impl Backend for RelayedTargetBackend {
+                fn state(&self) -> BoxFuture<'_, Result<AppState, AppError>> {
+                    Box::pin(async { Err(AppError::not_paired()) })
+                }
+                fn tools(&self, _on: Option<Value>) -> BoxFuture<'_, Result<Vec<Value>, AppError>> {
+                    Box::pin(async { Err(AppError::not_paired()) })
+                }
+                fn call(
+                    &self,
+                    request: CallRequest,
+                    _on_event: Option<tauri::ipc::Channel<Value>>,
+                ) -> BoxFuture<'_, Result<Value, AppError>> {
+                    let link = self.link.clone();
+                    Box::pin(async move {
+                        let machine = request
+                            .on
+                            .as_ref()
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("tower")
+                            .to_owned();
+                        link.call_machine(&machine, &request.tool, request.args, |_| {})
+                            .await
+                            .map(|r| r.value)
+                            .map_err(AppError::from)
+                    })
+                }
+                fn cancel(&self, _id: CallId) -> BoxFuture<'_, Result<CancelResult, AppError>> {
+                    Box::pin(async { Err(AppError::not_paired()) })
+                }
+                fn pair(
+                    &self,
+                    _invite: String,
+                    _name: String,
+                ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                    Box::pin(async { Err(AppError::not_paired()) })
+                }
+                fn unpair(&self, _node: String) -> BoxFuture<'_, Result<UnpairResult, AppError>> {
+                    Box::pin(async { Err(AppError::not_paired()) })
+                }
+                fn select_node(&self, _node: String) -> BoxFuture<'_, Result<AppState, AppError>> {
+                    Box::pin(async { Err(AppError::not_paired()) })
+                }
+                fn repair_store(&self) -> BoxFuture<'_, Result<RepairResult, AppError>> {
+                    Box::pin(async { Err(AppError::not_paired()) })
+                }
+                fn invalidate_sessions(&self) -> BoxFuture<'_, Result<(), AppError>> {
+                    Box::pin(async { Ok(()) })
+                }
+                fn learn(&self) -> BoxFuture<'_, Result<LearnResult, AppError>> {
+                    Box::pin(async { Err(AppError::not_paired()) })
+                }
+                fn accept_identity_change(
+                    &self,
+                    _node: String,
+                    _fingerprints: Vec<String>,
+                ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                    Box::pin(async { Err(AppError::not_paired()) })
+                }
+                fn dismiss_identity_change(
+                    &self,
+                    _node: String,
+                ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                    Box::pin(async { Err(AppError::not_paired()) })
+                }
+                fn content_target(&self, machine: &str) -> Result<ContentTarget, AppError> {
+                    Ok(ContentTarget {
+                        link: self.link.clone(),
+                        link_node: machine.to_owned(),
+                        machine: machine.to_owned(),
+                        principal: "device:pixel".to_owned(),
+                        holder: "fleet:1".to_owned(),
+                        learned_identity: None,
+                    })
+                }
+                fn is_pairing_holder_live(&self, _: &str) -> bool {
+                    true
+                }
+            }
+
+            let backend: Arc<dyn Backend> = Arc::new(RelayedTargetBackend { link });
+            let platform = Arc::new(MockPlatform::new(dir.path()));
+            let mgr = TransferManager::with_options(
+                dir.path(),
+                backend,
+                platform.clone(),
+                2,
+                Duration::from_secs(2),
+            );
+            platform
+                .picked_files
+                .lock()
+                .unwrap()
+                .push(PickedUploadFile {
+                    local_path: src.to_string_lossy().into_owned(),
+                    name: "raced.txt".into(),
+                    size: payload.len() as u64,
+                    mime: None,
+                });
+            let picked = mgr.pick_uploads().await.unwrap();
+            let up = mgr
+                .enqueue_upload(
+                    "studio".into(),
+                    "/home/me/Uploads".into(),
+                    Some(vec![picked[0].handle.clone()]),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let done = wait_for_state(&mgr, &up.id, |s| s == TransferState::Done).await;
+            assert_eq!(done.path, "/home/me/Uploads/raced (2).txt");
+            assert_eq!(done.name, "raced (2).txt");
+            assert_eq!(
+                studio_files
+                    .lock()
+                    .unwrap()
+                    .get("/home/me/Uploads/raced.txt")
+                    .map(Vec::as_slice),
+                Some(b"raced-on-studio-between-stat-and-put".as_slice()),
+                "raced file on studio must remain untouched"
+            );
+            assert_eq!(
+                studio_uploaded
+                    .lock()
+                    .unwrap()
+                    .get("/home/me/Uploads/raced (2).txt")
+                    .map(Vec::as_slice),
+                Some(payload.as_slice())
+            );
+            let reqs = seen_inner_puts.lock().unwrap();
+            assert_eq!(reqs.len(), 2, "expected Exists refusal then numbered retry");
+            assert!(reqs.iter().all(|r| r["if_exists"] == json!("fail")));
             mgr.shutdown();
         }
     }
@@ -8524,8 +8833,7 @@ mod tests {
     async fn direct_upload_checks_destination_when_final_ok_lost_and_retries_unsolicited_cancel() {
         let dir = tempfile::tempdir().unwrap();
         let remote = Arc::new(Mutex::new(MockRemoteState {
-            advertise_cap_no_replace: true,
-            reply_no_replace: true,
+            advertise_cap_if_exists: true,
             cancel_after_put_commit: true,
             ..MockRemoteState::default()
         }));
@@ -8680,7 +8988,7 @@ mod tests {
                     tokio::spawn(async move {
                         let greeting = json!({
                             "protocol": 1,
-                            "capabilities": [CAP_STREAM_RELAY, CAP_PUT_NO_REPLACE],
+                            "capabilities": [CAP_STREAM_RELAY, CAP_IF_EXISTS],
                         });
                         let _ = server_out
                             .write_all(format!("{greeting}\n").as_bytes())
@@ -8706,7 +9014,7 @@ mod tests {
                             .cloned()
                             .unwrap_or_default();
                         let offset = got.len();
-                        let ready = json!({ "offset": offset, "no_replace": true });
+                        let ready = json!({ "offset": offset });
                         let _ = server_out.write_all(format!("{ready}\n").as_bytes()).await;
 
                         let abort_mid = cancel_mid_once.swap(false, Ordering::SeqCst);
@@ -9069,5 +9377,481 @@ mod tests {
         );
 
         mgr.shutdown();
+    }
+
+    #[cfg(all(unix, not(any(target_os = "android", target_os = "ios"))))]
+    #[tokio::test]
+    async fn real_binary_uploads_atomic_if_exists_direct_relayed_and_older_stat_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn find_workspace_legion_bin() -> Option<PathBuf> {
+            if let Ok(p) = std::env::var("LEGION_BIN") {
+                let pb = PathBuf::from(p);
+                if pb.is_file() {
+                    return Some(pb);
+                }
+            }
+            let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+            for rel in [
+                "../../../target/debug/legion",
+                "../../../target/release/legion",
+            ] {
+                let candidate = manifest.join(rel);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+            None
+        }
+
+        fn write_wrapper(
+            path: &Path,
+            bin: &Path,
+            legion_home: &Path,
+            user_home: &Path,
+            race_on_stream: Option<(&Path, &Path, &str)>,
+        ) {
+            let race_block = match race_on_stream {
+                Some((trigger, target, content)) => format!(
+                    "if [ \"$1\" = \"stream\" ] && [ -f '{}' ]; then\n  rm -f '{}'\n  printf '%s' '{}' > '{}'\nfi\n",
+                    trigger.display(),
+                    trigger.display(),
+                    content,
+                    target.display(),
+                ),
+                None => String::new(),
+            };
+            let script = format!(
+                "#!/bin/sh\nexport LEGION_HOME='{}'\nexport HOME='{}'\nunset XDG_CONFIG_HOME XDG_STATE_HOME\n{}exec '{}' \"$@\"\n",
+                legion_home.display(),
+                user_home.display(),
+                race_block,
+                bin.display(),
+            );
+            fs::write(path, script).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        fn count_audit_fs_stat(legion_home: &Path) -> usize {
+            let audit = legion_home.join("state/audit.jsonl");
+            let Ok(text) = fs::read_to_string(&audit) else {
+                return 0;
+            };
+            text.lines()
+                .filter(|line| line.contains("\"fs.stat\""))
+                .count()
+        }
+
+        struct LocalBinaryBackend {
+            link: Link,
+        }
+
+        impl Backend for LocalBinaryBackend {
+            fn state(&self) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn tools(&self, _on: Option<Value>) -> BoxFuture<'_, Result<Vec<Value>, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn call(
+                &self,
+                _request: CallRequest,
+                _on_event: Option<tauri::ipc::Channel<Value>>,
+            ) -> BoxFuture<'_, Result<Value, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn cancel(&self, _id: CallId) -> BoxFuture<'_, Result<CancelResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn pair(
+                &self,
+                _invite: String,
+                _name: String,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn unpair(&self, _node: String) -> BoxFuture<'_, Result<UnpairResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn select_node(&self, _node: String) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn repair_store(&self) -> BoxFuture<'_, Result<RepairResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn invalidate_sessions(&self) -> BoxFuture<'_, Result<(), AppError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn learn(&self) -> BoxFuture<'_, Result<LearnResult, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn accept_identity_change(
+                &self,
+                _node: String,
+                _fingerprints: Vec<String>,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn dismiss_identity_change(
+                &self,
+                _node: String,
+            ) -> BoxFuture<'_, Result<AppState, AppError>> {
+                Box::pin(async { Err(AppError::not_paired()) })
+            }
+            fn content_target(&self, machine: &str) -> Result<ContentTarget, AppError> {
+                Ok(ContentTarget {
+                    link: self.link.clone(),
+                    link_node: machine.to_owned(),
+                    machine: machine.to_owned(),
+                    principal: "owner".to_owned(),
+                    holder: "local:test".to_owned(),
+                    learned_identity: None,
+                })
+            }
+            fn is_pairing_holder_live(&self, _: &str) -> bool {
+                true
+            }
+        }
+
+        // Part 1: Current `legion` binary — direct AND relayed uploads raced between `fs.stat`
+        // and `put` are refused atomically by `"if_exists": "fail"`.
+        if let Some(legion_bin) = find_workspace_legion_bin() {
+            let root = tempfile::tempdir().unwrap();
+            let home_a = root.path().join("legion-a");
+            let home_b = root.path().join("legion-b");
+            let user_a = root.path().join("user-a");
+            let user_b = root.path().join("user-b");
+            let uploads_a = user_a.join("uploads");
+            let uploads_b = user_b.join("uploads");
+            for d in [
+                home_a.join("config"),
+                home_b.join("config"),
+                uploads_a.clone(),
+                uploads_b.clone(),
+            ] {
+                fs::create_dir_all(&d).unwrap();
+            }
+            let trigger_a = root.path().join("trigger-a");
+            let trigger_b = root.path().join("trigger-b");
+            fs::write(&trigger_a, b"arm").unwrap();
+            fs::write(&trigger_b, b"arm").unwrap();
+
+            let wrap_a = root.path().join("tower.sh");
+            let wrap_b = root.path().join("pi.sh");
+            write_wrapper(
+                &wrap_a,
+                &legion_bin,
+                &home_a,
+                &user_a,
+                Some((
+                    &trigger_a,
+                    &uploads_a.join("raced.txt"),
+                    "created-between-stat-and-put-direct",
+                )),
+            );
+            write_wrapper(
+                &wrap_b,
+                &legion_bin,
+                &home_b,
+                &user_b,
+                Some((
+                    &trigger_b,
+                    &uploads_b.join("raced-relayed.txt"),
+                    "created-between-stat-and-put-relayed",
+                )),
+            );
+
+            fs::write(home_a.join("config/node.toml"), "name = \"tower\"\n").unwrap();
+            fs::write(home_b.join("config/node.toml"), "name = \"pi\"\n").unwrap();
+            fs::write(home_a.join("config/policy.toml"), "default = \"owner\"\n").unwrap();
+            fs::write(home_b.join("config/policy.toml"), "default = \"owner\"\n").unwrap();
+            fs::write(
+                home_a.join("config/fleet.toml"),
+                format!(
+                    "[machines.tower]\nssh = \"127.0.0.1\"\n\n[machines.pi]\ncommand = ['{}', \"rpc\"]\n",
+                    wrap_b.display()
+                ),
+            )
+            .unwrap();
+            fs::write(
+                home_b.join("config/fleet.toml"),
+                format!(
+                    "[machines.pi]\nssh = \"127.0.0.1\"\n\n[machines.tower]\ncommand = ['{}', \"rpc\"]\n",
+                    wrap_a.display()
+                ),
+            )
+            .unwrap();
+
+            let link = Link::new(LinkConfig {
+                nodes: vec![NodeLink::local("tower", wrap_a.to_string_lossy())],
+                ..LinkConfig::default()
+            });
+            let backend: Arc<dyn Backend> = Arc::new(LocalBinaryBackend { link: link.clone() });
+            let mgr_dir = root.path().join("mgr-current");
+            fs::create_dir_all(&mgr_dir).unwrap();
+            let platform = Arc::new(MockPlatform::new(&mgr_dir));
+            let mgr = TransferManager::with_options(
+                &mgr_dir,
+                backend,
+                platform.clone(),
+                2,
+                Duration::from_secs(5),
+            );
+
+            // Direct upload #1: `fs.stat` sees NotFound, then `tower.sh` creates `raced.txt` right
+            // as `legion stream` opens -> `"if_exists": "fail"` refuses atomically -> `raced (2).txt`.
+            let src1 = root.path().join("src1.txt");
+            fs::write(&src1, b"new-direct-upload-1").unwrap();
+            platform
+                .picked_files
+                .lock()
+                .unwrap()
+                .push(PickedUploadFile {
+                    local_path: src1.to_string_lossy().into_owned(),
+                    name: "raced.txt".into(),
+                    size: 19,
+                    mime: None,
+                });
+            let p1 = mgr.pick_uploads().await.unwrap();
+            let u1 = mgr
+                .enqueue_upload(
+                    "tower".into(),
+                    uploads_a.to_string_lossy().into_owned(),
+                    Some(vec![p1[0].handle.clone()]),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let d1 = wait_for_state(&mgr, &u1.id, |s| s.is_terminal()).await;
+            assert_eq!(d1.state, TransferState::Done, "err={:?}", d1.error);
+            assert_eq!(d1.name, "raced (2).txt");
+            assert!(
+                !trigger_a.exists(),
+                "race trigger must have fired between fs.stat and stream put"
+            );
+            assert_eq!(
+                fs::read(uploads_a.join("raced.txt")).unwrap(),
+                b"created-between-stat-and-put-direct"
+            );
+            assert_eq!(
+                fs::read(uploads_a.join("raced (2).txt")).unwrap(),
+                b"new-direct-upload-1"
+            );
+            assert_eq!(link.stream_supports("tower", CAP_IF_EXISTS), Some(true));
+            let stats_after_first = count_audit_fs_stat(&home_a);
+            assert!(
+                stats_after_first >= 1,
+                "first upload before stream greeting probes fs.stat"
+            );
+
+            // Direct upload #2: CAP_IF_EXISTS is cached -> zero new fs.stat calls, still refuses
+            // pre-existing file atomically via `"if_exists": "fail"`.
+            fs::write(uploads_a.join("second.txt"), b"keep-second").unwrap();
+            let src2 = root.path().join("src2.txt");
+            fs::write(&src2, b"new-direct-upload-2").unwrap();
+            {
+                let mut picked = platform.picked_files.lock().unwrap();
+                picked.clear();
+                picked.push(PickedUploadFile {
+                    local_path: src2.to_string_lossy().into_owned(),
+                    name: "second.txt".into(),
+                    size: 19,
+                    mime: None,
+                });
+            }
+            let p2 = mgr.pick_uploads().await.unwrap();
+            let u2 = mgr
+                .enqueue_upload(
+                    "tower".into(),
+                    uploads_a.to_string_lossy().into_owned(),
+                    Some(vec![p2[0].handle.clone()]),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let d2 = wait_for_state(&mgr, &u2.id, |s| s.is_terminal()).await;
+            assert_eq!(d2.state, TransferState::Done, "err={:?}", d2.error);
+            assert_eq!(d2.name, "second (2).txt");
+            assert_eq!(
+                count_audit_fs_stat(&home_a),
+                stats_after_first,
+                "upload #2 must skip fs.stat once CAP_IF_EXISTS is cached"
+            );
+            assert_eq!(
+                fs::read(uploads_a.join("second.txt")).unwrap(),
+                b"keep-second"
+            );
+            assert_eq!(
+                fs::read(uploads_a.join("second (2).txt")).unwrap(),
+                b"new-direct-upload-2"
+            );
+
+            // Relayed upload to `pi` via `tower`: `fs.stat` sees NotFound, then `pi.sh` creates
+            // `raced-relayed.txt` right as `legion stream` opens on `pi` -> atomic `if_exists: "fail"`.
+            let src3 = root.path().join("src3.txt");
+            fs::write(&src3, b"new-relayed-upload").unwrap();
+            {
+                let mut picked = platform.picked_files.lock().unwrap();
+                picked.clear();
+                picked.push(PickedUploadFile {
+                    local_path: src3.to_string_lossy().into_owned(),
+                    name: "raced-relayed.txt".into(),
+                    size: 18,
+                    mime: None,
+                });
+            }
+            let p3 = mgr.pick_uploads().await.unwrap();
+            let u3 = mgr
+                .enqueue_upload(
+                    "pi".into(),
+                    uploads_b.to_string_lossy().into_owned(),
+                    Some(vec![p3[0].handle.clone()]),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let d3 = wait_for_state(&mgr, &u3.id, |s| s.is_terminal()).await;
+            assert_eq!(d3.state, TransferState::Done, "err={:?}", d3.error);
+            assert_eq!(d3.name, "raced-relayed (2).txt");
+            assert!(
+                !trigger_b.exists(),
+                "relayed race trigger must have fired between fs.stat and stream put on pi"
+            );
+            assert_eq!(
+                fs::read(uploads_b.join("raced-relayed.txt")).unwrap(),
+                b"created-between-stat-and-put-relayed"
+            );
+            assert_eq!(
+                fs::read(uploads_b.join("raced-relayed (2).txt")).unwrap(),
+                b"new-relayed-upload"
+            );
+
+            mgr.shutdown();
+            link.close().await;
+        }
+
+        // Part 2: Optional real legacy node check (e.g. `LEGION_OLD_BIN` built from `d1ce1b49`),
+        // proving the `fs.stat` fallback still works cleanly when `if_exists` is absent.
+        if let Ok(old_bin_str) = std::env::var("LEGION_OLD_BIN") {
+            let old_bin = PathBuf::from(&old_bin_str);
+            assert!(
+                old_bin.is_file(),
+                "LEGION_OLD_BIN does not exist: {}",
+                old_bin.display()
+            );
+            let root = tempfile::tempdir().unwrap();
+            let home_old = root.path().join("legion-old");
+            let user_old = root.path().join("user-old");
+            let uploads_old = user_old.join("uploads");
+            fs::create_dir_all(home_old.join("config")).unwrap();
+            fs::create_dir_all(&uploads_old).unwrap();
+            fs::write(home_old.join("config/node.toml"), "name = \"oldnode\"\n").unwrap();
+            fs::write(home_old.join("config/policy.toml"), "default = \"owner\"\n").unwrap();
+            let wrap_old = root.path().join("oldnode.sh");
+            write_wrapper(&wrap_old, &old_bin, &home_old, &user_old, None);
+
+            fs::write(uploads_old.join("legacy.txt"), b"keep-legacy-1").unwrap();
+            fs::write(uploads_old.join("legacy2.txt"), b"keep-legacy-2").unwrap();
+
+            let link = Link::new(LinkConfig {
+                nodes: vec![NodeLink::local("oldnode", wrap_old.to_string_lossy())],
+                ..LinkConfig::default()
+            });
+            let backend: Arc<dyn Backend> = Arc::new(LocalBinaryBackend { link: link.clone() });
+            let mgr_dir = root.path().join("mgr-old");
+            fs::create_dir_all(&mgr_dir).unwrap();
+            let platform = Arc::new(MockPlatform::new(&mgr_dir));
+            let mgr = TransferManager::with_options(
+                &mgr_dir,
+                backend,
+                platform.clone(),
+                2,
+                Duration::from_secs(5),
+            );
+
+            // Upload #1 onto pre-existing `legacy.txt`: fs.stat picks `legacy (2).txt`, and
+            // greeting from `d1ce1b49` caches `CAP_IF_EXISTS == Some(false)`.
+            let src1 = root.path().join("legacy-src1.txt");
+            fs::write(&src1, b"uploaded-legacy-1").unwrap();
+            platform
+                .picked_files
+                .lock()
+                .unwrap()
+                .push(PickedUploadFile {
+                    local_path: src1.to_string_lossy().into_owned(),
+                    name: "legacy.txt".into(),
+                    size: 17,
+                    mime: None,
+                });
+            let p1 = mgr.pick_uploads().await.unwrap();
+            let u1 = mgr
+                .enqueue_upload(
+                    "oldnode".into(),
+                    uploads_old.to_string_lossy().into_owned(),
+                    Some(vec![p1[0].handle.clone()]),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let d1 = wait_for_state(&mgr, &u1.id, |s| s.is_terminal()).await;
+            assert_eq!(d1.state, TransferState::Done, "err={:?}", d1.error);
+            assert_eq!(d1.name, "legacy (2).txt");
+            assert_eq!(
+                fs::read(uploads_old.join("legacy.txt")).unwrap(),
+                b"keep-legacy-1"
+            );
+            assert_eq!(
+                fs::read(uploads_old.join("legacy (2).txt")).unwrap(),
+                b"uploaded-legacy-1"
+            );
+            assert_eq!(
+                link.stream_supports("oldnode", CAP_IF_EXISTS),
+                Some(false),
+                "d1ce1b49 node must omit if_exists from greeting"
+            );
+            let old_stats_after_first = count_audit_fs_stat(&home_old);
+
+            // Upload #2 onto pre-existing `legacy2.txt`: continues using fs.stat fallback cleanly.
+            let src2 = root.path().join("legacy-src2.txt");
+            fs::write(&src2, b"uploaded-legacy-2").unwrap();
+            {
+                let mut picked = platform.picked_files.lock().unwrap();
+                picked.clear();
+                picked.push(PickedUploadFile {
+                    local_path: src2.to_string_lossy().into_owned(),
+                    name: "legacy2.txt".into(),
+                    size: 17,
+                    mime: None,
+                });
+            }
+            let p2 = mgr.pick_uploads().await.unwrap();
+            let u2 = mgr
+                .enqueue_upload(
+                    "oldnode".into(),
+                    uploads_old.to_string_lossy().into_owned(),
+                    Some(vec![p2[0].handle.clone()]),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let d2 = wait_for_state(&mgr, &u2.id, |s| s.is_terminal()).await;
+            assert_eq!(d2.state, TransferState::Done, "err={:?}", d2.error);
+            assert_eq!(d2.name, "legacy2 (2).txt");
+            assert!(
+                count_audit_fs_stat(&home_old) >= old_stats_after_first + 2,
+                "older node must keep fs.stat collision fallback"
+            );
+            assert_eq!(
+                fs::read(uploads_old.join("legacy2.txt")).unwrap(),
+                b"keep-legacy-2"
+            );
+            assert_eq!(
+                fs::read(uploads_old.join("legacy2 (2).txt")).unwrap(),
+                b"uploaded-legacy-2"
+            );
+
+            mgr.shutdown();
+            link.close().await;
+        }
     }
 }

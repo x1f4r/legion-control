@@ -28,8 +28,8 @@ use crate::content::{
 };
 use crate::invite::{Enrolled, SshTarget, SshTimeouts};
 use crate::put::{
-    CAP_PUT_NO_REPLACE, PUT_STREAM_BUF_BYTES, PutRequest, PutStream, handshake_put,
-    handshake_put_relayed, validate_blake3_hash,
+    PUT_STREAM_BUF_BYTES, PutRequest, PutStream, handshake_put, handshake_put_relayed,
+    validate_blake3_hash,
 };
 use crate::session::{CallError, Session};
 
@@ -2939,9 +2939,6 @@ impl Link {
             Some(&record_caps),
         )
         .await?;
-        if stream.no_replace_confirmed() {
-            live.record_stream_capabilities(vec![CAP_PUT_NO_REPLACE.to_owned()]);
-        }
         stream.attach_flight(Box::new(flight));
         Ok(stream)
     }
@@ -8252,7 +8249,7 @@ mod tests {
                     hash: fake_hash.clone(),
                     mode: None,
                     mtime: None,
-                    no_replace: false,
+                    if_exists: crate::put::PutIfExists::Replace,
                 },
             )
             .await
@@ -8318,7 +8315,7 @@ mod tests {
                     hash: fake_hash.clone(),
                     mode: None,
                     mtime: None,
-                    no_replace: false,
+                    if_exists: crate::put::PutIfExists::Replace,
                 },
             )
             .await
@@ -8355,7 +8352,7 @@ mod tests {
                     hash: fake_hash,
                     mode: None,
                     mtime: None,
-                    no_replace: false,
+                    if_exists: crate::put::PutIfExists::Replace,
                 },
             )
             .await
@@ -8550,7 +8547,7 @@ mod tests {
             hash: format!("blake3:{}", "a".repeat(64)),
             mode: None,
             mtime: None,
-            no_replace: false,
+            if_exists: crate::put::PutIfExists::Replace,
         };
 
         // 1. Learned direct refuses device key + old relay -> both `open_content` and `open_put`

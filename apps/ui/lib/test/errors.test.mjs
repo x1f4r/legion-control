@@ -82,6 +82,24 @@ test('formatErrorForDisplay produces the exact plain sentences and hides reasons
   assert.match(techUnknown.detail, /reason: unknown_machine/);
   assert.match(techUnknown.detail, /fleet\.toml/);
 
+  // Exists (for example atomic `put` with `if_exists: "fail"`)
+  const exists = {
+    code: 'exists',
+    message: '/home/me/report.pdf already exists.',
+    hint: 'Pass if_exists="replace", "skip", or "rename", or choose another path.',
+    machine: 'studio',
+  };
+  const plainExists = formatErrorForDisplay({ error: exists, technical: false });
+  assert.equal(plainExists.heading, 'Something with that name already exists.');
+  assert.equal(plainExists.detail, null);
+  assert.equal(plainExists.machinePrefix, '');
+
+  const techExists = formatErrorForDisplay({ error: exists, technical: true });
+  assert.equal(techExists.heading, '/home/me/report.pdf already exists.');
+  assert.match(techExists.detail, /if_exists/);
+  assert.equal(techExists.machinePrefix, 'studio: ');
+  assert.equal(isTerminalHint(exists.hint), true);
+
   // Device removed or unknown
   const removed = {
     code: 'denied',

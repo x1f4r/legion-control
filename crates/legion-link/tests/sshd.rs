@@ -610,7 +610,7 @@ async fn real_sshd_session_and_security_checks() {
                         hash: sample_hash.clone(),
                         mode: Some(0o644),
                         mtime: None,
-                        no_replace: false,
+                        if_exists: legion_link::PutIfExists::Replace,
                     },
                 )
                 .await
@@ -645,7 +645,7 @@ async fn real_sshd_session_and_security_checks() {
                             hash: sample_hash.clone(),
                             mode: Some(0o644),
                             mtime: None,
-                            no_replace: false,
+                            if_exists: legion_link::PutIfExists::Replace,
                         },
                     )
                     .await
@@ -669,7 +669,7 @@ async fn real_sshd_session_and_security_checks() {
                             hash: sample_hash.clone(),
                             mode: Some(0o644),
                             mtime: None,
-                            no_replace: false,
+                            if_exists: legion_link::PutIfExists::Replace,
                         },
                     )
                     .await
@@ -692,7 +692,7 @@ async fn real_sshd_session_and_security_checks() {
                             hash: sample_hash.clone(),
                             mode: Some(0o644),
                             mtime: None,
-                            no_replace: false,
+                            if_exists: legion_link::PutIfExists::Replace,
                         },
                     )
                     .await
@@ -720,7 +720,7 @@ async fn real_sshd_session_and_security_checks() {
                                 .to_owned(),
                             mode: Some(0o644),
                             mtime: None,
-                            no_replace: false,
+                            if_exists: legion_link::PutIfExists::Replace,
                         },
                     )
                     .await
@@ -761,7 +761,7 @@ async fn real_sshd_session_and_security_checks() {
                             hash: sample_hash.clone(),
                             mode: Some(0o644),
                             mtime: None,
-                            no_replace: false,
+                            if_exists: legion_link::PutIfExists::Replace,
                         },
                     )
                     .await

@@ -13,7 +13,7 @@ const TERMINAL_HINT_PATTERNS = [
   /\btools\.d\b/i,
   /\b(?:GET|POST|PUT|DELETE)\s+\/v\d+\//,
   /(?:^|[\s(])(?:~\/|\/(?:etc|home|var|usr|opt)\/|[A-Za-z]:\\)/,
-  /\b(?:force|dry_run|on)\s*[:=]\s*(?:true|false|["'<])/i,
+  /\b(?:force|dry_run|on|if_exists)\s*[:=]\s*(?:true|false|["'<])/i,
   /\s--[a-z][a-z0-9-]*/,
   TOOL_NAME_RE,
 ];
@@ -174,7 +174,10 @@ export function formatErrorForDisplay({
   const forcePlainByCode =
     !title &&
     error &&
-    (code === 'needs_newer_legion' || code === 'unknown_tool' || code === 'invalid_args');
+    (code === 'needs_newer_legion' ||
+      code === 'unknown_tool' ||
+      code === 'invalid_args' ||
+      code === 'exists');
 
   let heading = rawHeading;
   let machinePrefix = '';

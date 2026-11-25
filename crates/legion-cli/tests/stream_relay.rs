@@ -361,7 +361,7 @@ fn helper(args: &[String]) -> ExitCode {
         }
         Some("echo-put-header") => {
             // Records the exact stream header line received from the relay and refuses with
-            // `exists` when `if_exists == "fail"` or `no_replace == true`.
+            // `exists` when `if_exists == "fail"`.
             let seen_file = PathBuf::from(&args[1]);
             let mut out = std::io::stdout().lock();
             writeln!(
@@ -369,7 +369,7 @@ fn helper(args: &[String]) -> ExitCode {
                 "{}",
                 json!({
                     "protocol": 1,
-                    "capabilities": ["if_exists", "put.no_replace", "stream.relay"]
+                    "capabilities": ["if_exists", "stream.relay"]
                 })
             )
             .unwrap();
@@ -381,9 +381,7 @@ fn helper(args: &[String]) -> ExitCode {
             }
             fs::write(&seen_file, &line).unwrap();
             let req: Value = serde_json::from_str(&line).unwrap();
-            if req.get("no_replace") == Some(&Value::Bool(true))
-                || req.get("if_exists").and_then(Value::as_str) == Some("fail")
-            {
+            if req.get("if_exists").and_then(Value::as_str) == Some("fail") {
                 let err = json!({
                     "error": {
                         "code": "exists",
@@ -2160,8 +2158,8 @@ fn relayed_put_if_exists_fail_refuses_existing_file_and_preserves_fields() {
         "existing file on studio must remain untouched after if_exists=skip"
     );
 
-    // 3. Relayed `put` preserves both `if_exists` and `no_replace: true` verbatim in the forwarded
-    //    header while supplying the relay-resolved `"as"` principal.
+    // 3. Relayed `put` preserves `if_exists` and unknown inner `put` keys verbatim in the
+    //    forwarded header while supplying the relay-resolved `"as"` principal.
     {
         let mut child = spawn_stream(&tower, Some("device"));
         let mut stdin = child.stdin.take().unwrap();
@@ -2180,7 +2178,7 @@ fn relayed_put_if_exists_fail_refuses_existing_file_and_preserves_fields() {
                     "size": replacement.len(),
                     "hash": replacement_hash,
                     "if_exists": "fail",
-                    "no_replace": true,
+                    "future_flag": true,
                     "as": "admin",
                 }
             }),
@@ -2194,7 +2192,7 @@ fn relayed_put_if_exists_fail_refuses_existing_file_and_preserves_fields() {
     let forwarded: Value =
         serde_json::from_str(&fs::read_to_string(&seen_header).unwrap()).unwrap();
     assert_eq!(forwarded["if_exists"], json!("fail"), "{forwarded}");
-    assert_eq!(forwarded["no_replace"], json!(true), "{forwarded}");
+    assert_eq!(forwarded["future_flag"], json!(true), "{forwarded}");
     assert_eq!(
         forwarded["as"],
         json!("device"),

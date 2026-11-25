@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 
 use legion_link::proto::ErrorCode;
 use legion_link::{
-    Link, LinkConfig, LinkOptions, MachineRouteStatus, NodeOrigin, PutRequest,
-    REASON_DEVICE_REMOVED_OR_UNKNOWN, Route,
+    CAP_IF_EXISTS, Link, LinkConfig, LinkOptions, MachineRouteStatus, NodeOrigin, PutIfExists,
+    PutRequest, REASON_DEVICE_REMOVED_OR_UNKNOWN, Route,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -980,7 +980,7 @@ async fn real_two_sshd_relayed_streams_then_learn_switches_to_direct() {
                     hash: upload_hash.clone(),
                     mode: None,
                     mtime: None,
-                    no_replace: false,
+                    if_exists: PutIfExists::Replace,
                 },
             )
             .await
@@ -1019,7 +1019,7 @@ async fn real_two_sshd_relayed_streams_then_learn_switches_to_direct() {
                     hash: upload_hash.clone(),
                     mode: None,
                     mtime: None,
-                    no_replace: false,
+                    if_exists: PutIfExists::Replace,
                 },
             )
             .await
@@ -1074,7 +1074,7 @@ async fn real_two_sshd_relayed_streams_then_learn_switches_to_direct() {
                 hash: upload_hash.clone(),
                 mode: None,
                 mtime: None,
-                no_replace: false,
+                if_exists: PutIfExists::Replace,
             },
         )
         .await
@@ -1086,6 +1086,338 @@ async fn real_two_sshd_relayed_streams_then_learn_switches_to_direct() {
     assert_eq!(
         fs::read(user_b.join("uploads/direct.bin")).unwrap(),
         upload_payload
+    );
+
+    drop(sshd_a);
+    drop(sshd_b);
+    link.close().await;
+}
+
+#[tokio::test]
+async fn real_two_sshd_direct_and_relayed_put_if_exists_fail_refuses_raced_file_atomically() {
+    if !cfg!(unix) || find_sshd().is_none() || find_tool("ssh-keygen").is_none() {
+        eprintln!("skipping two-sshd if_exists race test: sshd/ssh-keygen unavailable");
+        return;
+    }
+    let Some(legion_bin) = find_legion_bin() else {
+        panic!(
+            "built `legion` binary not found; run `cargo build -p legion-cli` (or set LEGION_BIN) before running fleet_routes"
+        );
+    };
+
+    let root = strict_tempdir();
+    let user_a = root.path().join("home-a");
+    let user_b = root.path().join("home-b");
+    let home_a = root.path().join("legion-a");
+    let home_b = root.path().join("legion-b");
+    let auth_a = user_a.join(".ssh").join("authorized_keys");
+    let auth_b = user_b.join(".ssh").join("authorized_keys");
+
+    for dir in [
+        home_a.join("config"),
+        home_b.join("config"),
+        user_a.join(".ssh"),
+        user_b.join(".ssh"),
+        user_a.join("uploads"),
+        user_b.join("uploads"),
+    ] {
+        fs::create_dir_all(&dir).unwrap();
+    }
+    #[cfg(unix)]
+    for dir in [&user_a, &user_b, &user_a.join(".ssh"), &user_b.join(".ssh")] {
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    }
+
+    let Some(sshd_a) = ManagedSshd::new(&root.path().join("sshd-a"), &auth_a, &user_a) else {
+        return;
+    };
+    let Some(sshd_b) = ManagedSshd::new(&root.path().join("sshd-b"), &auth_b, &user_b) else {
+        return;
+    };
+
+    fs::write(
+        home_a.join("config/node.toml"),
+        format!(
+            "name = \"tower\"\n\n[devices]\nhosts = [\"127.0.0.1\"]\nport = {}\nuser = {:?}\nauthorized_keys = {}\nhost_keys = [{}]\n",
+            sshd_a.port,
+            sshd_a.user,
+            toml_literal(&auth_a),
+            toml_literal(&sshd_a.host_key_pub),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        home_b.join("config/node.toml"),
+        format!(
+            "name = \"pi\"\n\n[devices]\nhosts = [\"127.0.0.1\"]\nport = {}\nuser = {:?}\nauthorized_keys = {}\nhost_keys = [{}]\n",
+            sshd_b.port,
+            sshd_b.user,
+            toml_literal(&auth_b),
+            toml_literal(&sshd_b.host_key_pub),
+        ),
+    )
+    .unwrap();
+    let policy = "default = \"owner\"\n";
+    fs::write(home_a.join("config/policy.toml"), policy).unwrap();
+    fs::write(home_b.join("config/policy.toml"), policy).unwrap();
+
+    let node_b_exec = root.path().join("node-b.sh");
+    let node_a_exec = root.path().join("node-a.sh");
+    write_node_wrapper(&node_b_exec, &legion_bin, &home_b, &user_b);
+    write_node_wrapper(&node_a_exec, &legion_bin, &home_a, &user_a);
+
+    fs::write(
+        home_a.join("config/fleet.toml"),
+        format!(
+            "[machines.tower]\nssh = \"127.0.0.1\"\n\n[machines.pi]\ncommand = [{}, \"rpc\"]\n",
+            toml_literal(&node_b_exec),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        home_b.join("config/fleet.toml"),
+        format!(
+            "[machines.pi]\nssh = \"127.0.0.1\"\n\n[machines.tower]\ncommand = [{}, \"rpc\"]\n",
+            toml_literal(&node_a_exec),
+        ),
+    )
+    .unwrap();
+
+    let payload = b"atomic-if-exists-upload-payload-bytes".to_vec();
+    fs::write(user_a.join("seed-if-exists.bin"), &payload).unwrap();
+    let payload_hash =
+        blake3_via_legion_stream(&legion_bin, &home_a, &user_a, "~/seed-if-exists.bin");
+
+    // Pair with `tower` only so `tower` is direct and `pi` is relayed via `tower`.
+    let invite_out = run_legion(
+        &legion_bin,
+        &home_a,
+        &user_a,
+        &[
+            "device.invite",
+            "name=pixel",
+            "role=owner",
+            "allow_owner=true",
+        ],
+    );
+    let invite_text = invite_out["invite"].as_str().unwrap();
+    let link = Link::with_options(
+        LinkConfig::default(),
+        LinkOptions {
+            allow_loopback_endpoints: true,
+            ..LinkOptions::default()
+        },
+    );
+    link.pair(invite_text, "pixel").await.unwrap();
+    assert!(link.config().node("pi").is_none());
+
+    // 1. Direct upload on `tower`: create the colliding file *between `fs.stat` and `put`*.
+    //    `fs.stat` sees NotFound, then the file appears on disk before `put`; `"if_exists": "fail"`
+    //    must still refuse atomically with `ErrorCode::Exists` and cache `CAP_IF_EXISTS`.
+    let stat_direct = link
+        .call_machine(
+            "tower",
+            "fs.stat",
+            json!({ "path": "~/uploads/raced-direct.bin" }),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(stat_direct.code, ErrorCode::NotFound, "{stat_direct}");
+    let direct_raced_contents = b"created-between-stat-and-put-direct";
+    fs::write(
+        user_a.join("uploads/raced-direct.bin"),
+        direct_raced_contents,
+    )
+    .unwrap();
+
+    let err = link
+        .open_put(
+            "tower",
+            PutRequest {
+                path: "~/uploads/raced-direct.bin".to_owned(),
+                size: payload.len() as u64,
+                hash: payload_hash.clone(),
+                mode: Some(0o644),
+                mtime: None,
+                if_exists: PutIfExists::Fail,
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.code, ErrorCode::Exists, "{err}");
+    assert_eq!(err.machine.as_deref(), Some("tower"), "{err}");
+    assert_eq!(
+        link.stream_supports("tower", CAP_IF_EXISTS),
+        Some(true),
+        "current node must advertise and cache if_exists even when first put returns Exists"
+    );
+    assert_eq!(
+        fs::read(user_a.join("uploads/raced-direct.bin")).unwrap(),
+        direct_raced_contents,
+        "direct raced file must remain untouched"
+    );
+
+    // Retry onto sibling path succeeds and reports `if_exists_supported() == true`.
+    let mut direct_sibling = link
+        .open_put(
+            "tower",
+            PutRequest {
+                path: "~/uploads/raced-direct (2).bin".to_owned(),
+                size: payload.len() as u64,
+                hash: payload_hash.clone(),
+                mode: Some(0o644),
+                mtime: None,
+                if_exists: PutIfExists::Fail,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(direct_sibling.route(), &Route::Direct);
+    assert!(direct_sibling.if_exists_supported());
+    direct_sibling.write_all(&payload).await.unwrap();
+    let done = direct_sibling.finish().await.unwrap();
+    assert_eq!(done.hash, payload_hash);
+    assert_eq!(
+        fs::read(user_a.join("uploads/raced-direct (2).bin")).unwrap(),
+        payload
+    );
+
+    // 2. Direct upload commit race on `tower`: file appears *after `PutReady`, before `PutDone`*.
+    let mut direct_commit_race = link
+        .open_put(
+            "tower",
+            PutRequest {
+                path: "~/uploads/raced-commit-direct.bin".to_owned(),
+                size: payload.len() as u64,
+                hash: payload_hash.clone(),
+                mode: Some(0o644),
+                mtime: None,
+                if_exists: PutIfExists::Fail,
+            },
+        )
+        .await
+        .unwrap();
+    let direct_commit_contents = b"created-during-upload-direct";
+    fs::write(
+        user_a.join("uploads/raced-commit-direct.bin"),
+        direct_commit_contents,
+    )
+    .unwrap();
+    direct_commit_race.write_all(&payload).await.unwrap();
+    let err = direct_commit_race.finish().await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Exists, "{err}");
+    assert_eq!(err.machine.as_deref(), Some("tower"), "{err}");
+    assert_eq!(
+        fs::read(user_a.join("uploads/raced-commit-direct.bin")).unwrap(),
+        direct_commit_contents
+    );
+
+    // 3. Relayed upload on `pi` via `tower`: create the colliding file *between `fs.stat` and `put`*.
+    let stat_relayed = link
+        .call_machine(
+            "pi",
+            "fs.stat",
+            json!({ "path": "~/uploads/raced-relayed.bin" }),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(stat_relayed.code, ErrorCode::NotFound, "{stat_relayed}");
+    let relayed_raced_contents = b"created-between-stat-and-put-relayed";
+    fs::write(
+        user_b.join("uploads/raced-relayed.bin"),
+        relayed_raced_contents,
+    )
+    .unwrap();
+
+    let err = link
+        .open_put(
+            "pi",
+            PutRequest {
+                path: "~/uploads/raced-relayed.bin".to_owned(),
+                size: payload.len() as u64,
+                hash: payload_hash.clone(),
+                mode: Some(0o644),
+                mtime: None,
+                if_exists: PutIfExists::Fail,
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.code, ErrorCode::Exists, "{err}");
+    assert_eq!(err.machine.as_deref(), Some("pi"), "{err}");
+    assert_eq!(
+        fs::read(user_b.join("uploads/raced-relayed.bin")).unwrap(),
+        relayed_raced_contents,
+        "relayed raced file on pi must remain untouched"
+    );
+
+    // Retry onto sibling path over relay succeeds.
+    let mut relayed_sibling = link
+        .open_put(
+            "pi",
+            PutRequest {
+                path: "~/uploads/raced-relayed (2).bin".to_owned(),
+                size: payload.len() as u64,
+                hash: payload_hash.clone(),
+                mode: Some(0o644),
+                mtime: None,
+                if_exists: PutIfExists::Fail,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        relayed_sibling.route(),
+        &Route::Relay {
+            via: "tower".to_owned()
+        }
+    );
+    relayed_sibling.write_all(&payload).await.unwrap();
+    let done = relayed_sibling.finish().await.unwrap();
+    assert_eq!(done.hash, payload_hash);
+    assert_eq!(
+        fs::read(user_b.join("uploads/raced-relayed (2).bin")).unwrap(),
+        payload
+    );
+
+    // 4. Relayed upload commit race on `pi`: file appears *after `PutReady`, before `PutDone`*.
+    let mut relayed_commit_race = link
+        .open_put(
+            "pi",
+            PutRequest {
+                path: "~/uploads/raced-commit-relayed.bin".to_owned(),
+                size: payload.len() as u64,
+                hash: payload_hash.clone(),
+                mode: Some(0o644),
+                mtime: None,
+                if_exists: PutIfExists::Fail,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        relayed_commit_race.route(),
+        &Route::Relay {
+            via: "tower".to_owned()
+        }
+    );
+    let relayed_commit_contents = b"created-during-upload-relayed";
+    fs::write(
+        user_b.join("uploads/raced-commit-relayed.bin"),
+        relayed_commit_contents,
+    )
+    .unwrap();
+    relayed_commit_race.write_all(&payload).await.unwrap();
+    let err = relayed_commit_race.finish().await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Exists, "{err}");
+    assert_eq!(err.machine.as_deref(), Some("pi"), "{err}");
+    assert_eq!(
+        fs::read(user_b.join("uploads/raced-commit-relayed.bin")).unwrap(),
+        relayed_commit_contents
     );
 
     drop(sshd_a);

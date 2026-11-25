@@ -109,18 +109,18 @@ JSON carries control, never bulk bytes. File content beyond what `fs.read` allow
 (1 MiB) moves over a second pipe, `legion stream`. Its first line on stdin is one JSON object
 carrying `protocol` (starting at 1), `op`, optional `as`, and the operation's fields; raw bytes
 follow in the direction the operation needs. The node's first line on stdout, before any reply or
-refusal, is `{"protocol": 1, "capabilities": ["stream.relay"]}` (older nodes emit `{"protocol": 1}`
-without `capabilities`) so both ends agree on the protocol version and optional stream capabilities
-before bulk bytes move (waiting up to 60 seconds for the handshake and first reply, and 120 seconds
-between messages or chunks). While an operation works on something long it writes `{"busy": true}`
-every 10 seconds where a reply line is awaited:
+refusal, is `{"protocol": 1, "capabilities": ["if_exists", "rename", "stream.relay"]}` (older nodes
+emit `{"protocol": 1}` without `capabilities`) so both ends agree on the protocol version and
+optional stream capabilities before bulk bytes move (waiting up to 60 seconds for the handshake and
+first reply, and 120 seconds between messages or chunks). While an operation works on something long
+it writes `{"busy": true}` every 10 seconds where a reply line is awaited:
 
 | `op` | Header | Then |
 | --- | --- | --- |
 | `manifest` | `{protocol, op, root, checksum?, exclude?}` | one JSON line per entry on stdout, then `{done, entries, skipped}` |
 | `stat` | `{protocol, op, path, checksum?, if_size?}` | one JSON line `{kind, size, mode?, hash?, mtime?, partial?, case_insensitive?}` on stdout |
 | `get` | `{protocol, op, path, offset?, length?, keep_open?}` | one JSON line `{size, offset, length, mtime, keep_open?}` on stdout, then `length` bytes from `offset` (to the end when `length` is absent; followed by `{"done": true}` when `keep_open` is true) |
-| `put` | `{protocol, op, path, size, hash, mode?, mtime?, no_replace?}` | `{offset}` on stdout (what is on disk decides where it starts); bytes on stdin; `{ok, size, hash}` when verified and renamed |
+| `put` | `{protocol, op, path, size, hash, mode?, mtime?, if_exists?}` | `{offset}` on stdout (what is on disk decides where it starts; `if_exists` accepts `"replace"`, `"fail"`, `"skip"` or `"rename"`, refusing existing files atomically with `exists` under `"fail"`); bytes on stdin; `{ok, size, hash}` when verified and renamed |
 | `pack` | `{protocol, op, root, names: […]}` | `{ready, skipped}` on stdout, then a tar stream of those names |
 | `unpack` | `{protocol, op, root, entries: [{path, kind, size?, hash?, target?}]}` | `{ready}` on stdout; a tar stream on stdin (only the planned `entries` are accepted, verified before replacing the destination); `{ok, files, …}` when done |
 | `delete` | `{protocol, op, root, names: […]}` | `{removed, skipped}` on stdout |
