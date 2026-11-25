@@ -49,9 +49,13 @@ One table in `legion-core` (`media`) maps a file extension to a **category** and
 | `archive` | zip, tar, gz, xz, zst, 7z, rar |
 | `other` | everything else |
 
-The table is by extension only, case-insensitive; nothing is opened to guess. `fs.list`,
-`fs.find` and `fs.stat` report `category` and `mime` for regular files. The existing `kind`
-(`file`, `dir`, `symlink`, `other`) keeps its meaning.
+The table is by extension only, case-insensitive; `fs.list` and `fs.stat` never open files to guess.
+As a targeted exception for `.ts`, `fs.find` and `fs.thumb` sniff the leading bytes of regular `.ts`
+files for MPEG-TS sync packets (`0x47` at 188/192-byte intervals, rejecting plain UTF-8 text) so
+video recordings named `.ts` match `categories: ["video"]` (`video/mp2t`) and thumbnail with
+`ffmpeg`, while TypeScript `.ts` files remain `text` (`text/typescript`). `fs.list`, `fs.find` and
+`fs.stat` report `category` and `mime` for regular files. The existing `kind` (`file`, `dir`,
+`symlink`, `other`) keeps its meaning.
 
 ## Tools
 
@@ -61,22 +65,75 @@ node.
 ### Looking
 
 - `fs.list` gains `sort` (`name`, `modified`, `size`), `order` (`asc`, `desc`), `categories`
-  (list, keeps directories), `offset`, and reports `total` and `truncated`. Directories still
-  come first.
-- `fs.find` gains `name` (words that must all appear in the file name, case-insensitive),
-  `categories`, `min_size`, `max_size`, `modified_after`, `modified_before`, `sort`, `order`,
-  `hidden` (separate from `ignore`, so a search can skip dot files without obeying `.gitignore`)
-  and `budget_ms` (default 10 000, at most 60 000). A search that runs out of time or reaches
+  (list, keeps directories), `offset`, and reports `total`, `total_exact` and `truncated`.
+  Directories still come first; `name` uses natural case-insensitive order (`file2` before
+  `file10`). `depth: 1` always counts every direct child (`total_exact: true`); recursive
+  listings (`depth > 1`) stay on one filesystem and bound counting once the requested page is
+  full, reporting a lower-bound `total` with `total_exact: false` when cut short.
+- `fs.find` gains `name` (whitespace-separated words that must all appear in the file name,
+  case-insensitive, Unicode-aware), `categories`, `min_size`, `max_size`, `modified_after`,
+  `modified_before` (RFC 3339 timestamps in the same format `fs.stat` and `fs.list` return),
+  `sort`, `order`, `hidden` (separate from `ignore`, defaulting to `false` when `ignore` is
+  `true` and `true` when `ignore` is `false`, so a search can skip hidden entries without obeying
+  `.gitignore`) and `budget_ms` (default 10 000, at most 60 000). Without `sort`, results stream
+  in directory-entry order for speed; pass `sort` when deterministic ordering is needed. Each
+  reply carries `machine` (the node that produced it); a search that runs out of time or reaches
   `limit` returns what it has with `truncated: true` and `reason` (`time` or `limit`). With
-  `on: "all"` it is a search of the fleet; machines that are off are reported, not waited for.
-- `fs.thumb` (read): `{paths: [1..32], size: 96..512 = 256, fit: "cover" | "contain"}` returns,
-  per path, `{mime, content (base64), width, height}` or an error. Pictures are decoded on the
-  node (JPEG, PNG, GIF first frame, WebP, BMP; EXIF orientation applied) inside hard limits:
-  source at most 64 MiB and 100 megapixels, decoding off the async threads, a bounded number at
-  once. Video posters are made with `ffmpeg` when the node has it and reported `unsupported`
-  otherwise. Results are cached in the state directory under a key of path, size, modification
-  time and parameters, with the cache capped (256 MiB, least recently used first). A thumbnail of
-  a file is allowed exactly when `fs.read` of it is.
+  `on: "all"` it fans out concurrently across the fleet, returning `{"results": {"<machine>":
+  {"ok": {machine, matches, truncated, reason?}} | {"error": {code, message, hint?, machine}}}}`
+  so unreachable machines are reported per key rather than failing the search.
+- `fs.thumb` (read): `{paths: [1..32], size: 96..512 = 256, fit: "contain" | "cover"}` returns
+  exactly one entry per input path in input order: `{"results": [{path, ok: {mime, content
+  (base64), width, height}} | {path, error}]}`. Regular files are opened non-blockingly once
+  (`O_NONBLOCK | O_NOCTTY` plus `fstat` regular-file verification on Unix; disk file check on
+  Windows) across `fs.*` and `legion-xfer` so swapping a regular file for a FIFO or special file
+  cannot block a node thread. Pictures are header-peeked (`<= 128 KiB`, cross-checking inner frame
+  dimensions in JPEG/GIF/WebP against outer container headers and walking GIF extension blocks up
+  to the peek bound without a fixed block cutoff), reserved against the shared in-flight byte
+  budget before reading the full file, and decoded out-of-process in a memory-bounded worker that
+  receives the already-opened file handle on `stdin`, starts with a cleared minimal environment,
+  validates its CLI arguments strictly before allocating, and opens nothing by path (JPEG, PNG, GIF
+  first frame, WebP, BMP; EXIF orientation applied). Admission caps source files at 64 MiB and
+  estimated peak decode memory at 256 MiB per image (admitting 48–61 MP baseline JPEGs while
+  capping heavier progressive/16-bit/interlaced encodings). Over-cap JPEGs fall back to a validated
+  embedded MPF preview (preferred) or EXIF IFD1 thumbnail through the same limits with the main
+  image's EXIF orientation, returning a per-path `too_large` error only when none is usable. Every
+  worker enforces an exact cross-OS live-heap cap via a capped global allocator (sized at
+  `1.35x estimated_peak + 8 MiB`, floored at `16 MiB`, exiting immediately on overshoot; unlimited
+  in the normal node at the cost of one relaxed atomic load) backed by a 10 ms RSS watchdog on
+  every platform (including macOS) set above the measured per-platform worker startup baseline plus
+  `heap_cap` plus `max(6 MiB, 10% of heap_cap)` headroom, an OS backstop limit above that watchdog
+  limit (`RLIMIT_AS` with virtual-address headroom on Linux, `RLIMIT_DATA` on other non-macOS Unix,
+  suspended-create Job Object memory limit on Windows), and a 10 s wall-clock kill timeout. Each
+  worker's in-flight reservation equals its watchdog resident limit (`baseline + heap_cap + max(6
+  MiB, 10%)`), so the sum of live image and `<= 1080p` video worker limits never exceeds the shared
+  budget of `min(512 MiB, effective RAM / 8)` (floored at 256 MiB, honoring Linux cgroup v2/v1 and
+  Windows Job Object memory limits), scheduled round-robin by principal with anti-starvation aging
+  across up to 16 concurrent decodes (scaled to CPU cores, bounded by the shared byte budget) and a
+  10 s bounded wait (returning retryable `busy`). Only allocator-cap memory kills (when the capped
+  allocator itself stops an image exceeding its heap cap) are recorded as negative bad-file entries
+  in `thumb-cache/` keyed to file identity plus `size` and `fit`, and those entries expire after
+  1 day so the file is retried after expiry; backstop kills (`rss_watchdog` / OS limit while the
+  allocator stayed under cap), external signals (`SIGKILL`, `SIGTERM`), and crashes return a
+  transient per-path error without poisoning the cache (logging baseline/cap/limit/peak
+  diagnostics). Timeouts are never remembered permanently as bad; repeated CPU-busy timeouts of the
+  same file/size/fit trigger a short 5-minute in-memory back-off. Output is JPEG, or PNG when the
+  source has transparency. Video posters (including sniffed MPEG-TS `.ts` recordings) run `ffmpeg`
+  by resolved absolute path with a cleared minimal environment and `MALLOC_ARENA_MAX=2` (capping
+  glibc arena reservations; `-threads 1` limits decoder, encoder, and filter threads rather than
+  making `ffmpeg` strictly single-threaded), under the RSS watchdog as the deciding resident limit
+  plus a +1 GiB virtual-address backstop (256 MiB resident cap for `<= 1080p` videos sharing the
+  512 MiB pool; `> 1080p` 4K/8K videos drain the entire shared pool and all video slots so they run
+  strictly one at a time with zero concurrent images or videos under an exclusive `min(768 MiB,
+  max(256 MiB, effective RAM / 4))` resident budget, preserving rotation metadata; no shell,
+  `-max_pixels 67108864`, `-max_alloc 134217728`, `-protocol_whitelist file`, MOV/MP4 demuxer
+  pinned with `-enable_drefs 0 -use_absolute_path 0`, non-MOV `-format_whitelist` excluding MOV and
+  playlists/manifests, video-only mapping, 15 s time limit) when `ffmpeg` is on `PATH` and report
+  `unsupported`
+  otherwise. Positive thumbnails and expiring bad-file entries share a process-wide lock-free cache
+  handle in the state directory (`thumb-cache/`) keyed by path, OS file identity, metadata change
+  time, source size, modification time and parameters, reconciled directly on disk against the
+  256 MiB LRU cap. A thumbnail of a file is allowed exactly when `fs.read` of it is.
 
 ### Moving
 

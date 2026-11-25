@@ -1,13 +1,16 @@
 //! Search tools: `fs.find` and `fs.grep`.
 
-use std::collections::VecDeque;
-use std::fs::{self, File};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, VecDeque};
+use std::fs;
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use globset::{GlobBuilder, GlobMatcher};
 use ignore::WalkBuilder;
+use legion_core::media::{Category, classify_path};
 use legion_core::proto::{Effect, ErrorBody, ErrorCode};
 use legion_core::{Access, CancellationToken, Ctx, Registry, ToolError};
 use regex::RegexBuilder;
@@ -16,12 +19,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    EntryKind, MAX_REPLY_BYTES, OwnDirFilter, Progress, cancelled_error, check_fs_path,
-    format_mtime, map_io_error, path_to_string, run_blocking,
+    EntryKind, MAX_REPLY_BYTES, OwnDirFilter, Progress, SortField, SortOrder, cancelled_error,
+    check_fs_path, compare_by_sort, format_mtime, map_io_error, path_to_string, platform,
+    run_blocking,
 };
 
 const DEFAULT_FIND_LIMIT: u32 = 200;
 const MAX_FIND_LIMIT: u32 = 5000;
+const DEFAULT_FIND_BUDGET_MS: u64 = 10_000;
+const MAX_FIND_BUDGET_MS: u64 = 60_000;
 const DEFAULT_GREP_LIMIT: u32 = 100;
 const MAX_GREP_LIMIT: u32 = 1000;
 const MAX_GREP_CONTEXT: u32 = 5;
@@ -36,7 +42,7 @@ pub(super) fn register(registry: &mut Registry) {
     registry.add_fn(
         "fs.find",
         Effect::Read,
-        "Find files and directories under a path matching optional glob, kind and depth filters, respecting .gitignore and skipping hidden entries by default.",
+        "Find files and directories under a path matching optional name words, glob, kind, category, size, modification time and depth filters within a time budget, with optional sorting and separate hidden and .gitignore controls. Unsorted searches stream in directory-entry order so huge directories cut off promptly within budget_ms; pass `sort` when deterministic ordering is needed. With `on: \"all\"`, searches every machine in the fleet concurrently and reports unreachable machines per key.",
         find,
     );
     registry.add_fn(
@@ -96,12 +102,16 @@ impl GlobFilter {
 }
 
 /// Configures `ignore::WalkBuilder` consistently for `fs.find` and `fs.grep`: never follows
-/// symbolic links, stays on one file system unless `cross_filesystems` is set, sorts entries
-/// deterministically, skips Legion's own configuration and state directories for non-admin roles,
-/// and respects `.gitignore` even outside a `.git` repository when `respect_ignore` is true.
+/// symbolic links, stays on one file system unless `cross_filesystems` is set, optionally sorts
+/// entries per directory, skips Legion's own configuration and state directories for non-admin
+/// roles, keeps hidden-file filtering separate from `.gitignore` / `.ignore`, and respects
+/// `.gitignore` even outside a `.git` repository when `respect_ignore` is true.
+#[allow(clippy::too_many_arguments)]
 fn build_walker(
     root: &Path,
     respect_ignore: bool,
+    include_hidden: bool,
+    sort_per_dir: bool,
     max_depth: Option<usize>,
     cross_filesystems: bool,
     own_dirs: OwnDirFilter,
@@ -110,8 +120,16 @@ fn build_walker(
     let mut builder = WalkBuilder::new(root);
     builder.follow_links(false);
     builder.same_file_system(!cross_filesystems);
-    builder.sort_by_file_name(|a, b| a.cmp(b));
-    builder.standard_filters(respect_ignore);
+    if sort_per_dir {
+        builder.sort_by_file_name(|a, b| a.cmp(b));
+    }
+    builder.standard_filters(false);
+    builder.hidden(!include_hidden);
+    builder.parents(respect_ignore);
+    builder.ignore(respect_ignore);
+    builder.git_ignore(respect_ignore);
+    builder.git_global(respect_ignore);
+    builder.git_exclude(respect_ignore);
     if respect_ignore {
         builder.require_git(false);
     }
@@ -127,9 +145,26 @@ fn build_walker(
             list.push(path_to_string(entry.path()));
             return false;
         }
-        true
+        // On Windows, `ignore`'s built-in hidden filter only checks leading dots; honor the
+        // Windows FILE_ATTRIBUTE_HIDDEN bit too so hidden directories are pruned consistently.
+        !(!include_hidden
+            && platform::IS_WINDOWS
+            && entry
+                .metadata()
+                .ok()
+                .is_some_and(|meta| platform::is_hidden_attr(&meta)))
     });
     builder
+}
+
+/// Why `fs.find` stopped before visiting the entire tree or returning every match.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum TruncateReason {
+    /// The search reached `budget_ms`.
+    Time,
+    /// The search reached `limit` or the 1 MiB reply byte budget.
+    Limit,
 }
 
 /// Arguments of `fs.find`.
@@ -138,12 +173,41 @@ fn build_walker(
 struct FindArgs {
     /// Root directory to search (absolute or starting with `~`).
     path: String,
+    /// Optional space-separated words that must all appear in the entry name (case-insensitive,
+    /// Unicode-aware).
+    #[serde(default)]
+    name: Option<String>,
     /// Optional glob pattern (for example `"**/*.rs"` or `"*.toml"`).
     #[serde(default)]
     glob: Option<String>,
     /// Optional entry kind filter (`file`, `dir`, `symlink` or `other`).
     #[serde(default)]
     kind: Option<EntryKind>,
+    /// Optional list of regular-file categories to match (`image`, `video`, `audio`, `document`,
+    /// `text`, `archive`, `other`).
+    #[serde(default)]
+    categories: Option<Vec<Category>>,
+    /// Minimum size in bytes (inclusive). Matches regular files unless `kind` selects another kind.
+    #[serde(default)]
+    min_size: Option<u64>,
+    /// Maximum size in bytes (inclusive). Matches regular files unless `kind` selects another kind.
+    #[serde(default)]
+    max_size: Option<u64>,
+    /// Only include entries modified at or after this RFC 3339 timestamp (for example
+    /// `"2026-11-24T02:40:18.942Z"`).
+    #[serde(default)]
+    modified_after: Option<String>,
+    /// Only include entries modified at or before this RFC 3339 timestamp (for example
+    /// `"2026-11-24T02:40:18.942Z"`).
+    #[serde(default)]
+    modified_before: Option<String>,
+    /// Optional field to sort matches by (`name`, `modified`, or `size`).
+    #[serde(default)]
+    sort: Option<SortField>,
+    /// Sort direction (`asc` or `desc`); defaults to `asc` when `sort` is set, and sorts by
+    /// `name` when given without `sort`.
+    #[serde(default)]
+    order: Option<SortOrder>,
     /// Maximum directory depth to descend (1 means direct children only).
     #[serde(default)]
     #[schemars(range(min = 1))]
@@ -152,9 +216,17 @@ struct FindArgs {
     #[serde(default = "default_find_limit")]
     #[schemars(range(min = 1, max = 5000))]
     limit: u32,
-    /// Respect `.gitignore` / `.ignore` rules and skip hidden files.
+    /// Respect `.gitignore` and `.ignore` rules.
     #[serde(default = "default_true")]
     ignore: bool,
+    /// Include hidden files and directories (dotfiles, and Windows hidden entries). Defaults to
+    /// `false` when `ignore` is `true`, and `true` when `ignore` is `false`.
+    #[serde(default)]
+    hidden: Option<bool>,
+    /// Time budget for the walk in milliseconds, from 1 to 60000 (default 10000).
+    #[serde(default = "default_find_budget_ms")]
+    #[schemars(range(min = 1, max = 60000))]
+    budget_ms: u64,
     /// Descend into directories mounted from other file systems (false stays on one file system).
     #[serde(default)]
     cross_filesystems: bool,
@@ -162,6 +234,10 @@ struct FindArgs {
 
 fn default_find_limit() -> u32 {
     DEFAULT_FIND_LIMIT
+}
+
+fn default_find_budget_ms() -> u64 {
+    DEFAULT_FIND_BUDGET_MS
 }
 
 fn default_true() -> bool {
@@ -175,15 +251,95 @@ struct FindMatch {
     kind: EntryKind,
     size: u64,
     mtime: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    category: Option<Category>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mime: Option<String>,
 }
 
 /// Result of `fs.find`.
 #[derive(Debug, Serialize)]
 struct FindResult {
+    machine: String,
     matches: Vec<FindMatch>,
     truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<TruncateReason>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     skipped: Vec<String>,
+}
+
+/// Parses an RFC 3339 timestamp argument for `modified_after` / `modified_before`.
+fn parse_timestamp_arg(field: &str, raw: &str) -> Result<jiff::Timestamp, ErrorBody> {
+    raw.trim().parse::<jiff::Timestamp>().map_err(|error| {
+        ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!("Invalid {field} timestamp {raw:?}: {error}."),
+        )
+        .with_hint(
+            "Use an RFC 3339 UTC timestamp such as \"2026-11-24T02:40:18.942Z\", the same format fs.stat and fs.list return.",
+        )
+    })
+}
+
+/// Candidate kept in the bounded top-K heap when `fs.find` is asked to sort matches.
+struct SortedCandidate {
+    found: FindMatch,
+    name: String,
+    mtime_raw: Option<SystemTime>,
+    sort: SortField,
+    order: SortOrder,
+}
+
+impl SortedCandidate {
+    /// Desired presentation order (`Less` means this candidate should appear earlier).
+    fn cmp_desired(&self, other: &Self) -> Ordering {
+        compare_by_sort(
+            self.sort,
+            self.order,
+            &self.name,
+            &other.name,
+            self.mtime_raw,
+            other.mtime_raw,
+            self.found.size,
+            other.found.size,
+        )
+        .then_with(|| self.found.path.cmp(&other.found.path))
+    }
+}
+
+impl PartialEq for SortedCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp_desired(other) == Ordering::Equal
+    }
+}
+
+impl Eq for SortedCandidate {}
+
+/// Orders the *worst* candidate (the one that sorts last in the requested order) as `Greater` so
+/// `BinaryHeap::peek()` always points to the item to evict when a better match arrives.
+impl Ord for SortedCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.cmp_desired(other)
+    }
+}
+
+impl PartialOrd for SortedCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Checks whether every whitespace-separated word in `words` appears in `name` (case-insensitive,
+/// Unicode-aware).
+fn name_matches_words(name: &str, lower_words: &[String]) -> bool {
+    if lower_words.is_empty() {
+        return true;
+    }
+    let lowered = name.to_lowercase();
+    lower_words
+        .iter()
+        .all(|word| lowered.contains(word.as_str()))
 }
 
 async fn find(ctx: &Ctx, args: FindArgs) -> Result<FindResult, ToolError> {
@@ -196,6 +352,16 @@ async fn find(ctx: &Ctx, args: FindArgs) -> Result<FindResult, ToolError> {
             ),
         ));
     }
+    if !(1..=MAX_FIND_BUDGET_MS).contains(&args.budget_ms) {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!(
+                "fs.find budget_ms must be between 1 and {MAX_FIND_BUDGET_MS}, and {} was given.",
+                args.budget_ms
+            ),
+        )
+        .with_hint("Pass a budget_ms between 1 and 60000 milliseconds."));
+    }
     if args.max_depth == Some(0) {
         return Err(ErrorBody::new(
             ErrorCode::InvalidArgs,
@@ -205,15 +371,64 @@ async fn find(ctx: &Ctx, args: FindArgs) -> Result<FindResult, ToolError> {
             "Use max_depth: 1 for direct children, or omit max_depth for unlimited depth.",
         ));
     }
+    if let (Some(min), Some(max)) = (args.min_size, args.max_size)
+        && min > max
+    {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!("fs.find min_size ({min}) is greater than max_size ({max})."),
+        )
+        .with_hint("Set min_size to a value less than or equal to max_size."));
+    }
+    let modified_after = args
+        .modified_after
+        .as_deref()
+        .map(|raw| parse_timestamp_arg("modified_after", raw))
+        .transpose()?;
+    let modified_before = args
+        .modified_before
+        .as_deref()
+        .map(|raw| parse_timestamp_arg("modified_before", raw))
+        .transpose()?;
+    if let (Some(after), Some(before)) = (modified_after, modified_before)
+        && after > before
+    {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "fs.find modified_after is later than modified_before.",
+        )
+        .with_hint("Set modified_after to a timestamp at or before modified_before."));
+    }
     let glob = args.glob.as_deref().map(GlobFilter::compile).transpose()?;
+    let name_words: Vec<String> = args
+        .name
+        .as_deref()
+        .map(|text| {
+            text.split_whitespace()
+                .map(str::to_lowercase)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let sort_spec: Option<(SortField, SortOrder)> = match (args.sort, args.order) {
+        (Some(field), order) => Some((field, order.unwrap_or_default())),
+        (None, Some(order)) => Some((SortField::Name, order)),
+        (None, None) => None,
+    };
+
     let root = check_fs_path(ctx.grant(), &args.path, Access::Read)?;
     let own_dirs = OwnDirFilter::for_ctx(ctx);
+    let machine = ctx.node_name().to_owned();
     let kind_filter = args.kind;
+    let categories = args.categories;
+    let min_size = args.min_size;
+    let max_size = args.max_size;
     let max_depth = args
         .max_depth
         .map(|d| usize::try_from(d).unwrap_or(usize::MAX));
     let limit = usize::try_from(args.limit).unwrap_or(usize::MAX);
     let respect_ignore = args.ignore;
+    let include_hidden = args.hidden.unwrap_or(!args.ignore);
+    let budget = Duration::from_millis(args.budget_ms);
     let cross_filesystems = args.cross_filesystems;
 
     run_blocking(ctx, "fs.find", move |cancel, mut progress| {
@@ -226,30 +441,53 @@ async fn find(ctx: &Ctx, args: FindArgs) -> Result<FindResult, ToolError> {
             .with_hint("Pass a directory to fs.find."));
         }
 
-        let mut matches = Vec::new();
-        let mut truncated = false;
+        let deadline = Instant::now() + budget;
+        let mut iterations: u64 = 0;
         let mut visited: u64 = 0;
+        let mut reason: Option<TruncateReason> = None;
         let skipped_buf = Arc::new(Mutex::new(Vec::new()));
-        let mut reply_bytes = serde_json::to_vec(&FindResult {
+        let envelope_bytes = serde_json::to_vec(&FindResult {
+            machine: machine.clone(),
             matches: Vec::new(),
-            truncated: false,
+            truncated: true,
+            reason: Some(TruncateReason::Limit),
             skipped: Vec::new(),
         })
-        .map_or(64, |v| v.len());
+        .map_or(128, |v| v.len());
 
-        for item in build_walker(
+        let mut unsorted_matches: Vec<FindMatch> = Vec::new();
+        let mut reply_bytes = envelope_bytes;
+        let mut top_heap: BinaryHeap<SortedCandidate> = BinaryHeap::new();
+        let mut overflowed_limit = false;
+
+        // Unsorted walks deliberately stream entries lazily without `sort_by_file_name`, because
+        // buffering and sorting a 200,000-entry directory before yielding entry #1 would blow past
+        // short `budget_ms` limits. Pass `sort` for deterministic ordering.
+        let walker = build_walker(
             &root,
             respect_ignore,
+            include_hidden,
+            false,
             max_depth,
             cross_filesystems,
             own_dirs,
             Arc::clone(&skipped_buf),
         )
-        .build()
-        {
-            if cancel.is_cancelled() {
-                return Err(cancelled_error("fs.find"));
+        .build();
+
+        for item in walker {
+            // Check cancellation and the time budget on EVERY iteration — including entries that
+            // return I/O errors — so a tree full of unreadable directories cannot escape the budget.
+            if iterations.is_multiple_of(32) {
+                if cancel.is_cancelled() {
+                    return Err(cancelled_error("fs.find"));
+                }
+                if Instant::now() >= deadline {
+                    reason = Some(TruncateReason::Time);
+                    break;
+                }
             }
+            iterations = iterations.saturating_add(1);
             let Ok(entry) = item else {
                 continue;
             };
@@ -257,7 +495,11 @@ async fn find(ctx: &Ctx, args: FindArgs) -> Result<FindResult, ToolError> {
                 continue;
             }
             visited += 1;
-            let matched_count = matches.len();
+            let matched_count = if sort_spec.is_some() {
+                top_heap.len()
+            } else {
+                unsorted_matches.len()
+            };
             progress.maybe_emit(|| json!({"visited": visited, "matches": matched_count}));
 
             let Some(file_type) = entry.file_type() else {
@@ -267,44 +509,149 @@ async fn find(ctx: &Ctx, args: FindArgs) -> Result<FindResult, ToolError> {
             if kind_filter.is_some_and(|want| kind != want) {
                 continue;
             }
+            if (min_size.is_some() || max_size.is_some())
+                && kind_filter.is_none()
+                && kind != EntryKind::File
+            {
+                continue;
+            }
             let entry_path = entry.path();
+            let (mut category, mut mime) = if kind == EntryKind::File {
+                let info = classify_path(entry_path);
+                (Some(info.category), Some(info.mime))
+            } else {
+                (None, None)
+            };
+            if kind == EntryKind::File
+                && entry_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("ts"))
+                && categories.as_deref().is_none_or(|wanted| {
+                    wanted.contains(&Category::Video) || wanted.contains(&Category::Text)
+                })
+                && super::thumb_probe::is_mpeg_ts_file(entry_path)
+            {
+                category = Some(Category::Video);
+                mime = Some("video/mp2t");
+            }
+            if let Some(wanted) = categories.as_deref()
+                && !category.is_some_and(|cat| wanted.contains(&cat))
+            {
+                continue;
+            }
+            let file_name = entry.file_name().to_string_lossy();
+            if !name_words.is_empty() && !name_matches_words(&file_name, &name_words) {
+                continue;
+            }
             if glob
                 .as_ref()
                 .is_some_and(|filter| !filter.matches(&root, entry_path))
             {
                 continue;
             }
-            if matches.len() == limit {
-                truncated = true;
-                break;
-            }
+
             let Ok(entry_meta) = fs::symlink_metadata(entry_path) else {
                 continue;
             };
+            let size = entry_meta.len();
+            if min_size.is_some_and(|min| size < min) || max_size.is_some_and(|max| size > max) {
+                continue;
+            }
+            let mtime_raw = entry_meta.modified().ok();
+            if modified_after.is_some() || modified_before.is_some() {
+                let Some(ts) = mtime_raw.and_then(|t| jiff::Timestamp::try_from(t).ok()) else {
+                    continue;
+                };
+                if modified_after.is_some_and(|after| ts < after)
+                    || modified_before.is_some_and(|before| ts > before)
+                {
+                    continue;
+                }
+            }
+
             let found = FindMatch {
                 path: path_to_string(entry_path),
                 kind,
-                size: entry_meta.len(),
+                size,
                 mtime: format_mtime(&entry_meta),
+                category,
+                mime: mime.map(str::to_owned),
             };
-            let item_bytes = serde_json::to_vec(&found).map_or(0, |v| v.len())
-                + usize::from(!matches.is_empty());
-            if !matches.is_empty() && reply_bytes.saturating_add(item_bytes) > MAX_REPLY_BYTES {
-                truncated = true;
-                break;
+
+            if let Some((sort_field, sort_order)) = sort_spec {
+                let candidate = SortedCandidate {
+                    found,
+                    name: file_name.into_owned(),
+                    mtime_raw,
+                    sort: sort_field,
+                    order: sort_order,
+                };
+                if top_heap.len() < limit {
+                    top_heap.push(candidate);
+                } else {
+                    overflowed_limit = true;
+                    if let Some(worst) = top_heap.peek()
+                        && candidate.cmp_desired(worst) == Ordering::Less
+                    {
+                        top_heap.pop();
+                        top_heap.push(candidate);
+                    }
+                }
+            } else {
+                if unsorted_matches.len() == limit {
+                    reason = Some(TruncateReason::Limit);
+                    break;
+                }
+                let item_bytes = serde_json::to_vec(&found).map_or(0, |v| v.len())
+                    + usize::from(!unsorted_matches.is_empty());
+                if !unsorted_matches.is_empty()
+                    && reply_bytes.saturating_add(item_bytes) > MAX_REPLY_BYTES
+                {
+                    reason = Some(TruncateReason::Limit);
+                    break;
+                }
+                reply_bytes = reply_bytes.saturating_add(item_bytes);
+                unsorted_matches.push(found);
             }
-            reply_bytes = reply_bytes.saturating_add(item_bytes);
-            matches.push(found);
         }
+
+        let matches = if sort_spec.is_some() {
+            if reason.is_none() && overflowed_limit {
+                reason = Some(TruncateReason::Limit);
+            }
+            let mut sorted: Vec<SortedCandidate> = top_heap.into_vec();
+            sorted.sort_by(SortedCandidate::cmp_desired);
+            let mut out = Vec::with_capacity(sorted.len());
+            let mut used_bytes = envelope_bytes;
+            for item in sorted {
+                let item_bytes = serde_json::to_vec(&item.found).map_or(0, |v| v.len())
+                    + usize::from(!out.is_empty());
+                if !out.is_empty() && used_bytes.saturating_add(item_bytes) > MAX_REPLY_BYTES {
+                    if reason.is_none() {
+                        reason = Some(TruncateReason::Limit);
+                    }
+                    break;
+                }
+                used_bytes = used_bytes.saturating_add(item_bytes);
+                out.push(item.found);
+            }
+            out
+        } else {
+            unsorted_matches
+        };
 
         let mut skipped = skipped_buf
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         skipped.sort();
+        let truncated = reason.is_some();
         Ok(FindResult {
+            machine,
             matches,
             truncated,
+            reason,
             skipped,
         })
     })
@@ -437,6 +784,8 @@ async fn grep(ctx: &Ctx, args: GrepArgs) -> Result<GrepResult, ToolError> {
             for item in build_walker(
                 &root,
                 respect_ignore,
+                !respect_ignore,
+                true,
                 None,
                 cross_filesystems,
                 own_dirs,
@@ -522,9 +871,12 @@ fn grep_file(path: &Path, fail_on_open: bool, state: &mut GrepState<'_>) -> Resu
     if state.cancel.is_cancelled() {
         return Err(cancelled_error("fs.grep"));
     }
-    match fs::metadata(path) {
-        Ok(meta) if meta.is_file() => {}
-        Ok(_) if fail_on_open => {
+    let file = match legion_os::open_regular::open_regular_read(path) {
+        Ok((file, _meta)) => file,
+        Err(
+            legion_os::open_regular::OpenRegularError::IsDirectory
+            | legion_os::open_regular::OpenRegularError::NotRegularFile,
+        ) if fail_on_open => {
             return Err(ErrorBody::new(
                 ErrorCode::InvalidArgs,
                 format!(
@@ -534,13 +886,9 @@ fn grep_file(path: &Path, fail_on_open: bool, state: &mut GrepState<'_>) -> Resu
             )
             .with_hint("Pass a regular file or directory to fs.grep."));
         }
-        Ok(_) => return Ok(()),
-        Err(error) if fail_on_open => return Err(map_io_error("read", path, error)),
-        Err(_) => return Ok(()),
-    }
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if fail_on_open => return Err(map_io_error("read", path, error)),
+        Err(legion_os::open_regular::OpenRegularError::Io(error)) if fail_on_open => {
+            return Err(map_io_error("read", path, error));
+        }
         Err(_) => return Ok(()),
     };
     let mut reader = BufReader::with_capacity(BINARY_PROBE_BYTES, file);

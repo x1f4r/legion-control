@@ -1,11 +1,13 @@
 //! Read-only inspection tools: `fs.list`, `fs.stat`, `fs.read` and `fs.hash`.
 
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use legion_core::media::{Category, classify_path};
 use legion_core::proto::{Effect, ErrorBody, ErrorCode};
 use legion_core::{Access, CancellationToken, Ctx, Registry, ToolError};
 use schemars::JsonSchema;
@@ -13,14 +15,20 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
-    Encoding, EntryKind, MAX_REPLY_BYTES, OwnDirFilter, Progress, cancelled_error, check_fs_path,
-    check_regular_file, format_blake3, format_mtime, is_hidden, map_io_error, path_to_string,
-    platform, run_blocking,
+    Encoding, EntryKind, MAX_REPLY_BYTES, OwnDirFilter, Progress, SortField, SortOrder,
+    cancelled_error, check_fs_path, compare_by_sort, format_blake3, format_mtime, is_hidden,
+    map_io_error, path_to_string, platform, run_blocking,
 };
 
 const MAX_LIST_DEPTH: u32 = 8;
 const DEFAULT_LIST_LIMIT: u32 = 500;
 const MAX_LIST_LIMIT: u32 = 5000;
+/// Maximum matching entries counted during a multi-level (`depth > 1`) walk before stopping with
+/// `total_exact: false`. Single-directory (`depth == 1`) listings always read and count every
+/// direct child accurately.
+const MAX_RECURSIVE_LIST_COUNT: usize = 10_000;
+/// Wall-clock budget for recursive (`depth > 1`) listing walks so deep trees stay bounded.
+const RECURSIVE_LIST_BUDGET: Duration = Duration::from_secs(2);
 const MAX_READ_LENGTH: u64 = 1024 * 1024;
 const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -28,13 +36,13 @@ pub(super) fn register(registry: &mut Registry) {
     registry.add_fn(
         "fs.list",
         Effect::Read,
-        "List entries in a directory up to a bounded depth and count, directories first then by name, reporting symbolic links without following them.",
+        "List entries in a directory up to a bounded depth and count, directories first then ordered by name (natural case-insensitive), modified time, or size, with optional category filtering, paging, total/total_exact counts, staying on one file system for depth > 1, and reporting symbolic links without following them.",
         list,
     );
     registry.add_fn(
         "fs.stat",
         Effect::Read,
-        "Return metadata for a path (kind, size, modification time, Unix mode, readonly flag, and symbolic link target) without following a symbolic link.",
+        "Return metadata for a path (kind, size, modification time, Unix mode, readonly flag, symbolic link target, and file category and MIME type) without following a symbolic link.",
         stat,
     );
     registry.add_fn(
@@ -68,6 +76,18 @@ struct ListArgs {
     #[serde(default = "default_list_limit")]
     #[schemars(range(min = 1, max = 5000))]
     limit: u32,
+    /// Number of matching entries to skip before returning up to `limit`.
+    #[serde(default)]
+    offset: u64,
+    /// Field to sort by within directories and within non-directories (`name`, `modified`, or `size`).
+    #[serde(default)]
+    sort: SortField,
+    /// Sort direction (`asc` or `desc`). Directories always come first regardless of order.
+    #[serde(default)]
+    order: SortOrder,
+    /// Optional list of file categories to include; directories are always kept.
+    #[serde(default)]
+    categories: Option<Vec<Category>>,
 }
 
 fn default_list_depth() -> u32 {
@@ -94,6 +114,10 @@ struct ListEntry {
     mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    category: Option<Category>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mime: Option<String>,
 }
 
 /// Result of `fs.list`.
@@ -101,6 +125,8 @@ struct ListEntry {
 struct ListResult {
     path: String,
     entries: Vec<ListEntry>,
+    total: usize,
+    total_exact: bool,
     truncated: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     skipped: Vec<String>,
@@ -131,6 +157,10 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
     let max_depth = args.depth;
     let include_hidden = args.hidden;
     let limit = usize::try_from(args.limit).unwrap_or(usize::MAX);
+    let offset = usize::try_from(args.offset).unwrap_or(usize::MAX);
+    let sort = args.sort;
+    let order = args.order;
+    let categories = args.categories;
 
     run_blocking(ctx, "fs.list", move |cancel, mut progress| {
         let meta = fs::metadata(&root).map_err(|error| map_io_error("list", &root, error))?;
@@ -141,34 +171,73 @@ async fn list(ctx: &Ctx, args: ListArgs) -> Result<ListResult, ToolError> {
             )
             .with_hint("Use fs.stat or fs.read for a file, or pass its parent directory."));
         }
+        let root_device = platform::device_id(&root, &meta);
         let root_str = path_to_string(&root);
         let reply_bytes = serde_json::to_vec(&ListResult {
             path: root_str.clone(),
             entries: Vec::new(),
-            truncated: false,
+            total: usize::MAX,
+            total_exact: false,
+            truncated: true,
             skipped: Vec::new(),
         })
-        .map_or(64, |v| v.len());
+        .map_or(112, |v| v.len());
+
+        // For `depth > 1`, bound work proportionally to `offset + limit` (with a hard ceiling and
+        // wall-clock budget) so `fs.list /usr depth=8 limit=1` stops promptly rather than walking
+        // hundreds of thousands of entries just to compute `total`.
+        let page_end = offset.saturating_add(limit);
+        let count_cap = if max_depth > 1 {
+            Some(
+                page_end
+                    .saturating_mul(2)
+                    .max(page_end.saturating_add(1))
+                    .min(MAX_RECURSIVE_LIST_COUNT),
+            )
+        } else {
+            None
+        };
+        let visit_cap = count_cap.map(|c| c.saturating_mul(4).clamp(256, 40_000));
+        let deadline = (max_depth > 1).then(|| Instant::now() + RECURSIVE_LIST_BUDGET);
+
         let mut entries = Vec::new();
         let mut skipped = Vec::new();
-        let mut truncated = false;
+        let mut total: usize = 0;
+        let mut visited: usize = 0;
+        let mut page_full = false;
+        let mut stopped_early = false;
         let mut state = ListWalk {
             max_depth,
             include_hidden,
             limit,
+            offset,
+            sort,
+            order,
+            categories: categories.as_deref(),
+            root_device,
+            count_cap,
+            visit_cap,
+            deadline,
             reply_bytes,
             own_dirs: &own_dirs,
             cancel: &cancel,
             progress: &mut progress,
             entries: &mut entries,
             skipped: &mut skipped,
-            truncated: &mut truncated,
+            total: &mut total,
+            visited: &mut visited,
+            page_full: &mut page_full,
+            stopped_early: &mut stopped_early,
         };
         list_dir(&root, 1, &mut state)?;
         skipped.sort();
+        let total_exact = !stopped_early;
+        let truncated = stopped_early || offset.saturating_add(entries.len()) < total;
         Ok(ListResult {
             path: root_str,
             entries,
+            total,
+            total_exact,
             truncated,
             skipped,
         })
@@ -180,18 +249,52 @@ struct ListWalk<'a> {
     max_depth: u32,
     include_hidden: bool,
     limit: usize,
+    offset: usize,
+    sort: SortField,
+    order: SortOrder,
+    categories: Option<&'a [Category]>,
+    root_device: Option<platform::DeviceId>,
+    count_cap: Option<usize>,
+    visit_cap: Option<usize>,
+    deadline: Option<Instant>,
     reply_bytes: usize,
     own_dirs: &'a OwnDirFilter,
     cancel: &'a CancellationToken,
     progress: &'a mut Progress,
     entries: &'a mut Vec<ListEntry>,
     skipped: &'a mut Vec<String>,
-    truncated: &'a mut bool,
+    total: &'a mut usize,
+    visited: &'a mut usize,
+    page_full: &'a mut bool,
+    stopped_early: &'a mut bool,
+}
+
+impl ListWalk<'_> {
+    fn hit_recursive_budget(&self) -> bool {
+        if let Some(deadline) = self.deadline
+            && self.visited.is_multiple_of(32)
+            && Instant::now() >= deadline
+        {
+            return true;
+        }
+        if *self.page_full {
+            if self.count_cap.is_some_and(|cap| *self.total >= cap) {
+                return true;
+            }
+            if self.visit_cap.is_some_and(|cap| *self.visited >= cap) {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 fn list_dir(dir: &Path, depth: u32, walk: &mut ListWalk<'_>) -> Result<(), ToolError> {
     if walk.cancel.is_cancelled() {
         return Err(cancelled_error("fs.list"));
+    }
+    if *walk.stopped_early {
+        return Ok(());
     }
     let read_dir = match fs::read_dir(dir) {
         Ok(iter) => iter,
@@ -201,10 +304,24 @@ fn list_dir(dir: &Path, depth: u32, walk: &mut ListWalk<'_>) -> Result<(), ToolE
         Err(_) => return Ok(()),
     };
 
-    let mut children: Vec<(String, PathBuf, fs::Metadata, EntryKind)> = Vec::new();
+    struct ChildItem {
+        name: String,
+        path: PathBuf,
+        meta: fs::Metadata,
+        kind: EntryKind,
+        category: Option<Category>,
+        mime: Option<&'static str>,
+    }
+
+    let mut children: Vec<ChildItem> = Vec::new();
     for item in read_dir {
-        if walk.cancel.is_cancelled() {
+        *walk.visited = walk.visited.saturating_add(1);
+        if walk.visited.is_multiple_of(32) && walk.cancel.is_cancelled() {
             return Err(cancelled_error("fs.list"));
+        }
+        if depth > 1 && walk.hit_recursive_budget() {
+            *walk.stopped_early = true;
+            return Ok(());
         }
         let Ok(entry) = item else {
             continue;
@@ -224,55 +341,110 @@ fn list_dir(dir: &Path, depth: u32, walk: &mut ListWalk<'_>) -> Result<(), ToolE
             continue;
         }
         let kind = EntryKind::from_file_type(meta.file_type());
-        children.push((name, child_path, meta, kind));
+        let (category, mime) = if kind == EntryKind::File {
+            let info = classify_path(&child_path);
+            (Some(info.category), Some(info.mime))
+        } else {
+            (None, None)
+        };
+        if let Some(wanted) = walk.categories
+            && kind != EntryKind::Dir
+            && !category.is_some_and(|cat| wanted.contains(&cat))
+        {
+            continue;
+        }
+        children.push(ChildItem {
+            name,
+            path: child_path,
+            meta,
+            kind,
+            category,
+            mime,
+        });
     }
 
     children.sort_by(|a, b| {
-        let a_rank = usize::from(a.3 != EntryKind::Dir);
-        let b_rank = usize::from(b.3 != EntryKind::Dir);
-        a_rank.cmp(&b_rank).then_with(|| a.0.cmp(&b.0))
+        let a_rank = usize::from(a.kind != EntryKind::Dir);
+        let b_rank = usize::from(b.kind != EntryKind::Dir);
+        a_rank.cmp(&b_rank).then_with(|| {
+            compare_by_sort(
+                walk.sort,
+                walk.order,
+                &a.name,
+                &b.name,
+                a.meta.modified().ok(),
+                b.meta.modified().ok(),
+                a.meta.len(),
+                b.meta.len(),
+            )
+        })
     });
 
-    for (name, child_path, meta, kind) in children {
+    for child in children {
+        let ChildItem {
+            name,
+            path: child_path,
+            meta,
+            kind,
+            category,
+            mime,
+        } = child;
         if walk.cancel.is_cancelled() {
             return Err(cancelled_error("fs.list"));
         }
-        if walk.entries.len() == walk.limit {
-            *walk.truncated = true;
+        if *walk.stopped_early {
             return Ok(());
         }
-        let target = if kind == EntryKind::Symlink {
-            fs::read_link(&child_path)
-                .ok()
-                .map(|link| path_to_string(&link))
-        } else {
-            None
-        };
-        let entry = ListEntry {
-            name,
-            path: path_to_string(&child_path),
-            kind,
-            size: meta.len(),
-            mtime: format_mtime(&meta),
-            mode: platform::unix_mode(&meta),
-            target,
-        };
-        let entry_bytes = serde_json::to_vec(&entry).map_or(0, |v| v.len())
-            + usize::from(!walk.entries.is_empty());
-        if !walk.entries.is_empty()
-            && walk.reply_bytes.saturating_add(entry_bytes) > MAX_REPLY_BYTES
-        {
-            *walk.truncated = true;
+        if walk.max_depth > 1 && walk.hit_recursive_budget() {
+            *walk.stopped_early = true;
             return Ok(());
         }
-        walk.reply_bytes = walk.reply_bytes.saturating_add(entry_bytes);
-        walk.entries.push(entry);
-        let count = walk.entries.len();
-        walk.progress.maybe_emit(|| json!({"entries": count}));
+        let index = *walk.total;
+        *walk.total = walk.total.saturating_add(1);
 
-        if kind == EntryKind::Dir && depth < walk.max_depth {
+        if index >= walk.offset && !*walk.page_full {
+            if walk.entries.len() == walk.limit {
+                *walk.page_full = true;
+            } else {
+                let target = if kind == EntryKind::Symlink {
+                    fs::read_link(&child_path)
+                        .ok()
+                        .map(|link| path_to_string(&link))
+                } else {
+                    None
+                };
+                let entry = ListEntry {
+                    name,
+                    path: path_to_string(&child_path),
+                    kind,
+                    size: meta.len(),
+                    mtime: format_mtime(&meta),
+                    mode: platform::unix_mode(&meta),
+                    target,
+                    category,
+                    mime: mime.map(str::to_owned),
+                };
+                let entry_bytes = serde_json::to_vec(&entry).map_or(0, |v| v.len())
+                    + usize::from(!walk.entries.is_empty());
+                if !walk.entries.is_empty()
+                    && walk.reply_bytes.saturating_add(entry_bytes) > MAX_REPLY_BYTES
+                {
+                    *walk.page_full = true;
+                } else {
+                    walk.reply_bytes = walk.reply_bytes.saturating_add(entry_bytes);
+                    walk.entries.push(entry);
+                    let count = walk.entries.len();
+                    walk.progress.maybe_emit(|| json!({"entries": count}));
+                }
+            }
+        }
+
+        if kind == EntryKind::Dir
+            && depth < walk.max_depth
+            && platform::same_device(&walk.root_device, &child_path, &meta)
+        {
             list_dir(&child_path, depth + 1, walk)?;
-            if *walk.truncated {
+            if *walk.stopped_early {
                 return Ok(());
             }
         }
@@ -300,6 +472,10 @@ struct StatResult {
     readonly: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    category: Option<Category>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mime: Option<String>,
 }
 
 async fn stat(ctx: &Ctx, args: StatArgs) -> Result<StatResult, ToolError> {
@@ -313,6 +489,12 @@ async fn stat(ctx: &Ctx, args: StatArgs) -> Result<StatResult, ToolError> {
         } else {
             None
         };
+        let (category, mime) = if kind == EntryKind::File {
+            let info = classify_path(&path);
+            (Some(info.category), Some(info.mime.to_owned()))
+        } else {
+            (None, None)
+        };
         Ok(StatResult {
             path: path_to_string(&path),
             kind,
@@ -321,6 +503,8 @@ async fn stat(ctx: &Ctx, args: StatArgs) -> Result<StatResult, ToolError> {
             mode: platform::unix_mode(&meta),
             readonly: meta.permissions().readonly(),
             target,
+            category,
+            mime,
         })
     })
     .await
@@ -380,18 +564,8 @@ async fn read(ctx: &Ctx, args: ReadArgs) -> Result<ReadResult, ToolError> {
     let requested_encoding = args.encoding;
 
     run_blocking(ctx, "fs.read", move |cancel, _progress| {
-        check_regular_file(&path, "read", "Use fs.list to inspect a directory.")?;
-        let mut file = File::open(&path).map_err(|error| map_io_error("read", &path, error))?;
-        let meta = file
-            .metadata()
-            .map_err(|error| map_io_error("read", &path, error))?;
-        if !meta.is_file() {
-            return Err(ErrorBody::new(
-                ErrorCode::InvalidArgs,
-                format!("{} is not a regular file.", path.display()),
-            )
-            .with_hint("Pass a regular file path to fs.read."));
-        }
+        let (mut file, meta) =
+            super::open_regular_file(&path, "read", "Use fs.list to inspect a directory.")?;
         let size = meta.len();
         let base64_raw_limit = max_base64_raw_bytes(&path, size, offset);
         let effective_length = if requested_encoding == Some(Encoding::Base64) {
@@ -648,18 +822,8 @@ struct HashResult {
 async fn hash(ctx: &Ctx, args: HashArgs) -> Result<HashResult, ToolError> {
     let path = check_fs_path(ctx.grant(), &args.path, Access::Read)?;
     run_blocking(ctx, "fs.hash", move |cancel, mut progress| {
-        check_regular_file(&path, "hash", "Pass a file path to fs.hash.")?;
-        let mut file = File::open(&path).map_err(|error| map_io_error("hash", &path, error))?;
-        let meta = file
-            .metadata()
-            .map_err(|error| map_io_error("hash", &path, error))?;
-        if !meta.is_file() {
-            return Err(ErrorBody::new(
-                ErrorCode::InvalidArgs,
-                format!("{} is not a regular file.", path.display()),
-            )
-            .with_hint("Pass a regular file path to fs.hash."));
-        }
+        let (mut file, meta) =
+            super::open_regular_file(&path, "hash", "Pass a file path to fs.hash.")?;
         let total = meta.len();
         let mut hasher = blake3::Hasher::new();
         let mut buf = [0u8; STREAM_CHUNK_BYTES];

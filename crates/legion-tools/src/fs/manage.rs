@@ -787,7 +787,8 @@ fn copy_regular_file(
         Err(error) => return Err(map_io_error("inspect", to, error)),
     }
 
-    let source_file = File::open(from).map_err(|error| map_io_error("read", from, error))?;
+    let (source_file, _source_meta) =
+        super::open_regular_file(from, "read", "Pass a regular file path to copy.")?;
     let mut reader = CancelProgressReader {
         inner: source_file,
         cancel,
