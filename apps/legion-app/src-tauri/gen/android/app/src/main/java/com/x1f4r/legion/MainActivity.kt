@@ -27,13 +27,17 @@ class MainActivity : TauriActivity() {
   @Volatile
   private var bridgeReplyProxy: JavaScriptReplyProxy? = null
   private lateinit var localNetworkPermissionLauncher: ActivityResultLauncher<String>
+  private lateinit var notificationPermissionLauncher: ActivityResultLauncher<String>
   private val pendingLocalNetworkRequests = mutableListOf<Int>()
+  private val pendingNotificationCallbacks = mutableListOf<(Boolean) -> Unit>()
 
   private val backCallback = object : OnBackPressedCallback(false) {
     override fun handleOnBackPressed() {
       val webView = attachedWebView
       if (webView != null && webView.canGoBack()) {
         webView.goBack()
+        webView.post { syncBackNavigation(webView) }
+        webView.postDelayed({ syncBackNavigation(webView) }, 80L)
       } else {
         isEnabled = false
         onBackPressedDispatcher.onBackPressed()
@@ -95,6 +99,33 @@ class MainActivity : TauriActivity() {
           localNetworkPermissionLauncher.launch(Manifest.permission.ACCESS_LOCAL_NETWORK)
         }
       }
+      "history_changed" -> {
+        runOnUiThread {
+          attachedWebView?.let { syncBackNavigation(it) }
+        }
+      }
+    }
+  }
+
+  fun requestNotificationPermission(callback: (Boolean) -> Unit) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+      callback(true)
+      return
+    }
+    if (ContextCompat.checkSelfPermission(
+        this,
+        Manifest.permission.POST_NOTIFICATIONS,
+      ) == PackageManager.PERMISSION_GRANTED
+    ) {
+      callback(true)
+      return
+    }
+    runOnUiThread {
+      val shouldLaunch = pendingNotificationCallbacks.isEmpty()
+      pendingNotificationCallbacks.add(callback)
+      if (shouldLaunch) {
+        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+      }
     }
   }
 
@@ -119,6 +150,15 @@ class MainActivity : TauriActivity() {
         pendingLocalNetworkRequests.clear()
         resolveLocalNetworkRequests(ids, granted)
       }
+    notificationPermissionLauncher =
+      registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        val cbs = pendingNotificationCallbacks.toList()
+        pendingNotificationCallbacks.clear()
+        for (cb in cbs) {
+          runCatching { cb(granted) }
+        }
+      }
+    TransferBridge.setActiveActivity(this)
     applySystemBarStyle(resources.configuration)
     super.onCreate(savedInstanceState)
 
@@ -190,6 +230,19 @@ class MainActivity : TauriActivity() {
     } else {
       backCallback.isEnabled = false
     }
+  }
+
+  override fun onResume() {
+    super.onResume()
+    TransferBridge.setActiveActivity(this)
+    attachedWebView?.let { syncBackNavigation(it) }
+  }
+
+  override fun onDestroy() {
+    if (TransferBridge.currentActivity() === this) {
+      TransferBridge.setActiveActivity(null)
+    }
+    super.onDestroy()
   }
 
   override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -315,6 +368,36 @@ class MainActivity : TauriActivity() {
         document.addEventListener('DOMContentLoaded', function(){
           if (cachedInsets) applyInsets(cachedInsets);
         }, { once: true });
+
+        function notifyHistoryChanged(){
+          try {
+            bridge.postMessage(JSON.stringify({ type: 'history_changed' }));
+          } catch (_) {
+            // Ignore if bridge is unavailable.
+          }
+        }
+        try {
+          var origPushState = history.pushState;
+          if (typeof origPushState === 'function') {
+            history.pushState = function(){
+              var res = origPushState.apply(this, arguments);
+              notifyHistoryChanged();
+              return res;
+            };
+          }
+          var origReplaceState = history.replaceState;
+          if (typeof origReplaceState === 'function') {
+            history.replaceState = function(){
+              var res = origReplaceState.apply(this, arguments);
+              notifyHistoryChanged();
+              return res;
+            };
+          }
+          window.addEventListener('hashchange', notifyHistoryChanged);
+          window.addEventListener('popstate', notifyHistoryChanged);
+        } catch (_) {
+          // Ignore if history hooks cannot be installed.
+        }
 
         try {
           bridge.postMessage(JSON.stringify({ type: 'init' }));
