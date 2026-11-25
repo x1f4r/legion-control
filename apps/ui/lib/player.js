@@ -6,6 +6,8 @@ import { baseFileName, entryCategory } from './files.js';
 export const OVERLAY_HIDE_DELAY_MS = 3000;
 export const DOUBLE_TAP_WINDOW_MS = 300;
 export const STALL_SPINNER_DELAY_MS = 400;
+export const TURN_SETTLE_MS = 200;
+export const TURN_LEAVE_GUARD_MS = 600;
 export const RESUME_MIN_DURATION_S = 600; // 10 minutes
 export const RESUME_END_THRESHOLD = 0.95; // last 5%
 export const RESUME_CHIP_DURATION_MS = 5000;
@@ -1049,6 +1051,126 @@ export function createFullscreenController({
     leave,
     syncFromPlatform,
     handlePopState,
+    dispose,
+  };
+}
+
+// ── Orientation turn watcher (injectable clock, orientation-event first, in-flight guard) ───
+
+/**
+ * Watches device turns between portrait and landscape to enter/leave rotation full screen.
+ *
+ * Uses orientation change events where the platform provides them (ignoring plain `resize`
+ * events such as soft keyboards or address bars), applies a short settle debounce and post-leave
+ * guard on an injectable clock (never cleared early by a transient portrait reading), and never
+ * starts a second entry while an `orientation.lock` / enter operation is already in flight.
+ */
+export function createTurnWatcher({
+  clock = defaultClock(),
+  settleMs = TURN_SETTLE_MS,
+  leaveGuardMs = TURN_LEAVE_GUARD_MS,
+  hasOrientationEvent = false,
+  isLandscape = () => false,
+  isFullscreen = () => false,
+  getFullscreenSource = () => null,
+  isInFlight = () => false,
+  onEnterRotation = () => {},
+  onLeaveRotation = () => {},
+} = {}) {
+  let disposed = false;
+  let wasLandscape = false;
+  let guardUntil = 0;
+  let settleTimer = null;
+  let pendingOp = false;
+
+  function clearSettleTimer() {
+    if (settleTimer != null) {
+      clock.clearTimeout(settleTimer);
+      settleTimer = null;
+    }
+  }
+
+  function runOp(fn) {
+    pendingOp = true;
+    let res;
+    try {
+      res = fn();
+    } catch {
+      pendingOp = false;
+      return;
+    }
+    if (res && typeof res.then === 'function') {
+      res.then(
+        () => {
+          pendingOp = false;
+        },
+        () => {
+          pendingOp = false;
+        },
+      );
+    } else {
+      pendingOp = false;
+    }
+  }
+
+  function evaluate(initial = false) {
+    if (disposed) return;
+    const landscape = Boolean(isLandscape());
+    const turnedToLandscape = initial ? landscape : !wasLandscape && landscape;
+    wasLandscape = landscape;
+
+    if (pendingOp || isInFlight()) {
+      return;
+    }
+    if (!initial && clock.now() < guardUntil) {
+      return;
+    }
+
+    if (turnedToLandscape && !isFullscreen()) {
+      runOp(onEnterRotation);
+    } else if (!landscape && isFullscreen() && getFullscreenSource() === 'rotation') {
+      runOp(onLeaveRotation);
+    }
+  }
+
+  function scheduleEvaluation() {
+    if (disposed) return;
+    clearSettleTimer();
+    settleTimer = clock.setTimeout(() => {
+      settleTimer = null;
+      evaluate(false);
+    }, settleMs);
+  }
+
+  function start() {
+    evaluate(true);
+  }
+
+  function onOrientationEvent() {
+    scheduleEvaluation();
+  }
+
+  function onResize() {
+    if (hasOrientationEvent) return;
+    scheduleEvaluation();
+  }
+
+  function noteLeave() {
+    if (disposed) return;
+    clearSettleTimer();
+    guardUntil = clock.now() + leaveGuardMs;
+  }
+
+  function dispose() {
+    disposed = true;
+    clearSettleTimer();
+  }
+
+  return {
+    start,
+    onOrientationEvent,
+    onResize,
+    noteLeave,
     dispose,
   };
 }

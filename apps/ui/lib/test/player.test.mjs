@@ -10,6 +10,7 @@ import {
   computeResumePosition,
   createFullscreenController,
   createResumeStore,
+  createTurnWatcher,
   createVideoController,
   DOUBLE_TAP_WINDOW_MS,
   extractTagsMap,
@@ -32,6 +33,8 @@ import {
   STALL_SPINNER_DELAY_MS,
   stripFileExtension,
   tapZoneForPosition,
+  TURN_LEAVE_GUARD_MS,
+  TURN_SETTLE_MS,
 } from '../player.js';
 
 function createFakeClock(startMs = 1_000_000) {
@@ -786,4 +789,110 @@ test('detectAppImmersiveCapability and createAppLink report true only when a wor
     if (prevNavDesc) Object.defineProperty(globalThis, 'navigator', prevNavDesc);
     else delete globalThis.navigator;
   }
+});
+
+test('createTurnWatcher uses orientation events on injectable clock, guards post-leave bounces, and blocks re-entry during in-flight lock', async () => {
+  const clock = createFakeClock();
+  let landscape = false;
+  let fullscreen = false;
+  let source = null;
+  let externalInFlight = false;
+  let enterCount = 0;
+  let leaveCount = 0;
+  let resolvePendingEnter = null;
+
+  const watcher = createTurnWatcher({
+    clock,
+    hasOrientationEvent: true,
+    isLandscape: () => landscape,
+    isFullscreen: () => fullscreen,
+    getFullscreenSource: () => source,
+    isInFlight: () => externalInFlight,
+    onEnterRotation: () => {
+      enterCount += 1;
+      return new Promise((resolve) => {
+        resolvePendingEnter = () => {
+          fullscreen = true;
+          source = 'rotation';
+          resolve();
+        };
+      });
+    },
+    onLeaveRotation: () => {
+      leaveCount += 1;
+      fullscreen = false;
+      source = null;
+    },
+  });
+
+  watcher.start();
+  assert.equal(enterCount, 0);
+
+  // Plain resize is ignored when the platform has orientation events.
+  landscape = true;
+  watcher.onResize();
+  clock.advance(TURN_SETTLE_MS * 2);
+  assert.equal(enterCount, 0);
+
+  // Reset to portrait, then turn to landscape via orientation event -> enters after settleMs.
+  landscape = false;
+  watcher.onOrientationEvent();
+  clock.advance(TURN_SETTLE_MS);
+  landscape = true;
+  watcher.onOrientationEvent();
+  clock.advance(TURN_SETTLE_MS - 1);
+  assert.equal(enterCount, 0);
+  clock.advance(1);
+  assert.equal(enterCount, 1);
+
+  // Second turn / bounce while the first orientation.lock is still in flight must NOT start another entry.
+  landscape = false;
+  watcher.onOrientationEvent();
+  clock.advance(TURN_SETTLE_MS);
+  landscape = true;
+  watcher.onOrientationEvent();
+  clock.advance(TURN_SETTLE_MS);
+  assert.equal(enterCount, 1);
+
+  // Finish the first entry and turn back to portrait -> leaves rotation fullscreen.
+  resolvePendingEnter();
+  await Promise.resolve();
+  landscape = false;
+  watcher.onOrientationEvent();
+  clock.advance(TURN_SETTLE_MS);
+  assert.equal(leaveCount, 1);
+  assert.equal(fullscreen, false);
+
+  // Leaving fullscreen sets a clock-based guard that is NOT cleared early by a transient portrait reading.
+  watcher.noteLeave();
+  landscape = false;
+  watcher.onOrientationEvent();
+  clock.advance(TURN_SETTLE_MS); // still within TURN_LEAVE_GUARD_MS (200 < 600)
+  landscape = true;
+  watcher.onOrientationEvent();
+  clock.advance(TURN_SETTLE_MS); // t = 400 < 600 -> must NOT bounce back into fullscreen!
+  assert.equal(enterCount, 1);
+
+  // After the guard expires, turning portrait -> landscape enters again cleanly.
+  clock.advance(TURN_LEAVE_GUARD_MS);
+  landscape = false;
+  watcher.onOrientationEvent();
+  clock.advance(TURN_SETTLE_MS);
+  // Also verify external controller inFlight (e.g. button-initiated orientation.lock) prevents a second entry.
+  externalInFlight = true;
+  landscape = true;
+  watcher.onOrientationEvent();
+  clock.advance(TURN_SETTLE_MS);
+  assert.equal(enterCount, 1);
+
+  externalInFlight = false;
+  landscape = false;
+  watcher.onOrientationEvent();
+  clock.advance(TURN_SETTLE_MS);
+  landscape = true;
+  watcher.onOrientationEvent();
+  clock.advance(TURN_SETTLE_MS);
+  assert.equal(enterCount, 2);
+
+  watcher.dispose();
 });

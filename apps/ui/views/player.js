@@ -2,12 +2,13 @@
 // gestures, seek-on-release position slider with honest slow-seek state, resume, queue, keys,
 // native/browser immersive full screen, and music listening screen with tags, covers & MediaSession.
 
-import { html, useCallback, useEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
+import { html, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
 import { Icon } from '../icons.js';
 import {
   clampVolume,
   classifyPlayerKey,
   createResumeStore,
+  createTurnWatcher,
   createVideoController,
   extractTagsMap,
   extractThumbMap,
@@ -400,7 +401,8 @@ export function VideoPlayer({
   isFullscreenRef.current = isFullscreen;
   const fullscreenSourceRef = useRef(fullscreenSource);
   fullscreenSourceRef.current = fullscreenSource;
-  const leavingFsUntilRef = useRef(0);
+  const turnWatcherRef = useRef(null);
+  const prevIsFullscreenRef = useRef(isFullscreen);
   const activeSeekSeqRef = useRef(0);
   const lastSavedAtRef = useRef(0);
   const resumedAppliedRef = useRef(false);
@@ -484,6 +486,26 @@ export function VideoPlayer({
     controller.dismissResumeChip();
   }, [machine, path, controller, resumeStore]);
 
+  // Sync `<video>` src cleanly via layout effect so Preact never writes `src=""` while the next
+  // file's URL is being minted.
+  useLayoutEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    if (mediaUrl) {
+      if (v.getAttribute('src') !== mediaUrl) {
+        v.setAttribute('src', mediaUrl);
+      }
+    } else if (v.hasAttribute('src')) {
+      try {
+        v.pause();
+        v.removeAttribute('src');
+        v.load();
+      } catch {
+        // Ignore teardown errors.
+      }
+    }
+  }, [mediaUrl]);
+
   // When a newly minted mediaUrl arrives for the current file, clear error and enter loading until metadata arrives.
   useEffect(() => {
     if (!mediaUrl) {
@@ -550,13 +572,20 @@ export function VideoPlayer({
   );
 
   const leaveFullscreen = useCallback(async () => {
-    const wasLandscapeNow = typeof window !== 'undefined' && window.innerWidth > window.innerHeight;
-    leavingFsUntilRef.current = wasLandscapeNow ? Date.now() + 900 : 0;
+    turnWatcherRef.current?.noteLeave();
     controller.notifyActivity({ show: true });
     if (fullscreenController) {
       await fullscreenController.leave();
     }
   }, [controller, fullscreenController]);
+
+  // Engage the post-leave turn settle guard even when full screen ends externally (Back, Esc, sheets).
+  useEffect(() => {
+    if (prevIsFullscreenRef.current && !isFullscreen) {
+      turnWatcherRef.current?.noteLeave();
+    }
+    prevIsFullscreenRef.current = isFullscreen;
+  }, [isFullscreen]);
 
   // Report iOS Safari `<video>` webkitendfullscreen back to the single controller.
   useEffect(() => {
@@ -571,33 +600,55 @@ export function VideoPlayer({
   useEffect(() => {
     if (!touchOrientationDevice || !fullscreenController) return undefined;
 
-    let wasLandscape = false;
-    const checkOrientation = (initial = false) => {
-      const landscape = window.innerWidth > window.innerHeight;
-      const turnedToLandscape = initial ? landscape : !wasLandscape && landscape;
-      wasLandscape = landscape;
-      if (!landscape) {
-        leavingFsUntilRef.current = 0;
+    const hasScreenOrientation = typeof window.screen?.orientation?.addEventListener === 'function';
+    const hasOrientationChange = 'onorientationchange' in window;
+    const hasOrientationEvent = hasScreenOrientation || hasOrientationChange;
+
+    const readLandscape = () => {
+      const orientationType = window.screen?.orientation?.type;
+      if (typeof orientationType === 'string' && orientationType) {
+        return /^landscape/i.test(orientationType);
       }
-      if (Date.now() < leavingFsUntilRef.current) {
-        return;
-      }
-      if (turnedToLandscape && !isFullscreenRef.current) {
-        enterFullscreen('rotation');
-      } else if (!landscape && isFullscreenRef.current && fullscreenSourceRef.current === 'rotation') {
-        leaveFullscreen();
-      }
+      return window.innerWidth > window.innerHeight;
     };
 
-    checkOrientation(true);
-    const onResize = () => checkOrientation(false);
-    window.addEventListener('resize', onResize);
-    window.addEventListener('orientationchange', onResize);
-    window.screen?.orientation?.addEventListener?.('change', onResize);
+    const watcher = createTurnWatcher({
+      clock: getPlayerClock(),
+      hasOrientationEvent,
+      isLandscape: readLandscape,
+      isFullscreen: () => isFullscreenRef.current,
+      getFullscreenSource: () => fullscreenSourceRef.current,
+      isInFlight: () => Boolean(fullscreenController.getState().inFlight),
+      onEnterRotation: () => enterFullscreen('rotation'),
+      onLeaveRotation: () => leaveFullscreen(),
+    });
+    turnWatcherRef.current = watcher;
+    watcher.start();
+
+    const onOrientation = () => watcher.onOrientationEvent();
+    const onResize = () => watcher.onResize();
+
+    if (hasScreenOrientation) {
+      window.screen.orientation.addEventListener('change', onOrientation);
+    }
+    if (hasOrientationChange) {
+      window.addEventListener('orientationchange', onOrientation);
+    }
+    if (!hasOrientationEvent) {
+      window.addEventListener('resize', onResize);
+    }
     return () => {
-      window.removeEventListener('resize', onResize);
-      window.removeEventListener('orientationchange', onResize);
-      window.screen?.orientation?.removeEventListener?.('change', onResize);
+      turnWatcherRef.current = null;
+      watcher.dispose();
+      if (hasScreenOrientation) {
+        window.screen.orientation.removeEventListener('change', onOrientation);
+      }
+      if (hasOrientationChange) {
+        window.removeEventListener('orientationchange', onOrientation);
+      }
+      if (!hasOrientationEvent) {
+        window.removeEventListener('resize', onResize);
+      }
     };
   }, [touchOrientationDevice, fullscreenController, enterFullscreen, leaveFullscreen]);
 
@@ -882,7 +933,6 @@ export function VideoPlayer({
       <video
         ref=${bindVideoRef}
         class="viewer-video"
-        src=${mediaUrl || undefined}
         playsinline
         preload="metadata"
         aria-label=${name}
@@ -1297,6 +1347,26 @@ export function MusicPlayer({
   moreOpenRef.current = moreOpen;
 
   const display = useMemo(() => formatMusicDisplay(tags, name), [tags, name]);
+
+  // Sync `<audio>` src cleanly via layout effect so Preact never writes `src=""` while the next
+  // track's URL is being minted.
+  useLayoutEffect(() => {
+    const a = audioRef.current;
+    if (!a) return;
+    if (mediaUrl) {
+      if (a.getAttribute('src') !== mediaUrl) {
+        a.setAttribute('src', mediaUrl);
+      }
+    } else if (a.hasAttribute('src')) {
+      try {
+        a.pause();
+        a.removeAttribute('src');
+        a.load();
+      } catch {
+        // Ignore teardown errors.
+      }
+    }
+  }, [mediaUrl]);
 
   // Apply playbackRate changes (set via More sheet) to `<audio>` immediately and on effect flush.
   if (audioRef.current && audioRef.current.playbackRate !== playbackRate) {
@@ -1808,7 +1878,6 @@ export function MusicPlayer({
 
       <audio
         ref=${bindAudioRef}
-        src=${mediaUrl || undefined}
         preload="metadata"
         aria-label=${display.title}
         onLoadedMetadata=${(e) => {
