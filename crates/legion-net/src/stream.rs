@@ -52,12 +52,12 @@ use crate::guard::{Expected, Guarded, Watch};
 use legion_core::audit::{self, AuditLog, Entry as AuditEntry, Outcome};
 use legion_core::config::ConfigStore;
 use legion_core::policy::Policy;
-use legion_core::{Access, CreateKind, Door, Grant, Paths};
+use legion_core::{Access, CancellationToken, CreateKind, Door, Grant, Paths};
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
 use legion_tools::xfer::{error as xfer_error, manifest, resolve_root};
 use legion_xfer::{
-    CaseCollision, Entry, EntryKind, Hash, ManifestOptions, SkippedEntry, Timestamp,
-    resolve_relative_path,
+    CaseCollision, Entry, EntryKind, Hash, ManifestOptions, SkippedEntry, StreamCheckedError,
+    Timestamp, resolve_relative_path,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -335,6 +335,34 @@ impl From<ErrorBody> for Failure {
     }
 }
 
+/// Tuning options for [`serve_with_options`].
+#[derive(Clone, Debug)]
+pub struct StreamServeOptions {
+    /// Coalescing window for successful `keep_open` `get` audit records.
+    pub audit_coalesce_window: Duration,
+    /// Server-side idle timeout for a `keep_open` stream waiting between requests.
+    pub keep_open_idle_timeout: Duration,
+    /// Byte interval between live policy/path re-checks during a streaming `get`.
+    pub recheck_bytes: u64,
+    /// Time interval between live policy/path re-checks during a streaming `get`.
+    pub recheck_interval: Duration,
+    /// Optional shutdown signal (such as SIGTERM/SIGINT) that flushes pending audit records and
+    /// ends a `keep_open` session cleanly.
+    pub shutdown: Option<CancellationToken>,
+}
+
+impl Default for StreamServeOptions {
+    fn default() -> Self {
+        Self {
+            audit_coalesce_window: GET_AUDIT_COALESCE_WINDOW,
+            keep_open_idle_timeout: KEEP_OPEN_IDLE_TIMEOUT,
+            recheck_bytes: GET_RECHECK_BYTES,
+            recheck_interval: GET_RECHECK_INTERVAL,
+            shutdown: None,
+        }
+    }
+}
+
 /// Serves one operation: reads its header from `input`, checks it, runs it, writes its replies to
 /// `output` and its line to the audit log.
 ///
@@ -361,6 +389,60 @@ pub fn serve_with_door<R: Read, W: Write>(
     input: R,
     output: W,
 ) -> Result<(), ErrorBody> {
+    let options = StreamServeOptions::default();
+    let started = Instant::now();
+    let mut input = BufReader::new(input);
+    let mut output = BufWriter::with_capacity(OUTPUT_BUFFER, output);
+    let _ =
+        line(&mut output, &json!({ "protocol": STREAM_PROTOCOL })).and_then(|()| output.flush());
+    let (header, recorded) = match read_header(&mut input) {
+        Ok(read) => read,
+        Err(error) => {
+            let error = error.with_machine(host.name.clone());
+            let _ = reply_error(&mut output, &error);
+            return Err(error);
+        }
+    };
+    if matches!(
+        header.op,
+        Op::Get {
+            keep_open: true,
+            ..
+        }
+    ) {
+        return serve_keep_open_gets_with_source(
+            host,
+            pinned,
+            door,
+            device,
+            &options,
+            header,
+            recorded,
+            output,
+            |_| match read_next_header(&mut input) {
+                Ok(Some(pair)) => NextHeader::Header(pair),
+                Ok(None) => NextHeader::Eof,
+                Err(err) => NextHeader::Error(err),
+            },
+        );
+    }
+    serve_single_op(
+        host, pinned, door, device, &options, header, recorded, started, &mut input, &mut output,
+    )
+}
+
+/// Like [`serve_with_door`], with injectable timers and shutdown signaling for `keep_open`
+/// streams (periodic idle audit flush, server-side idle session close, and mid-stream policy
+/// re-checks).
+pub fn serve_with_options<R: Read + Send + 'static, W: Write>(
+    host: &Host,
+    pinned: Option<&str>,
+    door: Door,
+    device: Option<&str>,
+    options: StreamServeOptions,
+    input: R,
+    output: W,
+) -> Result<(), ErrorBody> {
     let started = Instant::now();
     let mut input = BufReader::new(input);
     let mut output = BufWriter::with_capacity(OUTPUT_BUFFER, output);
@@ -383,8 +465,91 @@ pub fn serve_with_door<R: Read, W: Write>(
             ..
         }
     ) {
-        return serve_keep_open_gets(host, pinned, door, device, header, recorded, input, output);
+        // Read subsequent headers on a dedicated thread so the main loop can wake up to flush
+        // coalesced audit buckets, enforce the idle timeout, or respond to shutdown while stdin
+        // stays open.
+        let (tx, rx) = mpsc::sync_channel::<Result<Option<(Header, Value)>, ErrorBody>>(1);
+        std::thread::spawn(move || {
+            loop {
+                let next = read_next_header(&mut input);
+                let stop = matches!(next, Ok(None) | Err(_));
+                if tx.send(next).is_err() || stop {
+                    break;
+                }
+            }
+        });
+        return serve_keep_open_gets_with_source(
+            host,
+            pinned,
+            door,
+            device,
+            &options,
+            header,
+            recorded,
+            output,
+            |bucket| {
+                let idle_since = Instant::now();
+                loop {
+                    if options
+                        .shutdown
+                        .as_ref()
+                        .is_some_and(CancellationToken::is_cancelled)
+                    {
+                        return NextHeader::IdleExit;
+                    }
+                    if let Some(pending) = bucket.as_ref()
+                        && pending.started.elapsed() >= options.audit_coalesce_window
+                        && let Some(finished) = bucket.take()
+                    {
+                        finished.flush(host, door, device);
+                    }
+                    let elapsed_idle = idle_since.elapsed();
+                    if elapsed_idle >= options.keep_open_idle_timeout {
+                        return NextHeader::IdleExit;
+                    }
+                    let until_idle = options.keep_open_idle_timeout.saturating_sub(elapsed_idle);
+                    let until_flush = bucket
+                        .as_ref()
+                        .map(|b| {
+                            options
+                                .audit_coalesce_window
+                                .saturating_sub(b.started.elapsed())
+                        })
+                        .unwrap_or(until_idle);
+                    let mut wait = until_idle.min(until_flush);
+                    if options.shutdown.is_some() {
+                        wait = wait.min(Duration::from_millis(50));
+                    }
+                    match rx.recv_timeout(wait) {
+                        Ok(Ok(Some(pair))) => return NextHeader::Header(pair),
+                        Ok(Ok(None)) | Err(RecvTimeoutError::Disconnected) => {
+                            return NextHeader::Eof;
+                        }
+                        Ok(Err(err)) => return NextHeader::Error(err),
+                        Err(RecvTimeoutError::Timeout) => {}
+                    }
+                }
+            },
+        );
     }
+    serve_single_op(
+        host, pinned, door, device, &options, header, recorded, started, &mut input, &mut output,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serve_single_op<R: BufRead, W: Write>(
+    host: &Host,
+    pinned: Option<&str>,
+    door: Door,
+    device: Option<&str>,
+    options: &StreamServeOptions,
+    header: Header,
+    recorded: Value,
+    started: Instant,
+    input: &mut R,
+    output: &mut BufWriter<W>,
+) -> Result<(), ErrorBody> {
     let tool = format!("stream.{}", header.op.name());
     let config = ConfigStore::new(host.paths.config_dir());
     let (principal, result) = match authorise(host, &config, pinned, &header) {
@@ -392,7 +557,17 @@ pub fn serve_with_door<R: Read, W: Write>(
             let principal = grant.principal().to_owned();
             (
                 Some(principal),
-                run(host, &grant, header.op, &mut input, &mut output),
+                run(
+                    host,
+                    &config,
+                    pinned,
+                    header.as_principal.as_deref(),
+                    &grant,
+                    options,
+                    header.op,
+                    input,
+                    output,
+                ),
             )
         }
         Err((principal, error)) => (principal, Err(Failure::Reply(error))),
@@ -406,7 +581,7 @@ pub fn serve_with_door<R: Read, W: Write>(
         }),
         Err(Failure::Reply(error)) => {
             let error = machine(error, host);
-            let _ = reply_error(&mut output, &error);
+            let _ = reply_error(output, &error);
             Err(error)
         }
         Err(Failure::Raw(error)) => Err(machine(error, host)),
@@ -420,6 +595,23 @@ pub fn serve_with_door<R: Read, W: Write>(
 /// Coalescing window for persistent `keep_open` `get` audit records on one stream pipe: at most
 /// one audit line per `(principal, path)` per minute, summarizing request count and total bytes.
 const GET_AUDIT_COALESCE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Maximum time a persistent `keep_open` `legion stream` process waits idle between requests
+/// before flushing any pending audit bucket and exiting cleanly.
+const KEEP_OPEN_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Byte interval between mid-stream policy/path re-checks during a `get`.
+const GET_RECHECK_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Time interval between mid-stream policy/path re-checks during a `get`.
+const GET_RECHECK_INTERVAL: Duration = Duration::from_secs(2);
+
+enum NextHeader {
+    Header((Header, Value)),
+    Eof,
+    IdleExit,
+    Error(ErrorBody),
+}
 
 struct GetAuditBucket {
     principal: String,
@@ -451,20 +643,23 @@ impl GetAuditBucket {
 }
 
 /// Serves a persistent sequence of `get` operations over one `legion stream` pipe (`keep_open:
-/// true`). Each request re-authorises live `policy.toml` and `Grant::check_path`, emits
-/// `GetReady` with `keep_open: true`, streams exact `length` bytes, and terminates each frame with
-/// `{"done": true}\n`. Successful range reads for the same `(principal, path)` coalesce into at
-/// most one `stream.get` audit record per minute with total bytes served.
+/// true`). Each request re-authorises live `policy.toml` and `Grant::check_path`, re-checks
+/// permission periodically during long reads, emits `GetReady` with `keep_open: true`, streams
+/// exact `length` bytes, and terminates each frame with `{"done": true}\n`. Successful range reads
+/// for the same `(principal, path)` coalesce into at most one `stream.get` audit record per
+/// coalescing window, flushing on timer expiry, revocation, bucket switch, idle close, EOF, or
+/// shutdown.
 #[allow(clippy::too_many_arguments)]
-fn serve_keep_open_gets<R: Read, W: Write>(
+fn serve_keep_open_gets_with_source<W: Write>(
     host: &Host,
     pinned: Option<&str>,
     door: Door,
     device: Option<&str>,
+    options: &StreamServeOptions,
     first_header: Header,
     first_recorded: Value,
-    mut input: BufReader<R>,
     mut output: BufWriter<W>,
+    mut next_header: impl FnMut(&mut Option<GetAuditBucket>) -> NextHeader,
 ) -> Result<(), ErrorBody> {
     let config = ConfigStore::new(host.paths.config_dir());
     let mut bucket: Option<GetAuditBucket> = None;
@@ -473,10 +668,10 @@ fn serve_keep_open_gets<R: Read, W: Write>(
     loop {
         let (header, recorded) = match current.take() {
             Some(pair) => pair,
-            None => match read_next_header(&mut input) {
-                Ok(Some(pair)) => pair,
-                Ok(None) => break,
-                Err(error) => {
+            None => match next_header(&mut bucket) {
+                NextHeader::Header(pair) => pair,
+                NextHeader::Eof | NextHeader::IdleExit => break,
+                NextHeader::Error(error) => {
                     if let Some(pending) = bucket.take() {
                         pending.flush(host, door, device);
                     }
@@ -521,6 +716,9 @@ fn serve_keep_open_gets<R: Read, W: Write>(
         let grant = match authorise(host, &config, pinned, &header) {
             Ok(grant) => grant,
             Err((principal, error)) => {
+                if let Some(pending) = bucket.take() {
+                    pending.flush(host, door, device);
+                }
                 let error = machine(error, host);
                 let _ = reply_error(&mut output, &error);
                 record(
@@ -538,7 +736,19 @@ fn serve_keep_open_gets<R: Read, W: Write>(
         };
         let principal = grant.principal().to_owned();
 
-        match get_range_framed(&grant, &path, offset, length, true, &mut output) {
+        match get_range_framed(
+            host,
+            &config,
+            pinned,
+            header.as_principal.as_deref(),
+            &grant,
+            options,
+            &path,
+            offset,
+            length,
+            true,
+            &mut output,
+        ) {
             Ok(served_bytes) => {
                 if let Err(err) =
                     line(&mut output, &json!({ "done": true })).and_then(|()| output.flush())
@@ -566,7 +776,7 @@ fn serve_keep_open_gets<R: Read, W: Write>(
                     if let Some(b) = bucket.as_mut() {
                         b.requests = b.requests.saturating_add(1);
                         b.bytes = b.bytes.saturating_add(served_bytes);
-                        if b.started.elapsed() >= GET_AUDIT_COALESCE_WINDOW
+                        if b.started.elapsed() >= options.audit_coalesce_window
                             && let Some(finished) = bucket.take()
                         {
                             finished.flush(host, door, device);
@@ -586,6 +796,11 @@ fn serve_keep_open_gets<R: Read, W: Write>(
                 }
             }
             Err(Failure::Reply(error)) => {
+                if error.code == ErrorCode::Denied
+                    && let Some(pending) = bucket.take()
+                {
+                    pending.flush(host, door, device);
+                }
                 let error = machine(error, host);
                 if reply_error(&mut output, &error).is_err() {
                     if let Some(pending) = bucket.take() {
@@ -627,6 +842,7 @@ fn serve_keep_open_gets<R: Read, W: Write>(
     if let Some(pending) = bucket.take() {
         pending.flush(host, door, device);
     }
+    let _ = output.flush();
     Ok(())
 }
 
@@ -820,9 +1036,14 @@ fn record(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run<R: BufRead, W: Write>(
     host: &Host,
+    config: &ConfigStore,
+    pinned: Option<&str>,
+    as_principal: Option<&str>,
     grant: &Grant,
+    options: &StreamServeOptions,
     op: Op,
     input: &mut R,
     output: &mut W,
@@ -843,7 +1064,20 @@ fn run<R: BufRead, W: Write>(
             offset,
             length,
             keep_open: _,
-        } => get(grant, &path, offset, length, output),
+        } => get_range_framed(
+            host,
+            config,
+            pinned,
+            as_principal,
+            grant,
+            options,
+            &path,
+            offset,
+            length,
+            false,
+            output,
+        )
+        .map(|_| ()),
         Op::Put {
             path,
             size,
@@ -1052,26 +1286,22 @@ fn case_insensitive(path: &Path) -> Option<bool> {
     None
 }
 
-fn get<W: Write>(
-    grant: &Grant,
-    path: &str,
-    offset: u64,
-    length: Option<u64>,
-    output: &mut W,
-) -> Result<(), Failure> {
-    get_range_framed(grant, path, offset, length, false, output).map(|_| ())
-}
-
+#[allow(clippy::too_many_arguments)]
 fn get_range_framed<W: Write>(
+    host: &Host,
+    config: &ConfigStore,
+    pinned: Option<&str>,
+    as_principal: Option<&str>,
     grant: &Grant,
-    path: &str,
+    options: &StreamServeOptions,
+    raw_path: &str,
     offset: u64,
     length: Option<u64>,
     keep_open: bool,
     output: &mut W,
 ) -> Result<u64, Failure> {
-    let path = grant.check_path(path, Access::Read)?;
-    let source = legion_xfer::open_get_range(&path, offset, length).map_err(xfer_error)?;
+    let checked_path = grant.check_path(raw_path, Access::Read)?;
+    let source = legion_xfer::open_get_range(&checked_path, offset, length).map_err(xfer_error)?;
     reply(
         output,
         &GetReady {
@@ -1083,10 +1313,60 @@ fn get_range_framed<W: Write>(
             keep_open: keep_open.then_some(true),
         },
     )?;
+
+    let mut last_checked_bytes = 0u64;
+    let mut last_checked_at = Instant::now();
+    let recheck_bytes = options.recheck_bytes.max(1);
+    let recheck_interval = options.recheck_interval;
+
     let written = source
-        .stream_to(&mut *output)
-        .map_err(|error| Failure::Raw(xfer_error(error)))?;
+        .stream_to_checked(&mut *output, |written| {
+            if options
+                .shutdown
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                return Err(ErrorBody::new(
+                    ErrorCode::Cancelled,
+                    "The stream stopped because the node is shutting down.",
+                ));
+            }
+            if written.saturating_sub(last_checked_bytes) < recheck_bytes
+                && last_checked_at.elapsed() < recheck_interval
+            {
+                return Ok(());
+            }
+            last_checked_bytes = written;
+            last_checked_at = Instant::now();
+            recheck_get_access(host, config, pinned, as_principal, raw_path)
+        })
+        .map_err(|err| match err {
+            StreamCheckedError::Xfer(error) => Failure::Raw(xfer_error(error)),
+            StreamCheckedError::Aborted(error) => Failure::Raw(error),
+        })?;
     Ok(written)
+}
+
+/// Re-verifies live `policy.toml` authorization for `fs.read` and `Grant::check_path` during a
+/// long `get` so revoking a principal's role or narrowing its allowed paths stops active streams.
+fn recheck_get_access(
+    host: &Host,
+    config: &ConfigStore,
+    pinned: Option<&str>,
+    as_principal: Option<&str>,
+    raw_path: &str,
+) -> Result<(), ErrorBody> {
+    let policy = config.get::<Policy>()?;
+    let principal = policy.resolve(as_principal, pinned)?;
+    let spec = ToolSpec {
+        name: "fs.read".to_owned(),
+        description: String::new(),
+        effect: Effect::Read,
+        input_schema: json!({"type": "object"}),
+    };
+    let grant = policy.authorize(&principal, &spec, &host.paths)?;
+    let _ = grant.check_path(raw_path, Access::Read)?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -22,7 +22,8 @@ mod platform;
 pub use archive::{PackReport, UnpackReport, pack, unpack, unpack_filtered};
 pub use error::{Error, Result};
 pub use file::{
-    GetStream, PART_SUFFIX, PutReport, get, open_get, open_get_range, part_path, put, resume_offset,
+    GetStream, PART_SUFFIX, PutReport, StreamCheckedError, get, open_get, open_get_range,
+    part_path, put, resume_offset,
 };
 pub use hash::{Hash, HashingReader, HashingWriter};
 pub use manifest::{
