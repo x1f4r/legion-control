@@ -15,7 +15,6 @@ pub use legion_link::{RemoteOs, StderrTail, Subcommand, TransportHandle, remote_
 use legion_proto::{ErrorBody, ErrorCode};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::sync::OwnedSemaphorePermit;
 use tokio::task::JoinHandle;
 
 use crate::config::validate_ssh_target;
@@ -110,12 +109,6 @@ impl Pipe {
         spawn_process("ssh", &args)
     }
 
-    /// Attaches a per-target concurrency permit that is released automatically when the pipe ends.
-    pub(crate) fn with_permit(mut self, permit: OwnedSemaphorePermit) -> Self {
-        self.handle.permit = Some(permit);
-        self
-    }
-
     /// Splits the pipe into its raw stdin, stdout, and process lifecycle handle.
     pub fn into_parts(self) -> (ChildStdin, ChildStdout, PipeHandle) {
         (self.stdin, self.stdout, self.handle)
@@ -140,7 +133,6 @@ pub struct PipeHandle {
     child: Child,
     stderr: Arc<StderrTail>,
     stderr_task: Option<JoinHandle<()>>,
-    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl PipeHandle {
@@ -261,7 +253,6 @@ fn spawn_process(program: &str, args: &[String]) -> Result<Pipe, ErrorBody> {
             child,
             stderr,
             stderr_task: Some(stderr_task),
-            permit: None,
         },
     })
 }

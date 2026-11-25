@@ -30,10 +30,6 @@ use crate::state::StateStore;
 /// Maximum number of new remote connections opened concurrently during a fan-out or ping.
 const MAX_CONCURRENT_CONNECTS: usize = 8;
 
-/// Maximum concurrent transfer `legion stream` pipes per target machine (separate from content
-/// reads and RPC).
-const MAX_TRANSFER_STREAMS_PER_TARGET: usize = 8;
-
 /// Maximum concurrent active content `legion stream` pipes per target machine (separate from
 /// transfers and RPC).
 const MAX_CONTENT_PIPES_PER_TARGET: usize = 8;
@@ -142,8 +138,6 @@ struct MachineSlot {
     /// Serializes opening a new session for this machine so concurrent first calls share one.
     open_lock: tokio::sync::Mutex<()>,
     current: Mutex<Option<LiveEntry>>,
-    /// Dedicated concurrency cap for `fs.transfer` / general stream pipes to this machine.
-    transfer_stream_permits: Arc<Semaphore>,
     /// Dedicated content-read pipe pool with per-holder fair sharing, acquire timeout, and warm
     /// `keep_open` pipe reuse.
     content_pipes: Arc<ContentPipePool>,
@@ -858,14 +852,6 @@ impl Fleet {
             (live.active_system, live.active_os)
         };
 
-        // Transfers and general streams use their own per-target permit pool, isolated from
-        // content-read pipes so stalled or heavy content traffic never queues transfers.
-        let stream_permit = if subcommand == Subcommand::Stream {
-            Some(acquire_stream_permit(&slot.transfer_stream_permits, machine, &cancel).await?)
-        } else {
-            None
-        };
-
         let _permit = acquire_connect_permit(&self.inner.connect_permits, machine, &cancel).await?;
         let pipe = match &system.transport {
             Transport::Command { argv } => Pipe::spawn_command(argv, subcommand),
@@ -884,10 +870,6 @@ impl Fleet {
         }
         .map_err(|err| err.with_machine(machine))?;
 
-        let pipe = match stream_permit {
-            Some(permit) => pipe.with_permit(permit),
-            None => pipe,
-        };
         Ok(pipe)
     }
 
@@ -1846,7 +1828,6 @@ impl Fleet {
             Arc::new(MachineSlot {
                 open_lock: tokio::sync::Mutex::new(()),
                 current: Mutex::new(None),
-                transfer_stream_permits: Arc::new(Semaphore::new(MAX_TRANSFER_STREAMS_PER_TARGET)),
                 content_pipes: Arc::new(ContentPipePool::new(
                     opts.max_content_pipes_per_target,
                     opts.max_idle_content_pipes,
@@ -3204,25 +3185,6 @@ fn is_done_frame(line: &[u8]) -> bool {
     map.len() == 1 && map.get("done") == Some(&Value::Bool(true))
 }
 
-async fn acquire_stream_permit(
-    permits: &Arc<Semaphore>,
-    machine: &str,
-    cancel: &CancellationToken,
-) -> Result<tokio::sync::OwnedSemaphorePermit, ErrorBody> {
-    tokio::select! {
-        biased;
-        () = cancel.cancelled() => Err(ErrorBody::new(
-            ErrorCode::Cancelled,
-            format!("Opening a stream to {machine} was cancelled."),
-        )
-        .with_machine(machine)),
-        permit = Arc::clone(permits).acquire_owned() => permit.map_err(|_| {
-            ErrorBody::new(ErrorCode::Internal, "Stream concurrency limiter closed.")
-                .with_machine(machine)
-        }),
-    }
-}
-
 impl Fleet {
     /// The effect a tool that is not built in has on another machine, as the target reports it:
     /// `None` when the target does not report the tool, or is reached through a relay, whose
@@ -4359,5 +4321,86 @@ printf 'closed\n' > "{exited}"
             "holder A must not exceed half capacity while holder B was waiting"
         );
         drop((a1, a2, a3, b_permit));
+    }
+
+    #[tokio::test]
+    async fn transfer_pipe_takes_no_content_permit_and_has_no_per_target_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::create_dir_all(paths.state_dir()).unwrap();
+
+        #[cfg(unix)]
+        let cmd_json = r#"["/bin/sh", "-c", "exec cat", "rpc"]"#;
+        #[cfg(windows)]
+        let cmd_json = r#"["cmd", "/C", "more", "rpc"]"#;
+
+        std::fs::write(
+            paths.config_dir().join("fleet.toml"),
+            format!("[machines.pi]\ncommand = {cmd_json}\n"),
+        )
+        .unwrap();
+
+        let config = ConfigStore::new(paths.config_dir());
+        let fleet = Fleet::with_options(
+            &paths,
+            FleetOptions {
+                max_content_pipes_per_target: 4,
+                max_idle_content_pipes: 2,
+                idle_content_pipe_ttl: Duration::from_secs(60),
+                idle_reap_interval: Duration::from_secs(60),
+                content_pipe_acquire_timeout: Duration::from_millis(100),
+            },
+        );
+        let cancel = CancellationToken::new();
+
+        // Exhaust every content pipe permit on `pi`.
+        let slot = fleet.slot("pi");
+        let mut content_permits = Vec::new();
+        for _ in 0..4 {
+            content_permits.push(
+                slot.content_pipes
+                    .acquire("holder-a", "pi", Duration::from_secs(1), &cancel)
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            slot.content_pipes
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .active_total,
+            4
+        );
+
+        // Opening 16 concurrent transfer stream pipes on `pi` succeeds immediately without taking
+        // any content permit or hitting any per-target transfer cap.
+        let mut pipes = Vec::new();
+        for _ in 0..16 {
+            let pipe = tokio::time::timeout(
+                Duration::from_secs(5),
+                fleet.open_pipe_for(&config, "tower", "pi", Subcommand::Stream, cancel.clone()),
+            )
+            .await
+            .expect("transfer pipe open must not block on content pool or per-target cap")
+            .unwrap();
+            pipes.push(pipe);
+        }
+        assert_eq!(
+            slot.content_pipes
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .active_total,
+            4,
+            "transfer pipes must not acquire content pool permits"
+        );
+
+        for pipe in pipes {
+            pipe.close(Duration::from_millis(50)).await;
+        }
+        drop(content_permits);
+        fleet.close().await;
     }
 }
