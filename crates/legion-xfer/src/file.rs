@@ -466,12 +466,21 @@ where
     }
     let res = match claim_new(candidate) {
         Ok(claim_file) => {
-            if let Ok(id) = platform::open_claim_identity(&claim_file) {
+            let claimed_id = platform::open_claim_identity(&claim_file).ok();
+            if let Some(id) = claimed_id {
                 let _ = write_claim_record(&claim_path, ClaimRecord::Claimed(id));
             }
             drop(claim_file);
             if let Err(err) = replace_over(temp, candidate) {
-                let _ = fs::remove_file(candidate);
+                let matches_claim = claimed_id.is_some_and(|recorded| {
+                    fs::symlink_metadata(candidate)
+                        .is_ok_and(|meta| meta.file_type().is_file() && meta.len() == 0)
+                        && platform::symlink_claim_identity(candidate)
+                            .is_ok_and(|id| id.nlink == 1 && id.matches_unmodified(&recorded))
+                });
+                if matches_claim {
+                    let _ = fs::remove_file(candidate);
+                }
                 let _ = fs::remove_file(&claim_path);
                 Err(err)
             } else {
@@ -834,7 +843,36 @@ const SHORT_LOCK_SWEEP_AGE: Duration = Duration::from_secs(30);
 #[derive(Debug)]
 pub struct OwnedTempGuard {
     owner_path: PathBuf,
+    temp_path: PathBuf,
+    recorded: FileClaimIdentity,
     lock_file: Option<File>,
+}
+
+impl OwnedTempGuard {
+    /// Returns `true` when the owned temporary file on disk is still a 0-byte, single-linked
+    /// regular file matching the exact `(dev, ino, ctime, btime)` recorded at creation.
+    pub fn matches_unmodified_probe(&self) -> bool {
+        let name_ok = self
+            .temp_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|n| {
+                n.starts_with(".legion-move-probe-") && platform::is_sweepable_temp_name(n)
+            });
+        if !name_ok {
+            return false;
+        }
+        let meta_ok = fs::symlink_metadata(&self.temp_path)
+            .is_ok_and(|m| m.file_type().is_file() && m.len() == 0);
+        meta_ok
+            && platform::symlink_claim_identity(&self.temp_path)
+                .is_ok_and(|id| id.nlink == 1 && id.matches_unmodified(&self.recorded))
+    }
+
+    /// Removes the owned probe marker only if it still matches [`Self::matches_unmodified_probe`].
+    pub fn remove_matching_probe(&self) -> bool {
+        self.matches_unmodified_probe() && fs::remove_file(&self.temp_path).is_ok()
+    }
 }
 
 impl Drop for OwnedTempGuard {
@@ -885,6 +923,8 @@ pub fn register_owned_temp(
         let _ = lock_file.flush();
         Some(OwnedTempGuard {
             owner_path,
+            temp_path: temp_path.to_path_buf(),
+            recorded: id,
             lock_file: Some(lock_file),
         })
     } else {
@@ -923,6 +963,44 @@ pub fn record_probe_marker(state_dir: &Path, marker_path: &Path, file: &File) {
 /// Removes the probe marker tracking record created by [`record_probe_marker`].
 pub fn forget_probe_marker(state_dir: &Path, marker_path: &Path) {
     let _ = fs::remove_file(probe_marker_state_path(state_dir, marker_path));
+}
+
+/// Removes `marker_path` only when a matching `v2` ownership record exists under
+/// `<state_dir>/xfer/probes/` and `marker_path` is still a 0-byte, single-linked regular file
+/// matching the recorded `(dev, ino, ctime, btime)` identity. Removes the tracking record if one
+/// was present and returns `true` only when the marker file itself was unlinked.
+pub fn remove_owned_probe_marker(state_dir: &Path, marker_path: &Path) -> bool {
+    let record_path = probe_marker_state_path(state_dir, marker_path);
+    let Ok(text) = fs::read_to_string(&record_path) else {
+        return false;
+    };
+    let mut lines = text.lines();
+    let removed = if let (Some(header), Some(_path_line)) = (lines.next(), lines.next()) {
+        let mut parts = header.split_whitespace();
+        let name_ok = marker_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|n| {
+                n.starts_with(".legion-move-probe-") && platform::is_sweepable_temp_name(n)
+            });
+        let meta_ok = fs::symlink_metadata(marker_path)
+            .is_ok_and(|m| m.file_type().is_file() && m.len() == 0);
+        if parts.next() == Some("v2")
+            && let Some(recorded) = parse_claim_identity(&mut parts)
+            && name_ok
+            && meta_ok
+            && platform::symlink_claim_identity(marker_path)
+                .is_ok_and(|id| id.nlink == 1 && id.matches_unmodified(&recorded))
+        {
+            fs::remove_file(marker_path).is_ok()
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    let _ = fs::remove_file(&record_path);
+    removed
 }
 
 /// Sweeps every abandoned temporary file whose ownership record under `<state_dir>/xfer/temps/` is
@@ -3138,5 +3216,144 @@ mod tests {
         fs::write(&orphan_lock, b"").unwrap();
         crate::rename::recover_pending_renames(state_dir.path(), None);
         assert!(!orphan_lock.exists());
+    }
+
+    #[test]
+    fn place_via_claim_does_not_unlink_replaced_candidate_on_replace_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let temp = dir.path().join(".legion-part");
+        let candidate = dir.path().join("target.txt");
+        fs::write(&temp, b"incoming").unwrap();
+
+        // Case 1: Between `claim_new` and `replace_over` failing, another process replaces
+        // `candidate` with a non-empty user file. Cleanup must NOT unlink it.
+        let mut replace_with_data = |_t: &Path, c: &Path| -> Result<()> {
+            let replacement = dir.path().join("other-data");
+            fs::write(&replacement, b"important-user-data").unwrap();
+            platform::replace_file(&replacement, c)?;
+            Err(Error::Io {
+                path: Some(c.to_path_buf()),
+                source: io::Error::other("simulated replace failure"),
+            })
+        };
+        let err = place_via_claim(
+            state_dir.path(),
+            &temp,
+            &candidate,
+            &mut platform::create_new_private,
+            &mut replace_with_data,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Io { .. }), "{err:?}");
+        assert_eq!(
+            fs::read(&candidate).unwrap(),
+            b"important-user-data",
+            "place_via_claim must never unlink a file that replaced the claim"
+        );
+        fs::remove_file(&candidate).unwrap();
+
+        // Case 2: Another process replaces `candidate` with a DIFFERENT 0-byte file (new inode).
+        // Because its identity no longer matches the recorded claim, cleanup must NOT unlink it.
+        let mut replace_with_other_empty = |_t: &Path, c: &Path| -> Result<()> {
+            let replacement = dir.path().join("other-empty");
+            File::create(&replacement).unwrap();
+            let repl_id = platform::symlink_claim_identity(&replacement).unwrap();
+            platform::replace_file(&replacement, c)?;
+            let now_id = platform::symlink_claim_identity(c).unwrap();
+            assert_eq!(repl_id.ino, now_id.ino);
+            Err(Error::Io {
+                path: Some(c.to_path_buf()),
+                source: io::Error::other("simulated replace failure"),
+            })
+        };
+        let err = place_via_claim(
+            state_dir.path(),
+            &temp,
+            &candidate,
+            &mut platform::create_new_private,
+            &mut replace_with_other_empty,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Io { .. }), "{err:?}");
+        assert!(
+            candidate.exists(),
+            "place_via_claim must never unlink a different 0-byte inode that replaced the claim"
+        );
+        fs::remove_file(&candidate).unwrap();
+
+        // Case 3: When `replace_over` fails and `candidate` is still our exact untouched claim,
+        // cleanup removes our own empty claim cleanly.
+        let mut plain_fail = |_t: &Path, c: &Path| -> Result<()> {
+            Err(Error::Io {
+                path: Some(c.to_path_buf()),
+                source: io::Error::other("simulated plain failure"),
+            })
+        };
+        let err = place_via_claim(
+            state_dir.path(),
+            &temp,
+            &candidate,
+            &mut platform::create_new_private,
+            &mut plain_fail,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Io { .. }), "{err:?}");
+        assert!(
+            !candidate.exists(),
+            "place_via_claim should still clean up its own unmodified empty claim"
+        );
+    }
+
+    #[test]
+    fn remove_owned_probe_marker_checks_ownership_record_and_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+
+        // 1. An unowned 0-byte `.legion-move-probe-*.tmp` has no state record and is NEVER removed.
+        let unowned = dir.path().join(".legion-move-probe-unowned.tmp");
+        File::create(&unowned).unwrap();
+        assert!(!remove_owned_probe_marker(state_dir.path(), &unowned));
+        assert!(
+            unowned.exists(),
+            "unowned 0-byte probe-named file must never be removed"
+        );
+
+        // 2. An owned marker that was replaced by a different 0-byte file is NOT removed.
+        let replaced = dir.path().join(".legion-move-probe-replaced.tmp");
+        let f = File::create(&replaced).unwrap();
+        record_probe_marker(state_dir.path(), &replaced, &f);
+        drop(f);
+        let fresh = dir.path().join("fresh-empty");
+        File::create(&fresh).unwrap();
+        platform::replace_file(&fresh, &replaced).unwrap();
+        assert!(!remove_owned_probe_marker(state_dir.path(), &replaced));
+        assert!(
+            replaced.exists(),
+            "replaced 0-byte file at probe path must not be removed"
+        );
+
+        // 3. An owned unmodified 0-byte marker IS removed and its tracking record cleaned up.
+        let owned = dir.path().join(".legion-move-probe-owned.tmp");
+        let f2 = File::create(&owned).unwrap();
+        record_probe_marker(state_dir.path(), &owned, &f2);
+        drop(f2);
+        assert!(remove_owned_probe_marker(state_dir.path(), &owned));
+        assert!(!owned.exists());
+
+        // 4. Held `OwnedTempGuard::remove_matching_probe` refuses to remove a replaced 0-byte file
+        //    and removes its own unmodified probe.
+        let held = dir.path().join(".legion-move-probe-held.tmp");
+        let hf = File::create(&held).unwrap();
+        let guard = register_owned_temp(state_dir.path(), &held, &hf).unwrap();
+        drop(hf);
+        assert!(guard.matches_unmodified_probe());
+        let fresh2 = dir.path().join("fresh-held-empty");
+        File::create(&fresh2).unwrap();
+        platform::replace_file(&fresh2, &held).unwrap();
+        assert!(!guard.matches_unmodified_probe());
+        assert!(!guard.remove_matching_probe());
+        assert!(held.exists());
+        drop(guard);
     }
 }
