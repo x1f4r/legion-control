@@ -552,3 +552,62 @@ fn m7_restored_backup_edit_first_then_more() {
         assert!(live_tower, "TODAY's work {i} must reach tower as live");
     }
 }
+
+/// A newly joining member stopping mid-page (due to a deferral or page limit) on a peer that
+/// already ran tombstone/fingerprint pruning must still receive valid chained fingerprints and
+/// never trip false duplicate-member detection or self-rotation.
+#[test]
+fn m8_joining_member_mid_page_deferral_after_pruning_preserves_fingerprints() {
+    let tmp = scratch();
+    let t = tmp.path();
+    let two = ["tower", "pi"];
+    let mut tower = open_real(&t.join("tower"), &t.join("tower.redb"), "tower", &two);
+    let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &two);
+
+    fs::create_dir_all(t.join("tower")).unwrap();
+    for i in 0..5 {
+        fs::write(t.join(format!("tower/f{i}.txt")), format!("v1-{i}")).unwrap();
+    }
+    tower.scan(ts(0)).unwrap();
+    pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(1))
+        .unwrap();
+    // Tower learns pi's direct ack and runs GC/pruning.
+    tower
+        .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(2))
+        .unwrap();
+
+    // Unscanned edit on tower's last file causes a deferral when laptop pulls.
+    fs::write(t.join("tower/f4.txt"), "unscanned-newer-bytes").unwrap();
+
+    // Laptop joins the existing two-member folder.
+    let three = ["tower", "pi", "laptop"];
+    tower.add_member("laptop").unwrap();
+    pi.add_member("laptop").unwrap();
+    let mut laptop = open_real(&t.join("laptop"), &t.join("laptop.redb"), "laptop", &three);
+
+    let rep1 = laptop
+        .pull_from_peer(&EnginePeer::new(&tower, "laptop"), ts(10))
+        .unwrap();
+    assert!(rep1.deferred >= 1, "unscanned f4.txt must defer on page 1");
+
+    // Tower pulling from laptop while laptop is mid-page must NOT falsely rotate tower, and
+    // laptop pulling from tower again must NOT falsely flag tower as a duplicate member!
+    let tower_inc_before = tower.meta().unwrap().incarnation;
+    tower
+        .pull_from_peer(&EnginePeer::new(&laptop, "tower"), ts(11))
+        .unwrap();
+    assert_eq!(
+        tower.meta().unwrap().incarnation,
+        tower_inc_before,
+        "tower must not falsely self-rotate when laptop stopped mid-page"
+    );
+
+    tower.scan(ts(12)).unwrap();
+    laptop
+        .pull_from_peer(&EnginePeer::new(&tower, "laptop"), ts(13))
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(t.join("laptop/f4.txt")).unwrap(),
+        "unscanned-newer-bytes"
+    );
+}

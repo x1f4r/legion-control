@@ -1207,14 +1207,29 @@ impl RedbIndexStore {
                 }
             }
             if let Some(min_keep) = batch.prune_seq_fingerprints_below {
-                let to_prune: Vec<u64> = seq_fps
+                // Retain every fingerprint at or above `min_keep`, PLUS `rec.seq` and `rec.seq - 1`
+                // for every record still stored in `by_seq` so newly joining or rejoining members
+                // stopping at any page or deferral boundary always receive and validate valid
+                // chained fingerprints.
+                let mut to_prune = Vec::new();
+                for res in seq_fps
                     .range(..min_keep)
                     .map_err(|e| storage_err("range prune seq_fingerprints", e))?
-                    .map(|res| {
-                        res.map(|(k, _)| k.value())
-                            .map_err(|e| storage_err("step prune seq_fingerprints", e))
-                    })
-                    .collect::<Result<_>>()?;
+                {
+                    let (k, _) = res.map_err(|e| storage_err("step prune seq_fingerprints", e))?;
+                    let seq = k.value();
+                    let needed_for_record = by_seq
+                        .get(seq)
+                        .map_err(|e| storage_err("check by_seq for prune", e))?
+                        .is_some()
+                        || by_seq
+                            .get(seq.saturating_add(1))
+                            .map_err(|e| storage_err("check next by_seq for prune", e))?
+                            .is_some();
+                    if !needed_for_record {
+                        to_prune.push(seq);
+                    }
+                }
                 for k in to_prune {
                     seq_fps
                         .remove(k)

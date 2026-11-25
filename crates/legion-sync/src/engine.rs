@@ -3793,6 +3793,9 @@ fn recompute_peer_applied_ack(
             if candidate == 0 {
                 cursor.applied_ack_seq = 0;
                 cursor.acked_fingerprint = None;
+            } else if candidate == cursor.seq && cursor.head_fingerprint.is_some() {
+                cursor.applied_ack_seq = candidate;
+                cursor.acked_fingerprint = cursor.head_fingerprint;
             } else if candidate == min_unapplied_seq.saturating_sub(1) && prev_fp.is_some() {
                 cursor.applied_ack_seq = candidate;
                 cursor.acked_fingerprint = prev_fp;

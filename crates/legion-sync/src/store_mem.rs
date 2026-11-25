@@ -422,7 +422,15 @@ impl IndexStore for MemoryIndexStore {
             self.seq_fingerprints.clear();
         }
         if let Some(min_keep) = batch.prune_seq_fingerprints_below {
-            self.seq_fingerprints.retain(|&seq, _| seq >= min_keep);
+            // Retain every fingerprint at or above `min_keep`, PLUS `rec.seq` and `rec.seq - 1`
+            // for every record still stored in `by_seq` so newly joining or rejoining members
+            // stopping at any page or deferral boundary always receive and validate valid chained
+            // fingerprints.
+            self.seq_fingerprints.retain(|&seq, _| {
+                seq >= min_keep
+                    || self.by_seq.contains_key(&seq)
+                    || self.by_seq.contains_key(&seq.saturating_add(1))
+            });
         }
         for (seq, fp) in batch.upsert_seq_fingerprints {
             self.seq_fingerprints.insert(seq, fp);
