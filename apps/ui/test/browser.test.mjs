@@ -1094,6 +1094,70 @@ test('fleet connections routes, identity-change acceptance, pairing sync notice,
     assert.equal(lastCall.tool, 'power.restart');
     assert.deepEqual(lastCall.on, ['tower', 'pi', 'studio']);
 
+    // 10. Settings -> About -> Updates in browser door explains the browser stays as new as the server.
+    await p.goto(`${server.url}/?mock=basic#/settings/about`, { waitUntil: 'domcontentloaded' });
+    await p.getByText('Updates', { exact: true }).waitFor();
+    await p.getByText('Always up to date').waitFor();
+    await p.getByText(/browser interface is always as new as tower/i).waitFor();
+
+    // 11. Native app mode (`update`): plain mode hides channel/sequence/key, shows Update now & notes;
+    //     Technical details reveals channel, sequence, key fingerprint, and source machine.
+    await p.goto(`${server.url}/?mock=multi,update#/settings/about`, { waitUntil: 'domcontentloaded' });
+    await p.getByText('Version 0.2.0 is ready').waitFor();
+    await p.getByRole('button', { name: 'Update now' }).waitFor();
+    await p.getByText('Update automatically').waitFor();
+    await p.getByText('Automatic fleet updates and faster status refresh.').waitFor();
+    const plainAboutText = await p.locator('main.main').innerText();
+    assert.ok(!plainAboutText.includes('SHA256:MockPreviewKey'), 'Key fingerprint must be hidden when Technical details is off');
+    await assertNoToolNames(p, 'about updates plain');
+
+    await p.goto(`${server.url}/?mock=multi,update,tech#/settings/about`, { waitUntil: 'domcontentloaded' });
+    await p.getByText('Update details').waitFor();
+    await p.getByText('preview + stable').waitFor();
+    await p.getByText(/SHA256:MockPreviewKey/).waitFor();
+
+    // 12. Linux .deb mode (`update-deb`): never offers Update now, shows exact apt-get command
+    //     and verified private copy SHA-256.
+    await p.goto(`${server.url}/?mock=multi,update-deb#/settings/about`, { waitUntil: 'domcontentloaded' });
+    await p.getByText('Version 0.2.0 is available').waitFor();
+    await p.getByText(/sudo apt-get install /).waitFor();
+    await p.getByText(/SHA-256: a{64}/).waitFor();
+    assert.equal(await p.getByRole('button', { name: 'Update now' }).count(), 0);
+
+    // 12b. Failed update (`update-failed`): plain mode hides raw error detail and offers Try again;
+    //      Technical details exposes raw error detail.
+    await p.goto(`${server.url}/?mock=multi,update-failed#/settings/about`, { waitUntil: 'domcontentloaded' });
+    await p.getByText('Version 0.2.0 did not finish installing.').waitFor();
+    await p.getByRole('button', { name: 'Try again' }).waitFor();
+    assert.ok(
+      !(await p.locator('main.main').innerText()).includes('INSTALL_FAILED_VERIFICATION_FAILURE'),
+      'Raw installer error must stay hidden outside Technical details',
+    );
+    await p.goto(`${server.url}/?mock=multi,update-failed,tech#/settings/about`, { waitUntil: 'domcontentloaded' });
+    await p.getByText('INSTALL_FAILED_VERIFICATION_FAILURE').waitFor();
+
+    // 12c. Metered pause (`update-metered`) and sequence-0 build (`update-seq0`).
+    await p.goto(`${server.url}/?mock=multi,update-metered#/settings/about`, { waitUntil: 'domcontentloaded' });
+    await p.getByText(/metered connection/i).waitFor();
+    await p.getByRole('button', { name: 'Update now' }).waitFor();
+
+    await p.goto(`${server.url}/?mock=multi,update-seq0,tech#/settings/about`, { waitUntil: 'domcontentloaded' });
+    await p.getByText('Updates disabled in this build').waitFor();
+    await p.getByText('0 (updates disabled)').waitFor();
+
+    // 13. Quiet unbordered one-time "Updated to 0.2.0 · What is new" notice on first screen, sheet, and dismiss.
+    await p.goto(`${server.url}/?mock=multi,updated#/machines`, { waitUntil: 'domcontentloaded' });
+    const updateRow = p.locator('.update-note');
+    await updateRow.waitFor();
+    assert.equal(await updateRow.locator('.btn').count(), 0, 'Post-update row must not contain bordered buttons');
+    assert.equal(await p.locator('nav.nav a').count(), 4, 'Root bottom bar has 4 tabs alongside update notice');
+    await maybeShot(p, 'mock-phone-dark-updated');
+    await updateRow.locator('.update-note-link').click();
+    await p.locator('.sheet').getByText('What is new in 0.2.0').waitFor();
+    await p.locator('.sheet').getByText('Automatic fleet updates and faster status refresh.').waitFor();
+    await p.locator('.sheet').getByRole('button', { name: 'Done' }).click();
+    await p.locator('.update-note').waitFor({ state: 'hidden' });
+
     await ctx.close();
     assert.deepEqual(pageErrors, [], `Uncaught page errors: ${pageErrors.join('\n')}`);
     assert.deepEqual(consoleErrors, [], `Console/CSP errors: ${consoleErrors.join('\n')}`);

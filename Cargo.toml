@@ -17,6 +17,7 @@ legion-link = { path = "crates/legion-link" }
 legion-core = { path = "crates/legion-core" }
 legion-net = { path = "crates/legion-net" }
 legion-tools = { path = "crates/legion-tools" }
+legion-update = { path = "crates/legion-update" }
 legion-xfer = { path = "crates/legion-xfer" }
 dunce = "1.0.5"
 # Verifies offline Ed25519 release signatures over SHA256SUMS against the compiled-in public key.

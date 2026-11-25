@@ -31,6 +31,7 @@ jiff.workspace = true
 legion-core.workspace = true
 legion-os.workspace = true
 legion-proto.workspace = true
+legion-update.workspace = true
 legion-xfer.workspace = true
 regex.workspace = true
 same-file.workspace = true

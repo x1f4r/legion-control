@@ -11,7 +11,7 @@
 
 use std::fmt::Write as _;
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -23,7 +23,6 @@ use legion_os::run::{RunOptions, run};
 use legion_os::shell::CommandSpec;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::binfmt::verify_binary_matches_target;
 use crate::floor::{SemVer, check_version_transition, commit_floor, node_floor_path};
@@ -36,7 +35,7 @@ pub const RELEASE_REPO_URL: &str = "https://github.com/x1f4r/legion-control";
 pub const RELEASE_TAG_PREFIX: &str = "legion-v";
 
 /// Name of the checksum manifest attached to every Legion release.
-pub const CHECKSUMS_FILENAME: &str = "SHA256SUMS";
+pub use legion_update::CHECKSUMS_FILENAME;
 
 /// Timeout for querying the GitHub releases API.
 const API_TIMEOUT: Duration = Duration::from_secs(30);
@@ -359,97 +358,13 @@ pub fn target_triple_for(os: &str, arch: &str) -> Result<&'static str, ErrorBody
 }
 
 /// Computes the lowercase hex SHA-256 digest of a file on disk.
-pub fn sha256_file(path: &Path) -> Result<String, ErrorBody> {
-    let mut file = File::open(path).map_err(|err| {
-        ErrorBody::new(
-            ErrorCode::Failed,
-            format!(
-                "Could not open {} to compute SHA-256: {err}.",
-                path.display()
-            ),
-        )
-    })?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buf).map_err(|err| {
-            ErrorBody::new(
-                ErrorCode::Failed,
-                format!(
-                    "Could not read {} while computing SHA-256: {err}.",
-                    path.display()
-                ),
-            )
-        })?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buf[..read]);
-    }
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(64);
-    for byte in digest {
-        let _ = write!(&mut hex, "{byte:02x}");
-    }
-    Ok(hex)
-}
+pub use legion_update::sha256_file;
 
 /// Finds the expected lowercase SHA-256 hex digest for `asset_name` inside a `SHA256SUMS` file.
-pub fn lookup_checksum(sums_text: &str, asset_name: &str) -> Result<String, ErrorBody> {
-    for raw_line in sums_text.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut parts = line.splitn(2, char::is_whitespace);
-        let Some(hash_raw) = parts.next() else {
-            continue;
-        };
-        let Some(rest) = parts.next() else {
-            continue;
-        };
-        let file = rest
-            .trim_start()
-            .strip_prefix('*')
-            .unwrap_or(rest.trim_start())
-            .trim();
-        if file == asset_name {
-            if hash_raw.len() != 64 || !hash_raw.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err(ErrorBody::new(
-                    ErrorCode::Failed,
-                    format!("{CHECKSUMS_FILENAME} has a malformed SHA-256 entry for {asset_name}."),
-                )
-                .with_hint("Re-download the release checksums or verify the release assets."));
-            }
-            return Ok(hash_raw.to_ascii_lowercase());
-        }
-    }
-    Err(ErrorBody::new(
-        ErrorCode::Failed,
-        format!("{CHECKSUMS_FILENAME} does not contain an entry for {asset_name}."),
-    )
-    .with_hint("Check that the release includes this platform target and a matching SHA256SUMS."))
-}
+pub use legion_update::lookup_checksum;
 
 /// Verifies `path` against the `SHA256SUMS` content for `asset_name`, returning the verified digest.
-pub fn verify_file_checksum(
-    path: &Path,
-    sums_text: &str,
-    asset_name: &str,
-) -> Result<String, ErrorBody> {
-    let expected = lookup_checksum(sums_text, asset_name)?;
-    let actual = sha256_file(path)?;
-    if actual != expected {
-        return Err(ErrorBody::new(
-            ErrorCode::Failed,
-            format!("SHA-256 mismatch for {asset_name}: expected {expected}, got {actual}."),
-        )
-        .with_hint(
-            "The downloaded file may be corrupted or tampered with; nothing was installed.",
-        ));
-    }
-    Ok(actual)
-}
+pub use legion_update::verify_file_checksum;
 
 /// Directory under `<state_dir>/dist/<version>/<target>/` where downloaded release binaries live.
 pub fn dist_cache_dir(paths: &Paths, version: &str, target: &str) -> PathBuf {
@@ -668,6 +583,9 @@ pub fn random_hex(byte_len: usize) -> Result<String, ErrorBody> {
 /// Called once at process startup so a previous `meta.update` that renamed a running executable
 /// aside leaves no stale binaries in the install directory.
 pub fn cleanup_old_binary() {
+    // Keep the compiled-in sequence marker in release binaries so packaging tools can verify it
+    // without executing the binary.
+    let _ = std::hint::black_box(legion_update::compiled_sequence_marker());
     if let Ok(exe) = legion_core::current_exe() {
         cleanup_old_binaries_next_to(&exe);
     }
@@ -1909,12 +1827,7 @@ mod tests {
     }
 
     fn sha256_bytes(bytes: &[u8]) -> String {
-        let digest = Sha256::digest(bytes);
-        let mut hex = String::with_capacity(64);
-        for byte in digest {
-            let _ = write!(&mut hex, "{byte:02x}");
-        }
-        hex
+        legion_update::sha256_bytes(bytes)
     }
 
     #[test]

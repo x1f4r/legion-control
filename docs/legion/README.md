@@ -64,7 +64,7 @@ next
   - Check that everything is configured and reachable with `legion meta.doctor`.
 ```
 
-List the tools built into the binary (79 tools across 15 families, plus any local extensions):
+List the tools built into the binary (82 tools across 16 families, plus any local extensions):
 
 ```sh
 legion tools
