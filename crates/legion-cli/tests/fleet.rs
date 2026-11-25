@@ -1418,6 +1418,56 @@ fn fan_out_all_partial_failure_all_failed_and_unknown_machine() {
         3,
         "listing this node in fleet.toml must not run or audit it twice"
     );
+
+    // `fs.find` with `--on all` searches reachable machines concurrently, names each machine in
+    // its own result, and reports unreachable machines without failing the call.
+    fs::write(laptop.home().join("holiday_local.jpg"), b"jpg").unwrap();
+    fs::write(pi.home().join("holiday_remote.png"), b"png").unwrap();
+    let find_all = laptop.run(&[
+        "fs.find",
+        "path=~",
+        "name=holiday",
+        "categories=[\"image\"]",
+        "ignore=false",
+        "--on",
+        "all",
+    ]);
+    assert_eq!(
+        find_all.code, 0,
+        "fleet fs.find with one unreachable node should exit 0: {}",
+        find_all.stdout
+    );
+    let find_results = &find_all.json()["results"];
+    assert_eq!(find_results["laptop"]["ok"]["machine"], json!("laptop"));
+    assert_eq!(
+        find_results["laptop"]["ok"]["matches"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        find_results["laptop"]["ok"]["matches"][0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("holiday_local.jpg")
+    );
+    assert_eq!(find_results["pi"]["ok"]["machine"], json!("pi"));
+    assert_eq!(
+        find_results["pi"]["ok"]["matches"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        find_results["pi"]["ok"]["matches"][0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("holiday_remote.png")
+    );
+    assert_eq!(find_results["tower"]["error"]["code"], json!("unreachable"));
+    assert_eq!(find_results["tower"]["error"]["machine"], json!("tower"));
     assert!(
         results["tower"]["error"]["hint"]
             .as_str()

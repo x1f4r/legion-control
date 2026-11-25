@@ -2445,3 +2445,404 @@ async fn list_supports_natural_sort_modified_size_categories_and_paging() {
     assert_eq!(past_end["total"], json!(7));
     assert_eq!(past_end["truncated"], json!(false));
 }
+
+#[tokio::test]
+async fn find_supports_words_categories_size_time_hidden_sort_and_unicode() {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let f = Fixture::new();
+    std::fs::write(f.work.join(".gitignore"), "ignored_pic.jpg\n").unwrap();
+    std::fs::create_dir_all(f.work.join("sub")).unwrap();
+
+    let write_file = |rel: &str, size: usize, secs: u64| {
+        let p = f.work.join(rel);
+        let file = std::fs::File::create(&p).unwrap();
+        std::io::Write::write_all(&mut &file, &vec![b'x'; size]).unwrap();
+        file.set_modified(UNIX_EPOCH + Duration::from_secs(secs))
+            .unwrap();
+    };
+
+    write_file("Holiday_Beach_2.jpg", 100, 1_700_000_100);
+    write_file("holiday_beach_10.PNG", 500, 1_700_000_300);
+    write_file("sub/Übung_Sommer_2026.pdf", 250, 1_700_000_200);
+    write_file("ignored_pic.jpg", 400, 1_700_000_400);
+    write_file(".hidden_pic.jpg", 300, 1_700_000_500);
+    write_file("notes.txt", 50, 1_700_000_150);
+
+    // Multi-word name filter (case-insensitive, any word order) + machine name in result.
+    let by_words = f
+        .call(
+            "fs.find",
+            json!({"path": "~/projects", "name": "BEACH holiday", "sort": "name"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(by_words["machine"], json!(f.node.name()));
+    assert_eq!(by_words["truncated"], json!(false));
+    assert!(by_words.get("reason").is_none());
+    let word_names: Vec<&str> = by_words["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            Path::new(m["path"].as_str().unwrap())
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        })
+        .collect();
+    // Natural ordering puts 2 before 10.
+    assert_eq!(
+        word_names,
+        vec!["Holiday_Beach_2.jpg", "holiday_beach_10.PNG"]
+    );
+
+    // Unicode case-insensitive word matching.
+    let unicode = f
+        .call(
+            "fs.find",
+            json!({"path": "~/projects", "name": "übung 2026", "categories": ["document"]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unicode["matches"].as_array().unwrap().len(), 1);
+    assert!(
+        unicode["matches"][0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("Übung_Sommer_2026.pdf")
+    );
+    assert_eq!(unicode["matches"][0]["category"], json!("document"));
+
+    // Size bounds filter regular files inclusively.
+    let by_size = f
+        .call(
+            "fs.find",
+            json!({
+                "path": "~/projects",
+                "min_size": 100,
+                "max_size": 300,
+                "sort": "size",
+                "order": "desc"
+            }),
+        )
+        .await
+        .unwrap();
+    let sized: Vec<&str> = by_size["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            Path::new(m["path"].as_str().unwrap())
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(sized, vec!["Übung_Sommer_2026.pdf", "Holiday_Beach_2.jpg"]);
+
+    // Modification time bounds using the same RFC 3339 format returned by fs.stat.
+    let t_after = jiff::Timestamp::from_second(1_700_000_150)
+        .unwrap()
+        .strftime("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    let t_before = jiff::Timestamp::from_second(1_700_000_250)
+        .unwrap()
+        .strftime("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    let by_time = f
+        .call(
+            "fs.find",
+            json!({
+                "path": "~/projects",
+                "kind": "file",
+                "modified_after": t_after,
+                "modified_before": t_before,
+                "sort": "modified",
+                "order": "asc"
+            }),
+        )
+        .await
+        .unwrap();
+    let timed: Vec<&str> = by_time["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            Path::new(m["path"].as_str().unwrap())
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(timed, vec!["notes.txt", "Übung_Sommer_2026.pdf"]);
+
+    // `hidden` is separate from `ignore`:
+    // `ignore: false, hidden: false` includes gitignored files while skipping dotfiles.
+    let no_ignore_no_hidden = f
+        .call(
+            "fs.find",
+            json!({
+                "path": "~/projects",
+                "categories": ["image"],
+                "ignore": false,
+                "hidden": false,
+                "sort": "name"
+            }),
+        )
+        .await
+        .unwrap();
+    let imgs_no_hidden: Vec<&str> = no_ignore_no_hidden["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            Path::new(m["path"].as_str().unwrap())
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(
+        imgs_no_hidden,
+        vec![
+            "Holiday_Beach_2.jpg",
+            "holiday_beach_10.PNG",
+            "ignored_pic.jpg"
+        ]
+    );
+
+    // `ignore: true, hidden: true` respects `.gitignore` while still finding dotfiles.
+    let ignore_with_hidden = f
+        .call(
+            "fs.find",
+            json!({
+                "path": "~/projects",
+                "categories": ["image"],
+                "ignore": true,
+                "hidden": true,
+                "sort": "name"
+            }),
+        )
+        .await
+        .unwrap();
+    let imgs_with_hidden: Vec<&str> = ignore_with_hidden["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            Path::new(m["path"].as_str().unwrap())
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(
+        imgs_with_hidden,
+        vec![
+            ".hidden_pic.jpg",
+            "Holiday_Beach_2.jpg",
+            "holiday_beach_10.PNG"
+        ]
+    );
+
+    // Sorted top-K with `limit` returns the true top items and reports `reason: "limit"`.
+    let top_two = f
+        .call(
+            "fs.find",
+            json!({
+                "path": "~/projects",
+                "categories": ["image"],
+                "ignore": false,
+                "hidden": true,
+                "sort": "size",
+                "order": "desc",
+                "limit": 2
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(top_two["truncated"], json!(true));
+    assert_eq!(top_two["reason"], json!("limit"));
+    let top_names: Vec<&str> = top_two["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            Path::new(m["path"].as_str().unwrap())
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(top_names, vec!["holiday_beach_10.PNG", "ignored_pic.jpg"]);
+
+    // Invalid bounds and timestamps are rejected cleanly.
+    for bad in [
+        json!({"path": "~/projects", "budget_ms": 0}),
+        json!({"path": "~/projects", "budget_ms": 60001}),
+        json!({"path": "~/projects", "min_size": 500, "max_size": 100}),
+        json!({"path": "~/projects", "modified_after": "not-a-timestamp"}),
+        json!({
+            "path": "~/projects",
+            "modified_after": "2026-11-25T00:00:00Z",
+            "modified_before": "2026-11-24T00:00:00Z"
+        }),
+    ] {
+        let err = f.call("fs.find", bad.clone()).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgs, "{bad}");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn find_never_follows_symlinks_out_of_allowed_roots() {
+    use std::os::unix::fs::symlink;
+
+    let f = Fixture::new();
+    f.write_config(
+        "policy.toml",
+        r#"
+[principals.jailed]
+role = "jailed"
+
+[roles.jailed]
+allow = ["effect:read"]
+paths = ["~/projects/**"]
+"#,
+    );
+    let outside = f.home.join("outside_secret_dir");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret_needle.txt"), "secret").unwrap();
+    std::fs::write(f.work.join("inside_needle.txt"), "ok").unwrap();
+    symlink(&outside, f.work.join("escape_dir")).unwrap();
+
+    let res = f
+        .call_as(
+            "jailed",
+            "fs.find",
+            json!({"path": "~/projects", "name": "needle"}),
+        )
+        .await
+        .unwrap();
+    let paths: Vec<&str> = res["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths.len(), 1, "{paths:?}");
+    assert!(paths[0].ends_with("inside_needle.txt"));
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn list_and_find_respect_windows_hidden_attribute() {
+    let f = Fixture::new();
+    let visible = f.work.join("visible.txt");
+    let hidden = f.work.join("win_hidden.txt");
+    std::fs::write(&visible, "ok").unwrap();
+    std::fs::write(&hidden, "secret").unwrap();
+    let status = std::process::Command::new("attrib")
+        .args(["+H", hidden.to_str().unwrap()])
+        .status()
+        .expect("attrib should run on Windows");
+    assert!(status.success(), "attrib +H failed: {status}");
+
+    let listed = f
+        .call("fs.list", json!({"path": "~/projects", "hidden": false}))
+        .await
+        .unwrap();
+    let list_names: Vec<&str> = listed["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(list_names, vec!["visible.txt"]);
+
+    let found = f
+        .call(
+            "fs.find",
+            json!({"path": "~/projects", "ignore": false, "hidden": false}),
+        )
+        .await
+        .unwrap();
+    let found_names: Vec<&str> = found["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            Path::new(m["path"].as_str().unwrap())
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(found_names, vec!["visible.txt"]);
+}
+
+#[tokio::test]
+async fn find_large_directory_cuts_off_within_budget() {
+    use std::time::{Duration, Instant};
+
+    let f = Fixture::new();
+    let big = f.work.join("huge");
+    std::fs::create_dir_all(&big).unwrap();
+
+    // 200,000 files on Unix; use a smaller count on Windows CI where Defender scans each newly
+    // created file on NTFS so the fixture setup itself stays fast.
+    #[cfg(not(windows))]
+    const TOTAL_FILES: usize = 200_000;
+    #[cfg(windows)]
+    const TOTAL_FILES: usize = 10_000;
+
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(2, 8))
+        .unwrap_or(4);
+    let per_worker = TOTAL_FILES.div_ceil(workers);
+    std::thread::scope(|scope| {
+        for w in 0..workers {
+            let dir = big.clone();
+            scope.spawn(move || {
+                let start = w * per_worker;
+                let end = (start + per_worker).min(TOTAL_FILES);
+                for idx in start..end {
+                    let _ = std::fs::File::create(dir.join(format!("f_{idx:06}.txt")));
+                }
+            });
+        }
+    });
+
+    let started = Instant::now();
+    let res = f
+        .call(
+            "fs.find",
+            json!({
+                "path": f.p(&big),
+                "name": "does_not_match_any_file",
+                "ignore": false,
+                "budget_ms": 40,
+            }),
+        )
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(
+        res["truncated"],
+        json!(true),
+        "expected time truncation: {res}"
+    );
+    assert_eq!(res["reason"], json!("time"));
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "fs.find took {elapsed:?} for a 40ms budget"
+    );
+}
