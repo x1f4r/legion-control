@@ -17,12 +17,12 @@ use std::time::Duration;
 
 use legion_link::proto::{ErrorCode, PROTOCOL};
 use legion_link::{
-    CancellationToken, DeviceKey, Invite, Link, LinkConfig, NodeLink, REASON_AUTH_FAILED,
-    REASON_DEVICE_REMOVED_OR_UNKNOWN, REASON_HOST_KEY_MISMATCH, SshTarget, SshTimeouts, Subcommand,
-    ssh,
+    CancellationToken, DeviceKey, Invite, Link, LinkConfig, NodeLink, PutRequest,
+    REASON_AUTH_FAILED, REASON_DEVICE_REMOVED_OR_UNKNOWN, REASON_HOST_KEY_MISMATCH, SshTarget,
+    SshTimeouts, Subcommand, ssh,
 };
 use serde_json::json;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct TestEnv {
     host: String,
@@ -34,6 +34,8 @@ struct TestEnv {
     auth_keys_path: Option<String>,
     enrol_script: Option<String>,
     sample_file: Option<String>,
+    upload_key: Option<DeviceKey>,
+    upload_dir: Option<String>,
     legion_bin: Option<String>,
     key: DeviceKey,
     node: String,
@@ -60,6 +62,13 @@ fn env_target() -> Option<TestEnv> {
     let sample_file = env::var("LEGION_LINK_SAMPLE_FILE")
         .ok()
         .filter(|s| !s.trim().is_empty());
+    let upload_key = env::var("LEGION_LINK_UPLOAD_KEY_FILE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|p| DeviceKey::from_openssh(&fs::read_to_string(p).unwrap()).unwrap());
+    let upload_dir = env::var("LEGION_LINK_UPLOAD_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
     let legion_bin = env::var("LEGION_LINK_BIN")
         .ok()
         .filter(|s| !s.trim().is_empty());
@@ -77,6 +86,8 @@ fn env_target() -> Option<TestEnv> {
         auth_keys_path,
         enrol_script,
         sample_file,
+        upload_key,
+        upload_dir,
         legion_bin,
         key,
         node,
@@ -488,6 +499,151 @@ async fn real_sshd_session_and_security_checks() {
             .unwrap();
         assert_eq!(unknown.code, ErrorCode::NotFound);
 
+        // 6c. `Link::open_put` over real sshd: read-only principal is refused (`denied`);
+        //     writable principal uploads cleanly, resumes from a partial `.legion-part` file,
+        //     rejects a hash mismatch, and works over `NodeLink::local`.
+        let sample_hash_val = link
+            .call(
+                &env.node,
+                "fs.hash",
+                json!({"path": sample_file}),
+                None,
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let sample_hash = sample_hash_val["hash"].as_str().unwrap().to_owned();
+
+        if let Some(upload_dir) = &env.upload_dir {
+            // Read-only `phone` principal must be refused before any byte is sent.
+            let denied = link
+                .open_put(
+                    &env.node,
+                    PutRequest {
+                        path: format!("{upload_dir}/denied.bin"),
+                        size: expected.len() as u64,
+                        hash: sample_hash.clone(),
+                        mode: Some(0o644),
+                        mtime: None,
+                    },
+                )
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(denied.code, ErrorCode::Denied, "{denied}");
+
+            if let Some(upload_key) = &env.upload_key {
+                let writer_link = Link::new(LinkConfig {
+                    device_key: Some(upload_key.to_openssh().unwrap()),
+                    nodes: vec![NodeLink::ssh(
+                        &env.node,
+                        SshTarget {
+                            hosts: vec![env.host.clone()],
+                            port: env.port,
+                            user: env.user.clone(),
+                            host_keys: vec![env.ed25519_host_key.clone()],
+                        },
+                        Some("writer".to_owned()),
+                    )],
+                    ..LinkConfig::default()
+                });
+
+                // Full 5 MiB upload verified by remote BLAKE3 hash.
+                let dest = format!("{upload_dir}/full.bin");
+                let mut put = writer_link
+                    .open_put(
+                        &env.node,
+                        PutRequest {
+                            path: dest.clone(),
+                            size: expected.len() as u64,
+                            hash: sample_hash.clone(),
+                            mode: Some(0o644),
+                            mtime: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(put.offset(), 0);
+                put.write_all(&expected).await.unwrap();
+                let done = put.finish().await.unwrap();
+                assert_eq!(done.size, expected.len() as u64);
+                assert_eq!(done.hash, sample_hash);
+                assert_eq!(fs::read(&dest).unwrap(), expected);
+
+                // Partial upload interrupted mid-stream leaves `.legion-part`; the second attempt
+                // reports the saved offset and finishes cleanly.
+                let resumed_dest = format!("{upload_dir}/resumed.bin");
+                let mut partial = writer_link
+                    .open_put(
+                        &env.node,
+                        PutRequest {
+                            path: resumed_dest.clone(),
+                            size: expected.len() as u64,
+                            hash: sample_hash.clone(),
+                            mode: Some(0o644),
+                            mtime: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(partial.offset(), 0);
+                let first_half = 1_500_000usize;
+                partial.write_all(&expected[..first_half]).await.unwrap();
+                partial.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                partial.cancel();
+                drop(partial);
+                tokio::time::sleep(Duration::from_millis(150)).await;
+
+                let mut resumed = writer_link
+                    .open_put(
+                        &env.node,
+                        PutRequest {
+                            path: resumed_dest.clone(),
+                            size: expected.len() as u64,
+                            hash: sample_hash.clone(),
+                            mode: Some(0o644),
+                            mtime: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let off = resumed.offset() as usize;
+                assert!(
+                    off > 0 && off <= first_half,
+                    "expected resumed upload offset in 1..={first_half}, got {off}"
+                );
+                resumed.write_all(&expected[off..]).await.unwrap();
+                let done = resumed.finish().await.unwrap();
+                assert_eq!(done.size, expected.len() as u64);
+                assert_eq!(done.hash, sample_hash);
+                assert_eq!(fs::read(&resumed_dest).unwrap(), expected);
+
+                // Hash mismatch is rejected cleanly by the remote node.
+                let bad_dest = format!("{upload_dir}/bad-hash.bin");
+                let mut bad = writer_link
+                    .open_put(
+                        &env.node,
+                        PutRequest {
+                            path: bad_dest.clone(),
+                            size: 64,
+                            hash: "blake3:0000000000000000000000000000000000000000000000000000000000000000"
+                                .to_owned(),
+                            mode: Some(0o644),
+                            mtime: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                bad.write_all(&[0x5Au8; 64]).await.unwrap();
+                let err = bad.finish().await.unwrap_err();
+                assert_ne!(err.code, ErrorCode::InvalidArgs);
+                assert!(!std::path::Path::new(&bad_dest).exists());
+
+                writer_link.close().await;
+            }
+        }
+
         // Local child pipe (`NodeLink::local`) when both `local` feature and binary are present.
         #[cfg(feature = "local")]
         if let Some(legion_bin) = &env.legion_bin {
@@ -504,6 +660,27 @@ async fn real_sshd_session_and_security_checks() {
             let mut lbuf = Vec::new();
             ls.read_to_end(&mut lbuf).await.unwrap();
             assert_eq!(lbuf, &expected[512..512 + 4096]);
+            if let Some(upload_dir) = &env.upload_dir {
+                let local_dest = format!("{upload_dir}/local-put.bin");
+                let mut lp = local_link
+                    .open_put(
+                        "local-node",
+                        PutRequest {
+                            path: local_dest.clone(),
+                            size: expected.len() as u64,
+                            hash: sample_hash.clone(),
+                            mode: Some(0o644),
+                            mtime: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(lp.offset(), 0);
+                lp.write_all(&expected).await.unwrap();
+                let done = lp.finish().await.unwrap();
+                assert_eq!(done.hash, sample_hash);
+                assert_eq!(fs::read(&local_dest).unwrap(), expected);
+            }
             local_link.close().await;
         }
         #[cfg(not(feature = "local"))]

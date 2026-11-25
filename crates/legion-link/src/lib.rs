@@ -99,6 +99,7 @@ pub mod key;
 pub mod link;
 #[cfg(feature = "local")]
 pub mod local;
+pub mod put;
 pub mod session;
 #[cfg(feature = "ssh")]
 pub mod ssh;
@@ -159,6 +160,7 @@ pub use link::{
     MachineRouteStatus, NodeLink, NodeOrigin, PendingIdentityChange, Route, RoutedValue,
     SessionOpener, parse_optional_target, public_key_fingerprint,
 };
+pub use put::{PutRequest, PutResult, PutStream};
 pub use session::{
     CallError, OpenError, Session, SessionInfo, TransportHandle, cancel_reply_timeout,
 };
