@@ -913,6 +913,7 @@ export function VideoPlayer({
           leaveFullscreen();
           break;
         case 'close':
+          if (e.key === 'Escape' && fullscreenController?.recentlyExitedFromPlatform?.()) break;
           if (onClose) onClose();
           break;
         default:

@@ -811,6 +811,7 @@ export function createFullscreenController({
   getElement = () => null,
   getVideo = () => null,
   onChange = () => {},
+  now = () => Date.now(),
 } = {}) {
   let state = {
     active: false,
@@ -824,6 +825,7 @@ export function createFullscreenController({
   let activeViewerHash = getHash() || '';
   let pendingPopResolvers = [];
   let pendingPopTimer = null;
+  let lastPlatformExitAt = -Infinity;
 
   function emit() {
     if (disposed) return;
@@ -942,6 +944,7 @@ export function createFullscreenController({
       pushedHistory,
       inFlight: false,
     };
+    lastPlatformExitAt = -Infinity;
     emit();
     return { active: true, mode: res?.mode || 'none' };
   }
@@ -978,6 +981,7 @@ export function createFullscreenController({
     if (disposed) return;
     if (!platformActive && state.active) {
       const hadPushed = state.pushedHistory;
+      lastPlatformExitAt = now();
       state = {
         active: false,
         source: null,
@@ -989,6 +993,10 @@ export function createFullscreenController({
         popFullscreenHistory();
       }
     }
+  }
+
+  function recentlyExitedFromPlatform(windowMs = 250) {
+    return now() - lastPlatformExitAt < windowMs;
   }
 
   function handlePopState() {
@@ -1047,6 +1055,7 @@ export function createFullscreenController({
     enter,
     leave,
     syncFromPlatform,
+    recentlyExitedFromPlatform,
     handlePopState,
     dispose,
   };

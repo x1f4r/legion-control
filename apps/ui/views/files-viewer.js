@@ -3,7 +3,7 @@
 // on content addresses, text (128 KiB + load more), extensionless text probing, and in-place
 // "Open in another app" staging with progress, cancel, and honest errors.
 
-import { html, useEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
+import { html, useEffect, useLayoutEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
 import { Icon } from '../icons.js';
 import { plainErrorMessage } from '../lib/errors.js';
 import {
@@ -1154,7 +1154,7 @@ export function FilesViewer({
   // text, and unplayable/error screens): Escape exits full screen first then closes, F leaves
   // full screen, N/P step through video/audio queues so an unplayable file never strands the queue,
   // and Left/Right step through pictures.
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (usingCustomPlayer) return undefined;
     function onKeyDown(e) {
       if (moreOpen || document.querySelector('.scrim')) return;
@@ -1174,7 +1174,7 @@ export function FilesViewer({
         e.preventDefault();
         if (isViewerFullscreen) {
           fullscreenController.leave();
-        } else {
+        } else if (!fullscreenController.recentlyExitedFromPlatform?.()) {
           handleClose();
         }
       } else if ((e.key === 'f' || e.key === 'F') && isViewerFullscreen) {
