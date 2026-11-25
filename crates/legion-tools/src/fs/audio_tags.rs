@@ -295,22 +295,35 @@ fn read_mp4_box_header_raw<R: Read + Seek>(
     Some((box_type, payload_start, box_end))
 }
 
-/// Returns true for characters that must be removed from audio tag text: control characters,
-/// bidirectional overrides/isolates/marks, invisible zero-width/BOM/soft-hyphen characters,
-/// Unicode tag characters (`U+E0000..=U+E007F`), and all 66 Unicode noncharacters.
+/// Returns true for characters that must be removed from audio tag text:
+/// - Control characters (`U+0000..=U+001F`, `U+007F..=U+009F`)
+/// - Soft hyphen (`U+00AD`), Combining Grapheme Joiner (`U+034F`), Hangul fillers
+///   (`U+115F`, `U+3164`), Mongolian Vowel Separator (`U+180E`)
+/// - Zero-width and invisible format characters (`U+200B`, `U+2060..=U+2064`, `U+FEFF`,
+///   `U+FFF9..=U+FFFB`)
+/// - Bidirectional marks, embeddings, overrides, and isolates (`U+061C`, `U+200E..=U+200F`,
+///   `U+202A..=U+202E`, `U+2066..=U+2069`)
+/// - Unicode tag characters (`U+E0000..=U+E007F`)
+/// - All 66 Unicode noncharacters (`U+FDD0..=U+FDEF` and `U+xxFFFE..=U+xxFFFF` in every plane)
 pub(crate) fn is_stripped_tag_char(ch: char) -> bool {
     let cp = ch as u32;
     ch.is_control()
         || matches!(
             ch,
             '\u{00AD}' // soft hyphen
+            | '\u{034F}' // Combining Grapheme Joiner
             | '\u{061C}' // Arabic Letter Mark
+            | '\u{115F}' // Hangul Choseong Filler
+            | '\u{180E}' // Mongolian Vowel Separator
             | '\u{200B}' // Zero Width Space
             | '\u{200E}'..='\u{200F}' // LRM, RLM
             | '\u{202A}'..='\u{202E}' // LRE, RLE, PDF, LRO, RLO
+            | '\u{2060}'..='\u{2064}' // Word Joiner & invisible math operators
             | '\u{2066}'..='\u{2069}' // LRI, RLI, FSI, PDI
-            | '\u{FEFF}' // BOM / ZWNBSP
+            | '\u{3164}' // Hangul Filler
             | '\u{FDD0}'..='\u{FDEF}' // noncharacters
+            | '\u{FEFF}' // BOM / ZWNBSP
+            | '\u{FFF9}'..='\u{FFFB}' // Interlinear annotation format chars
             | '\u{E0000}'..='\u{E007F}' // Unicode tag characters
         )
         || (cp & 0xFFFF) >= 0xFFFE
@@ -3284,10 +3297,19 @@ mod tests {
         let bidi = "A\u{061C}\u{200E}\u{200F}\u{202A}\u{202B}\u{202C}\u{202D}\u{202E}\u{2066}\u{2067}\u{2068}\u{2069}B";
         assert_eq!(clean_tag_text(bidi).as_deref(), Some("AB"));
 
-        // U+200B (ZWSP), U+FEFF (BOM), U+00AD (soft hyphen).
+        // U+200B (ZWSP), U+FEFF (BOM), U+00AD (soft hyphen), and additional invisible format &
+        // filler code points (U+034F, U+115F, U+180E, U+2060..=U+2064, U+3164, U+FFF9..=U+FFFB).
         assert_eq!(
             clean_tag_text("\u{FEFF}Hel\u{00AD}lo\u{200B}World\u{FEFF}").as_deref(),
             Some("HelloWorld")
+        );
+        let extra_invisible = "A\u{034F}\u{115F}\u{180E}\u{2060}\u{2061}\u{2062}\u{2063}\u{2064}\u{3164}\u{FFF9}\u{FFFA}\u{FFFB}B";
+        assert_eq!(clean_tag_text(extra_invisible).as_deref(), Some("AB"));
+        assert_eq!(
+            clean_tag_text(
+                "\u{034F}\u{115F}\u{180E}\u{2060}\u{2061}\u{2062}\u{2063}\u{2064}\u{3164}\u{FFF9}\u{FFFA}\u{FFFB}"
+            ),
+            None
         );
 
         // Unicode tag characters U+E0000..=U+E007F (smuggled prompt-injection plane).

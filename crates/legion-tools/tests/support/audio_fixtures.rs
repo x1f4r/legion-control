@@ -1398,13 +1398,19 @@ pub fn assert_clean_tags_item(item: &serde_json::Value) {
                         || matches!(
                             ch,
                             '\u{00AD}'
+                                | '\u{034F}'
                                 | '\u{061C}'
+                                | '\u{115F}'
+                                | '\u{180E}'
                                 | '\u{200B}'
                                 | '\u{200E}'..='\u{200F}'
                                 | '\u{2028}'..='\u{202E}'
+                                | '\u{2060}'..='\u{2064}'
                                 | '\u{2066}'..='\u{2069}'
-                                | '\u{FEFF}'
+                                | '\u{3164}'
                                 | '\u{FDD0}'..='\u{FDEF}'
+                                | '\u{FEFF}'
+                                | '\u{FFF9}'..='\u{FFFB}'
                                 | '\u{E0000}'..='\u{E007F}'
                         )
                         || (cp & 0xFFFF) >= 0xFFFE;
