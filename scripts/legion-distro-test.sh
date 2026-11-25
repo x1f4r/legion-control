@@ -146,10 +146,10 @@ if [[ "$LEGION_DISTRO_KIND" == "deb" ]]; then
   printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
   chmod 0755 /usr/sbin/policy-rc.d
 
-  step "Installing test prerequisites (openssh-server, openssh-client, systemd, jq)"
+  step "Installing test prerequisites (openssh-server, openssh-client, systemd, jq, curl, python3)"
   apt-get update -qq
   apt-get install -y -qq --no-install-recommends \
-    ca-certificates jq openssh-client openssh-server systemd >/dev/null
+    ca-certificates curl jq openssh-client openssh-server python3 systemd >/dev/null
 
   step "Installing .deb with apt-get install"
   # List the archive once and search the text: `grep -q` leaving a pipe early kills the writer
@@ -181,8 +181,8 @@ elif [[ "$LEGION_DISTRO_KIND" == "arch" ]]; then
   EXPECTED_MANAGER="pacman"
   EXPECTED_HINT_NEEDLE="pacman"
 
-  step "Installing Arch prerequisites (base-devel, namcap, openssh, systemd, jq)"
-  pacman -Syu --noconfirm --needed base-devel jq namcap openssh systemd >/dev/null
+  step "Installing Arch prerequisites (base-devel, namcap, openssh, openssl, systemd, jq, curl, python)"
+  pacman -Syu --noconfirm --needed base-devel curl jq namcap openssh openssl python systemd >/dev/null
 
   if [[ "$LEGION_TEST_MODE" == "pkgbuild" ]]; then
     step "Installing rustup for PKGBUILD source build"
@@ -203,8 +203,16 @@ elif [[ "$LEGION_DISTRO_KIND" == "arch" ]]; then
     fi
 
     step "Checking PKGBUILD files with namcap"
-    namcap /work/repo/packaging/arch/PKGBUILD
-    namcap /work/repo/packaging/arch/legion-bin/PKGBUILD
+    for pb in \
+      /work/repo/packaging/arch/PKGBUILD \
+      /work/repo/packaging/arch/legion-bin/PKGBUILD \
+      /work/repo/packaging/arch/legion-app/PKGBUILD; do
+      PB_NAMCAP="$(namcap "$pb")"
+      if [[ -n "$PB_NAMCAP" ]]; then
+        printf '%s\n' "$PB_NAMCAP" >&2
+        fail "namcap reported issues on $pb"
+      fi
+    done
 
     step "Building legion from source via makepkg as non-root user"
     su -s /bin/bash builder -c '
@@ -320,7 +328,11 @@ printf '%s' "$DOCTOR_JSON" | jq -e --arg mgr "$EXPECTED_MANAGER" \
   '.ok == true and (.checks | any(.name == "installation" and (.detail | contains($mgr))))' >/dev/null \
   || fail "meta.doctor failed or omitted installation check: $DOCTOR_JSON"
 
-step "Running real tools (sys.info, fs.list, exec.run, detached job)"
+step "Running real tools (meta.whoami, sys.info, fs.list, fs.read, fs.thumb, fs.tags, legion serve, exec.run, detached job)"
+WHOAMI_JSON="$(run_as_me 'legion meta.whoami --json')"
+printf '%s' "$WHOAMI_JSON" | jq -e '.principal == "owner" and .role == "owner" and .door == "cli" and .node == "tower"' >/dev/null \
+  || fail "meta.whoami failed: $WHOAMI_JSON"
+
 SYS_JSON="$(run_as_me 'legion sys.info --json')"
 printf '%s' "$SYS_JSON" | jq -e '(.hostname | length > 0) and (.os != null)' >/dev/null \
   || fail "sys.info failed: $SYS_JSON"
@@ -328,6 +340,77 @@ printf '%s' "$SYS_JSON" | jq -e '(.hostname | length > 0) and (.os != null)' >/d
 FS_JSON="$(run_as_me 'legion fs.list path=/home/me --json')"
 printf '%s' "$FS_JSON" | jq -e '.entries | any(.name == ".config")' >/dev/null \
   || fail "fs.list failed: $FS_JSON"
+
+run_as_me '
+  set -euo pipefail
+  mkdir -p /home/me/media-test
+  printf "hello-distro\n" > /home/me/media-test/note.txt
+  python3 - <<'\''PY'\''
+import os, struct, zlib
+
+def make_png(w, h):
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff)
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+    raw = b"".join(b"\x00" + bytes([180, 90, 50]) * w for _ in range(h))
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+
+png = make_png(32, 32)
+with open("/home/me/media-test/sample.png", "wb") as fh:
+    fh.write(png)
+
+def id3_text(fid, text):
+    body = b"\x03" + text.encode("utf-8")
+    return fid.encode("ascii") + struct.pack(">I", len(body)) + b"\x00\x00" + body
+
+apic_body = b"\x00image/png\x00\x03\x00" + png
+apic = b"APIC" + struct.pack(">I", len(apic_body)) + b"\x00\x00" + apic_body
+frames = id3_text("TIT2", "Distro Song") + id3_text("TPE1", "Distro Artist") + id3_text("TALB", "Distro Album") + apic
+sz = len(frames)
+syncsafe = bytes([(sz >> 21) & 0x7f, (sz >> 14) & 0x7f, (sz >> 7) & 0x7f, sz & 0x7f])
+id3 = b"ID3\x03\x00\x00" + syncsafe + frames
+mp3_frame = b"\xff\xfb\x90\x00" + b"\x00" * 413
+with open("/home/me/media-test/song.mp3", "wb") as fh:
+    fh.write(id3 + mp3_frame)
+PY
+'
+
+READ_JSON="$(run_as_me 'legion fs.read path=/home/me/media-test/note.txt --json')"
+printf '%s' "$READ_JSON" | jq -e '.content == "hello-distro\n" and .eof == true' >/dev/null \
+  || fail "fs.read failed: $READ_JSON"
+
+THUMB_JSON="$(run_as_me 'legion fs.thumb paths='\''["/home/me/media-test/sample.png","/home/me/media-test/song.mp3"]'\'' --json')"
+printf '%s' "$THUMB_JSON" | jq -e '
+  (.results | length == 2)
+  and (.results[0].ok.width == 32 and .results[0].ok.height == 32 and (.results[0].ok.content | length > 0))
+  and (.results[1].ok.width == 32 and .results[1].ok.height == 32 and (.results[1].ok.content | length > 0))
+' >/dev/null || fail "fs.thumb failed: $THUMB_JSON"
+
+TAGS_JSON="$(run_as_me 'legion fs.tags paths='\''["/home/me/media-test/song.mp3"]'\'' --json')"
+printf '%s' "$TAGS_JSON" | jq -e '
+  .results[0].ok.title == "Distro Song"
+  and .results[0].ok.artist == "Distro Artist"
+  and .results[0].ok.album == "Distro Album"
+  and .results[0].ok.cover == true
+' >/dev/null || fail "fs.tags failed: $TAGS_JSON"
+
+run_as_me '
+  set -euo pipefail
+  legion serve --listen 127.0.0.1:17117 > /tmp/legion-serve.log 2>&1 &
+  SPID=$!
+  trap "kill $SPID 2>/dev/null || true; wait $SPID 2>/dev/null || true" EXIT
+  READY=0
+  for _ in $(seq 1 40); do
+    if curl -fsS http://127.0.0.1:17117/v1/health >/dev/null 2>&1; then
+      READY=1
+      break
+    fi
+    sleep 0.1
+  done
+  test "$READY" -eq 1
+  curl -fsS http://127.0.0.1:17117/v1/health | jq -e ".ok == true and .node == \"tower\"" >/dev/null
+  curl -fsS http://127.0.0.1:17117/ | grep -qi "<!doctype html>"
+'
 
 EXEC_JSON="$(run_as_me 'legion exec.run cmd="printf distro-ok" --json')"
 printf '%s' "$EXEC_JSON" | jq -e '.exit_code == 0 and .stdout == "distro-ok"' >/dev/null \
