@@ -36,7 +36,7 @@ use std::io::{self, Write as _};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -201,6 +201,8 @@ pub struct HttpDoor {
     full: Arc<crate::mcp::catalog::CatalogCache>,
     compact: Arc<crate::mcp::catalog::CatalogCache>,
     content_limits: ContentStreamLimits,
+    /// Total bytes handed to OS TCP sockets while a content response stream is active.
+    content_socket_bytes: Arc<AtomicU64>,
 }
 
 impl HttpDoor {
@@ -214,6 +216,7 @@ impl HttpDoor {
             node,
             router,
             content_limits: ContentStreamLimits::default(),
+            content_socket_bytes: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -221,6 +224,11 @@ impl HttpDoor {
     pub fn with_content_limits(mut self, limits: ContentStreamLimits) -> Self {
         self.content_limits = limits;
         self
+    }
+
+    #[cfg(test)]
+    fn content_socket_bytes(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.content_socket_bytes)
     }
 
     /// Serves connections from `listener` until `shutdown` completes, then stops accepting,
@@ -348,6 +356,7 @@ impl HttpDoor {
                 stream,
                 Arc::clone(&active_streams),
                 conn_abort.clone(),
+                Arc::clone(&self.content_socket_bytes),
                 content_limits.write_idle_timeout,
                 content_limits.min_rate_window,
                 content_limits.min_rate_bytes,
@@ -488,6 +497,7 @@ struct MonitoredTcpStream {
     inner: TcpStream,
     active: Arc<AtomicUsize>,
     abort: CancellationToken,
+    socket_bytes: Arc<AtomicU64>,
     sndbuf_applied: bool,
     write_idle_timeout: Duration,
     min_rate_window: Duration,
@@ -513,6 +523,7 @@ impl MonitoredTcpStream {
         inner: TcpStream,
         active: Arc<AtomicUsize>,
         abort: CancellationToken,
+        socket_bytes: Arc<AtomicU64>,
         write_idle_timeout: Duration,
         min_rate_window: Duration,
         min_rate_bytes: u64,
@@ -521,6 +532,7 @@ impl MonitoredTcpStream {
             inner,
             active,
             abort,
+            socket_bytes,
             sndbuf_applied: false,
             write_idle_timeout,
             min_rate_window,
@@ -569,6 +581,7 @@ impl MonitoredTcpStream {
         let now = Instant::now();
         match write_op(&mut self.inner, cx) {
             Poll::Ready(Ok(n)) => {
+                self.socket_bytes.fetch_add(n as u64, Ordering::Relaxed);
                 if let Some(since) = self.blocked_since.take() {
                     self.blocked_accum = self
                         .blocked_accum
@@ -1406,6 +1419,7 @@ mod tests {
             server,
             Arc::clone(&active),
             CancellationToken::new(),
+            Arc::new(AtomicU64::new(0)),
             Duration::from_secs(5),
             Duration::from_millis(120),
             64 * 1024,
@@ -1470,6 +1484,7 @@ mod tests {
             server,
             active,
             CancellationToken::new(),
+            Arc::new(AtomicU64::new(0)),
             Duration::from_secs(5),
             Duration::from_millis(200),
             512 * 1024,
@@ -1499,5 +1514,249 @@ mod tests {
         let err = err.expect("trickling client must be disconnected by minimum-rate rule");
         assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
         trickle.abort();
+    }
+
+    #[tokio::test]
+    async fn revoked_content_stream_writes_bounded_bytes_to_socket_after_revocation() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("legion");
+        let user_home = dir.path().join("user");
+        std::fs::create_dir_all(home.join("config")).unwrap();
+        std::fs::create_dir_all(home.join("state")).unwrap();
+        std::fs::create_dir_all(&user_home).unwrap();
+
+        let big_len = 16 * 1024 * 1024usize;
+        let big_file = user_home.join("movie.bin");
+        std::fs::write(&big_file, vec![b'M'; big_len]).unwrap();
+
+        let paths = legion_core::Paths::under(&home);
+        std::fs::write(paths.config_file("node.toml"), "name = \"tower\"\n").unwrap();
+        std::fs::write(
+            paths.config_file("policy.toml"),
+            "\
+[principals.slow]
+role = \"observer\"
+
+[principals.stalled]
+role = \"observer\"
+
+[roles.observer]
+allow = [\"effect:read\"]
+",
+        )
+        .unwrap();
+
+        let node = Node::new(paths.clone(), legion_tools::registry());
+        let slow_tok = node
+            .call(legion_core::Call::new(
+                legion_core::Door::Cli,
+                "token.add",
+                serde_json::json!({ "name": "slow-tok", "principal": "slow" }),
+            ))
+            .await
+            .unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let stalled_tok = node
+            .call(legion_core::Call::new(
+                legion_core::Door::Cli,
+                "token.add",
+                serde_json::json!({ "name": "stalled-tok", "principal": "stalled" }),
+            ))
+            .await
+            .unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let door = HttpDoor::new(node.clone(), Arc::new(legion_core::Local)).unwrap();
+        let socket_bytes = door.content_socket_bytes();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
+        let server_task = tokio::spawn(async move {
+            let _ = door.serve(listener, stop.cancelled()).await;
+        });
+
+        async fn mint(port: u16, token: &str, path: &std::path::Path) -> String {
+            let body = serde_json::json!({ "path": path.to_string_lossy() }).to_string();
+            let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let req = format!(
+                "POST /v1/content HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            s.write_all(req.as_bytes()).await.unwrap();
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.unwrap();
+            let text = String::from_utf8(resp).unwrap();
+            let (_, json_body) = text.split_once("\r\n\r\n").unwrap();
+            serde_json::from_str::<serde_json::Value>(json_body).unwrap()["url"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+
+        async fn read_headers(conn: &mut TcpStream) {
+            let mut header_buf = Vec::new();
+            let mut byte = [0u8; 1];
+            while !header_buf.ends_with(b"\r\n\r\n") {
+                conn.read_exact(&mut byte).await.unwrap();
+                header_buf.push(byte[0]);
+            }
+            let head = String::from_utf8_lossy(&header_buf);
+            assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+        }
+
+        let audit_has_read = |principal: &str| {
+            std::fs::read_to_string(paths.audit_log())
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .any(|e| e["tool"] == "content.read" && e["principal"] == principal)
+        };
+
+        // Upper bound on bytes the server may hand to the OS socket after the revocation instant:
+        // at most one send buffer (128 KiB) plus one 64 KiB chunk write before the 1s watcher cuts
+        // the connection, and zero bytes after the abort decision.
+        let max_post_revoke_socket_bytes = (CONTENT_SOCKET_SNDBUF + 64 * 1024) as u64;
+
+        // 1. Slow 20 KB/s reader.
+        let slow_url = mint(port, &slow_tok, &big_file).await;
+        let mut slow_conn = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let get = format!(
+            "GET {slow_url} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        );
+        slow_conn.write_all(get.as_bytes()).await.unwrap();
+        read_headers(&mut slow_conn).await;
+        let mut chunk = [0u8; 4096];
+        slow_conn.read_exact(&mut chunk).await.unwrap();
+        // Let the initial loopback burst fill OS buffers before revocation.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        node.call(legion_core::Call::new(
+            legion_core::Door::Cli,
+            "token.remove",
+            serde_json::json!({ "name": "slow-tok" }),
+        ))
+        .await
+        .unwrap();
+        let revoked_at = Instant::now();
+        let written_at_revoke = socket_bytes.load(Ordering::Acquire);
+
+        let mut server_cut_at = None;
+        let mut client_after_revoke = 0usize;
+        while revoked_at.elapsed() < Duration::from_secs(4) {
+            if server_cut_at.is_none() && audit_has_read("slow") {
+                server_cut_at = Some(revoked_at.elapsed());
+                break;
+            }
+            match tokio::time::timeout(Duration::from_millis(200), slow_conn.read(&mut chunk)).await
+            {
+                Ok(Ok(0)) | Ok(Err(_)) => {
+                    server_cut_at.get_or_insert(revoked_at.elapsed());
+                    break;
+                }
+                Ok(Ok(n)) => {
+                    client_after_revoke += n;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(_) => {}
+            }
+        }
+        let server_cut_elapsed = server_cut_at.expect("watcher must cut slow reader within 4s");
+        let written_at_cut = socket_bytes.load(Ordering::Acquire);
+        assert!(
+            server_cut_elapsed <= Duration::from_secs(3),
+            "expected slow reader cutoff within ~2s, took {server_cut_elapsed:?}"
+        );
+        // Drain any bytes already in the client's OS receive buffer, then verify nothing further
+        // was handed to the socket by the server after the abort decision.
+        let mut tail = Vec::new();
+        let _ =
+            tokio::time::timeout(Duration::from_secs(2), slow_conn.read_to_end(&mut tail)).await;
+        client_after_revoke += tail.len();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let written_final = socket_bytes.load(Ordering::Acquire);
+        assert_eq!(
+            written_final, written_at_cut,
+            "server must hand zero bytes to socket after abort decision"
+        );
+        let written_after_revoke = written_final.saturating_sub(written_at_revoke);
+        assert!(
+            written_after_revoke <= max_post_revoke_socket_bytes,
+            "server handed too many bytes to socket after revocation for slow reader: {written_after_revoke} > {max_post_revoke_socket_bytes} (cut at {server_cut_elapsed:?}, client drained {client_after_revoke})"
+        );
+        assert!(
+            client_after_revoke < 4 * 1024 * 1024,
+            "client drained unreasonably large tail after slow-reader revocation: {client_after_revoke} bytes"
+        );
+
+        // 2. Completely stalled reader (never reads again after initial 16 KiB).
+        let stalled_url = mint(port, &stalled_tok, &big_file).await;
+        let mut stalled_conn = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let get = format!(
+            "GET {stalled_url} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        );
+        stalled_conn.write_all(get.as_bytes()).await.unwrap();
+        read_headers(&mut stalled_conn).await;
+        let mut initial = [0u8; 16 * 1024];
+        stalled_conn.read_exact(&mut initial).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        node.call(legion_core::Call::new(
+            legion_core::Door::Cli,
+            "token.remove",
+            serde_json::json!({ "name": "stalled-tok" }),
+        ))
+        .await
+        .unwrap();
+        let stalled_revoked_at = Instant::now();
+        let stalled_written_at_revoke = socket_bytes.load(Ordering::Acquire);
+
+        let mut stalled_cut_at = None;
+        while stalled_revoked_at.elapsed() < Duration::from_secs(4) {
+            if audit_has_read("stalled") {
+                stalled_cut_at = Some(stalled_revoked_at.elapsed());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let stalled_cut_elapsed =
+            stalled_cut_at.expect("watcher must cut stalled reader within 4s");
+        let stalled_written_at_cut = socket_bytes.load(Ordering::Acquire);
+        assert!(
+            stalled_cut_elapsed <= Duration::from_secs(3),
+            "expected stalled reader cutoff within ~2s, took {stalled_cut_elapsed:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let stalled_written_final = socket_bytes.load(Ordering::Acquire);
+        assert_eq!(
+            stalled_written_final, stalled_written_at_cut,
+            "server must hand zero bytes to stalled socket after abort decision"
+        );
+        let stalled_written_after_revoke =
+            stalled_written_final.saturating_sub(stalled_written_at_revoke);
+        assert!(
+            stalled_written_after_revoke <= max_post_revoke_socket_bytes,
+            "server handed too many bytes to socket after revocation for stalled reader: {stalled_written_after_revoke} > {max_post_revoke_socket_bytes} (cut at {stalled_cut_elapsed:?})"
+        );
+        let mut stalled_tail = Vec::new();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            stalled_conn.read_to_end(&mut stalled_tail),
+        )
+        .await;
+        assert!(
+            stalled_tail.len() < 4 * 1024 * 1024,
+            "stalled client drained unreasonably large tail: {} bytes",
+            stalled_tail.len()
+        );
+
+        shutdown.cancel();
+        server_task.await.unwrap();
     }
 }

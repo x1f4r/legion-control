@@ -561,6 +561,10 @@ pub(crate) async fn serve(State(shared): State<Arc<Shared>>, request: Request) -
                             let live = watch_shared.content_tickets.is_live(&ticket.key_hash)
                                 && watch_source.check_live(&ticket).is_ok();
                             if !live {
+                                // Abort the TCP connection first so zero further bytes can be
+                                // handed to the socket while the revoked ticket's audit summary
+                                // flushes to disk.
+                                ctrl.abort.cancel();
                                 let removed = watch_shared
                                     .content_tickets
                                     .revoke_holder_hashes(&ticket.holder);
@@ -568,7 +572,6 @@ pub(crate) async fn serve(State(shared): State<Arc<Shared>>, request: Request) -
                                     .content_audit
                                     .flush_removed(&watch_shared.node, &removed)
                                     .await;
-                                ctrl.abort.cancel();
                                 break;
                             }
                         }
