@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   baseFileName,
   buildTransferDestination,
+  canOpenExternally,
   categoryFromName,
   changedPresetCutoff,
   createThumbQueue,
@@ -16,6 +17,7 @@ import {
   formatFolderTotal,
   formatPathForDisplay,
   formatShowingCount,
+  isExtensionlessName,
   isHiddenName,
   isRetryableThumbError,
   isThumbEligible,
@@ -34,6 +36,7 @@ import {
   THUMB_MAX_RETRIES,
   THUMB_RETRY_BASE_MS,
   toggleSelection,
+  viewerModeFromName,
 } from '../files.js';
 import { createThumbCache, thumbCacheKey } from '../thumb-cache.js';
 import {
@@ -427,6 +430,76 @@ test('thumb cache enforces LRU bounds and files-store persists device preference
   assert.equal(readTextWrapPreference(storage), true);
   writeTextWrapPreference(storage, false);
   assert.equal(readTextWrapPreference(storage), false);
+});
+
+test('viewerModeFromName, canOpenExternally, and isExtensionlessName follow canonical table', () => {
+  // Playable media containers try the inline player.
+  for (const name of [
+    'track.flac',
+    'song.mp3',
+    'concert.m4a',
+    'voice.ogg',
+    'clip.opus',
+    'sample.wav',
+    'movie.mp4',
+    'clip.webm',
+    'archive.mkv',
+    'camera.mov',
+    'bluray.m2ts',
+    'photo.jpg',
+    'render.png',
+    'modern.avif',
+    'diagram.svg',
+  ]) {
+    assert.equal(viewerModeFromName(name), 'inline', `expected inline viewer for ${name}`);
+  }
+
+  // Known non-WebView pictures try fs.thumb preview before fallback.
+  for (const name of ['shot.heic', 'shot.heif', 'scan.tif', 'scan.tiff', 'raw.dng', 'raw.cr2', 'raw.cr3', 'raw.nef', 'raw.arw', 'raw.raf', 'raw.orf', 'raw.rw2']) {
+    assert.equal(categoryFromName(name), 'image', `expected image category for ${name}`);
+    assert.equal(viewerModeFromName(name), 'thumb_or_fallback', `expected thumb_or_fallback for ${name}`);
+    assert.equal(canOpenExternally(name), true, `expected external open allowed for ${name}`);
+  }
+
+  // Known non-WebView audio/video skip the player straight to fallback, while allowing external open.
+  for (const name of ['old.wma', 'synth.mid', 'old.avi', 'old.wmv', 'old.flv', 'old.rm']) {
+    assert.equal(viewerModeFromName(name), 'fallback', `expected fallback viewer for ${name}`);
+    assert.equal(canOpenExternally(name), true, `expected external open allowed for ${name}`);
+  }
+
+  // Security-sensitive types, archives, web docs, SVG, scripts, executables, and extensionless files
+  // must NEVER be offered for external opening.
+  for (const blocked of [
+    'diagram.svg',
+    'index.html',
+    'page.htm',
+    'feed.xml',
+    'app.js',
+    'script.py',
+    'run.sh',
+    'installer.apk',
+    'setup.exe',
+    'archive.zip',
+    'backup.tar.gz',
+    'legacy.doc',
+    'legacy.rtf',
+    'README',
+    '.gitignore',
+    'mystery.unknownext',
+  ]) {
+    assert.equal(canOpenExternally(blocked), false, `expected ${blocked} to be refused for external open`);
+  }
+
+  // Safe documents & data formats allow external open.
+  for (const allowed of ['manual.pdf', 'book.epub', 'memo.docx', 'sheet.xlsx', 'deck.pptx', 'doc.odt', 'data.csv', 'notes.txt', 'config.json', 'track.flac']) {
+    assert.equal(canOpenExternally(allowed), true, `expected ${allowed} to allow external open`);
+  }
+
+  assert.equal(isExtensionlessName('README'), true);
+  assert.equal(isExtensionlessName('/home/me/Makefile'), true);
+  assert.equal(isExtensionlessName('.gitignore'), true);
+  assert.equal(isExtensionlessName('notes.txt'), false);
+  assert.equal(isExtensionlessName('archive.tar.gz'), false);
 });
 
 test('extractThumbMap converts real fs.thumb results and rejects legacy or malformed replies', () => {

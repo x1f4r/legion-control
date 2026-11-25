@@ -9,7 +9,6 @@ pub mod transfers;
 pub mod updater;
 
 use std::sync::Arc;
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -19,7 +18,6 @@ use std::time::Duration;
 /// bound rather than cutting it off.
 pub(crate) const BACKGROUND_REFRESH_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
-#[cfg(not(target_os = "android"))]
 use tauri::WindowEvent;
 use tauri::webview::NewWindowResponse;
 use tauri::{Manager, RunEvent, Url, WebviewWindowBuilder};
@@ -372,18 +370,6 @@ pub fn run() {
 
     let builder = tauri::Builder::default();
 
-    #[cfg(target_os = "android")]
-    let builder = builder.register_asynchronous_uri_scheme_protocol(
-        content::CUSTOM_SCHEME_NAME,
-        |ctx, request, responder| {
-            let content_server = Arc::clone(&ctx.app_handle().state::<SharedContentServer>().0);
-            tauri::async_runtime::spawn(async move {
-                let response = content_server.handle_custom_scheme(request).await;
-                responder.respond(response);
-            });
-        },
-    );
-
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let builder = if should_register_single_instance(verify_only) {
         builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -501,6 +487,8 @@ pub fn run() {
                 commands::device_name,
                 commands::ready,
                 commands::content_url,
+                commands::content_status,
+                commands::content_revoke,
                 commands::transfer_download,
                 commands::transfer_pick_uploads,
                 commands::transfer_upload,
@@ -593,7 +581,10 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building Legion application");
 
-    app.run(|app_handle, event| match event {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let mobile_suspended = AtomicBool::new(false);
+
+    app.run(move |app_handle, event| match event {
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         RunEvent::WindowEvent {
             label,
@@ -642,25 +633,46 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }
-        #[cfg(target_os = "ios")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         RunEvent::WindowEvent {
             event: WindowEvent::Suspended,
             ..
         } => {
+            mobile_suspended.store(true, Ordering::Release);
+            #[cfg(target_os = "ios")]
             if let Some(transfers) = app_handle.try_state::<SharedTransfers>() {
                 transfers.0.pause_all_active(PauseReason::Background);
             }
         }
-        #[cfg(target_os = "ios")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         RunEvent::WindowEvent {
             event: WindowEvent::Resumed,
             ..
         } => {
+            mobile_suspended.store(false, Ordering::Release);
             if let Some(content) = app_handle.try_state::<SharedContentServer>() {
                 content.0.on_app_resumed();
             }
+            #[cfg(target_os = "ios")]
             if let Some(transfers) = app_handle.try_state::<SharedTransfers>() {
                 transfers.0.resume_paused_for(PauseReason::Background);
+            }
+        }
+        #[cfg(target_os = "ios")]
+        RunEvent::WindowEvent {
+            event: WindowEvent::Focused(true),
+            ..
+        } => {
+            // If iOS went inactive (`sceneWillResignActive`) and returned to active
+            // (`sceneDidBecomeActive`) without entering background, `WindowEvent::Resumed` does
+            // not fire; still recover the listener and resume background-paused transfers.
+            if mobile_suspended.swap(false, Ordering::AcqRel) {
+                if let Some(content) = app_handle.try_state::<SharedContentServer>() {
+                    content.0.on_app_resumed();
+                }
+                if let Some(transfers) = app_handle.try_state::<SharedTransfers>() {
+                    transfers.0.resume_paused_for(PauseReason::Background);
+                }
             }
         }
         RunEvent::ExitRequested { code, api, .. } => {
@@ -740,6 +752,7 @@ mod tests {
             "http://localhost:8080/",
             "http://127.0.0.1/",
             "http://127.0.0.1:45123/v1/content/tok/evil.html",
+            "http://127.0.0.1:45123/v1/content/tok/evil.html?download=1",
             "http://127.0.0.1:45123/v1/content/tok/evil.svg",
             "http://legion-content.localhost/v1/content/tok/evil.html",
             "http://legion-content.localhost/v1/content/tok/evil.svg",
@@ -747,12 +760,20 @@ mod tests {
             "legion-content://localhost/v1/content/tok/evil.svg",
             "http://tauri.localhost:9999/",
             "http://user@tauri.localhost/",
+            "http://tauri.localhost.evil.example/",
             "tauri://evil.example/",
             "tauri://localhost:1234/",
+            "tauri://localhost.evil.example/",
             "file:///etc/passwd",
             "data:text/html,<h1>hi</h1>",
             "javascript:alert(1)",
             "about:blank",
+            "chrome-error://chromewebdata/",
+            "blob:http://127.0.0.1:45123/00000000-0000-0000-0000-000000000000",
+            "blob:http://tauri.localhost/00000000-0000-0000-0000-000000000000",
+            "blob:tauri://localhost/00000000-0000-0000-0000-000000000000",
+            "view-source:http://127.0.0.1:45123/v1/content/tok/evil.html",
+            "ws://127.0.0.1:45123/v1/content/tok/evil.html",
         ];
 
         for raw in blocked {
@@ -796,6 +817,26 @@ mod tests {
             desktop.lines().any(|line| line.trim() == "Name=Legion"),
             "desktop template should keep Name=Legion for application launchers"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn default_capability_allows_event_listen_without_emit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let raw = std::fs::read_to_string(manifest_dir.join("capabilities/default.json"))?;
+        let cap: serde_json::Value = serde_json::from_str(&raw)?;
+        let perms: Vec<&str> = cap
+            .get("permissions")
+            .and_then(|v| v.as_array())
+            .ok_or("missing permissions array in capabilities/default.json")?
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(perms.contains(&"core:event:allow-listen"));
+        assert!(perms.contains(&"core:event:allow-unlisten"));
+        assert!(!perms.contains(&"core:event:allow-emit"));
+        assert!(!perms.contains(&"core:event:allow-emit-to"));
         Ok(())
     }
 

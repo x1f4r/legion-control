@@ -1351,6 +1351,7 @@ fn classify_channel_open_error(err: russh::Error) -> StreamOpenError {
             )
             .with_details(json!({
                 "reason": "channel_open_failure",
+                "permits_free": true,
                 "retryable": true,
             })),
         ),
@@ -1404,7 +1405,7 @@ impl Drop for BoundedChannelReader {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let incomplete = !state.eof;
             state.reader_dropped = true;
-            state.queue.clear();
+            state.queue = VecDeque::new();
             state.buffered = 0;
             incomplete
         };

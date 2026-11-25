@@ -511,6 +511,7 @@ pub(crate) async fn serve(State(shared): State<Arc<Shared>>, request: Request) -
     let hooks = StreamHooks {
         limiter: Some(shared.content_limiter.clone()),
         bytes_served: None,
+        stream_failed: None,
         active_guard: Some(Box::new(ActiveContentStreamGuard::new(
             conn_ctrl.as_ref().map(|c| Arc::clone(&c.active)),
             stop_watcher.clone(),

@@ -40,7 +40,7 @@ function scratch(t) {
 const PASSING = "import test from 'node:test';\ntest('holds', () => {});\n";
 const FAILING = "import assert from 'node:assert/strict';\nimport test from 'node:test';\ntest('a planted failure', () => assert.fail('planted in tests'));\n";
 
-test('the scripts leg checks syntax, invisible characters, script and UI tests, and private data in order', { skip: process.platform === 'win32' }, (t) => {
+test('the scripts leg checks syntax, invisible characters, media table sync, script and UI tests, and private data in order', { skip: process.platform === 'win32' }, (t) => {
   const { write, run } = scratch(t);
   write('tests/passing.test.mjs', PASSING);
   write('apps/ui/lib/test/passing.test.mjs', PASSING);
@@ -50,6 +50,7 @@ test('the scripts leg checks syntax, invisible characters, script and UI tests, 
   assert.deepEqual(green.calls, [
     'node scripts/check-syntax.mjs',
     'node scripts/check-invisible.mjs',
+    'node scripts/sync-media-table.mjs --check',
     'node --test tests/passing.test.mjs',
     'node --test apps/ui/lib/test/passing.test.mjs',
     'node scripts/check-private-data.mjs',
