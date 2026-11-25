@@ -432,6 +432,10 @@ pub struct FleetPushOutcome {
     pub reason: Option<String>,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Information returned by a node when enrolment succeeds, carrying everything needed to reconnect
 /// later using the permanent device key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -455,6 +459,10 @@ pub struct Enrolled {
     /// Exact sync command reported by the node when `not_synced_to` is non-empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync_command: Option<String>,
+    /// `true` when this pairing was confirmed via the pinned-key recovery probe rather than the
+    /// direct enrolment reply line (so `fleet` / `not_synced_to` were not returned by the node).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub recovered: bool,
 }
 
 #[cfg(feature = "ssh")]
@@ -679,7 +687,12 @@ mod enrol_client {
                 if cancel.is_cancelled() || err.code == ErrorCode::Cancelled {
                     return Err(cancelled_error(&invite.node));
                 }
-                if request_sent && matches!(err.code, ErrorCode::Timeout | ErrorCode::Unreachable) {
+                if request_sent
+                    && matches!(
+                        err.code,
+                        ErrorCode::Timeout | ErrorCode::Unreachable | ErrorCode::NotFound
+                    )
+                {
                     if let Some(enrolled) = probe().await {
                         return Ok(enrolled);
                     }
@@ -758,6 +771,7 @@ mod enrol_client {
             fleet: BTreeMap::new(),
             not_synced_to: Vec::new(),
             sync_command: None,
+            recovered: true,
         })
     }
 
@@ -970,6 +984,7 @@ mod enrol_client {
                 fleet: resp.fleet,
                 not_synced_to: resp.not_synced_to,
                 sync_command: resp.sync_command,
+                recovered: false,
             });
         }
 
@@ -1496,6 +1511,7 @@ mod tests {
             fleet: BTreeMap::new(),
             not_synced_to: Vec::new(),
             sync_command: None,
+            recovered: true,
         };
 
         // 1. Timeout after request was sent -> probe sees device key already enrolled -> succeeds.
@@ -1563,6 +1579,7 @@ mod tests {
             fleet: BTreeMap::new(),
             not_synced_to: Vec::new(),
             sync_command: None,
+            recovered: true,
         };
 
         let retry_recovered = enrol_client::enrol_flow(
@@ -1733,5 +1750,63 @@ mod tests {
         .unwrap_err();
         assert_eq!(unsent_err.code, ErrorCode::Unreachable);
         assert_eq!(unsent_probes.load(Ordering::SeqCst), 0);
+
+        // 7. NotFound after request was sent (e.g. a retry that waited behind the first
+        //    enrolment's lock and arrived after the invite was consumed) runs recovery and
+        //    succeeds when the device key is already enrolled.
+        let not_found_probes = Arc::new(AtomicUsize::new(0));
+        let not_found_probes_c = Arc::clone(&not_found_probes);
+        let not_found_recovered = enrol_client::enrol_flow(
+            &invite,
+            CancellationToken::new(),
+            true,
+            || async {
+                enrol_client::EnrolAttemptOutcome::ExchangeErr {
+                    err: ErrorBody::new(
+                        ErrorCode::NotFound,
+                        "This pairing invite is no longer valid or has already been used.",
+                    )
+                    .with_machine("tower"),
+                    request_sent: true,
+                }
+            },
+            || {
+                let expected = sample_enrolled();
+                async move {
+                    not_found_probes_c.fetch_add(1, Ordering::SeqCst);
+                    Some(expected)
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert!(not_found_recovered.recovered);
+        assert_eq!(not_found_probes.load(Ordering::SeqCst), 1);
+
+        // NotFound before the request left the client does not probe.
+        let unsent_nf_probes = Arc::new(AtomicUsize::new(0));
+        let unsent_nf_probes_c = Arc::clone(&unsent_nf_probes);
+        let unsent_nf_err = enrol_client::enrol_flow(
+            &invite,
+            CancellationToken::new(),
+            true,
+            || async {
+                enrol_client::EnrolAttemptOutcome::ExchangeErr {
+                    err: ErrorBody::new(ErrorCode::NotFound, "Missing invite."),
+                    request_sent: false,
+                }
+            },
+            || {
+                let expected = sample_enrolled();
+                async move {
+                    unsent_nf_probes_c.fetch_add(1, Ordering::SeqCst);
+                    Some(expected)
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unsent_nf_err.code, ErrorCode::NotFound);
+        assert_eq!(unsent_nf_probes.load(Ordering::SeqCst), 0);
     }
 }

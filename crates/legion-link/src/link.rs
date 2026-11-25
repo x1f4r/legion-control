@@ -755,8 +755,9 @@ impl Link {
             .await
     }
 
-    /// Like [`Link::pair`], but stops waiting and leaves [`LinkConfig`] untouched when `cancel`
-    /// is triggered.
+    /// Like [`Link::pair`], but stops waiting when `cancel` is triggered. Once enrolment succeeds,
+    /// the confirmed pairing is never discarded. If enrolment was recovered via the pinned-key
+    /// probe, also runs [`Link::learn`] immediately so learned fleet routes are populated.
     #[cfg(feature = "ssh")]
     pub async fn pair_cancellable(
         &self,
@@ -764,7 +765,22 @@ impl Link {
         device_name: &str,
         cancel: CancellationToken,
     ) -> Result<Enrolled, ErrorBody> {
-        self.pair_with(
+        self.pair_cancellable_with_learn(invite_text, device_name, cancel)
+            .await
+            .map(|(enrolled, _)| enrolled)
+    }
+
+    /// Like [`Link::pair_cancellable`], also returning the [`LearnReport`] when a recovered
+    /// pairing triggered [`Link::learn`] so callers (such as app persistence) can record learned
+    /// routes and any introducer disagreements without repeating the network call.
+    #[cfg(feature = "ssh")]
+    pub async fn pair_cancellable_with_learn(
+        &self,
+        invite_text: &str,
+        device_name: &str,
+        cancel: CancellationToken,
+    ) -> Result<(Enrolled, Option<LearnReport>), ErrorBody> {
+        self.pair_with_learn(
             invite_text,
             device_name,
             cancel,
@@ -783,7 +799,7 @@ impl Link {
         .await
     }
 
-    #[cfg(feature = "ssh")]
+    #[cfg(all(test, feature = "ssh"))]
     async fn pair_with<F, Fut>(
         &self,
         invite_text: &str,
@@ -791,6 +807,30 @@ impl Link {
         cancel: CancellationToken,
         enrol_fn: F,
     ) -> Result<Enrolled, ErrorBody>
+    where
+        F: FnOnce(
+            crate::invite::Invite,
+            crate::key::DeviceKey,
+            String,
+            SshTimeouts,
+            bool,
+            CancellationToken,
+        ) -> Fut,
+        Fut: Future<Output = Result<Enrolled, ErrorBody>>,
+    {
+        self.pair_with_learn(invite_text, device_name, cancel, enrol_fn)
+            .await
+            .map(|(enrolled, _)| enrolled)
+    }
+
+    #[cfg(feature = "ssh")]
+    async fn pair_with_learn<F, Fut>(
+        &self,
+        invite_text: &str,
+        device_name: &str,
+        cancel: CancellationToken,
+        enrol_fn: F,
+    ) -> Result<(Enrolled, Option<LearnReport>), ErrorBody>
     where
         F: FnOnce(
             crate::invite::Invite,
@@ -819,19 +859,20 @@ impl Link {
             .with_machine(&invite.node));
         }
 
-        let _mutation_guard = tokio::select! {
-            biased;
-            () = cancel.cancelled() => {
-                return Err(ErrorBody::new(
-                    ErrorCode::Cancelled,
-                    format!("Enrolment with {} was cancelled.", invite.node),
-                )
-                .with_machine(&invite.node));
-            }
-            guard = self.inner.mutation_lock.lock() => guard,
-        };
-
+        // Hold `mutation_lock` only while reading local config before the network exchange so
+        // `forget` and other local mutations are never blocked while waiting for the node.
         let (existing_key, already_paired_same_principal) = {
+            let _mutation_guard = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    return Err(ErrorBody::new(
+                        ErrorCode::Cancelled,
+                        format!("Enrolment with {} was cancelled.", invite.node),
+                    )
+                    .with_machine(&invite.node));
+                }
+                guard = self.inner.mutation_lock.lock() => guard,
+            };
             let cfg = self
                 .inner
                 .config
@@ -853,45 +894,48 @@ impl Link {
             }
         };
 
-        let node_name = invite.node.clone();
         let enrolled = enrol_fn(
             invite,
             device_key,
             name.to_owned(),
             self.inner.options.ssh_timeouts,
             !already_paired_same_principal,
-            cancel.clone(),
+            cancel,
         )
         .await?;
 
-        if cancel.is_cancelled() {
-            return Err(ErrorBody::new(
-                ErrorCode::Cancelled,
-                format!("Enrolment with {node_name} was cancelled."),
-            )
-            .with_machine(&node_name));
-        }
-
         let entry = NodeLink::from(enrolled.clone());
         {
-            let mut cfg = self
-                .inner
-                .config
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if cfg.device_key.is_none()
-                && let Some(pem) = generated_pem
+            let _mutation_guard = self.inner.mutation_lock.lock().await;
             {
-                cfg.device_key = Some(pem);
+                let mut cfg = self
+                    .inner
+                    .config
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if cfg.device_key.is_none()
+                    && let Some(pem) = generated_pem
+                {
+                    cfg.device_key = Some(pem);
+                }
+                cfg.upsert_node(entry);
             }
-            cfg.upsert_node(entry);
+
+            // Retire any cached session for this node so the next call opens cleanly with the fresh
+            // enrolment (while leaving any in-flight call untouched until it completes).
+            self.clear_route_state(&enrolled.node);
+            self.retire_node(&enrolled.node);
         }
 
-        // Retire any cached session for this node so the next call opens cleanly with the fresh
-        // enrolment (while leaving any in-flight call untouched until it completes).
-        self.clear_route_state(&enrolled.node);
-        self.retire_node(&enrolled.node);
-        Ok(enrolled)
+        // A recovered pairing arrived via the pinned-key `meta.whoami` probe rather than the
+        // direct enrolment reply, so it lacks fleet info. Run `learn()` immediately so learned
+        // fleet routes are populated just like a normal pairing.
+        let learn_report = if enrolled.recovered {
+            self.learn().await.ok()
+        } else {
+            None
+        };
+        Ok((enrolled, learn_report))
     }
 
     /// Stores a validated OpenSSH device key in the live [`LinkConfig`] in place without closing
@@ -4473,6 +4517,190 @@ mod tests {
             .unwrap_err();
         assert_eq!(bad_key_err.code, ErrorCode::InvalidArgs);
         assert_eq!(broken_link.config(), broken_cfg);
+
+        link.close().await;
+    }
+
+    #[cfg(feature = "ssh")]
+    #[tokio::test]
+    async fn pair_releases_mutation_lock_during_wait_keeps_completed_enrol_and_learns_on_recovery() {
+        use tokio::sync::Notify;
+
+        use crate::invite::Invite;
+        use crate::key::DeviceKey;
+
+        const HOST_KEY_A: &str =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea";
+        const HOST_KEY_B: &str =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIC4h9C6W8Z0V1e2yV7J6kN0pT8rW9xY1zA2bC3dE4fG5";
+
+        let make_invite = |node: &str, id: &str| {
+            Invite {
+                v: 1,
+                id: id.to_owned(),
+                node: node.to_owned(),
+                hosts: vec![format!("{node}.example.net")],
+                port: 22,
+                user: "me".to_owned(),
+                host_keys: vec![HOST_KEY_A.to_owned()],
+                key: STANDARD.encode([7u8; 32]),
+                principal: "device:phone".to_owned(),
+                expires: "2026-11-26T12:00:00Z".to_owned(),
+            }
+            .encode()
+            .unwrap()
+        };
+
+        // Custom opener whose `device.endpoint` answers with `tower` and peer `pi`.
+        let opener: SessionOpener = Arc::new(move |entry, _, cancel| {
+            Box::pin(async move {
+                let (client, server) = tokio::io::duplex(64 * 1024);
+                let (client_r, client_w) = tokio::io::split(client);
+                let (server_r, mut server_w) = tokio::io::split(server);
+                let node_name = entry.node.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+                    let mut lines = BufReader::new(server_r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let req: Request = serde_json::from_str(&line).unwrap();
+                        let resp = if req.method == method::HELLO {
+                            Response::ok(
+                                req.id,
+                                serde_json::to_value(HelloResult {
+                                    node: node_name.clone(),
+                                    node_explicit: None,
+                                    node_id: None,
+                                    version: "0.1.0".into(),
+                                    build: None,
+                                    protocol: PROTOCOL,
+                                    os: "linux".into(),
+                                    arch: "x86_64".into(),
+                                    systems: vec![],
+                                    system: None,
+                                    boot_id: None,
+                                })
+                                .unwrap(),
+                            )
+                        } else if req.method == method::CALL
+                            && req.params["tool"] == json!("device.endpoint")
+                        {
+                            Response::ok(
+                                req.id,
+                                json!({
+                                    "results": {
+                                        "tower": {
+                                            "ok": {
+                                                "node": "tower",
+                                                "hosts": ["tower.example.net"],
+                                                "port": 22,
+                                                "user": "me",
+                                                "host_keys": [HOST_KEY_A],
+                                            }
+                                        },
+                                        "pi": {
+                                            "ok": {
+                                                "node": "pi",
+                                                "hosts": ["pi.example.net"],
+                                                "port": 22,
+                                                "user": "me",
+                                                "host_keys": [HOST_KEY_B],
+                                            }
+                                        }
+                                    }
+                                }),
+                            )
+                        } else {
+                            Response::ok(req.id, json!({}))
+                        };
+                        let _ = server_w
+                            .write_all(
+                                format!("{}\n", serde_json::to_string(&resp).unwrap()).as_bytes(),
+                            )
+                            .await;
+                        let _ = server_w.flush().await;
+                    }
+                });
+                Session::open_io(
+                    client_r,
+                    client_w,
+                    &entry.node,
+                    None,
+                    Duration::from_secs(5),
+                    cancel,
+                )
+                .await
+            })
+        });
+
+        let key = DeviceKey::generate().unwrap();
+        let initial = LinkConfig {
+            device_key: Some(key.to_openssh().unwrap()),
+            nodes: vec![NodeLink::ssh(
+                "other",
+                SshTarget {
+                    hosts: vec!["other.example.net".to_owned()],
+                    port: 22,
+                    user: "me".to_owned(),
+                    host_keys: vec![HOST_KEY_B.to_owned()],
+                },
+                Some("device:phone".to_owned()),
+            )],
+            ..LinkConfig::default()
+        };
+        let link = Link::with_opener(initial, LinkOptions::default(), opener);
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let entered_c = Arc::clone(&entered);
+        let release_c = Arc::clone(&release);
+        let cancel = CancellationToken::new();
+        let cancel_c = cancel.clone();
+        let link_pair = link.clone();
+        let inv = make_invite("tower", "inv-lock");
+
+        let pair_task = tokio::spawn(async move {
+            link_pair
+                .pair_with_learn(&inv, "phone", cancel_c, move |invite, _, name, _, _, _| {
+                    async move {
+                        entered_c.notify_one();
+                        release_c.notified().await;
+                        Ok(Enrolled {
+                            node: invite.node.clone(),
+                            target: invite.target(),
+                            principal: invite.principal.clone(),
+                            role: "operator".to_owned(),
+                            device: name,
+                            fleet: BTreeMap::new(),
+                            not_synced_to: Vec::new(),
+                            sync_command: None,
+                            recovered: true,
+                        })
+                    }
+                })
+                .await
+        });
+
+        entered.notified().await;
+
+        // While pairing waits in `enrol_fn`, `forget("other")` MUST NOT block on `mutation_lock`.
+        let forgot = tokio::time::timeout(Duration::from_secs(1), link.forget("other"))
+            .await
+            .expect("forget must not block behind an in-flight pairing wait");
+        assert!(forgot);
+        assert!(link.config().node("other").is_none());
+
+        // Cancel fires right as enrolment finishes: confirmed enrolment MUST NOT be discarded,
+        // and because `recovered == true`, `learn()` runs immediately and adds `pi`.
+        cancel.cancel();
+        release.notify_one();
+        let (enrolled, learn_report) = pair_task.await.unwrap().unwrap();
+        assert_eq!(enrolled.node, "tower");
+        assert!(enrolled.recovered);
+        let report = learn_report.expect("recovered pairing must run learn()");
+        assert_eq!(report.added, vec!["pi".to_owned()]);
+        assert!(link.config().node("tower").is_some());
+        assert!(link.config().node("pi").is_some());
+        assert!(link.config().node("other").is_none());
 
         link.close().await;
     }
