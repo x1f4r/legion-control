@@ -69,6 +69,44 @@ pub(super) async fn rename_exclusive_async(
     rename_exclusive(from, to)
 }
 
+pub(super) fn exchange_files(a: &Path, b: &Path) -> Result<()> {
+    exclusive_rename::rename_exchange(a, b)
+}
+
+pub(super) fn replace_with_backup(_staged: &Path, _target: &Path, _backup: &Path) -> Result<()> {
+    Err(OsError::Unsupported {
+        detail: "replace_with_backup is Windows-only; use exchange_files on Unix".to_string(),
+    })
+}
+
+pub(super) fn file_change_id(_path: &Path, meta: &Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for v in [
+        meta.dev(),
+        meta.ino(),
+        meta.ctime() as u64,
+        meta.ctime_nsec() as u64,
+    ] {
+        h ^= v;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    Some(h)
+}
+
+pub(super) fn available_space(dir: &Path) -> Result<u64> {
+    exclusive_rename::available_space(dir)
+}
+
+pub(super) fn same_device(a: &Path, b: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let ma = fs::metadata(a)
+        .map_err(|err| OsError::from_io(format!("cannot stat {}", a.display()), err))?;
+    let mb = fs::metadata(b)
+        .map_err(|err| OsError::from_io(format!("cannot stat {}", b.display()), err))?;
+    Ok(ma.dev() == mb.dev())
+}
+
 #[allow(unsafe_code)]
 mod exclusive_rename {
     use std::ffi::CString;
@@ -145,12 +183,123 @@ mod exclusive_rename {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub(super) fn rename_exchange(a: &Path, b: &Path) -> crate::Result<()> {
+        let a_c = path_to_cstring(a).map_err(|e| match e {
+            ExclusiveRenameError::Io(ioe) => crate::OsError::from_io("invalid exchange path", ioe),
+            _ => crate::OsError::InvalidArgument {
+                detail: "invalid exchange path".to_string(),
+            },
+        })?;
+        let b_c = path_to_cstring(b).map_err(|e| match e {
+            ExclusiveRenameError::Io(ioe) => crate::OsError::from_io("invalid exchange path", ioe),
+            _ => crate::OsError::InvalidArgument {
+                detail: "invalid exchange path".to_string(),
+            },
+        })?;
+
+        // SAFETY: `a_c` and `b_c` are valid NUL-terminated C strings alive for the syscall.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                a_c.as_ptr(),
+                libc::AT_FDCWD,
+                b_c.as_ptr(),
+                libc::RENAME_EXCHANGE as libc::c_uint,
+            )
+        };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP) => {
+                Err(crate::OsError::Unsupported {
+                    detail: format!("atomic exchange unsupported for {}: {err}", b.display()),
+                })
+            }
+            _ => Err(crate::OsError::from_io(
+                format!("cannot exchange {} and {}", a.display(), b.display()),
+                err,
+            )),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn rename_exchange(a: &Path, b: &Path) -> crate::Result<()> {
+        let a_c = path_to_cstring(a).map_err(|e| match e {
+            ExclusiveRenameError::Io(ioe) => crate::OsError::from_io("invalid exchange path", ioe),
+            _ => crate::OsError::InvalidArgument {
+                detail: "invalid exchange path".to_string(),
+            },
+        })?;
+        let b_c = path_to_cstring(b).map_err(|e| match e {
+            ExclusiveRenameError::Io(ioe) => crate::OsError::from_io("invalid exchange path", ioe),
+            _ => crate::OsError::InvalidArgument {
+                detail: "invalid exchange path".to_string(),
+            },
+        })?;
+
+        // SAFETY: `a_c` and `b_c` are valid NUL-terminated C strings passed to `renamex_np`.
+        let rc = unsafe { libc::renamex_np(a_c.as_ptr(), b_c.as_ptr(), libc::RENAME_SWAP) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            #[allow(unreachable_patterns)]
+            Some(libc::ENOTSUP | libc::EOPNOTSUPP | libc::ENOSYS | libc::EINVAL) => {
+                Err(crate::OsError::Unsupported {
+                    detail: format!("atomic exchange unsupported for {}: {err}", b.display()),
+                })
+            }
+            _ => Err(crate::OsError::from_io(
+                format!("cannot exchange {} and {}", a.display(), b.display()),
+                err,
+            )),
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(super) fn rename_exchange(_a: &Path, _b: &Path) -> crate::Result<()> {
+        Err(crate::OsError::Unsupported {
+            detail: "atomic file exchange is not supported on this Unix platform".to_string(),
+        })
+    }
+
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     pub(super) fn rename_noreplace(
         _from: &Path,
         _to: &Path,
     ) -> std::result::Result<(), ExclusiveRenameError> {
         Err(ExclusiveRenameError::Unsupported)
+    }
+
+    pub(super) fn available_space(dir: &Path) -> crate::Result<u64> {
+        let dir_c = CString::new(dir.as_os_str().as_bytes()).map_err(|_| {
+            crate::OsError::InvalidArgument {
+                detail: format!("path contains interior NUL byte: {}", dir.display()),
+            }
+        })?;
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `dir_c` is a valid NUL-terminated C string and `stat` is a valid writable
+        // `libc::statvfs` struct.
+        let rc = unsafe { libc::statvfs(dir_c.as_ptr(), &mut stat) };
+        if rc != 0 {
+            return Err(crate::OsError::from_io(
+                format!("statvfs failed for {}", dir.display()),
+                io::Error::last_os_error(),
+            ));
+        }
+        #[allow(clippy::unnecessary_cast)]
+        let unit = if stat.f_frsize > 0 {
+            stat.f_frsize as u64
+        } else {
+            stat.f_bsize as u64
+        };
+        #[allow(clippy::unnecessary_cast)]
+        Ok((stat.f_bavail as u64).saturating_mul(unit))
     }
 }
 

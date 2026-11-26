@@ -207,6 +207,10 @@ jobs:
           } finally {
             Remove-Item -LiteralPath $tmpLocal -Recurse -Force -ErrorAction SilentlyContinue
           }
+      # Report 1,000-file real-disk apply throughput and write-through rename cost on Linux and Windows.
+      - name: Measure 1,000-file apply throughput
+        if: ${{ !cancelled() && (runner.os == 'Linux' || runner.os == 'Windows') }}
+        run: cargo test --locked --release -p legion-sync --test perf_scale apply_throughput_1k_small_files_real_disk -- --ignored --nocapture
 
   private-data:
     name: Private data

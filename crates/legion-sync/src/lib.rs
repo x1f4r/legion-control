@@ -1,0 +1,131 @@
+#![forbid(unsafe_code)]
+#![deny(missing_docs)]
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
+//! Hubless peer-to-peer folder synchronization engine.
+//!
+//! `legion-sync` implements the pure synchronization core described in `docs/legion/files.md`
+//! ("Keeping folders in sync") without any network transport, watcher daemon, or CLI/tool wiring.
+//! Both the member's filesystem ([`SyncFs`]) and remote peers ([`Peer`]) sit behind traits so the
+//! same engine runs against real directories on disk, future network transports, and a
+//! deterministic fault-injecting multi-member simulator.
+//!
+//! # Guarantees
+//!
+//! - **Pull-only writes**: a member only mutates its own disk, pulling incremental index records
+//!   by sequence number and verifying every file's BLAKE3 digest in `.legion-sync/tmp` before
+//!   using non-replacing renames or atomic swaps (`renameat2`, `renamex_np`, `ReplaceFileW` /
+//!   `MoveFileExW`, with claim-then-rename fallback) to move verified prior copies to
+//!   `.legion-sync/bin` and place the new file.
+//! - **Crash safety**: every working-tree mutation (including `restore_from_bin` and
+//!   `resolve_conflict`) is bracketed by a durable [`PendingOp`] write-ahead intent in the index
+//!   store; non-crash errors mid-apply recover immediately, and restarting after a crash at any
+//!   step converges without losing bytes or fabricating conflicts.
+//! - **No silent data loss**: remote deletions and replacements move existing copies to
+//!   `.legion-sync/bin` (30-day default retention, random bin IDs unique across restarts, clock
+//!   sanity guard on expiry, self-describing restore metadata); concurrent different edits
+//!   preserve both versions under deterministic content-hashed names
+//!   (`name (changed on <machine> <date>, <hash6>).ext`) with independent version vectors so sync
+//!   never replaces a live conflict copy with different content; delete-vs-change keeps the
+//!   change.
+//! - **Safe scanning & identity**: unreadable directories never emit deletions; `.legion-sync/marker.json`
+//!   stops unmounted or replaced folders before any deletion can be recorded; a mass-deletion
+//!   brake pauses before recording large-scale deletions; random per-index incarnations detect
+//!   backup restores, reinstalls, and cloned member IDs; short per-path hash ancestry and deleted
+//!   history prevent stale copies from winning or resurrecting deletions on join or re-add.
+//! - **Single in-folder store**: all sync history — records, permanent deletions, peer
+//!   acknowledgements, member identity, and bin metadata — lives in `.legion-sync/index.redb`
+//!   inside the folder so files and history travel together. Schema upgrades migrate in place.
+//! - **Identity per install**: a random instance token in the machine's local state directory
+//!   binds the folder's index to that install. Reinstalls, folder copies, and rollbacks rotate
+//!   only the incarnation and token while keeping every record, deletion, and version intact.
+//! - **Unversioned joins & content-based causality**: files found on disk with no prior history
+//!   have explicit [`RecordProvenance::Unversioned`] provenance and win nothing over versioned
+//!   history. Every edit and deletion records the content hash it acted on (`base_hash`) so a
+//!   change made on top of content `H` cleanly supersedes a concurrent copy that is still `H`.
+//! - **Direct acknowledgements**: peers report only what they have directly pulled and applied —
+//!   third-party hearsay is never accepted.
+//! - **Fixed ignore rules**: `.legion-sync` at any depth (including case-folded and NFKC
+//!   variants), `.DS_Store`, `Thumbs.db`, `desktop.ini`, and Legion in-flight files
+//!   (`*.legion-part`, `.legion-*.tmp`). `.git` and editor/download temporary files are left to
+//!   per-folder `ignore` globs. Nested sync folders are refused.
+//! - **Platform honesty**: names the local filesystem cannot hold (case clashes on
+//!   case-insensitive or Unicode-normalizing systems, Windows reserved names and forbidden
+//!   characters, over-long paths, and symbolic links on Windows) are held back and reported as
+//!   actionable problems rather than mangled.
+//!
+//! # Durable index storage choice: `redb`
+//!
+//! [`RedbIndexStore`] uses [`redb`] (v5.0) as the embedded index store:
+//!
+//! - **Cross-platform builds without a C toolchain**: pure Rust (zero C dependencies; only `libc`
+//!   on Unix), compiling cleanly for static Linux `musl`, macOS, and Windows
+//!   (`x86_64-pc-windows-gnu` and MSVC).
+//! - **ACID crash safety**: copy-on-write B+trees with dual checksummed superblocks and synced
+//!   transactions guarantee atomic commits across `RECORDS`, `BY_SEQ`, `TOMBSTONES`, `CONFLICTS`,
+//!   `FOLDED_LIVE`, `BIN_ENTRIES`, `HELD_BACK`, `PEER_CURSORS`, and `META`
+//!   (with an explicit `schema_version` refused cleanly when newer).
+//! - **500,000+ file scale**: compact versioned binary record encoding (`codec`), O(log N + K)
+//!   incremental sequence scans via `BY_SEQ`, subtree scans for file watchers, and per-page group
+//!   commits keep scans and applies fast.
+
+pub mod apply;
+pub mod codec;
+pub mod engine;
+pub mod error;
+pub mod fs_real;
+pub mod model;
+pub mod path;
+pub mod reconcile;
+pub mod scan;
+pub mod store_mem;
+pub mod store_redb;
+pub mod traits;
+pub mod version;
+
+pub use apply::{ApplyOutcome, RecoveryReport};
+pub use engine::{DEFAULT_PAGE_LIMIT, FOLDER_MARKER_PROBLEM_SENTENCE, PullReport, SyncEngine};
+pub use error::{FsErrorKind, INDEX_DAMAGED_PROBLEM_SENTENCE, Result, SyncError};
+pub use fs_real::{
+    RealFs, RealFsDurabilityAudit, RealFsDurabilityEvent, audit_real_fs_durability,
+    check_folders_not_nested,
+};
+pub use model::{
+    BinEntry, BinReason, ConflictChoice, ConflictInfo, DEFAULT_BIN_RETENTION,
+    DEFAULT_BRAKE_MIN_FILES, DEFAULT_BRAKE_MIN_PERCENT, DEFAULT_BRAKE_SETTLE_SECS,
+    DEFAULT_BRAKE_WINDOW_SECS, DEFAULT_FETCH_TIMEOUT, DeferredItem, DeletionBrake,
+    DeletionBrakeConfig, DeletionBrakeDecision, DeletionWindowState, ExpectedLocalSnapshot,
+    FORCED_ROTATION_COOLDOWN_SECS, FetchClock, FetchOptions, FolderConfig, FolderId, FolderMarker,
+    FolderMeta, FolderStatus, HandshakeHello, HeldBackRecord, INDEX_SCHEMA_VERSION,
+    InboundDeletionBrake, InboundDeletionBrakeDecision, IndexRecord, MAX_ANCESTRY_HASHES,
+    MAX_DEFERRAL_ATTEMPTS, MAX_FORCED_ROTATIONS_BEFORE_CONFIRM, MAX_HELD_BACK_ENTRIES,
+    MAX_LINK_TARGET_BYTES, MAX_PAGE_BYTES, MAX_PAGE_RECORDS, MAX_PEER_PROBLEMS,
+    MAX_VERSION_COUNTER, MAX_VV_INCARNATIONS_PER_MEMBER, MIN_MIGRATABLE_SCHEMA_VERSION,
+    MIN_PLAUSIBLE_CLOCK_SECS, MemberId, MemberState, MemberStatus, PageLimit, PeerAckView,
+    PeerCursor, PeerHandshake, PeerRefusalSummary, PeerRollbackClaimDecision,
+    PeerRollbackClaimState, PendingLocalDeletion, PendingOp, ProblemKind, RecordProvenance,
+    RecordsPage, RestoreStrategy, SYNC_PROTOCOL_VERSION, SyncProblem, SyncProgress,
+    chain_fingerprint, random_instance_token, validate_folder_id, validate_member_id,
+};
+pub use path::{
+    IgnoreMatcher, ParsedConflictPath, SYNC_BIN_DIR, SYNC_INDEX_FILE, SYNC_MARKER_FILE,
+    SYNC_META_DIR, SYNC_TMP_DIR, check_fs_compatibility, check_symlink_target_contained,
+    conflict_copy_path, is_fixed_ignored, is_internal_sync_path, is_os_litter_name,
+    parse_conflict_copy_path, validate_staged_tmp_token, validate_sync_path,
+};
+pub use reconcile::{
+    LocalIndexView, ReconcileDecision, compare_live_winner, derive_conflict_of, reconcile_record,
+    validate_incoming_record,
+};
+pub use scan::{ScanOptions, ScanReport};
+pub use store_mem::MemoryIndexStore;
+pub use store_redb::RedbIndexStore;
+pub use traits::{
+    FileInstanceTokenStore, FsCapabilities, FsMeta, FsWalkEntry, FsWalkResult, IndexStore,
+    InstanceTokenStore, MemoryInstanceTokenStore, Peer, StoreBatch, SyncFs, SyncWrite,
+};
+pub use version::{VersionKey, VersionOrder, VersionVector};

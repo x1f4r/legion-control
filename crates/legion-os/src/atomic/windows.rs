@@ -5,7 +5,7 @@
 //! or a concurrent reader holds the destination open. Retrying the rename preserves atomicity
 //! without ever deleting the destination first.
 
-use std::fs::{self, File, Metadata, OpenOptions};
+use std::fs::{File, Metadata, OpenOptions};
 use std::io;
 use std::path::Path;
 
@@ -13,9 +13,10 @@ use crate::win_proc;
 use crate::{OsError, Result};
 
 use super::{
-    ExclusiveRenameError, WINDOWS_INITIAL_BACKOFF, WINDOWS_MAX_BACKOFF, WINDOWS_REPLACE_TIMEOUT,
-    WriteOptions, is_retryable_windows_replace_error, retry_async_with_backoff,
-    retry_sync_with_backoff,
+    ExclusiveRenameError, WINDOWS_INITIAL_BACKOFF, WINDOWS_MAX_BACKOFF,
+    WINDOWS_REPLACE_BACKUP_TIMEOUT, WINDOWS_REPLACE_TIMEOUT, WriteOptions,
+    is_retryable_windows_replace_error, is_retryable_windows_replace_with_backup_error,
+    retry_async_with_backoff, retry_sync_with_backoff,
 };
 
 pub(super) fn configure_temp_open(_open: &mut OpenOptions, _restrictive: bool) {}
@@ -31,7 +32,7 @@ pub(super) fn apply_final_permissions(
 
 pub(super) fn replace_file(from: &Path, to: &Path) -> Result<()> {
     retry_sync_with_backoff(
-        || fs::rename(from, to),
+        || win_proc::move_file_replace_write_through(from, to),
         is_retryable_windows_replace_error,
         WINDOWS_REPLACE_TIMEOUT,
         WINDOWS_INITIAL_BACKOFF,
@@ -47,7 +48,7 @@ pub(super) fn replace_file(from: &Path, to: &Path) -> Result<()> {
 
 pub(super) async fn replace_file_async(from: &Path, to: &Path) -> Result<()> {
     retry_async_with_backoff(
-        || fs::rename(from, to),
+        || win_proc::move_file_replace_write_through(from, to),
         is_retryable_windows_replace_error,
         WINDOWS_REPLACE_TIMEOUT,
         WINDOWS_INITIAL_BACKOFF,
@@ -101,6 +102,51 @@ pub(super) async fn rename_exclusive_async(
     )
     .await
     .map_err(classify_windows_exclusive_error)
+}
+
+pub(super) fn exchange_files(_a: &Path, _b: &Path) -> Result<()> {
+    Err(OsError::Unsupported {
+        detail: "use replace_with_backup on Windows".to_string(),
+    })
+}
+
+pub(super) fn replace_with_backup(staged: &Path, target: &Path, backup: &Path) -> Result<()> {
+    retry_sync_with_backoff(
+        || win_proc::replace_file_with_backup(target, staged, backup),
+        is_retryable_windows_replace_with_backup_error,
+        WINDOWS_REPLACE_BACKUP_TIMEOUT,
+        WINDOWS_INITIAL_BACKOFF,
+        WINDOWS_MAX_BACKOFF,
+    )
+    .map_err(|err| {
+        if matches!(err.raw_os_error(), Some(1 | 50)) || err.kind() == io::ErrorKind::Unsupported {
+            OsError::Unsupported {
+                detail: format!("ReplaceFileW unsupported for {}: {err}", target.display()),
+            }
+        } else {
+            OsError::from_io(
+                format!(
+                    "cannot replace {} with {} (backup {})",
+                    target.display(),
+                    staged.display(),
+                    backup.display()
+                ),
+                err,
+            )
+        }
+    })
+}
+
+pub(super) fn file_change_id(path: &Path, _meta: &Metadata) -> Option<u64> {
+    win_proc::ntfs_file_change_id(path)
+}
+
+pub(super) fn available_space(dir: &Path) -> Result<u64> {
+    win_proc::available_space(dir)
+}
+
+pub(super) fn same_device(a: &Path, b: &Path) -> Result<bool> {
+    win_proc::same_device(a, b)
 }
 
 pub(super) fn sync_parent_dir(_parent: &Path) {}

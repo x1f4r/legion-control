@@ -29,9 +29,11 @@ use windows::Win32::Foundation::{
 use windows::Win32::Security::{EqualSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, GetFileInformationByHandle, MOVE_FILE_FLAGS, MoveFileExW, OPEN_ALWAYS,
-    OPEN_EXISTING, SYNCHRONIZE,
+    FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileBasicInfo,
+    FileIdInfo, GetDiskFreeSpaceExW, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING,
+    REPLACEFILE_IGNORE_ACL_ERRORS, REPLACEFILE_IGNORE_MERGE_ERRORS, ReplaceFileW, SYNCHRONIZE,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
@@ -574,8 +576,18 @@ fn to_wide_null(value: &OsStr) -> Vec<u16> {
     value.encode_wide().chain(std::iter::once(0)).collect()
 }
 
-/// Atomically rename `from` to `to` without `MOVEFILE_REPLACE_EXISTING` so Windows fails with
-/// `ERROR_ALREADY_EXISTS` / `ERROR_FILE_EXISTS` if `to` already exists.
+fn win32_error_to_io(err: &windows::core::Error) -> std::io::Error {
+    let raw = err.code().0 as u32;
+    if (raw >> 16) == 0x8007 {
+        std::io::Error::from_raw_os_error((raw & 0xFFFF) as i32)
+    } else {
+        std::io::Error::last_os_error()
+    }
+}
+
+/// Atomically rename `from` to `to` with `MOVEFILE_WRITE_THROUGH` and without
+/// `MOVEFILE_REPLACE_EXISTING`, so Windows fails with `ERROR_ALREADY_EXISTS` /
+/// `ERROR_FILE_EXISTS` if `to` already exists and flushes the directory change before returning.
 pub(crate) fn move_file_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     let from_wide = to_wide_null(from.as_os_str());
     let to_wide = to_wide_null(to.as_os_str());
@@ -585,12 +597,208 @@ pub(crate) fn move_file_no_replace(from: &Path, to: &Path) -> std::io::Result<()
         MoveFileExW(
             PCWSTR::from_raw(from_wide.as_ptr()),
             PCWSTR::from_raw(to_wide.as_ptr()),
-            MOVE_FILE_FLAGS(0),
+            MOVEFILE_WRITE_THROUGH,
         )
     } {
         Ok(()) => Ok(()),
-        Err(_) => Err(std::io::Error::last_os_error()),
+        Err(err) => Err(win32_error_to_io(&err)),
     }
+}
+
+/// Atomically rename `from` to `to`, replacing an existing destination and requesting write-through
+/// durability (`MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`).
+pub(crate) fn move_file_replace_write_through(from: &Path, to: &Path) -> std::io::Result<()> {
+    let from_wide = to_wide_null(from.as_os_str());
+    let to_wide = to_wide_null(to.as_os_str());
+    // SAFETY: Both pointers reference NUL-terminated UTF-16 buffers that remain valid for the
+    // duration of the `MoveFileExW` call.
+    match unsafe {
+        MoveFileExW(
+            PCWSTR::from_raw(from_wide.as_ptr()),
+            PCWSTR::from_raw(to_wide.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } {
+        Ok(()) => Ok(()),
+        Err(err) => Err(win32_error_to_io(&err)),
+    }
+}
+
+/// Atomically replaces existing `target` with `replacement`, moving the previous contents of
+/// `target` to `backup` via `ReplaceFileW`.
+pub(crate) fn replace_file_with_backup(
+    target: &Path,
+    replacement: &Path,
+    backup: &Path,
+) -> std::io::Result<()> {
+    let target_wide = to_wide_null(target.as_os_str());
+    let replacement_wide = to_wide_null(replacement.as_os_str());
+    let backup_wide = to_wide_null(backup.as_os_str());
+    // SAFETY: All three pointers reference valid NUL-terminated UTF-16 buffers alive for the call.
+    match unsafe {
+        ReplaceFileW(
+            PCWSTR::from_raw(target_wide.as_ptr()),
+            PCWSTR::from_raw(replacement_wide.as_ptr()),
+            PCWSTR::from_raw(backup_wide.as_ptr()),
+            REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS,
+            None,
+            None,
+        )
+    } {
+        Ok(()) => Ok(()),
+        Err(err) => Err(win32_error_to_io(&err)),
+    }
+}
+
+/// Queries NTFS change time (`FileBasicInfo`) and 128-bit file ID (`FileIdInfo`), falling back
+/// to `GetFileInformationByHandle` on volumes without `FileIdInfo`, and folds them into a 64-bit
+/// FNV-1a fingerprint.
+pub(crate) fn ntfs_file_change_id(path: &Path) -> Option<u64> {
+    let path_wide = to_wide_null(path.as_os_str());
+    // SAFETY: `path_wide` is a valid NUL-terminated UTF-16 path; handle is wrapped in OwnedHandle.
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR::from_raw(path_wide.as_ptr()),
+            FILE_READ_ATTRIBUTES.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .ok()?;
+    let owned = OwnedHandle(handle);
+
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut mix = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+
+    let mut basic = FILE_BASIC_INFO::default();
+    // SAFETY: `basic` is a properly sized out-buffer for `FileBasicInfo`.
+    let got_basic = unsafe {
+        GetFileInformationByHandleEx(
+            owned.0,
+            FileBasicInfo,
+            (&mut basic as *mut FILE_BASIC_INFO).cast::<c_void>(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    }
+    .is_ok();
+    if got_basic {
+        mix(&basic.ChangeTime.to_le_bytes());
+        mix(&basic.LastWriteTime.to_le_bytes());
+    }
+
+    let mut file_id = FILE_ID_INFO::default();
+    // SAFETY: `file_id` is a properly sized out-buffer for `FileIdInfo`.
+    let got_id = unsafe {
+        GetFileInformationByHandleEx(
+            owned.0,
+            FileIdInfo,
+            (&mut file_id as *mut FILE_ID_INFO).cast::<c_void>(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    }
+    .is_ok();
+    if got_id {
+        mix(&file_id.VolumeSerialNumber.to_le_bytes());
+        mix(&file_id.FileId.Identifier);
+        return Some(h);
+    }
+
+    let mut by_handle = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `by_handle` is a properly sized out-buffer for `GetFileInformationByHandle`.
+    if unsafe { GetFileInformationByHandle(owned.0, &mut by_handle) }.is_ok() {
+        mix(&by_handle.dwVolumeSerialNumber.to_le_bytes());
+        mix(&by_handle.nFileIndexHigh.to_le_bytes());
+        mix(&by_handle.nFileIndexLow.to_le_bytes());
+        mix(&by_handle.ftLastWriteTime.dwHighDateTime.to_le_bytes());
+        mix(&by_handle.ftLastWriteTime.dwLowDateTime.to_le_bytes());
+        return Some(h);
+    }
+
+    got_basic.then_some(h)
+}
+
+/// Returns free bytes available to the caller on the volume containing `dir`.
+pub(crate) fn available_space(dir: &Path) -> Result<u64> {
+    let dir_wide = to_wide_null(dir.as_os_str());
+    let mut free_for_caller = 0u64;
+    // SAFETY: `dir_wide` is a NUL-terminated UTF-16 path and `free_for_caller` is a valid stack
+    // `u64` output pointer.
+    unsafe {
+        GetDiskFreeSpaceExW(
+            PCWSTR::from_raw(dir_wide.as_ptr()),
+            Some(&mut free_for_caller),
+            None,
+            None,
+        )
+    }
+    .map_err(|err| {
+        OsError::from_io(
+            format!("cannot query free space for {}", dir.display()),
+            win32_error_to_io(&err),
+        )
+    })?;
+    Ok(free_for_caller)
+}
+
+fn volume_serial(path: &Path) -> Result<u64> {
+    let path_wide = to_wide_null(path.as_os_str());
+    // SAFETY: `path_wide` is a NUL-terminated UTF-16 path; handle is wrapped in OwnedHandle.
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR::from_raw(path_wide.as_ptr()),
+            FILE_READ_ATTRIBUTES.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+    }
+    .map_err(|err| {
+        OsError::from_io(
+            format!("cannot inspect volume for {}", path.display()),
+            win32_error_to_io(&err),
+        )
+    })?;
+    let owned = OwnedHandle(handle);
+
+    let mut file_id = FILE_ID_INFO::default();
+    // SAFETY: `file_id` is a properly sized out-buffer for `FileIdInfo`.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            owned.0,
+            FileIdInfo,
+            (&mut file_id as *mut FILE_ID_INFO).cast::<c_void>(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    }
+    .is_ok()
+    {
+        return Ok(file_id.VolumeSerialNumber);
+    }
+
+    let mut by_handle = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `by_handle` is a properly sized out-buffer for `GetFileInformationByHandle`.
+    unsafe { GetFileInformationByHandle(owned.0, &mut by_handle) }.map_err(|err| {
+        OsError::from_io(
+            format!("cannot query volume serial for {}", path.display()),
+            win32_error_to_io(&err),
+        )
+    })?;
+    Ok(u64::from(by_handle.dwVolumeSerialNumber))
+}
+
+/// Returns `true` when existing directories `a` and `b` reside on the same Windows volume.
+pub(crate) fn same_device(a: &Path, b: &Path) -> Result<bool> {
+    Ok(volume_serial(a)? == volume_serial(b)?)
 }
 
 /// Queries `(volume_serial, file_index, link_count)` for an already-open file handle via
