@@ -991,14 +991,77 @@ pub(crate) fn is_content_read_path(path: &str) -> bool {
     extract_raw_content_segments(path).is_some()
 }
 
-/// Redacts the ticket segment from `/v1/content/<ticket>/...` before writing request logs to
-/// stderr so bearer-equivalent content tickets never reach log files.
+/// Redacts bearer-equivalent content tickets, query strings, stray Legion tokens/invites, and
+/// control characters before writing request paths to stderr logs.
 pub(crate) fn redact_log_path(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("/v1/content/") {
-        return match rest.split_once('/') {
-            Some((_, name)) => format!("/v1/content/<redacted>/{name}"),
-            None => "/v1/content/<redacted>".to_owned(),
-        };
+    let without_query = path.split(['?', '#']).next().unwrap_or("");
+    let segments: Vec<&str> = without_query
+        .split('/')
+        .filter(|seg| !seg.is_empty())
+        .collect();
+    let is_content_route = segments.len() >= 3
+        && segments[0].eq_ignore_ascii_case("v1")
+        && segments[1].eq_ignore_ascii_case("content");
+
+    if segments.is_empty() {
+        return "/".to_owned();
     }
-    path.to_owned()
+
+    let mut out = String::with_capacity(without_query.len());
+    for (idx, seg) in segments.iter().enumerate() {
+        out.push('/');
+        if (is_content_route && idx == 2) || looks_like_legion_secret(seg) {
+            out.push_str("<redacted>");
+        } else {
+            for ch in seg.chars() {
+                if ch.is_control() {
+                    out.push('?');
+                } else {
+                    out.push(ch);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn looks_like_legion_secret(segment: &str) -> bool {
+    segment.contains("lgn_") || segment.contains("legion-invite-1.")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_log_path_hides_tickets_even_with_extra_slashes_queries_or_stray_tokens() {
+        let ticket = "AbCdEf0123456789_secretTicketValue987654321";
+        for sample in [
+            format!("/v1/content/{ticket}/photo.png"),
+            format!("//v1/content/{ticket}/photo.png"),
+            format!("///v1//content//{ticket}/photo.png"),
+            format!("/v1/content/{ticket}"),
+            format!("/V1/CONTENT/{ticket}/photo.png?download=1&token=lgn_secret"),
+        ] {
+            let logged = redact_log_path(&sample);
+            assert!(!logged.contains(ticket), "{sample} leaked into {logged}");
+            assert!(!logged.contains("lgn_"), "{sample} leaked query into {logged}");
+            assert!(logged.contains("<redacted>"), "{sample} -> {logged}");
+        }
+
+        assert_eq!(
+            redact_log_path("/v1/tools?token=lgn_supersecret"),
+            "/v1/tools"
+        );
+        assert_eq!(
+            redact_log_path("/v1/tools/lgn_supersecret"),
+            "/v1/tools/<redacted>"
+        );
+        assert_eq!(
+            redact_log_path("/v1/legion-invite-1.eyJzZWNyZXQiOjF9"),
+            "/v1/<redacted>"
+        );
+        assert_eq!(redact_log_path("/v1/health\r\nFAKE"), "/v1/health??FAKE");
+        assert_eq!(redact_log_path("/"), "/");
+    }
 }
