@@ -41,7 +41,8 @@ use super::thumb_cache::{ThumbCache, tags_bad_cache_key, tags_cache_key};
 use super::thumb_limit::AcquireError;
 use super::thumb_worker::{
     AudioTagsWorkerOutcome, MIN_IMAGE_HEAP_CAP_BYTES, backstop_margin_bytes, compute_worker_limits,
-    effective_decode_timeout, run_audio_tags_worker, worker_baseline_rss_bytes, worker_enabled,
+    dev_unsandboxed_reply_details, effective_decode_timeout, run_audio_tags_worker,
+    worker_baseline_rss_bytes, worker_enabled,
 };
 use super::{
     cancelled_error, check_fs_path, check_regular_file, map_io_error, open_regular_file,
@@ -71,7 +72,7 @@ pub(super) fn register(registry: &mut Registry) {
     registry.add_fn(
         "fs.tags",
         Effect::Read,
-        "Read audio metadata tags and cover presence for 1 to 32 audio file paths on this node (ID3v2/ID3v1 in MP3, WAV and AIFF, FLAC blocks, Ogg Vorbis/Opus comments, and MP4 items in M4A, M4B and MP4; parsed in an out-of-process memory-bounded worker capped at 16 MiB of tag data per file), returning per-path tags or per-path errors in input order, cached alongside thumbnails in the state directory. The cover flag reports cheaply that an embedded or folder picture was found, not that it decodes; callers should show their placeholder if fs.thumb later fails.",
+        "Read audio metadata tags and cover presence for 1 to 32 audio file paths on this node (ID3v2/ID3v1 in MP3, WAV and AIFF, FLAC blocks, Ogg Vorbis/Opus comments, and MP4 items in M4A, M4B and MP4; parsed in an out-of-process OS-sandboxed memory-bounded worker capped at 16 MiB of tag data per file), returning per-path tags or per-path errors in input order, cached alongside thumbnails in the state directory. The cover flag reports cheaply that an embedded or folder picture was found, not that it decodes; callers should show their placeholder if fs.thumb later fails.",
         tags,
     );
 }
@@ -149,6 +150,8 @@ impl TagsItem {
 #[derive(Debug, Serialize)]
 struct TagsResult {
     results: Vec<TagsItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<serde_json::Value>,
 }
 
 /// Finds all candidate folder cover pictures in `audio_path`'s parent directory in priority order
@@ -294,7 +297,10 @@ async fn tags(ctx: &Ctx, args: TagsArgs) -> Result<TagsResult, ToolError> {
     })
     .await?;
 
-    Ok(TagsResult { results })
+    Ok(TagsResult {
+        results,
+        details: dev_unsandboxed_reply_details(),
+    })
 }
 
 async fn run_tags_batch<F, Fut>(

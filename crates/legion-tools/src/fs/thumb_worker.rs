@@ -32,8 +32,12 @@ use legion_core::proto::{ErrorBody, ErrorCode};
 use legion_os::capped_alloc::{self, CAP_EXCEEDED_EXIT_CODE};
 use legion_os::mem_limit::process_rss_bytes;
 use legion_os::run::{RunOptions, RunOutput, run};
+use legion_os::sandbox::{
+    DEV_UNSANDBOXED_ENV, SandboxPolicy, SandboxReport, SandboxUnavailable, apply_worker_sandbox,
+    dev_unsandboxed_override_active,
+};
 use legion_os::shell::CommandSpec;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::audio_tags::{AudioFormat, CoverExtractMode, ParsedAudioTags, parse_audio};
 use super::cancelled_error;
@@ -45,8 +49,11 @@ use super::thumb_probe::target_output_overhead_bytes;
 /// Hidden subcommand flag handled before Tokio starts in `legion-cli`.
 pub const THUMB_WORKER_MODE: &str = "__thumb-worker";
 const PROBE_BASELINE_ARG: &str = "--probe-baseline";
+const PROBE_SANDBOX_ARG: &str = "--probe-sandbox";
 const AUDIO_TAGS_ARG: &str = "--audio-tags";
 const AUDIO_COVER_ARG: &str = "--audio-cover";
+#[cfg(debug_assertions)]
+const SIMULATE_SANDBOX_UNAVAILABLE_ENV: &str = "LEGION_TEST_SIMULATE_SANDBOX_UNAVAILABLE";
 
 const BASELINE_MAGIC: &[u8; 4] = b"LGTB";
 const BASELINE_FRAME_LEN: usize = 12;
@@ -109,6 +116,201 @@ static TEST_FORCE_TIMEOUT_CPU_BUSY: AtomicU8 = AtomicU8::new(0);
 static BASELINE_INIT: OnceLock<u64> = OnceLock::new();
 static OBSERVED_BASELINE_BYTES: AtomicU64 = AtomicU64::new(0);
 static PEAK_WORKER_RSS_FOR_TEST: AtomicU64 = AtomicU64::new(0);
+#[cfg(debug_assertions)]
+static TEST_SIMULATE_SANDBOX_UNAVAILABLE: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
+/// Test-only helper that simulates an unavailable OS decode sandbox (`None` restores normal
+/// behavior). Compiled only in debug builds and only fails closed.
+#[doc(hidden)]
+pub fn set_simulate_sandbox_unavailable_for_test(missing: Option<&str>) {
+    #[cfg(debug_assertions)]
+    {
+        let mut guard = TEST_SIMULATE_SANDBOX_UNAVAILABLE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *guard = missing.map(str::to_owned);
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = missing;
+    }
+}
+
+/// Test-only wrapper invoking the exact worker sandbox installation routine used by
+/// `__thumb-worker` before reading untrusted input.
+#[doc(hidden)]
+pub fn enter_worker_sandbox_for_test() -> Result<SandboxReport, SandboxUnavailable> {
+    apply_worker_sandbox()
+}
+
+/// Returns the structured top-level reply `details` object when a debug build explicitly enabled
+/// `LEGION_ALLOW_UNSANDBOXED_DECODE=1`; always `None` when sandboxed or in release builds.
+pub(crate) fn dev_unsandboxed_reply_details() -> Option<Value> {
+    dev_unsandboxed_override_active().then(|| {
+        json!({
+            "sandbox": "disabled",
+            "reason": "dev_override",
+        })
+    })
+}
+
+/// Returns `true` when `err` represents a fail-closed `sandbox_unavailable` rejection.
+pub(crate) fn is_sandbox_unavailable_error(err: &ErrorBody) -> bool {
+    err.code == ErrorCode::Unsupported
+        && err
+            .details
+            .as_ref()
+            .and_then(|d| d.get("reason"))
+            .and_then(Value::as_str)
+            == Some("sandbox_unavailable")
+}
+
+fn sandbox_unavailable_error(unavail: &SandboxUnavailable) -> ErrorBody {
+    ErrorBody::new(
+        ErrorCode::Unsupported,
+        format!(
+            "Media decoding is disabled on this node because the OS decode worker sandbox is unavailable ({}).",
+            unavail.missing
+        ),
+    )
+    .with_hint(
+        "Run Legion on a host with OS sandboxing available (Linux seccomp-BPF, macOS Seatbelt, or Windows AppContainer/Job Objects); check `legion meta.doctor` for details.",
+    )
+    .with_details(json!({
+        "reason": "sandbox_unavailable",
+        "missing": unavail.missing,
+        "platform": unavail.platform,
+        "detail": unavail.detail,
+    }))
+}
+
+fn enter_worker_sandbox_or_fail_closed() -> Result<(), ErrorBody> {
+    if dev_unsandboxed_override_active() {
+        return Ok(());
+    }
+    #[cfg(debug_assertions)]
+    if let Some(missing) = std::env::var_os(SIMULATE_SANDBOX_UNAVAILABLE_ENV) {
+        let missing_str = missing.to_string_lossy().into_owned();
+        let unavail = SandboxUnavailable {
+            platform: std::env::consts::OS.to_owned(),
+            missing: missing_str,
+            detail: "simulated decode worker sandbox unavailability for test".to_owned(),
+        };
+        return Err(sandbox_unavailable_error(&unavail));
+    }
+    match apply_worker_sandbox() {
+        Ok(_report) => Ok(()),
+        Err(unavail) => Err(sandbox_unavailable_error(&unavail)),
+    }
+}
+
+fn apply_worker_sandbox_run_options(mut options: RunOptions) -> RunOptions {
+    if dev_unsandboxed_override_active() {
+        options = options.env(DEV_UNSANDBOXED_ENV, "1");
+    } else {
+        options = options.sandbox(SandboxPolicy::Worker);
+    }
+    #[cfg(debug_assertions)]
+    {
+        let simulated = TEST_SIMULATE_SANDBOX_UNAVAILABLE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(missing) = simulated {
+            options = options.env(SIMULATE_SANDBOX_UNAVAILABLE_ENV, missing);
+        }
+    }
+    options
+}
+
+fn map_worker_spawn_error(kind: &str, display_path: &Path, err: legion_os::OsError) -> ErrorBody {
+    if !dev_unsandboxed_override_active()
+        && matches!(
+            err,
+            legion_os::OsError::Unsupported { .. } | legion_os::OsError::Platform { .. }
+        )
+    {
+        let unavail = SandboxUnavailable {
+            platform: std::env::consts::OS.to_owned(),
+            missing: "OS worker sandbox launch".to_owned(),
+            detail: err.to_string(),
+        };
+        return sandbox_unavailable_error(&unavail);
+    }
+    ErrorBody::new(
+        ErrorCode::Internal,
+        format!(
+            "Failed to launch {kind} for {}: {err}.",
+            display_path.display()
+        ),
+    )
+}
+
+/// Probes the live OS decode worker sandbox by running `__thumb-worker --probe-sandbox` inside
+/// [`SandboxPolicy::Worker`] (ignoring any dev override so `meta.doctor` reports true host health).
+pub(crate) async fn probe_worker_sandbox(cancel: CancellationToken) -> SandboxReport {
+    let exe = match legion_core::current_exe().or_else(|_| std::env::current_exe()) {
+        Ok(exe) => exe,
+        Err(err) => {
+            return SandboxUnavailable {
+                platform: std::env::consts::OS.to_owned(),
+                missing: "legion executable".to_owned(),
+                detail: format!("cannot locate legion binary to probe worker sandbox: {err}"),
+            }
+            .into_report();
+        }
+    };
+    let options = RunOptions::new(CommandSpec::Argv {
+        program: exe.into_os_string(),
+        args: vec![
+            OsString::from(THUMB_WORKER_MODE),
+            OsString::from(PROBE_SANDBOX_ARG),
+        ],
+    })
+    .env_clear(true)
+    .envs(minimal_system_env())
+    .env("MALLOC_ARENA_MAX", "2")
+    .sandbox(SandboxPolicy::Worker)
+    .timeout(Duration::from_secs(5))
+    .kill_grace(Duration::ZERO)
+    .capture_limit(MAX_WORKER_ERR_BYTES)
+    .cancel(cancel);
+
+    let output = match run(options).await {
+        Ok(out) => out,
+        Err(err) => {
+            return SandboxUnavailable {
+                platform: std::env::consts::OS.to_owned(),
+                missing: "OS worker sandbox launch".to_owned(),
+                detail: err.to_string(),
+            }
+            .into_report();
+        }
+    };
+
+    if output.success()
+        && let Ok(report) = serde_json::from_str::<SandboxReport>(output.stdout.text.trim())
+    {
+        return report;
+    }
+
+    let detail = if !output.stderr.text.trim().is_empty() {
+        output.stderr.text.trim().to_owned()
+    } else if let Some(sig) = output.signal {
+        format!("sandbox probe worker terminated by signal {sig}")
+    } else if let Some(code) = output.exit_code {
+        format!("sandbox probe worker exited with status {code}")
+    } else {
+        "sandbox probe worker did not return a valid report".to_owned()
+    };
+    SandboxUnavailable {
+        platform: std::env::consts::OS.to_owned(),
+        missing: "decode worker sandbox probe".to_owned(),
+        detail,
+    }
+    .into_report()
+}
 
 /// Test-only helper that resets the high-water worker peak RSS counter.
 #[doc(hidden)]
@@ -663,6 +865,17 @@ fn run_worker_main(args: &[OsString]) -> ExitCode {
         let _ = write_baseline_frame(baseline);
         return ExitCode::SUCCESS;
     }
+    if args.first().is_some_and(|a| a == PROBE_SANDBOX_ARG) {
+        let report = match apply_worker_sandbox() {
+            Ok(report) => report,
+            Err(unavail) => unavail.into_report(),
+        };
+        let mut out = io::stdout().lock();
+        if serde_json::to_writer(&mut out, &report).is_err() || out.flush().is_err() {
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
     if args.first().is_some_and(|a| a == AUDIO_TAGS_ARG) {
         return run_audio_tags_worker_main(&args[1..]);
     }
@@ -686,11 +899,18 @@ fn run_worker_main(args: &[OsString]) -> ExitCode {
         display_label,
     } = parsed;
 
-    // Sample this worker's own startup resident size after initialization and before decoding, and
-    // emit it as a 12-byte preamble frame (`LGTB` + u64) so the parent can track and log the real
-    // per-platform/per-build baseline.
+    // Sample this worker's own startup resident size after initialization and before entering the
+    // sandbox (which blocks `/proc/<pid>/statm` opens on Linux), and emit it as a 12-byte preamble
+    // frame (`LGTB` + u64).
     let startup_rss = process_rss_bytes(std::process::id()).unwrap_or(0);
     let _ = write_baseline_frame(startup_rss);
+
+    // Irreversibly enter (Linux/macOS) or verify (Windows) the OS sandbox BEFORE arming the heap
+    // cap or reading byte 0 of untrusted image input. Fail closed if unavailable.
+    if let Err(err) = enter_worker_sandbox_or_fail_closed() {
+        let _ = write_err_frame(&err);
+        return ExitCode::SUCCESS;
+    }
 
     // Arm the exact process-wide live-heap allocator cap BEFORE touching stdin or allocating
     // buffers for untrusted input.
@@ -774,8 +994,8 @@ fn run_audio_tags_worker_main(args: &[OsString]) -> ExitCode {
     let startup_rss = process_rss_bytes(std::process::id()).unwrap_or(0);
     let _ = write_baseline_frame(startup_rss);
 
-    capped_alloc::set_memory_cap(parsed.heap_cap_usize);
-
+    // Duplicate/stat/seek the already-open stdin handle BEFORE entering the sandbox (reads zero
+    // untrusted bytes; avoids needing `fcntl(F_DUPFD_CLOEXEC)` in the seccomp allowlist).
     let label_path = Path::new(&parsed.display_label);
     let (mut file, file_len) = match open_inherited_stdin_regular_file(label_path) {
         Ok(pair) => pair,
@@ -784,6 +1004,14 @@ fn run_audio_tags_worker_main(args: &[OsString]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
     };
+
+    // Enter/verify the OS sandbox BEFORE reading byte 0 of untrusted audio data.
+    if let Err(err) = enter_worker_sandbox_or_fail_closed() {
+        let _ = write_err_frame(&err);
+        return ExitCode::SUCCESS;
+    }
+
+    capped_alloc::set_memory_cap(parsed.heap_cap_usize);
 
     match parse_audio(
         &mut file,
@@ -817,8 +1045,8 @@ fn run_audio_cover_worker_main(args: &[OsString]) -> ExitCode {
     let startup_rss = process_rss_bytes(std::process::id()).unwrap_or(0);
     let _ = write_baseline_frame(startup_rss);
 
-    capped_alloc::set_memory_cap(parsed.heap_cap_usize);
-
+    // Duplicate/stat/seek the already-open stdin handle BEFORE entering the sandbox (reads zero
+    // untrusted bytes).
     let label_path = Path::new(&parsed.display_label);
     let (mut file, file_len) = match open_inherited_stdin_regular_file(label_path) {
         Ok(pair) => pair,
@@ -827,6 +1055,14 @@ fn run_audio_cover_worker_main(args: &[OsString]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
     };
+
+    // Enter/verify the OS sandbox BEFORE reading byte 0 of untrusted audio data.
+    if let Err(err) = enter_worker_sandbox_or_fail_closed() {
+        let _ = write_err_frame(&err);
+        return ExitCode::SUCCESS;
+    }
+
+    capped_alloc::set_memory_cap(parsed.heap_cap_usize);
 
     let extracted = match parse_audio(
         &mut file,
@@ -1155,17 +1391,11 @@ pub(crate) async fn run_thumb_worker(
     .raw_stdout(true)
     .cancel(cancel);
     // Keep glibc single-arena lean inside the worker as well.
-    options = options.env("MALLOC_ARENA_MAX", "2");
+    options = apply_worker_sandbox_run_options(options.env("MALLOC_ARENA_MAX", "2"));
 
-    let output = run(options).await.map_err(|err| {
-        ErrorBody::new(
-            ErrorCode::Internal,
-            format!(
-                "Failed to launch thumbnail worker for {}: {err}.",
-                display_path.display()
-            ),
-        )
-    })?;
+    let output = run(options)
+        .await
+        .map_err(|err| map_worker_spawn_error("thumbnail worker", display_path, err))?;
     PEAK_WORKER_RSS_FOR_TEST.fetch_max(output.peak_rss_bytes, Ordering::Relaxed);
 
     classify_worker_output(
@@ -1218,17 +1448,11 @@ pub(crate) async fn run_audio_tags_worker(
     .capture_limit(MAX_WORKER_TAGS_BYTES + 1024)
     .raw_stdout(true)
     .cancel(cancel);
-    options = options.env("MALLOC_ARENA_MAX", "2");
+    options = apply_worker_sandbox_run_options(options.env("MALLOC_ARENA_MAX", "2"));
 
-    let output = run(options).await.map_err(|err| {
-        ErrorBody::new(
-            ErrorCode::Internal,
-            format!(
-                "Failed to launch audio tag worker for {}: {err}.",
-                display_path.display()
-            ),
-        )
-    })?;
+    let output = run(options)
+        .await
+        .map_err(|err| map_worker_spawn_error("audio tag worker", display_path, err))?;
     PEAK_WORKER_RSS_FOR_TEST.fetch_max(output.peak_rss_bytes, Ordering::Relaxed);
 
     classify_audio_tags_output(
@@ -1291,17 +1515,11 @@ pub(crate) async fn run_audio_cover_worker(
     .capture_limit(MAX_WORKER_STDOUT_BYTES)
     .raw_stdout(true)
     .cancel(cancel);
-    options = options.env("MALLOC_ARENA_MAX", "2");
+    options = apply_worker_sandbox_run_options(options.env("MALLOC_ARENA_MAX", "2"));
 
-    let output = run(options).await.map_err(|err| {
-        ErrorBody::new(
-            ErrorCode::Internal,
-            format!(
-                "Failed to launch audio cover worker for {}: {err}.",
-                display_path.display()
-            ),
-        )
-    })?;
+    let output = run(options)
+        .await
+        .map_err(|err| map_worker_spawn_error("audio cover worker", display_path, err))?;
     PEAK_WORKER_RSS_FOR_TEST.fetch_max(output.peak_rss_bytes, Ordering::Relaxed);
 
     classify_audio_cover_output(

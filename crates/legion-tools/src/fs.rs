@@ -20,10 +20,12 @@ mod write;
 
 pub use tags::set_audio_tags_heap_cap_for_test;
 pub use thumb_worker::{
-    THUMB_WORKER_MODE, enable_thumb_worker_self, measured_worker_baseline_bytes_for_test,
-    peak_worker_rss_for_test, reset_peak_worker_rss_for_test, set_thumb_decode_timeout_for_test,
-    set_thumb_timeout_cpu_busy_for_test, try_thumb_worker_cli,
+    THUMB_WORKER_MODE, enable_thumb_worker_self, enter_worker_sandbox_for_test,
+    measured_worker_baseline_bytes_for_test, peak_worker_rss_for_test,
+    reset_peak_worker_rss_for_test, set_simulate_sandbox_unavailable_for_test,
+    set_thumb_decode_timeout_for_test, set_thumb_timeout_cpu_busy_for_test, try_thumb_worker_cli,
 };
+pub(crate) use thumb_worker::{probe_worker_sandbox, worker_enabled};
 
 use std::cmp::Ordering;
 use std::fs::{self, FileType, Metadata};

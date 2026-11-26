@@ -12,6 +12,7 @@ use legion_core::config::NodeFile;
 use legion_core::policy::{OWNER, Policy, Role};
 use legion_core::proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
 use legion_os::run::{RunOptions, run};
+use legion_os::sandbox::{SandboxReport, dev_unsandboxed_override_active};
 use legion_os::shell::CommandSpec;
 use serde::Deserialize;
 use serde_json::json;
@@ -86,6 +87,14 @@ pub(super) async fn append_extra_checks(ctx: &Ctx, quick: bool, checks: &mut Vec
 
     let ssh_path = find_program_on_env_path("ssh");
     checks.push(check_ssh_on_path(ssh_path.as_deref()));
+
+    if crate::fs::worker_enabled() {
+        let sandbox_report = crate::fs::probe_worker_sandbox(ctx.cancel_token().clone()).await;
+        checks.push(check_worker_sandbox(
+            &sandbox_report,
+            dev_unsandboxed_override_active(),
+        ));
+    }
 
     if let Some(pending) = crate::power::pending::pending(ctx.paths(), ctx.boot_id().as_deref()) {
         checks.push(check_pending_power(&pending));
@@ -193,6 +202,58 @@ pub struct FleetDeviceSyncEntry {
 #[derive(Deserialize)]
 struct FleetDevicesSyncResponse {
     results: BTreeMap<String, BTreeMap<String, FleetDeviceSyncEntry>>,
+}
+
+/// Summarizes the OS decode worker sandbox health in one actionable sentence for `meta.doctor`.
+pub fn check_worker_sandbox(report: &SandboxReport, dev_override: bool) -> Check {
+    const NAME: &str = "decode worker sandbox";
+    if dev_override {
+        return Check {
+            name: NAME.to_owned(),
+            ok: true,
+            warning: true,
+            detail: "Decode worker OS sandbox is bypassed by LEGION_ALLOW_UNSANDBOXED_DECODE=1 in this debug build (ignored in release builds).".to_owned(),
+            hint: Some(
+                "Unset LEGION_ALLOW_UNSANDBOXED_DECODE to re-enable OS-sandboxed media decoding."
+                    .to_owned(),
+            ),
+        };
+    }
+    if report.available && report.complete {
+        return Check {
+            name: NAME.to_owned(),
+            ok: true,
+            warning: false,
+            detail: report.detail.clone(),
+            hint: None,
+        };
+    }
+    if report.available {
+        return Check {
+            name: NAME.to_owned(),
+            ok: true,
+            warning: true,
+            detail: report.detail.clone(),
+            hint: Some(
+                "Enable Windows AppContainer profiles for this account so the decode worker also blocks user file reads and network access."
+                    .to_owned(),
+            ),
+        };
+    }
+    let missing = report.missing.as_deref().unwrap_or("OS sandbox");
+    Check {
+        name: NAME.to_owned(),
+        ok: false,
+        warning: false,
+        detail: format!(
+            "Decode worker OS sandbox is unavailable ({missing}): {}; fs.thumb and fs.tags refuse untrusted media until fixed.",
+            report.detail
+        ),
+        hint: Some(
+            "Run Legion on a kernel/OS that permits unprivileged sandboxing (Linux seccomp-BPF, macOS Seatbelt, or Windows AppContainer/Job Objects)."
+                .to_owned(),
+        ),
+    }
 }
 
 /// Builds `meta.doctor` warnings when two live devices in `devices.toml` share a public key or
@@ -1663,5 +1724,59 @@ deny = [\"effect:power\", \"effect:admin\"]
                 .as_deref()
                 .is_some_and(|h| h.contains("fleet.sync"))
         );
+    }
+
+    #[test]
+    fn worker_sandbox_check_reports_complete_partial_unavailable_and_dev_override() {
+        let complete = SandboxReport {
+            available: true,
+            complete: true,
+            platform: "linux".to_owned(),
+            mechanism: "seccomp-bpf+landlock".to_owned(),
+            detail: "Linux decode worker sandbox active (seccomp-BPF + Landlock).".to_owned(),
+            missing: None,
+        };
+        let ok_check = check_worker_sandbox(&complete, false);
+        assert_eq!(ok_check.name, "decode worker sandbox");
+        assert!(ok_check.ok && !ok_check.warning);
+        assert!(ok_check.hint.is_none());
+
+        let override_check = check_worker_sandbox(&complete, true);
+        assert!(override_check.ok && override_check.warning);
+        assert!(
+            override_check
+                .detail
+                .contains("LEGION_ALLOW_UNSANDBOXED_DECODE")
+        );
+
+        let partial = SandboxReport {
+            available: true,
+            complete: false,
+            platform: "windows".to_owned(),
+            mechanism: "restricted-token+job".to_owned(),
+            detail: "Windows Low-IL restricted token fallback active.".to_owned(),
+            missing: Some("AppContainer".to_owned()),
+        };
+        let warn_check = check_worker_sandbox(&partial, false);
+        assert!(warn_check.ok && warn_check.warning);
+        assert!(
+            warn_check
+                .hint
+                .as_deref()
+                .is_some_and(|h| h.contains("AppContainer"))
+        );
+
+        let unavailable = SandboxReport {
+            available: false,
+            complete: false,
+            platform: "linux".to_owned(),
+            mechanism: "none".to_owned(),
+            detail: "prctl(PR_SET_SECCOMP) failed: ENOSYS".to_owned(),
+            missing: Some("seccomp-bpf".to_owned()),
+        };
+        let fail_check = check_worker_sandbox(&unavailable, false);
+        assert!(!fail_check.ok && !fail_check.warning);
+        assert!(fail_check.detail.contains("seccomp-bpf"));
+        assert!(fail_check.hint.is_some());
     }
 }

@@ -16,8 +16,8 @@ use serde_json::json;
 
 pub use doctor::{
     FleetPingEntry, check_executable_on_path, check_installation, check_linux_lingering,
-    check_policy_exec_roles, check_self_in_fleet, check_ssh_on_path, extract_login_path,
-    fleet_ping_checks, parse_linger_output,
+    check_policy_exec_roles, check_self_in_fleet, check_ssh_on_path, check_worker_sandbox,
+    extract_login_path, fleet_ping_checks, parse_linger_output,
 };
 pub use init::{InitResult, render_node_toml, render_policy_toml};
 
@@ -38,7 +38,7 @@ pub fn register(registry: &mut Registry) {
     registry.add_fn(
         "meta.doctor",
         Effect::Read,
-        "Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, every configuration file parses, how legion was installed, the executable directory and ssh are on PATH, Linux systemd lingering is enabled, non-owner roles that allow exec are flagged as a warning, this node's own name appears in fleet.toml when fleet.toml lists machines, and each machine in fleet.toml is checked (unless quick=true; unreachable machines and node name mismatches are reported as warnings while protocol or reply errors fail). Each check says what it found and, when something is wrong, what to do. Passing acknowledge=\"devices-rollback\" (owner role only) clears a recorded configuration rollback failure in the state directory and audits who acknowledged it; otherwise it writes nothing but a probe file in the state directory, which it removes.",
+        "Check that this node is healthy: its configuration directory can be read, its state directory exists and can be written to, every configuration file parses, how legion was installed, the executable directory and ssh are on PATH, Linux systemd lingering is enabled, the decode worker OS sandbox is active, non-owner roles that allow exec are flagged as a warning, this node's own name appears in fleet.toml when fleet.toml lists machines, and each machine in fleet.toml is checked (unless quick=true; unreachable machines and node name mismatches are reported as warnings while protocol or reply errors fail). Each check says what it found and, when something is wrong, what to do. Passing acknowledge=\"devices-rollback\" (owner role only) clears a recorded configuration rollback failure in the state directory and audits who acknowledged it; otherwise it writes nothing but a probe file in the state directory, which it removes.",
         doctor,
     );
     init::register(registry);

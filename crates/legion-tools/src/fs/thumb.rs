@@ -123,9 +123,10 @@ use super::thumb_probe::{
     probe_image_profile, target_output_overhead_bytes, too_large_error,
 };
 use super::thumb_worker::{
-    AudioCoverWorkerOutcome, WorkerOutcome, compute_worker_limits, effective_decode_timeout,
-    heap_cap_from_estimate, minimal_system_env, run_audio_cover_worker, run_thumb_worker,
-    worker_baseline_rss_bytes, worker_enabled,
+    AudioCoverWorkerOutcome, WorkerOutcome, compute_worker_limits, dev_unsandboxed_reply_details,
+    effective_decode_timeout, heap_cap_from_estimate, is_sandbox_unavailable_error,
+    minimal_system_env, run_audio_cover_worker, run_thumb_worker, worker_baseline_rss_bytes,
+    worker_enabled,
 };
 use super::{
     cancelled_error, check_fs_path, check_regular_file, map_io_error, open_regular_file, platform,
@@ -355,7 +356,7 @@ pub(super) fn register(registry: &mut Registry) {
     registry.add(ThumbTool {
         spec: ToolSpec {
             name: "fs.thumb".to_owned(),
-            description: "Generate thumbnails for 1 to 32 image, audio or video paths on this node (size 96 to 1024; 64 MiB image source cap, 256 MiB estimated decode memory per image with EXIF/MPF preview fallback for larger JPEGs, audio embedded cover or folder cover fallback with 16 MiB tag cap, out-of-process memory-bounded workers, in-flight budget capped at min(512 MiB, effective RAM/8)), returning per-path base64 JPEG (or PNG when transparent) thumbnails or per-path errors in input order, cached in a 256 MiB LRU store in the state directory. Total base64 content in one reply is capped at 12 MiB; once adding the next path would exceed that budget, that path and every later path return retryable busy (details.reason = \"reply_budget\") so the caller can ask for them again.".to_owned(),
+            description: "Generate thumbnails for 1 to 32 image, audio or video paths on this node (size 96 to 1024; 64 MiB image source cap, 256 MiB estimated decode memory per image with EXIF/MPF preview fallback for larger JPEGs, audio embedded cover or folder cover fallback with 16 MiB tag cap, out-of-process OS-sandboxed memory-bounded workers, in-flight budget capped at min(512 MiB, effective RAM/8)), returning per-path base64 JPEG (or PNG when transparent) thumbnails or per-path errors in input order, cached in a 256 MiB LRU store in the state directory. Total base64 content in one reply is capped at 12 MiB; once adding the next path would exceed that budget, that path and every later path return retryable busy (details.reason = \"reply_budget\") so the caller can ask for them again.".to_owned(),
             effect: Effect::Read,
             input_schema: input_schema::<ThumbArgs>(),
         },
@@ -539,8 +540,11 @@ async fn thumb(ctx: &Ctx, args: ThumbArgs) -> Result<Value, ToolError> {
     )
     .await?;
 
-    let mut root = Map::with_capacity(1);
+    let mut root = Map::with_capacity(2);
     root.insert("results".to_owned(), Value::Array(results));
+    if let Some(details) = dev_unsandboxed_reply_details() {
+        root.insert("details".to_owned(), details);
+    }
     Ok(Value::Object(root))
 }
 
@@ -1165,6 +1169,9 @@ async fn thumb_audio(
                     .await;
                 }
                 AudioCoverWorkerOutcome::Rejected(err) => {
+                    if is_sandbox_unavailable_error(&err) {
+                        return Ok(ThumbOutcome::Error(err));
+                    }
                     record_bad_audio_cover(cache, &resolved, file, open_stamp, bad_key, &err).await;
                     return thumb_audio_folder_cover(
                         grant,
@@ -1375,7 +1382,8 @@ async fn thumb_audio_folder_cover(
                 if matches!(
                     err.code,
                     ErrorCode::Busy | ErrorCode::Timeout | ErrorCode::Conflict
-                ) {
+                ) || is_sandbox_unavailable_error(&err)
+                {
                     return Ok(ThumbOutcome::Error(err));
                 }
                 // Undecodable folder candidate: try the next candidate in priority order.
