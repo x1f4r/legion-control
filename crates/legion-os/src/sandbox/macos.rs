@@ -130,12 +130,13 @@ fn build_ffmpeg_sbpl_profile(
          (allow mach-lookup)\n\
          (allow signal (target self))\n\
          (allow file-read-metadata)\n\
+         (allow file-read* (literal \"/\") (literal \"/System\") (literal \"/System/Volumes\") (literal \"/System/Volumes/Preboot\") (literal \"/System/Volumes/Preboot/Cryptexes\") (literal \"/System/Cryptexes\"))\n\
          (allow file-read* (literal \"/dev/null\") (literal \"/dev/urandom\") (literal \"/dev/random\") (literal \"/dev/dtracehelper\"))\n\
          (allow file-write* (literal \"/dev/null\"))\n\
-         (allow file-read* (subpath \"/System/Library\") (subpath \"/System/Volumes/Preboot/Cryptexes\") (subpath \"/System/Cryptexes\") (subpath \"/private/var/db/dyld\") (subpath \"/usr/lib\") (subpath \"/Library/Frameworks\"))\n\
+         (allow file-read* (subpath \"/System/Library\") (subpath \"/System/Volumes/Preboot/Cryptexes\") (subpath \"/System/Cryptexes\") (subpath \"/Library/Apple\") (subpath \"/private/var/db/dyld\") (subpath \"/usr/lib\") (subpath \"/Library/Frameworks\"))\n\
          (allow file-read* (subpath \"/opt/homebrew/lib\") (subpath \"/opt/homebrew/Cellar\") (subpath \"/opt/homebrew/opt\"))\n\
          (allow file-read* (subpath \"/usr/local/lib\") (subpath \"/usr/local/Cellar\") (subpath \"/usr/local/opt\"))\n\
-         (allow file-map-executable (subpath \"/System/Library\") (subpath \"/System/Volumes/Preboot/Cryptexes\") (subpath \"/System/Cryptexes\") (subpath \"/usr/lib\") (subpath \"/Library/Frameworks\") (subpath \"/opt/homebrew\") (subpath \"/usr/local\"))\n",
+         (allow file-map-executable (subpath \"/System/Library\") (subpath \"/System/Volumes/Preboot/Cryptexes\") (subpath \"/System/Cryptexes\") (subpath \"/Library/Apple\") (subpath \"/usr/lib\") (subpath \"/Library/Frameworks\") (subpath \"/opt/homebrew\") (subpath \"/usr/local\"))\n",
     );
 
     // Allow executing, reading, and mapping ONLY the resolved `ffmpeg` binary (plus its prefix lib dir).

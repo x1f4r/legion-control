@@ -4244,8 +4244,9 @@ async fn test_ffmpeg_sandbox_blocks_network_and_unauthorized_files() {
         .await;
         assert!(
             ok_read.success() && ok_read.stdout.text.trim() == "OK:19",
-            "ffmpeg sandbox must allow reading the single input file: exit={:?} stdout={:?} stderr={:?}",
+            "ffmpeg sandbox must allow reading the single input file: exit={:?} signal={:?} stdout={:?} stderr={:?}",
             ok_read.exit_code,
+            ok_read.signal,
             ok_read.stdout.text,
             ok_read.stderr.text,
         );
