@@ -33,7 +33,6 @@ import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import org.json.JSONArray
 import org.json.JSONObject
-import java.util.IdentityHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -100,39 +99,15 @@ class MusicPlaybackService : MediaSessionService() {
 
   private inner class QueueForwardingPlayer(player: Player) : ForwardingPlayer(player) {
     private val rawListeners = ArrayList<Player.Listener>()
-    private val wrapperMap = IdentityHashMap<Player.Listener, Player.Listener>()
-
-    private inner class MetadataAwareListener(
-      private val delegate: Player.Listener,
-    ) : Player.Listener by delegate {
-      override fun onAvailableCommandsChanged(availableCommands: Player.Commands) {
-        delegate.onAvailableCommandsChanged(this@QueueForwardingPlayer.availableCommands)
-      }
-
-      override fun onMediaMetadataChanged(mediaMetadata: MediaMetadata) {
-        delegate.onMediaMetadataChanged(this@QueueForwardingPlayer.mediaMetadata)
-      }
-
-      override fun onEvents(player: Player, events: Player.Events) {
-        delegate.onEvents(this@QueueForwardingPlayer, events)
-      }
-    }
 
     override fun addListener(listener: Player.Listener) {
-      val wrapper = MetadataAwareListener(listener)
       rawListeners.add(listener)
-      wrapperMap[listener] = wrapper
-      super.addListener(wrapper)
+      super.addListener(listener)
     }
 
     override fun removeListener(listener: Player.Listener) {
       rawListeners.remove(listener)
-      val wrapper = wrapperMap.remove(listener)
-      if (wrapper != null) {
-        super.removeListener(wrapper)
-      } else {
-        super.removeListener(listener)
-      }
+      super.removeListener(listener)
     }
 
     fun notifyMetadataAndCommandsChanged() {
@@ -240,6 +215,29 @@ class MusicPlaybackService : MediaSessionService() {
         recordDebugTick()
       }
       syncTimersAndState(includeCover = false)
+    }
+
+    override fun onPlaybackSuppressionReasonChanged(playbackSuppressionReason: Int) {
+      recordDebugEvent(
+        "suppression_reason",
+        JSONObject()
+          .put("reason", suppressionReasonName(playbackSuppressionReason))
+          .put("playWhenReady", exoPlayer.playWhenReady)
+          .put("isPlaying", exoPlayer.isPlaying),
+      )
+      syncTimersAndState(includeCover = false)
+    }
+
+    override fun onAvailableCommandsChanged(availableCommands: Player.Commands) {
+      if (::forwardingPlayer.isInitialized && loaded) {
+        forwardingPlayer.notifyMetadataAndCommandsChanged()
+      }
+    }
+
+    override fun onMediaMetadataChanged(mediaMetadata: MediaMetadata) {
+      if (::forwardingPlayer.isInitialized && loaded) {
+        forwardingPlayer.notifyMetadataAndCommandsChanged()
+      }
     }
 
     override fun onVolumeChanged(volume: Float) {
@@ -565,7 +563,11 @@ class MusicPlaybackService : MediaSessionService() {
     val snapshot = JSONObject()
     runOnMainSync {
       snapshot.put("loaded", loaded)
-      snapshot.put("playing", loaded && exoPlayer.playWhenReady && exoPlayer.playbackState != Player.STATE_ENDED)
+      snapshot.put("playing", isEffectivelyPlaying())
+      snapshot.put("playWhenReady", loaded && exoPlayer.playWhenReady)
+      snapshot.put("suppressionReason", suppressionReasonName(exoPlayer.playbackSuppressionReason))
+      snapshot.put("sessionsCount", sessions.size)
+      snapshot.put("isPlaybackOngoing", isPlaybackOngoing)
       snapshot.put("positionMs", if (loaded) exoPlayer.currentPosition.coerceAtLeast(0L) else 0L)
       snapshot.put("durationMs", if (loaded) exoPlayer.duration.coerceAtLeast(0L) else 0L)
       snapshot.put("path", queue.currentTrack()?.path ?: JSONObject.NULL)
@@ -831,10 +833,19 @@ class MusicPlaybackService : MediaSessionService() {
     stopSelf()
   }
 
+  private fun isEffectivelyPlaying(): Boolean {
+    if (!loaded || activeError != null) return false
+    if (!exoPlayer.playWhenReady) return false
+    if (exoPlayer.playbackState == Player.STATE_ENDED || exoPlayer.playbackState == Player.STATE_IDLE) {
+      return false
+    }
+    return exoPlayer.playbackSuppressionReason == Player.PLAYBACK_SUPPRESSION_REASON_NONE
+  }
+
   private fun syncTimersAndState(includeCover: Boolean) {
-    val playing = loaded && exoPlayer.playWhenReady && exoPlayer.playbackState != Player.STATE_ENDED
+    val wantsPlay = loaded && exoPlayer.playWhenReady && exoPlayer.playbackState != Player.STATE_ENDED
     val buffering = loaded && exoPlayer.playbackState == Player.STATE_BUFFERING
-    if (playing || buffering) {
+    if (wantsPlay || buffering) {
       cancelPausedDismiss()
       startPositionTicker()
     } else {
@@ -903,7 +914,7 @@ class MusicPlaybackService : MediaSessionService() {
       }
       val positionMs = exoPlayer.currentPosition.coerceAtLeast(0L)
       val bufferedMs = exoPlayer.bufferedPosition.coerceAtLeast(0L)
-      val isPlaying = exoPlayer.playWhenReady && exoPlayer.playbackState != Player.STATE_ENDED && activeError == null
+      val isPlaying = isEffectivelyPlaying()
       val isBuffering = exoPlayer.playbackState == Player.STATE_BUFFERING && !isLoadingTrack
 
       state.put("loaded", true)
@@ -1173,6 +1184,13 @@ class MusicPlaybackService : MediaSessionService() {
       Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_BECOMING_NOISY -> "audio_becoming_noisy"
       Player.PLAY_WHEN_READY_CHANGE_REASON_REMOTE -> "remote"
       Player.PLAY_WHEN_READY_CHANGE_REASON_END_OF_MEDIA_ITEM -> "end_of_media_item"
+      else -> "other($reason)"
+    }
+
+    private fun suppressionReasonName(reason: Int): String = when (reason) {
+      Player.PLAYBACK_SUPPRESSION_REASON_NONE -> "none"
+      Player.PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS -> "transient_audio_focus_loss"
+      Player.PLAYBACK_SUPPRESSION_REASON_UNSUITABLE_AUDIO_OUTPUT -> "unsuitable_audio_output"
       else -> "other($reason)"
     }
   }
