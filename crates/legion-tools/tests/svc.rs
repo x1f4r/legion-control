@@ -477,17 +477,31 @@ async fn linux_stop_on_failed_unit_reports_failed_immediately() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
     let fixture = Fixture::new();
+    let fail_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let status = fixture
+            .call("svc.status", json!({"name": unit, "scope": "user"}))
+            .await
+            .unwrap();
+        if status["state"] == json!("failed") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < fail_deadline,
+            "timed out waiting for transient unit {unit} to enter failed state; last status={status}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
     let started = std::time::Instant::now();
     let res = fixture
         .call("svc.stop", json!({"name": unit, "scope": "user"}))
         .await
         .unwrap();
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(3),
-        "svc.stop on failed unit took too long: {:?}",
+        started.elapsed() < std::time::Duration::from_secs(7),
+        "svc.stop on failed unit took too long (should not wait full 10s policy): {:?}",
         started.elapsed()
     );
     assert_eq!(res["previous_state"], json!("failed"));

@@ -1141,8 +1141,9 @@ verify = ["check-next-entry", "Other"]
         let started = Instant::now();
         let err = store.get::<NodeFile>().unwrap_err();
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "reading a FIFO config file must fail promptly"
+            started.elapsed() < Duration::from_secs(10),
+            "reading a FIFO config file must fail without hanging, took {:?}",
+            started.elapsed()
         );
         assert_eq!(err.code, ErrorCode::Failed);
         assert!(

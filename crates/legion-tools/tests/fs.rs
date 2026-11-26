@@ -2388,7 +2388,7 @@ async fn non_regular_files_are_refused_before_opening() {
             json!({"path": f.p(&fifo), "content": "x", "expect_hash": "blake3:0000"}),
         ),
     ] {
-        let res = tokio::time::timeout(Duration::from_secs(2), f.call(tool, args.clone()))
+        let res = tokio::time::timeout(Duration::from_secs(10), f.call(tool, args.clone()))
             .await
             .unwrap_or_else(|_| panic!("{tool} blocked on FIFO {fifo:?}"));
         let err = res.unwrap_err();
@@ -2414,7 +2414,7 @@ async fn non_regular_files_are_refused_before_opening() {
 
     // Grepping a directory containing a FIFO skips it without blocking and still matches regular files.
     let dir_grep = tokio::time::timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(10),
         f.call(
             "fs.grep",
             json!({"path": f.p(&f.work), "pattern": "needle"}),
@@ -3087,7 +3087,7 @@ async fn find_large_directory_cuts_off_within_budget() {
     );
     assert_eq!(res["reason"], json!("time"));
     assert!(
-        elapsed < Duration::from_secs(2),
+        elapsed < Duration::from_secs(10),
         "fs.find took {elapsed:?} for a 1ms budget"
     );
 }

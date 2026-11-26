@@ -511,22 +511,24 @@ async fn kill_targets_reports_per_target_outcomes() {
     let reused_child = ChildGuard::new(spawn_helper("sleep", &["60"]));
     // 4. On Unix, a stubborn child that ignores SIGTERM until `force: true`.
     #[cfg(unix)]
-    let mut stubborn = ChildGuard::new(spawn_helper("stubborn", &[]));
+    let ready_dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    let stubborn_ready = ready_dir.path().join("stubborn.ready");
+    #[cfg(unix)]
+    let ready_arg = format!("--ready={}", stubborn_ready.display());
+    #[cfg(unix)]
+    let mut stubborn = ChildGuard::new(spawn_helper("stubborn", &[ready_arg.as_str()]));
 
     wait_for(Duration::from_secs(30), || {
         let base_ok = alive(normal.id()) && alive(reused_child.id());
         #[cfg(unix)]
-        let ok = base_ok && alive(stubborn.id());
+        let ok = base_ok && alive(stubborn.id()) && stubborn_ready.exists();
         #[cfg(not(unix))]
         let ok = base_ok;
         ok.then_some(())
     })
     .await
     .unwrap();
-
-    // Give stubborn child a moment to install its SIGTERM handler before signaling.
-    #[cfg(unix)]
-    tokio::time::sleep(Duration::from_millis(150)).await;
 
     let normal_start = start_time_of(&fixture, normal.id()).await;
     #[cfg(unix)]
