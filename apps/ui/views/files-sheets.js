@@ -10,10 +10,12 @@ import {
   formatPathForDisplay,
   joinFilePath,
   parentFilePath,
+  plainCategoryLabel,
 } from '../lib/files.js';
 import { readRecentDestinations, recordRecentDestination } from '../lib/files-store.js';
 import { formatBytes, formatRelativeTime, primaryDisk } from '../lib/format.js';
-import { Notice, Sheet } from './common.js';
+import { CopyButton, Notice, Sheet } from './common.js';
+import { FileName, FileNameList, FileNameSingle } from './file-name.js';
 
 function safeStorage() {
   try {
@@ -410,62 +412,78 @@ export function SendToSheet({
             <p class="label">Choose folder on ${dest}</p>
             ${pinnedDirsForDest.length > 0
               ? html`
-                  <div class="list">
-                    ${pinnedDirsForDest.map(
-                      (p) => html`
+                  <${FileNameList} className="list" lines=${2}>
+                    ${pinnedDirsForDest.map((p, idx) => {
+                      const label = p.label || baseFileName(p.path);
+                      const prev = idx > 0 ? pinnedDirsForDest[idx - 1].label || baseFileName(pinnedDirsForDest[idx - 1].path) : null;
+                      const next =
+                        idx + 1 < pinnedDirsForDest.length
+                          ? pinnedDirsForDest[idx + 1].label || baseFileName(pinnedDirsForDest[idx + 1].path)
+                          : null;
+                      return html`
                         <button
                           key=${p.id}
                           type="button"
                           class=${chosenDir === p.path ? 'row picked' : 'row'}
+                          aria-label=${label}
+                          title=${label}
                           onClick=${() => {
-                            setDestDirByMachine((prev) => ({ ...prev, [dest]: p.path }));
+                            setDestDirByMachine((prevMap) => ({ ...prevMap, [dest]: p.path }));
                             setPickingFolder(false);
                           }}
                         >
                           <span class="thumb folder"><${Icon} name="files" /></span>
                           <span class="body">
-                            <span class="title">${p.label || baseFileName(p.path)}</span>
+                            <${FileName} className="title fn-title" name=${label} before=${prev} after=${next} lines=${2} />
                             <span class="sub">Pinned · ${formatPathForDisplay(p.path, { technical })}</span>
                           </span>
                           <span class="check" aria-hidden="true"></span>
                         </button>
-                      `,
-                    )}
-                  </div>
+                      `;
+                    })}
+                  <//>
                 `
               : null}
 
             ${recentDirsForDest.length > 0
               ? html`
                   <p class="label">Last used on ${dest}</p>
-                  <div class="list">
-                    ${recentDirsForDest.map(
-                      (dir) => html`
+                  <${FileNameList} className="list" lines=${2}>
+                    ${recentDirsForDest.map((dir, idx) => {
+                      const label = folderDisplayName(dir, { technical });
+                      const prev = idx > 0 ? folderDisplayName(recentDirsForDest[idx - 1], { technical }) : null;
+                      const next =
+                        idx + 1 < recentDirsForDest.length
+                          ? folderDisplayName(recentDirsForDest[idx + 1], { technical })
+                          : null;
+                      return html`
                         <button
                           key=${dir}
                           type="button"
                           class=${chosenDir === dir ? 'row picked' : 'row'}
+                          aria-label=${label}
+                          title=${label}
                           onClick=${() => {
-                            setDestDirByMachine((prev) => ({ ...prev, [dest]: dir }));
+                            setDestDirByMachine((prevMap) => ({ ...prevMap, [dest]: dir }));
                             setPickingFolder(false);
                           }}
                         >
                           <span class="thumb folder"><${Icon} name="files" /></span>
                           <span class="body">
-                            <span class="title">${folderDisplayName(dir, { technical })}</span>
+                            <${FileName} className="title fn-title" name=${label} before=${prev} after=${next} lines=${2} />
                             <span class="sub">${formatPathForDisplay(dir, { technical })}</span>
                           </span>
                           <span class="check" aria-hidden="true"></span>
                         </button>
-                      `,
-                    )}
-                  </div>
+                      `;
+                    })}
+                  <//>
                 `
               : null}
 
             <p class="label">Browse ${formatPathForDisplay(browsePath, { technical })}</p>
             ${browseError ? html`<${Notice} error=${browseError} />` : null}
-            <div class="list">
+            <${FileNameList} className="list" lines=${2}>
               ${parentFilePath(browsePath)
                 ? html`
                     <button
@@ -483,20 +501,30 @@ export function SendToSheet({
                 : browseDirs.length === 0
                   ? html`<div class="row"><span class="body"><span class="sub">No subfolders here.</span></span></div>`
                   : browseDirs.map(
-                      (d) => html`
+                      (d, idx) => html`
                         <button
                           key=${d.path}
                           type="button"
                           class="row"
+                          aria-label=${d.name}
+                          title=${d.name}
                           onClick=${() => setBrowsePath(d.path)}
                         >
                           <span class="thumb folder"><${Icon} name="files" /></span>
-                          <span class="body"><span class="title">${d.name}</span></span>
+                          <span class="body">
+                            <${FileName}
+                              className="title fn-title"
+                              name=${d.name}
+                              before=${idx > 0 ? browseDirs[idx - 1].name : null}
+                              after=${idx + 1 < browseDirs.length ? browseDirs[idx + 1].name : null}
+                              lines=${2}
+                            />
+                          </span>
                           <span class="chev" aria-hidden="true">›</span>
                         </button>
                       `,
                     )}
-            </div>
+            <//>
             <div class="actions">
               <button type="button" class="btn" onClick=${() => setPickingFolder(false)}>Back</button>
               <button
@@ -608,7 +636,7 @@ export function SendToSheet({
                     >
                       <span class="thumb folder"><${Icon} name="files" /></span>
                       <span class="body">
-                        <span class="title">${chosenDirMeta.label}</span>
+                        <${FileNameSingle} className="title fn-title" name=${chosenDirMeta.label} lines=${2} />
                         <span class="sub">${chosenDirMeta.sub}</span>
                       </span>
                       <span class="chev word">Change</span>
@@ -703,6 +731,191 @@ export function SortSheet({ sortPref, kindFilter = '', onChange, onChangeKind = 
   `;
 }
 
+// ── Item sheet (long-press / context menu for any file or folder) ───────────────────────────
+
+export function ItemSheet({
+  machine,
+  entry,
+  caps,
+  deviceNoun = 'phone',
+  technical = false,
+  isStarred = false,
+  isPinned = false,
+  onStartSelect = null,
+  onSendTo = null,
+  onDownload = null,
+  onToggleStar = null,
+  onTogglePin = null,
+  onRename = null,
+  onDelete = null,
+  onClose,
+}) {
+  if (!entry) return null;
+  const fullName = entry.name || baseFileName(entry.path || '');
+  const isDir = entry.kind === 'dir';
+
+  return html`
+    <${Sheet} title=${fullName} onClose=${onClose}>
+      <div class="sheet-name-actions">
+        <${CopyButton} text=${fullName} label="Copy name" />
+        ${technical && entry.path
+          ? html`<${CopyButton} text=${machine ? `${machine}:${entry.path}` : entry.path} label="Copy path" />`
+          : null}
+      </div>
+
+      <div class="list">
+        <dl class=${technical ? 'kv' : 'kv plain'}>
+          <dt>${technical ? 'kind' : 'Kind'}</dt>
+          <dd>${plainCategoryLabel(entry)}</dd>
+          ${!isDir && entry.size != null
+            ? html`
+                <dt>${technical ? 'size' : 'Size'}</dt>
+                <dd>
+                  ${technical ? `${formatBytes(entry.size)} (${entry.size} bytes)` : formatBytes(entry.size)}
+                </dd>
+              `
+            : null}
+          ${entry.mtime
+            ? html`
+                <dt>${technical ? 'mtime' : 'Changed'}</dt>
+                <dd>${technical ? entry.mtime : formatRelativeTime(entry.mtime)}</dd>
+              `
+            : null}
+          ${machine
+            ? html`
+                <dt>${technical ? 'machine' : 'Machine'}</dt>
+                <dd>${machine}</dd>
+              `
+            : null}
+          ${technical && entry.path
+            ? html`
+                <dt>path</dt>
+                <dd>${entry.path}</dd>
+              `
+            : null}
+        </dl>
+      </div>
+
+      <div class="list spaced">
+        ${onStartSelect
+          ? html`
+              <button
+                type="button"
+                class="row"
+                onClick=${() => {
+                  onClose();
+                  onStartSelect(entry.path);
+                }}
+              >
+                <span class="body">
+                  <span class="title">Select</span>
+                  <span class="sub">Pick files to send, download, or delete</span>
+                </span>
+              </button>
+            `
+          : null}
+
+        ${!isDir && caps?.hasDownload && onDownload
+          ? html`
+              <button
+                type="button"
+                class="row"
+                onClick=${() => {
+                  onClose();
+                  onDownload(entry);
+                }}
+              >
+                <span class="body"><span class="title">Download to this ${deviceNoun}</span></span>
+              </button>
+            `
+          : null}
+
+        ${(caps?.hasTransfer || caps?.hasDownload) && onSendTo
+          ? html`
+              <button
+                type="button"
+                class="row"
+                onClick=${() => {
+                  onClose();
+                  onSendTo([entry]);
+                }}
+              >
+                <span class="body"><span class="title">Send to</span></span>
+              </button>
+            `
+          : null}
+
+        ${caps?.hasFavWrite && onToggleStar
+          ? html`
+              <button
+                type="button"
+                class="row"
+                onClick=${() => {
+                  onClose();
+                  onToggleStar(entry);
+                }}
+              >
+                <span class="body">
+                  <span class="title">${isStarred ? 'Remove from Favourites' : 'Star'}</span>
+                </span>
+              </button>
+            `
+          : null}
+
+        ${caps?.hasFavWrite && onTogglePin
+          ? html`
+              <button
+                type="button"
+                class="row"
+                onClick=${() => {
+                  onClose();
+                  onTogglePin(entry);
+                }}
+              >
+                <span class="body">
+                  <span class="title">${isPinned ? 'Unpin from Files' : 'Pin to Files'}</span>
+                  <span class="sub">
+                    ${isPinned ? 'Remove from the tiles at the top of Files' : 'Show as a tile at the top of Files'}
+                  </span>
+                </span>
+              </button>
+            `
+          : null}
+
+        ${caps?.hasMove && onRename
+          ? html`
+              <button
+                type="button"
+                class="row"
+                onClick=${() => {
+                  onClose();
+                  onRename(entry);
+                }}
+              >
+                <span class="body"><span class="title">Rename</span></span>
+              </button>
+            `
+          : null}
+
+        ${caps?.hasRemove && onDelete
+          ? html`
+              <button
+                type="button"
+                class="row"
+                onClick=${() => {
+                  onClose();
+                  onDelete([entry]);
+                }}
+              >
+                <span class="body"><span class="title" style="color:var(--bad)">Delete</span></span>
+              </button>
+            `
+          : null}
+      </div>
+    <//>
+  `;
+}
+
 // ── Folder More sheet ────────────────────────────────────────────────────────────────────────
 
 export function FolderMoreSheet({
@@ -721,8 +934,12 @@ export function FolderMoreSheet({
   onToggleHidden,
   onClose,
 }) {
+  const folderName = folderDisplayName(path);
   return html`
-    <${Sheet} title=${folderDisplayName(path)} onClose=${onClose}>
+    <${Sheet} title=${folderName} onClose=${onClose}>
+      <div class="sheet-name-actions">
+        <${CopyButton} text=${folderName} label="Copy name" />
+      </div>
       <div class="list">
         <button
           type="button"
@@ -1099,12 +1316,18 @@ export function SyncConflictsSheet({ syncFolder, link, folderChanges = null, onC
       ${conflicts.length === 0
         ? html`<div class="empty">No files have two versions right now.</div>`
         : html`
-            <div class="list">
+            <${FileNameList} className="list" lines=${2}>
               ${conflicts.map(
-                (c) => html`
-                  <div class="row" key=${c.path}>
+                (c, idx) => html`
+                  <div class="row" key=${c.path} role="group" aria-label=${c.path}>
                     <div class="body">
-                      <span class="title">${c.path}</span>
+                      <${FileName}
+                        className="title fn-title"
+                        name=${c.path}
+                        before=${idx > 0 ? conflicts[idx - 1].path : null}
+                        after=${idx + 1 < conflicts.length ? conflicts[idx + 1].path : null}
+                        lines=${2}
+                      />
                       <span class="sub wrap">${c.summary || 'Both versions are kept.'}</span>
                       <div class="row-actions">
                         <button
@@ -1128,7 +1351,7 @@ export function SyncConflictsSheet({ syncFolder, link, folderChanges = null, onC
                   </div>
                 `,
               )}
-            </div>
+            <//>
           `}
     <//>
   `;
@@ -1180,12 +1403,18 @@ export function SyncBinSheet({ syncFolder, link, folderChanges = null, onChanged
       ${entries.length === 0
         ? html`<div class="empty">The bin is empty.</div>`
         : html`
-            <div class="list">
+            <${FileNameList} className="list" lines=${2}>
               ${entries.map(
-                (item) => html`
-                  <div class="row" key=${item.path}>
+                (item, idx) => html`
+                  <div class="row" key=${item.path} role="group" aria-label=${item.path}>
                     <span class="body">
-                      <span class="title">${item.path}</span>
+                      <${FileName}
+                        className="title fn-title"
+                        name=${item.path}
+                        before=${idx > 0 ? entries[idx - 1].path : null}
+                        after=${idx + 1 < entries.length ? entries[idx + 1].path : null}
+                        lines=${2}
+                      />
                       <span class="sub">
                         ${formatBytes(item.size)} · deleted ${formatRelativeTime(item.deleted_at)}
                       </span>
@@ -1201,7 +1430,7 @@ export function SyncBinSheet({ syncFolder, link, folderChanges = null, onChanged
                   </div>
                 `,
               )}
-            </div>
+            <//>
           `}
     <//>
   `;
