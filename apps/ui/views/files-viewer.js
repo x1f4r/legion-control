@@ -167,6 +167,7 @@ export function FilesViewer({
   const [chromeHidden, setChromeHidden] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
   const [musicPlaybackRate, setMusicPlaybackRate] = useState(1);
+  const [videoZoomAction, setVideoZoomAction] = useState(null);
   const [fullscreenState, setFullscreenState] = useState({
     active: false,
     source: null,
@@ -2480,6 +2481,7 @@ export function FilesViewer({
               onOpenMore=${() => setMoreOpen(true)}
               onClose=${handleClose}
               onNavigateSibling=${onNavigateSibling}
+              onZoomActionChange=${setVideoZoomAction}
               onMediaLoadedMetadata=${(el) => applyPendingResume(expectedKey, expectedUrl, el)}
               onMediaTime=${(el) => noteMediaTime(expectedKey, el)}
               onMediaPlay=${(el) => noteMediaPlay(expectedKey, el)}
@@ -2679,6 +2681,24 @@ export function FilesViewer({
               </div>
 
               <div class="list spaced">
+                ${useVideoPlayer && isViewerFullscreen && videoZoomAction?.available
+                  ? html`
+                      <button
+                        type="button"
+                        class="row"
+                        onClick=${() => {
+                          setMoreOpen(false);
+                          videoZoomAction.toggle?.();
+                        }}
+                      >
+                        <span class="body">
+                          <span class="title">
+                            ${videoZoomAction.mode === 'fill' ? 'Fit to screen' : 'Zoom to fill'}
+                          </span>
+                        </span>
+                      </button>
+                    `
+                  : null}
                 ${usingCustomPlayer && caps?.hasDownload
                   ? html`
                       <button
