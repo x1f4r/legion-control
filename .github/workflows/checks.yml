@@ -361,3 +361,45 @@ jobs:
           set -euo pipefail
           cargo clippy -p legion-net -p legion-cli --all-targets --features move-between-places --locked -- -D warnings
           cargo test -p legion-net -p legion-cli --features move-between-places --locked
+
+  audit:
+    name: Dependency audit
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Install Rust
+        run: rustup toolchain install
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-audit
+            ~/.cargo/bin/cargo-deny
+          key: audit-tools-${{ runner.os }}-audit-0.22.2-deny-0.20.2
+      - name: Install cargo-audit and cargo-deny
+        run: |
+          set -euo pipefail
+          if [ ! -x "$HOME/.cargo/bin/cargo-audit" ]; then
+            cargo install --locked cargo-audit --version 0.22.2
+          fi
+          if [ ! -x "$HOME/.cargo/bin/cargo-deny" ]; then
+            cargo install --locked cargo-deny --version 0.20.2
+          fi
+      - name: Audit Rust dependencies (cargo-audit)
+        run: |
+          set -euo pipefail
+          cargo audit --deny warnings --file Cargo.lock
+          cargo audit --deny warnings --file apps/legion-app/src-tauri/Cargo.lock
+      - name: Check Rust advisories, licenses, bans, and sources (cargo-deny)
+        run: |
+          set -euo pipefail
+          cargo deny check
+          cargo deny --manifest-path apps/legion-app/src-tauri/Cargo.toml check
+      - name: Audit UI test dependencies (npm audit)
+        run: npm --prefix apps/ui/test audit --audit-level=low

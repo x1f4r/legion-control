@@ -203,7 +203,16 @@ cargo clippy --manifest-path apps/legion-app/src-tauri/Cargo.toml --all-targets 
 cargo test --manifest-path apps/legion-app/src-tauri/Cargo.toml --locked
 ```
 
-### Linux desktop (`.deb` and `.AppImage`)
+### Linux desktop (`.deb`, `.AppImage`, and Arch `PKGBUILD`)
+
+To build portable `.deb` and `.AppImage` bundles linked against Ubuntu 22.04's glibc 2.35 baseline
+(matching CI so they run on Debian 12/13, Ubuntu 22.04/24.04/26.04, and Arch):
+
+```sh
+bash scripts/build-linux-app-bundles.sh
+```
+
+To build directly against the host libraries instead:
 
 ```sh
 cd apps/legion-app
@@ -211,7 +220,10 @@ cargo tauri build --bundles deb,appimage
 ```
 
 Bundles land in `apps/legion-app/src-tauri/target/release/bundle/`. On systems without FUSE (such
-as CI runners), set `APPIMAGE_EXTRACT_AND_RUN=1`.
+as CI runners), set `APPIMAGE_EXTRACT_AND_RUN=1`. Verify a built `.deb` and `.AppImage` across clean
+containers with `bash scripts/legion-app-distro-test.sh debian:12 <deb> <AppImage>`. On Arch Linux,
+build a native `pacman` package with `packaging/arch/legion-app/PKGBUILD` (or
+`bash packaging/arch/build-local.sh app target/packages`).
 
 ### macOS desktop (`.app` and `.dmg`)
 
