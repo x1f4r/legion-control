@@ -2,7 +2,15 @@
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { applySearchHighlight, fitName, fitNameList, isNaturalBreak, splitNameEnding, toGraphemes } from '../file-name.js';
+import {
+  applySearchHighlight,
+  findDigitRuns,
+  fitName,
+  fitNameList,
+  isNaturalBreak,
+  splitNameEnding,
+  toGraphemes,
+} from '../file-name.js';
 
 // Deterministic fake measurer: proportional widths per grapheme so tests don't need a browser.
 function makeFakeMeasure(baseWidth = 7) {
@@ -60,16 +68,16 @@ test('toGraphemes preserves emoji ZWJ clusters, combining marks, and RTL text', 
   assert.equal(rtl.join(''), 'تسجيل_الشاشة_2026.mp4');
 });
 
-test('isNaturalBreak identifies space, _, -, ., letter/digit, and lower/upper transitions', () => {
+test('isNaturalBreak identifies space, _, -, ., letter/digit, and lower/upper outside digit runs', () => {
   const g = toGraphemes('myFile_2026-11.txt');
   const breaks = [];
   for (let i = 1; i < g.length; i += 1) {
     if (isNaturalBreak(g, i)) breaks.push(g.slice(0, i).join('') + '|' + g.slice(i).join(''));
   }
+  // `2026-11` is one atomic digit run, so there is no break at `-` inside it.
   assert.deepEqual(breaks, [
     'my|File_2026-11.txt',
     'myFile_|2026-11.txt',
-    'myFile_2026-|11.txt',
     'myFile_2026-11.|txt',
   ]);
 
@@ -79,6 +87,203 @@ test('isNaturalBreak identifies space, _, -, ., letter/digit, and lower/upper tr
     if (isNaturalBreak(ld, i)) ldBreaks.push(ld.slice(0, i).join('') + '|' + ld.slice(i).join(''));
   }
   assert.deepEqual(ldBreaks, ['Report|2026Final', 'Report2026|Final']);
+});
+
+test('exact phone (2 lines) and desktop (1 line) output for recordings, reports, and IMG photos', () => {
+  const measure = makeFakeMeasure(7);
+
+  // 1. Screen Recording 2026-11-25 at 14.03.19.mov
+  const recA = 'Screen Recording 2026-11-25 at 14.03.19.mov';
+  const recB = 'Screen Recording 2026-11-25 at 14.04.33.mov';
+  const recPhone = fitName(recA, null, recB, measure, 230, 2);
+  assertValidFit(recPhone, measure, 230, 2, 'rec phone');
+  assert.equal(recPhone.truncated, false);
+  assert.deepEqual(recPhone.lines, [
+    [{ text: 'Screen Recording 2026-11-25 at ', dim: true }],
+    [{ text: '14.03.19.mov', dim: false }],
+  ]);
+
+  const recDesktop = fitName(recA, null, recB, measure, 400, 1);
+  assertValidFit(recDesktop, measure, 400, 1, 'rec desktop');
+  assert.equal(recDesktop.truncated, false);
+  assert.deepEqual(recDesktop.lines, [
+    [
+      { text: 'Screen Recording 2026-11-25 at ', dim: true },
+      { text: '14.03.19.mov', dim: false },
+    ],
+  ]);
+
+  // 2. Quarterly_Architecture_Review_Q1_2026_Final_Approved.pdf
+  const repA = 'Quarterly_Architecture_Review_Q1_2026_Final_Approved.pdf';
+  const repB = 'Quarterly_Architecture_Review_Q2_2026_Final_Approved.pdf';
+  const repPhone = fitName(repA, null, repB, measure, 250, 2);
+  assertValidFit(repPhone, measure, 250, 2, 'rep phone');
+  assert.equal(repPhone.truncated, false);
+  assert.deepEqual(repPhone.lines, [
+    [{ text: 'Quarterly_Architecture_Review_', dim: true }],
+    [{ text: 'Q1_2026_Final_Approved.pdf', dim: false }],
+  ]);
+
+  const repDesktop = fitName(repA, null, repB, measure, 480, 1);
+  assertValidFit(repDesktop, measure, 480, 1, 'rep desktop');
+  assert.equal(repDesktop.truncated, false);
+  assert.deepEqual(repDesktop.lines, [
+    [
+      { text: 'Quarterly_Architecture_Review_', dim: true },
+      { text: 'Q1_2026_Final_Approved.pdf', dim: false },
+    ],
+  ]);
+
+  // 3. IMG_20261125_140311.jpg
+  const imgA = 'IMG_20261125_140311.jpg';
+  const imgB = 'IMG_20261125_140312.jpg';
+  // On phone list (fits 1 line) and phone grid (wraps cleanly to 2 lines):
+  const imgPhoneList = fitName(imgA, null, imgB, measure, 230, 2);
+  assertValidFit(imgPhoneList, measure, 230, 2, 'img phone list');
+  assert.deepEqual(imgPhoneList.lines, [
+    [
+      { text: 'IMG_20261125_', dim: true },
+      { text: '140311.jpg', dim: false },
+    ],
+  ]);
+
+  const imgPhoneGrid = fitName(imgA, null, imgB, measure, 110, 3);
+  assertValidFit(imgPhoneGrid, measure, 110, 3, 'img phone grid');
+  assert.deepEqual(imgPhoneGrid.lines, [
+    [{ text: 'IMG_20261125_', dim: true }],
+    [{ text: '140311.jpg', dim: false }],
+  ]);
+
+  const imgDesktop = fitName(imgA, null, imgB, measure, 400, 1);
+  assertValidFit(imgDesktop, measure, 400, 1, 'img desktop');
+  assert.deepEqual(imgDesktop.lines, [
+    [
+      { text: 'IMG_20261125_', dim: true },
+      { text: '140311.jpg', dim: false },
+    ],
+  ]);
+
+  // Emphasis does not split inside a word at letter-digit or case changes (`rev1`, camelCase).
+  const depA = 'deployment-checklist-europe-west-primary-cluster-rollout-plan-rev1';
+  const depB = 'deployment-checklist-europe-west-primary-cluster-rollout-plan-rev2';
+  const depDesktop = fitName(depA, null, depB, measure, 600, 1);
+  assert.equal(dimPrefixText(depDesktop), 'deployment-checklist-europe-west-primary-cluster-rollout-plan-');
+
+  const camelA = 'QuarterlyArchitectureReviewAlpha';
+  const camelB = 'QuarterlyArchitectureReviewBeta';
+  const camelFit = fitName(camelA, null, camelB, measure, 400, 1);
+  assert.equal(dimPrefixText(camelFit), '');
+});
+
+test('digit runs with ., :, -, and , stay atomic across wrapping, ellipsis, and emphasis', () => {
+  const measure = makeFakeMeasure(7);
+
+  // Verify findDigitRuns recognizes all four joiners and stops before non-digits.
+  for (const [sample, expectedRun] of [
+    ['clip 14.03.19.mov', '14.03.19'],
+    ['clip 14:03:19.mkv', '14:03:19'],
+    ['backup 2026-11-25.tar.gz', '2026-11-25'],
+    ['invoice 1,024.pdf', '1,024'],
+    ['release v1.4.2.zip', '1.4.2'],
+  ]) {
+    const g = toGraphemes(sample);
+    const runs = findDigitRuns(g);
+    const unique = new Set(runs.filter(Boolean));
+    assert.equal(unique.size, 1, `Expected 1 digit run in "${sample}"`);
+    const [span] = unique;
+    assert.equal(g.slice(span.start, span.end).join(''), expectedRun);
+  }
+
+  // Wrapping & emphasis never split inside a digit run for any joiner (., :, -, ,).
+  const pairs = [
+    ['Screen Recording 2026-11-25 at 14.03.19.mov', 'Screen Recording 2026-11-25 at 14.04.33.mov', '14.03.19', 'Screen Recording 2026-11-25 at '],
+    ['Meeting Audio 2026-11-25 at 14:03:19.flac', 'Meeting Audio 2026-11-25 at 14:04:33.flac', '14:03:19', 'Meeting Audio 2026-11-25 at '],
+    ['Archive Snapshot on 2026-11-25.tar.gz', 'Archive Snapshot on 2026-11-26.tar.gz', '2026-11-25', 'Archive Snapshot on '],
+    ['Quarterly Budget Total 1,024.pdf', 'Quarterly Budget Total 1,025.pdf', '1,024', 'Quarterly Budget Total '],
+    ['Production Release Build 1.4.2.zip', 'Production Release Build 1.4.3.zip', '1.4.2', 'Production Release Build '],
+  ];
+
+  for (const [a, b, run, expectedDim] of pairs) {
+    // At a tight width where line 1 could fit part of the digit run if it broke at a joiner:
+    const tightWidth = measure(expectedDim) + measure(run) * 0.6;
+    const fit2 = fitName(a, null, b, measure, tightWidth, 2);
+    assertValidFit(fit2, measure, tightWidth, 2, `wrap ${run}`);
+    assert.equal(dimPrefixText(fit2), expectedDim, `emphasis must not split ${run}`);
+    assert.ok(
+      fit2.lineTexts.some((line) => line.includes(run)),
+      `digit run ${run} was broken across lines: ${JSON.stringify(fit2.lineTexts)}`,
+    );
+
+    // Truncated 1-line: ellipsis must not land inside `run` (or inside `2026-11-25`!).
+    const fit1 = fitName(a, null, b, measure, 165, 1);
+    assertValidFit(fit1, measure, 165, 1, `trunc ${run}`);
+    assert.ok(fit1.text.includes(run), `truncated "${fit1.text}" must keep ${run} intact`);
+    assert.ok(!fit1.text.includes('…11-25') && !fit1.text.includes('2026-…'), `ellipsis landed inside date in "${fit1.text}"`);
+  }
+
+  // Leading digit run shared lead: `2026-11-25_...` keeps the whole date or drops it cleanly, never `2026-1…`.
+  const dateLeadA = '2026-11-25_camera_roll_export_selected_01.jpg';
+  const dateLeadB = '2026-11-25_camera_roll_export_selected_02.jpg';
+  for (const w of [140, 175, 220]) {
+    const fit = fitName(dateLeadA, null, dateLeadB, measure, w, 1);
+    assertValidFit(fit, measure, w, 1, `date lead @${w}`);
+    assert.ok(
+      !fit.text.startsWith('2026-1…') && !fit.text.startsWith('2026-…'),
+      `ellipsis must not cut leading date in "${fit.text}"`,
+    );
+  }
+
+  // A single digit run longer than the line falls back cleanly without overflowing `width`.
+  const hugeRun = '2026-11-25-14.03.19.000.123456.789012';
+  const huge2 = fitName(hugeRun, null, null, measure, 140, 2);
+  assertValidFit(huge2, measure, 140, 2, 'huge digit run 2-line');
+  assert.equal(huge2.truncated, false);
+  assert.equal(huge2.lines.length, 2);
+  assert.equal(huge2.text, hugeRun);
+
+  const huge1 = fitName(`${hugeRun}.log`, null, null, measure, 140, 1);
+  assertValidFit(huge1, measure, 140, 1, 'huge digit run 1-line');
+  assert.equal(huge1.truncated, true);
+  assert.ok(huge1.text.endsWith('6.789012.log'), `huge digit run ending missing: "${huge1.text}"`);
+});
+
+test('wrap break priority prefers space in last 40%, then _/-, then ., then letter-digit/case, inside word last', () => {
+  const measure = makeFakeMeasure(7);
+
+  // Space inside last 40% beats a later `_`.
+  const s1 = 'Project summary report_final_v2.pdf';
+  // Line 1 fits "Project summary report_final_" (~195px), "Project summary " (~107px), width 170px:
+  // "Project summary " is 107/170 = 63% >= 60%, so space wins over "report_" (150px).
+  const f1 = fitName(s1, null, null, measure, 170, 2);
+  assertValidFit(f1, measure, 170, 2, 'space in last 40%');
+  assert.deepEqual(f1.lineTexts, ['Project summary ', 'report_final_v2.pdf']);
+
+  // Space BEFORE 60% yields to `_` in the last 40%.
+  const s2 = 'My annual_architecture_review_draft.pdf';
+  // "My " (~20px, 11% < 60%) vs "My annual_architecture_" (~153px, 85% >= 60%).
+  const f2 = fitName(s2, null, null, measure, 180, 2);
+  assertValidFit(f2, measure, 180, 2, '_ beats early space');
+  assert.deepEqual(f2.lineTexts, ['My annual_architecture_', 'review_draft.pdf']);
+
+  // `_` or `-` in last 40% beats `.` and camelCase.
+  const s3 = 'deploy-cluster.nodeAlphaBeta.yaml';
+  // Width 155px: "deploy-" is ~48px (31% < 60%), "deploy-cluster." is ~98px (63% >= 60%) -> `.` wins over camelCase "Alpha".
+  const f3 = fitName(s3, null, null, measure, 155, 2);
+  assertValidFit(f3, measure, 155, 2, 'dot beats camelCase');
+  assert.deepEqual(f3.lineTexts, ['deploy-cluster.', 'nodeAlphaBeta.yaml']);
+
+  // Letter-digit / case change beats breaking inside a word.
+  const s4 = 'QuarterlyReportFinalSummary.pdf';
+  const f4 = fitName(s4, null, null, measure, 145, 2);
+  assertValidFit(f4, measure, 145, 2, 'camelCase beats mid-word');
+  assert.deepEqual(f4.lineTexts, ['QuarterlyReportFinal', 'Summary.pdf']);
+
+  // `_` or `-` in last 40% beats `.` when both fit on line 1.
+  const s5 = 'cluster-node_primary.config.yaml';
+  // "cluster-node_" (~86px, 66% >= 60% of 130px) beats "cluster-node_primary." (~130px? use 142px where both fit).
+  const f5 = fitName(s5, null, null, measure, 142, 2);
+  assertValidFit(f5, measure, 142, 2, '_ beats dot in last 40%');
+  assert.deepEqual(f5.lineTexts, ['cluster-node_', 'primary.config.yaml']);
 });
 
 test('splitNameEnding handles normal files, extensionless names, dotfiles, and multi-dot names', () => {
@@ -322,7 +527,7 @@ test('property test: generated sets with shared leads and shared endings across 
   ];
   const middles = [
     'Q1', 'Q2', 'Q3', 'Q4', 'alpha', 'beta', 'gamma', 'delta',
-    'draft_01', 'draft_02', 'revA', 'revB', 'node01', 'node02', 'Final', 'final',
+    'draft_01', 'draft_02', '14.03.19', '14:04:33', '1.4.2', '1,024', 'revA', 'revB', 'Final', 'final',
   ];
   const tails = [
     '_2026_Final_Approved',
@@ -391,9 +596,18 @@ test('property test: generated sets with shared leads and shared endings across 
           }
           seenDrawn.set(res.text, orig);
 
-          // Invariant 2: the ending (extension + 8 chars before it, or last 8 chars) is present
-          // whenever the ending itself fits in the width budget.
+          // Invariant 2: emphasis never changes inside a digit run.
           const g = toGraphemes(orig);
+          const runs = findDigitRuns(g);
+          if (res.dimChars > 0 && res.dimChars < g.length) {
+            assert.ok(
+              !(runs[res.dimChars - 1] !== null && runs[res.dimChars - 1] === runs[res.dimChars]),
+              `Emphasis changed inside digit run at dimChars=${res.dimChars} in ${ctx}`,
+            );
+          }
+
+          // Invariant 3: the ending (extension + 8 chars before it, or last 8 chars) is present
+          // whenever the ending itself fits in the width budget.
           const { endingStart } = splitNameEnding(g);
           const endingStr = g.slice(endingStart).join('');
           if (measure(`…${endingStr}`) <= width * maxLines * 0.78) {
