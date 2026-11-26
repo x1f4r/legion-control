@@ -48,11 +48,11 @@ const IDLE_CONTENT_REAP_INTERVAL: Duration = Duration::from_secs(10);
 /// Maximum time a content read waits for a pipe from the per-target pool before returning `503`.
 const CONTENT_PIPE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Initial bounded window requested on a remote content read for fast time to first byte.
+/// Initial bounded window requested on an unbounded remote content read for fast time to first byte.
 const INITIAL_REMOTE_CONTENT_WINDOW: u64 = 256 * 1024;
 
 /// Maximum bounded window requested per remote content read before returning the pipe to the pool.
-const MAX_REMOTE_CONTENT_WINDOW: u64 = 1024 * 1024;
+const MAX_REMOTE_CONTENT_WINDOW: u64 = 4 * 1024 * 1024;
 
 /// Tuning options for [`Fleet`], primarily for tests that shorten idle TTLs or acquire timeouts.
 #[derive(Clone, Copy, Debug)]
@@ -2766,7 +2766,7 @@ const REMOTE_MAX_REPLY_LINE: usize = 1024 * 1024;
 const REMOTE_MAX_DONE_LINE: usize = 256;
 const REMOTE_MAX_NOISE_LINES: usize = 64;
 const REMOTE_MAX_NOISE_BYTES: usize = 64 * 1024;
-const REMOTE_STREAM_BUF: usize = 64 * 1024;
+const REMOTE_STREAM_BUF: usize = 256 * 1024;
 
 struct ActiveRemotePipe {
     stdin: tokio::process::ChildStdin,
@@ -3135,7 +3135,7 @@ impl Fleet {
 
         let holder = req.holder.as_deref().unwrap_or(&req.principal);
         let first_window_len = req.length.map_or(INITIAL_REMOTE_CONTENT_WINDOW, |n| {
-            n.min(INITIAL_REMOTE_CONTENT_WINDOW)
+            n.min(MAX_REMOTE_CONTENT_WINDOW)
         });
         let opened = self
             .open_remote_window(
@@ -3222,7 +3222,9 @@ impl Fleet {
             principal: req.principal.clone(),
             path: req.path.clone(),
             next_offset: ready.offset.saturating_add(ready.length),
-            next_window_bytes: (INITIAL_REMOTE_CONTENT_WINDOW * 2).min(MAX_REMOTE_CONTENT_WINDOW),
+            next_window_bytes: first_window_len
+                .saturating_mul(2)
+                .min(MAX_REMOTE_CONTENT_WINDOW),
             expected_size: ready.size,
             expected_mtime: mtime,
             expected_file_id: ready.file_id,
@@ -4918,6 +4920,162 @@ printf 'closed\n' > "{exited}"
             pipe.close(Duration::from_millis(50)).await;
         }
         drop(content_permits);
+        fleet.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_content_window_honors_bounded_range_in_one_frame_and_ramps_unbounded_reads() {
+        use tokio::io::AsyncReadExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let paths = Paths::under(dir.path().join("legion")).with_home(&home);
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::write(paths.config_file("node.toml"), "name = \"tower\"\n").unwrap();
+
+        let log_file = dir.path().join("frames.log");
+        let file_size = 6 * 1024 * 1024usize;
+        // Fake `legion stream` script that logs each requested `(offset, length)` and returns
+        // zero-filled bytes of the requested size.
+        let script = dir.path().join("window-logger.sh");
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" != "stream" ]; then
+  exit 1
+fi
+printf '{{"protocol":1}}\n'
+size={file_size}
+while IFS= read -r req; do
+  off=$(printf '%s' "$req" | sed -n 's/.*"offset":\([0-9]*\).*/\1/p')
+  [ -z "$off" ] && off=0
+  req_len=$(printf '%s' "$req" | sed -n 's/.*"length":\([0-9]*\).*/\1/p')
+  avail=$((size - off))
+  [ "$avail" -lt 0 ] && avail=0
+  if [ -z "$req_len" ] || [ "$req_len" -gt "$avail" ]; then
+    out_len=$avail
+  else
+    out_len=$req_len
+  fi
+  printf '%s %s\n' "$off" "$out_len" >> "{log_path}"
+  printf '{{"size":%s,"offset":%s,"length":%s,"mtime":{{"secs":1700000000,"nanos":0}},"keep_open":true}}\n' "$size" "$off" "$out_len"
+  head -c "$out_len" /dev/zero
+  printf '{{"done":true}}\n'
+done
+"#,
+                log_path = log_file.display()
+            ),
+        )
+        .unwrap();
+        let fleet_toml = format!(
+            "[machines.far]\ncommand = [\"/bin/sh\", {}, \"rpc\"]\n",
+            serde_json::to_string(&script.to_string_lossy().into_owned()).unwrap(),
+        );
+        std::fs::write(paths.config_file("fleet.toml"), fleet_toml).unwrap();
+
+        let node = Node::new(paths.clone(), legion_tools::registry());
+        let fleet = Fleet::new(&paths);
+
+        let read_frames = |path: &std::path::Path| -> Vec<(u64, u64)> {
+            std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .map(|l| {
+                    let mut it = l.split_whitespace();
+                    (
+                        it.next().unwrap().parse().unwrap(),
+                        it.next().unwrap().parse().unwrap(),
+                    )
+                })
+                .collect()
+        };
+
+        // 1. Bounded 1 MiB range (<= MAX_REMOTE_CONTENT_WINDOW) must issue exactly ONE frame.
+        let mut opened = fleet
+            .open_content(
+                &node,
+                ContentRequest {
+                    machine: Some("far".to_owned()),
+                    path: "/video.mp4".to_owned(),
+                    offset: 131_072,
+                    length: Some(1024 * 1024),
+                    principal: "owner".to_owned(),
+                    holder: None,
+                    door: Door::Http,
+                    audit: false,
+                    cancel: CancellationToken::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        opened.reader.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf.len(), 1024 * 1024);
+        assert_eq!(read_frames(&log_file), vec![(131_072, 1024 * 1024)]);
+
+        // 2. Bounded 5 MiB range (> MAX_REMOTE_CONTENT_WINDOW = 4 MiB) must issue 4 MiB + 1 MiB.
+        std::fs::write(&log_file, "").unwrap();
+        let mut opened = fleet
+            .open_content(
+                &node,
+                ContentRequest {
+                    machine: Some("far".to_owned()),
+                    path: "/video.mp4".to_owned(),
+                    offset: 0,
+                    length: Some(5 * 1024 * 1024),
+                    principal: "owner".to_owned(),
+                    holder: None,
+                    door: Door::Http,
+                    audit: false,
+                    cancel: CancellationToken::new(),
+                },
+            )
+            .await
+            .unwrap();
+        buf.clear();
+        opened.reader.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf.len(), 5 * 1024 * 1024);
+        assert_eq!(
+            read_frames(&log_file),
+            vec![(0, 4 * 1024 * 1024), (4 * 1024 * 1024, 1024 * 1024)]
+        );
+
+        // 3. Unbounded full read (6 MiB) starts at 256 KiB for TTFB, then doubles up to 4 MiB.
+        std::fs::write(&log_file, "").unwrap();
+        let mut opened = fleet
+            .open_content(
+                &node,
+                ContentRequest {
+                    machine: Some("far".to_owned()),
+                    path: "/video.mp4".to_owned(),
+                    offset: 0,
+                    length: None,
+                    principal: "owner".to_owned(),
+                    holder: None,
+                    door: Door::Http,
+                    audit: false,
+                    cancel: CancellationToken::new(),
+                },
+            )
+            .await
+            .unwrap();
+        buf.clear();
+        opened.reader.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf.len(), file_size);
+        assert_eq!(
+            read_frames(&log_file),
+            vec![
+                (0, 256 * 1024),
+                (256 * 1024, 512 * 1024),
+                (768 * 1024, 1024 * 1024),
+                (1792 * 1024, 2 * 1024 * 1024),
+                (3840 * 1024, 2304 * 1024),
+            ]
+        );
+
         fleet.close().await;
     }
 }
