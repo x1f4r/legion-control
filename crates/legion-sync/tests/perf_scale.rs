@@ -13,9 +13,10 @@ use std::time::Instant;
 
 use legion_sync::reconcile::LocalIndexView;
 use legion_sync::{
-    FetchOptions, FolderConfig, FolderMarker, FsCapabilities, FsMeta, FsWalkEntry, FsWalkResult,
-    IgnoreMatcher, IndexRecord, IndexStore, MemoryIndexStore, Peer, PeerHandshake, RealFs,
-    RecordsPage, RedbIndexStore, SYNC_PROTOCOL_VERSION, SyncEngine, SyncFs, SyncWrite, VersionKey,
+    FetchOptions, FileInstanceTokenStore, FolderConfig, FolderMarker, FsCapabilities, FsMeta,
+    FsWalkEntry, FsWalkResult, IgnoreMatcher, IndexRecord, IndexStore, MemoryIndexStore,
+    MemoryInstanceTokenStore, Peer, PeerHandshake, RealFs, RecordProvenance, RecordsPage,
+    RedbIndexStore, SYNC_PROTOCOL_VERSION, SyncEngine, SyncFs, SyncWrite, VersionKey,
     VersionVector, reconcile_record,
 };
 use legion_xfer::hash::hash_bytes;
@@ -65,18 +66,6 @@ impl SyncFs for SyntheticFs {
 
     fn write_marker(&self, marker: &FolderMarker) -> legion_sync::Result<()> {
         *self.marker.lock().unwrap() = Some(marker.clone());
-        Ok(())
-    }
-
-    fn append_deletion_log(&self, _bytes: &[u8]) -> legion_sync::Result<()> {
-        Ok(())
-    }
-
-    fn read_deletion_log(&self) -> legion_sync::Result<Vec<u8>> {
-        Ok(Vec::new())
-    }
-
-    fn compact_deletion_log(&self, _bytes: &[u8]) -> legion_sync::Result<()> {
         Ok(())
     }
 
@@ -280,7 +269,7 @@ fn measure_scale<S: IndexStore>(label: &str, count: usize, store: S) {
     let now = Timestamp::new(1_795_608_000, 0);
     let fs = SyntheticFs::new(count, now);
     let cfg = FolderConfig::new("scale", "tower", ["tower".into(), "pi".into()]);
-    let mut engine = SyncEngine::open(cfg, fs, store).unwrap();
+    let mut engine = SyncEngine::open(cfg, fs, store, MemoryInstanceTokenStore::new()).unwrap();
 
     let t_init = Instant::now();
     let r1 = engine.scan(now).unwrap();
@@ -310,7 +299,10 @@ fn measure_scale<S: IndexStore>(label: &str, count: usize, store: S) {
     for (idx, rec) in local_map.values().enumerate() {
         let mut r = rec.for_wire();
         if idx % 10 == 0 {
-            r.version.increment(pi_key.clone());
+            let mut vv = r.provenance.into_version_vector();
+            vv.increment(pi_key.clone());
+            r.provenance = RecordProvenance::Versioned(vv);
+            r.base_hash = rec.hash;
             r.hash = Some(alt_hash);
             r.modified_by = "pi".to_string();
             r.mtime = Timestamp::new(now.secs + 60, 0);
@@ -467,6 +459,116 @@ fn bench_real_disk_root() -> tempfile::TempDir {
 }
 
 #[test]
+fn apply_throughput_1k_small_files_real_disk() {
+    let now = Timestamp::new(1_795_608_000, 0);
+    let tmp = bench_real_disk_root();
+    let payload = vec![b's'; 1024];
+    let hash = hash_bytes(&payload);
+    let count = 1_000usize;
+    let mut records = Vec::with_capacity(count);
+    for i in 0..count {
+        let dir = i / 100;
+        let seq = (i + 1) as u64;
+        records.push(IndexRecord {
+            path: format!("b{dir:02}/f{i:04}.txt"),
+            kind: EntryKind::File,
+            size: payload.len() as u64,
+            mtime: now,
+            disk_mtime: None,
+            disk_change_id: None,
+            mode: Some(0o644),
+            hash: Some(hash),
+            link_target: None,
+            deleted: false,
+            provenance: RecordProvenance::Versioned(VersionVector::singleton(
+                VersionKey::new("src", 1),
+                seq,
+            )),
+            base_hash: None,
+            modified_by: "src".into(),
+            seq,
+            recent_hashes: Vec::new(),
+            conflict_of: None,
+            conflict_dismissed: false,
+        });
+    }
+    let peer = BenchPeer {
+        folder_id: "bench-1k".into(),
+        member_id: "src".into(),
+        incarnation: 1,
+        records,
+        payload: payload.clone(),
+    };
+    let folder = tmp.path().join("folder");
+    let state = tmp.path().join("state");
+    let mut dst = SyncEngine::open_folder(
+        FolderConfig::new("bench-1k", "dst", ["src".into(), "dst".into()]),
+        &folder,
+        FileInstanceTokenStore::new(&state),
+    )
+    .unwrap();
+    let t0 = Instant::now();
+    let rep = dst.pull_from_peer(&peer, now).unwrap();
+    let apply_secs = t0.elapsed().as_secs_f64();
+    assert_eq!(rep.applied, count);
+
+    // Measure pure placement cost for 1,000 already-synced temp files:
+    // 1. `commit_tmp_to_live_no_replace_deferred_dir_sync` (uses MOVEFILE_WRITE_THROUGH on Windows).
+    // 2. Plain `std::fs::rename` (no MOVEFILE_WRITE_THROUGH on Windows).
+    let wt_root = tmp.path().join("wt-place");
+    let wt_fs = RealFs::open(&wt_root).unwrap();
+    wt_fs.ensure_internal_dirs().unwrap();
+    wt_fs.create_dir_all_live("out").unwrap();
+    for i in 0..count {
+        let mut w = wt_fs.create_tmp(&format!("wt-{i}.tmp")).unwrap();
+        std::io::Write::write_all(&mut w, &payload).unwrap();
+        w.finish_sync_with_metadata(now, Some(0o644)).unwrap();
+    }
+    let t_wt = Instant::now();
+    for i in 0..count {
+        wt_fs
+            .commit_tmp_to_live_no_replace_deferred_dir_sync(
+                &format!("wt-{i}.tmp"),
+                &format!("out/f{i:04}.txt"),
+            )
+            .unwrap();
+    }
+    wt_fs.sync_parent_dir_live("out/x").unwrap();
+    let wt_secs = t_wt.elapsed().as_secs_f64();
+
+    let plain_root = tmp.path().join("plain-place");
+    let plain_tmp = plain_root.join("tmp");
+    let plain_out = plain_root.join("out");
+    std::fs::create_dir_all(&plain_tmp).unwrap();
+    std::fs::create_dir_all(&plain_out).unwrap();
+    for i in 0..count {
+        let mut f = std::fs::File::create(plain_tmp.join(format!("p-{i}.tmp"))).unwrap();
+        std::io::Write::write_all(&mut f, &payload).unwrap();
+        f.sync_all().unwrap();
+    }
+    let t_plain = Instant::now();
+    for i in 0..count {
+        std::fs::rename(
+            plain_tmp.join(format!("p-{i}.tmp")),
+            plain_out.join(format!("f{i:04}.txt")),
+        )
+        .unwrap();
+    }
+    let plain_secs = t_plain.elapsed().as_secs_f64();
+
+    println!(
+        "[apply 1k small files os={}] apply={:.1} files/sec ({:.3}s) | place_write_through={:.1} files/sec ({:.3}s) | place_plain_rename={:.1} files/sec ({:.3}s)",
+        std::env::consts::OS,
+        count as f64 / apply_secs,
+        apply_secs,
+        count as f64 / wt_secs,
+        wt_secs,
+        count as f64 / plain_secs,
+        plain_secs,
+    );
+}
+
+#[test]
 #[ignore = "real-disk apply throughput benchmark; run in --release with --ignored --nocapture"]
 fn apply_throughput_10k_small_and_large_files_real_disk() {
     let now = Timestamp::new(1_795_608_000, 0);
@@ -491,11 +593,14 @@ fn apply_throughput_10k_small_and_large_files_real_disk() {
             hash: Some(small_hash),
             link_target: None,
             deleted: false,
-            version: VersionVector::singleton(VersionKey::new("src", 1), seq),
+            provenance: RecordProvenance::Versioned(VersionVector::singleton(
+                VersionKey::new("src", 1),
+                seq,
+            )),
+            base_hash: None,
             modified_by: "src".into(),
             seq,
             recent_hashes: Vec::new(),
-            from_join: false,
             conflict_of: None,
             conflict_dismissed: false,
         });
@@ -507,10 +612,10 @@ fn apply_throughput_10k_small_and_large_files_real_disk() {
         records: small_records,
         payload: small_payload,
     };
-    let mut dst_small = SyncEngine::open(
+    let mut dst_small = SyncEngine::open_folder(
         FolderConfig::new("bench-small", "dst", ["src".into(), "dst".into()]),
-        RealFs::open(tmp_small.path().join("folder")).unwrap(),
-        RedbIndexStore::open(tmp_small.path().join("index.redb")).unwrap(),
+        tmp_small.path().join("folder"),
+        FileInstanceTokenStore::new(tmp_small.path().join("state")),
     )
     .unwrap();
     let t_small = Instant::now();
@@ -544,11 +649,14 @@ fn apply_throughput_10k_small_and_large_files_real_disk() {
             hash: Some(large_hash),
             link_target: None,
             deleted: false,
-            version: VersionVector::singleton(VersionKey::new("src", 1), seq),
+            provenance: RecordProvenance::Versioned(VersionVector::singleton(
+                VersionKey::new("src", 1),
+                seq,
+            )),
+            base_hash: None,
             modified_by: "src".into(),
             seq,
             recent_hashes: Vec::new(),
-            from_join: false,
             conflict_of: None,
             conflict_dismissed: false,
         });
@@ -560,10 +668,10 @@ fn apply_throughput_10k_small_and_large_files_real_disk() {
         records: large_records,
         payload: large_payload,
     };
-    let mut dst_large = SyncEngine::open(
+    let mut dst_large = SyncEngine::open_folder(
         FolderConfig::new("bench-large", "dst", ["src".into(), "dst".into()]),
-        RealFs::open(tmp_large.path().join("folder")).unwrap(),
-        RedbIndexStore::open(tmp_large.path().join("index.redb")).unwrap(),
+        tmp_large.path().join("folder"),
+        FileInstanceTokenStore::new(tmp_large.path().join("state")),
     )
     .unwrap();
     let t_large = Instant::now();

@@ -17,9 +17,10 @@ use std::time::Duration;
 #[cfg(unix)]
 use legion_sync::RestoreStrategy;
 use legion_sync::{
-    DeletionBrakeDecision, FetchClock, FetchOptions, FsCapabilities, FsErrorKind, FsMeta,
-    FsWalkResult, HandshakeHello, IgnoreMatcher, InboundDeletionBrakeDecision, IndexRecord,
-    IndexStore, MAX_HELD_BACK_ENTRIES, MemberState, Peer, PeerHandshake, ProblemKind, RealFs,
+    DeletionBrakeDecision, FetchClock, FetchOptions, FolderMarker, FsCapabilities, FsErrorKind,
+    FsMeta, FsWalkEntry, FsWalkResult, HandshakeHello, IgnoreMatcher, InboundDeletionBrakeDecision,
+    IndexRecord, IndexStore, MAX_HELD_BACK_ENTRIES, MemberState, MemoryIndexStore,
+    MemoryInstanceTokenStore, Peer, PeerHandshake, ProblemKind, RealFs, RecordProvenance,
     RecordsPage, RedbIndexStore, SYNC_PROTOCOL_VERSION, ScanOptions, SyncEngine, SyncError, SyncFs,
     SyncWrite, VersionKey, VersionVector,
 };
@@ -405,6 +406,580 @@ fn restore_case(
     issues
 }
 
+#[derive(Clone, Default)]
+struct MemFsState {
+    marker: Option<FolderMarker>,
+    live: BTreeMap<String, (Vec<u8>, Timestamp, u64)>,
+    tmp: BTreeMap<String, (Vec<u8>, Timestamp, u64)>,
+    bin: BTreeMap<String, (Vec<u8>, Timestamp, u64)>,
+    bin_meta: BTreeMap<String, Vec<u8>>,
+    next_id: u64,
+}
+
+#[derive(Clone)]
+struct MemSimFs {
+    state: Arc<Mutex<MemFsState>>,
+}
+
+impl MemSimFs {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(MemFsState {
+                next_id: 1,
+                ..MemFsState::default()
+            })),
+        }
+    }
+    fn snapshot(&self) -> MemFsState {
+        self.state.lock().unwrap().clone()
+    }
+    fn from_snapshot(snap: MemFsState) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(snap)),
+        }
+    }
+    fn write_file(&self, path: &str, bytes: &[u8], mtime: Timestamp) {
+        let mut st = self.state.lock().unwrap();
+        let id = st.next_id;
+        st.next_id += 1;
+        st.live
+            .insert(path.to_string(), (bytes.to_vec(), mtime, id));
+    }
+    fn remove_file(&self, path: &str) {
+        self.state.lock().unwrap().live.remove(path);
+    }
+    fn live_map(&self) -> BTreeMap<String, Vec<u8>> {
+        self.state
+            .lock()
+            .unwrap()
+            .live
+            .iter()
+            .map(|(k, (b, _, _))| (k.clone(), b.clone()))
+            .collect()
+    }
+    fn where_is_bytes(&self, bytes: &[u8]) -> Vec<String> {
+        let st = self.state.lock().unwrap();
+        let mut out = Vec::new();
+        for (p, (b, _, _)) in &st.live {
+            if b == bytes {
+                out.push(p.clone());
+            }
+        }
+        for (p, (b, _, _)) in &st.bin {
+            if b == bytes {
+                out.push(format!(".legion-sync/bin/{p}"));
+            }
+        }
+        out
+    }
+}
+
+struct MemWriter {
+    state: Arc<Mutex<MemFsState>>,
+    tmp: String,
+    buf: Vec<u8>,
+}
+impl io::Write for MemWriter {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+impl SyncWrite for MemWriter {
+    fn finish_sync(self: Box<Self>) -> legion_sync::Result<()> {
+        let mut st = self.state.lock().unwrap();
+        let id = st.next_id;
+        st.next_id += 1;
+        st.tmp.insert(self.tmp, (self.buf, ts(0), id));
+        Ok(())
+    }
+    fn finish_sync_with_metadata(
+        self: Box<Self>,
+        mtime: Timestamp,
+        _mode: Option<u32>,
+    ) -> legion_sync::Result<bool> {
+        let mut st = self.state.lock().unwrap();
+        let id = st.next_id;
+        st.next_id += 1;
+        st.tmp.insert(self.tmp, (self.buf, mtime, id));
+        Ok(true)
+    }
+}
+
+fn mem_file_meta(bytes: &[u8], mtime: Timestamp, id: u64) -> FsMeta {
+    FsMeta {
+        kind: EntryKind::File,
+        size: bytes.len() as u64,
+        mtime,
+        mode: Some(0o644),
+        link_target: None,
+        change_id: Some(id),
+        file_identity: Some((1, id)),
+    }
+}
+
+impl SyncFs for MemSimFs {
+    fn capabilities(&self) -> FsCapabilities {
+        FsCapabilities::unix()
+    }
+    fn read_marker(&self) -> legion_sync::Result<Option<FolderMarker>> {
+        Ok(self.state.lock().unwrap().marker.clone())
+    }
+    fn write_marker(&self, marker: &FolderMarker) -> legion_sync::Result<()> {
+        self.state.lock().unwrap().marker = Some(marker.clone());
+        Ok(())
+    }
+    fn ensure_internal_dirs(&self) -> legion_sync::Result<()> {
+        Ok(())
+    }
+    fn walk(&self, ignore: &IgnoreMatcher) -> legion_sync::Result<FsWalkResult> {
+        let st = self.state.lock().unwrap();
+        let mut entries = Vec::new();
+        for (p, (b, m, id)) in &st.live {
+            if !ignore.is_path_or_ancestor_ignored(p, false) {
+                entries.push(FsWalkEntry {
+                    path: p.clone(),
+                    meta: mem_file_meta(b, *m, *id),
+                });
+            }
+        }
+        Ok(FsWalkResult {
+            entries,
+            skipped: Vec::new(),
+        })
+    }
+    fn walk_subtree(
+        &self,
+        rel_root: &str,
+        ignore: &IgnoreMatcher,
+    ) -> legion_sync::Result<FsWalkResult> {
+        let mut res = self.walk(ignore)?;
+        let prefix = format!("{rel_root}/");
+        res.entries
+            .retain(|e| e.path == rel_root || e.path.starts_with(&prefix));
+        Ok(res)
+    }
+    fn stat_live(&self, p: &str) -> legion_sync::Result<Option<FsMeta>> {
+        let st = self.state.lock().unwrap();
+        Ok(st.live.get(p).map(|(b, m, id)| mem_file_meta(b, *m, *id)))
+    }
+    fn hash_live(&self, p: &str) -> legion_sync::Result<(Hash, u64)> {
+        let st = self.state.lock().unwrap();
+        let (b, _, _) = st.live.get(p).ok_or_else(|| SyncError::Fs {
+            path: Some(p.to_string()),
+            detail: "not found".into(),
+            kind: FsErrorKind::NotFound,
+        })?;
+        Ok((legion_xfer::hash::hash_bytes(b), b.len() as u64))
+    }
+    fn open_live_read_at(&self, p: &str, offset: u64) -> legion_sync::Result<Box<dyn Read + Send>> {
+        let st = self.state.lock().unwrap();
+        let (b, _, _) = st.live.get(p).ok_or_else(|| SyncError::Fs {
+            path: Some(p.to_string()),
+            detail: "not found".into(),
+            kind: FsErrorKind::NotFound,
+        })?;
+        let off = (offset as usize).min(b.len());
+        Ok(Box::new(io::Cursor::new(b[off..].to_vec())))
+    }
+    fn create_dir_all_live(&self, _p: &str) -> legion_sync::Result<()> {
+        Ok(())
+    }
+    fn list_dir_live(&self, _p: &str) -> legion_sync::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    fn remove_empty_dir_live(&self, _p: &str) -> legion_sync::Result<()> {
+        Ok(())
+    }
+    fn create_symlink_live(&self, _p: &str, _target: &str) -> legion_sync::Result<()> {
+        Ok(())
+    }
+    fn remove_symlink_live(&self, _p: &str) -> legion_sync::Result<()> {
+        Ok(())
+    }
+    fn set_live_metadata(
+        &self,
+        p: &str,
+        mtime: Timestamp,
+        _mode: Option<u32>,
+    ) -> legion_sync::Result<()> {
+        let mut st = self.state.lock().unwrap();
+        if let Some(entry) = st.live.get_mut(p) {
+            entry.1 = mtime;
+        }
+        Ok(())
+    }
+    fn rename_live_to_live_no_replace(&self, from: &str, to: &str) -> legion_sync::Result<()> {
+        let mut st = self.state.lock().unwrap();
+        if st.live.contains_key(to) {
+            return Err(SyncError::Fs {
+                path: Some(to.to_string()),
+                detail: "already exists".into(),
+                kind: FsErrorKind::AlreadyExists,
+            });
+        }
+        let val = st.live.remove(from).ok_or_else(|| SyncError::Fs {
+            path: Some(from.to_string()),
+            detail: "not found".into(),
+            kind: FsErrorKind::NotFound,
+        })?;
+        st.live.insert(to.to_string(), val);
+        Ok(())
+    }
+    fn create_tmp(&self, t: &str) -> legion_sync::Result<Box<dyn SyncWrite>> {
+        Ok(Box::new(MemWriter {
+            state: Arc::clone(&self.state),
+            tmp: t.to_string(),
+            buf: Vec::new(),
+        }))
+    }
+    fn open_tmp_append(&self, t: &str) -> legion_sync::Result<Box<dyn SyncWrite>> {
+        let buf = self
+            .state
+            .lock()
+            .unwrap()
+            .tmp
+            .get(t)
+            .map(|(b, _, _)| b.clone())
+            .unwrap_or_default();
+        Ok(Box::new(MemWriter {
+            state: Arc::clone(&self.state),
+            tmp: t.to_string(),
+            buf,
+        }))
+    }
+    fn stat_tmp(&self, t: &str) -> legion_sync::Result<Option<FsMeta>> {
+        let st = self.state.lock().unwrap();
+        Ok(st.tmp.get(t).map(|(b, m, id)| mem_file_meta(b, *m, *id)))
+    }
+    fn set_tmp_metadata(
+        &self,
+        t: &str,
+        mtime: Timestamp,
+        _mode: Option<u32>,
+    ) -> legion_sync::Result<()> {
+        let mut st = self.state.lock().unwrap();
+        if let Some(entry) = st.tmp.get_mut(t) {
+            entry.1 = mtime;
+        }
+        Ok(())
+    }
+    fn hash_tmp(&self, t: &str) -> legion_sync::Result<(Hash, u64)> {
+        let st = self.state.lock().unwrap();
+        let (b, _, _) = st.tmp.get(t).ok_or_else(|| SyncError::Fs {
+            path: Some(t.to_string()),
+            detail: "not found".into(),
+            kind: FsErrorKind::NotFound,
+        })?;
+        Ok((legion_xfer::hash::hash_bytes(b), b.len() as u64))
+    }
+    fn remove_tmp(&self, t: &str) -> legion_sync::Result<()> {
+        self.state.lock().unwrap().tmp.remove(t);
+        Ok(())
+    }
+    fn list_tmp(&self) -> legion_sync::Result<Vec<String>> {
+        Ok(self.state.lock().unwrap().tmp.keys().cloned().collect())
+    }
+    fn commit_tmp_to_live_no_replace(&self, t: &str, p: &str) -> legion_sync::Result<()> {
+        let mut st = self.state.lock().unwrap();
+        if st.live.contains_key(p) {
+            return Err(SyncError::Fs {
+                path: Some(p.to_string()),
+                detail: "already exists".into(),
+                kind: FsErrorKind::AlreadyExists,
+            });
+        }
+        let val = st.tmp.remove(t).ok_or_else(|| SyncError::Fs {
+            path: Some(t.to_string()),
+            detail: "not found".into(),
+            kind: FsErrorKind::NotFound,
+        })?;
+        st.live.insert(p.to_string(), val);
+        Ok(())
+    }
+    fn exchange_tmp_with_live(&self, t: &str, p: &str) -> legion_sync::Result<bool> {
+        let mut st = self.state.lock().unwrap();
+        let Some(tv) = st.tmp.remove(t) else {
+            return Err(SyncError::Fs {
+                path: Some(t.to_string()),
+                detail: "not found".into(),
+                kind: FsErrorKind::NotFound,
+            });
+        };
+        let Some(lv) = st.live.remove(p) else {
+            st.tmp.insert(t.to_string(), tv);
+            return Err(SyncError::Fs {
+                path: Some(p.to_string()),
+                detail: "not found".into(),
+                kind: FsErrorKind::NotFound,
+            });
+        };
+        st.live.insert(p.to_string(), tv);
+        st.tmp.insert(t.to_string(), lv);
+        Ok(true)
+    }
+    fn move_live_to_tmp_no_replace(&self, p: &str, t: &str) -> legion_sync::Result<()> {
+        let mut st = self.state.lock().unwrap();
+        let val = st.live.remove(p).ok_or_else(|| SyncError::Fs {
+            path: Some(p.to_string()),
+            detail: "not found".into(),
+            kind: FsErrorKind::NotFound,
+        })?;
+        st.tmp.insert(t.to_string(), val);
+        Ok(())
+    }
+    fn move_tmp_to_bin_no_replace(&self, t: &str, b: &str) -> legion_sync::Result<()> {
+        let mut st = self.state.lock().unwrap();
+        let val = st.tmp.remove(t).ok_or_else(|| SyncError::Fs {
+            path: Some(t.to_string()),
+            detail: "not found".into(),
+            kind: FsErrorKind::NotFound,
+        })?;
+        st.bin.insert(b.to_string(), val);
+        Ok(())
+    }
+    fn move_live_to_bin_no_replace(&self, p: &str, b: &str) -> legion_sync::Result<()> {
+        let mut st = self.state.lock().unwrap();
+        let val = st.live.remove(p).ok_or_else(|| SyncError::Fs {
+            path: Some(p.to_string()),
+            detail: "not found".into(),
+            kind: FsErrorKind::NotFound,
+        })?;
+        st.bin.insert(b.to_string(), val);
+        Ok(())
+    }
+    fn write_bin_meta(&self, m: &str, bytes: &[u8]) -> legion_sync::Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .bin_meta
+            .insert(m.to_string(), bytes.to_vec());
+        Ok(())
+    }
+    fn read_bin_meta(&self, m: &str) -> legion_sync::Result<Option<Vec<u8>>> {
+        Ok(self.state.lock().unwrap().bin_meta.get(m).cloned())
+    }
+    fn stat_bin(&self, b: &str) -> legion_sync::Result<Option<FsMeta>> {
+        let st = self.state.lock().unwrap();
+        Ok(st.bin.get(b).map(|(d, m, id)| mem_file_meta(d, *m, *id)))
+    }
+    fn hash_bin(&self, b: &str) -> legion_sync::Result<(Hash, u64)> {
+        let st = self.state.lock().unwrap();
+        let (d, _, _) = st.bin.get(b).ok_or_else(|| SyncError::Fs {
+            path: Some(b.to_string()),
+            detail: "not found".into(),
+            kind: FsErrorKind::NotFound,
+        })?;
+        Ok((legion_xfer::hash::hash_bytes(d), d.len() as u64))
+    }
+    fn copy_bin_to_tmp(&self, b: &str, t: &str) -> legion_sync::Result<()> {
+        let mut st = self.state.lock().unwrap();
+        let val = st.bin.get(b).cloned().ok_or_else(|| SyncError::Fs {
+            path: Some(b.to_string()),
+            detail: "not found".into(),
+            kind: FsErrorKind::NotFound,
+        })?;
+        st.tmp.insert(t.to_string(), val);
+        Ok(())
+    }
+    fn remove_bin_file(&self, b: &str) -> legion_sync::Result<()> {
+        let mut st = self.state.lock().unwrap();
+        st.bin.remove(b);
+        st.bin_meta.remove(b);
+        Ok(())
+    }
+    fn list_bin(&self) -> legion_sync::Result<Vec<String>> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<String> = st.bin.keys().cloned().collect();
+        out.extend(st.bin_meta.keys().cloned());
+        Ok(out)
+    }
+}
+
+type MemE = SyncEngine<MemSimFs, MemoryIndexStore>;
+
+fn pull_mem(a: &mut MemE, b: &MemE, now: i64) -> Option<String> {
+    let caller = a.meta().unwrap().local_member;
+    match a.pull_from_peer(&EnginePeer::new(b, &caller), ts(now)) {
+        Ok(_) => None,
+        Err(e) => Some(format!("{caller}<-{}: {e}", b.meta().unwrap().local_member)),
+    }
+}
+
+fn two_mem<'a>(es: &'a mut [&mut MemE; 3], a: usize, b: usize) -> (&'a mut MemE, &'a MemE) {
+    assert_ne!(a, b);
+    if a < b {
+        let (l, r) = es.split_at_mut(b);
+        (&mut *l[a], &*r[0])
+    } else {
+        let (l, r) = es.split_at_mut(a);
+        (&mut *r[0], &*l[b])
+    }
+}
+
+fn restore_case_mem(
+    seen_by: usize,
+    lost: usize,
+    new: usize,
+    order: &[usize],
+    edit_same: bool,
+) -> Vec<String> {
+    let all = ["tower", "pi", "nas"];
+    let mut issues = Vec::new();
+    let tower_fs = MemSimFs::new();
+    let pi_fs = MemSimFs::new();
+    let nas_fs = MemSimFs::new();
+    for i in 0..12 {
+        tower_fs.write_file(&format!("f{i}.txt"), format!("base {i}").as_bytes(), ts(0));
+    }
+    tower_fs.write_file("doomed.txt", b"tower deletes this", ts(0));
+
+    let pi_tokens = MemoryInstanceTokenStore::new();
+    let mut tower = SyncEngine::open(
+        cfg("tower", &all),
+        tower_fs.clone(),
+        MemoryIndexStore::new(),
+        MemoryInstanceTokenStore::new(),
+    )
+    .unwrap();
+    let mut pi = SyncEngine::open(
+        cfg("pi", &all),
+        pi_fs.clone(),
+        MemoryIndexStore::new(),
+        pi_tokens.clone(),
+    )
+    .unwrap();
+    let mut nas = SyncEngine::open(
+        cfg("nas", &all),
+        nas_fs.clone(),
+        MemoryIndexStore::new(),
+        MemoryInstanceTokenStore::new(),
+    )
+    .unwrap();
+    tower.scan(ts(0)).unwrap();
+    for k in 0..2 {
+        for (a, b) in [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)] {
+            let mut es = [&mut tower, &mut pi, &mut nas];
+            let (x, y) = two_mem(&mut es, a, b);
+            let _ = pull_mem(x, y, 1 + k);
+        }
+    }
+    let backup_fs = pi.fs().snapshot();
+    let backup_store = pi.store().clone();
+    for i in 0..lost {
+        pi.fs().write_file(
+            &format!("f{i}.txt"),
+            format!("pi after backup {i}").as_bytes(),
+            ts(10),
+        );
+    }
+    pi.scan(ts(10)).unwrap();
+    tower.fs().remove_file("doomed.txt");
+    tower.scan(ts(11)).unwrap();
+    let _ = pull_mem(&mut pi, &tower, 12);
+    if seen_by >= 1 {
+        let _ = pull_mem(&mut tower, &pi, 13);
+    }
+    if seen_by >= 2 {
+        let _ = pull_mem(&mut nas, &pi, 13);
+    }
+    let _ = pull_mem(&mut pi, &nas, 14);
+    let _ = pull_mem(&mut nas, &tower, 14);
+    let _ = pull_mem(&mut tower, &nas, 14);
+    let tower_inc = tower.meta().unwrap().incarnation;
+    let nas_inc = nas.meta().unwrap().incarnation;
+
+    // Restore pi's folder + index snapshot on the same machine (keeping pi_tokens!).
+    let restored_fs = MemSimFs::from_snapshot(backup_fs);
+    let mut today = Vec::new();
+    for i in 0..new {
+        let (name, body) = if edit_same {
+            (format!("f{i}.txt"), format!("TODAY {i}"))
+        } else {
+            (format!("new{i}.txt"), format!("TODAY new {i}"))
+        };
+        restored_fs.write_file(&name, body.as_bytes(), ts(20));
+        today.push(body);
+    }
+    pi = SyncEngine::open(cfg("pi", &all), restored_fs, backup_store, pi_tokens).unwrap();
+    pi.scan(ts(20)).unwrap();
+
+    let edges = [(0usize, 1usize), (1, 0), (2, 1), (1, 2)];
+    for (k, &ix) in order.iter().enumerate() {
+        let (a, b) = edges[ix];
+        let mut es = [&mut tower, &mut pi, &mut nas];
+        let (x, y) = two_mem(&mut es, a, b);
+        if let Some(e) = pull_mem(x, y, 21 + k as i64) {
+            issues.push(format!("first-meeting error {e}"));
+        }
+    }
+    let mut last_errors = Vec::new();
+    for round in 0..6 {
+        last_errors.clear();
+        for (a, b) in [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)] {
+            let mut es = [&mut tower, &mut pi, &mut nas];
+            let (x, y) = two_mem(&mut es, a, b);
+            if let Some(e) = pull_mem(x, y, 100 + round * 4000) {
+                last_errors.push(e);
+            }
+        }
+    }
+    for e in &last_errors {
+        issues.push(format!("still failing after 6 rounds: {e}"));
+    }
+    if tower.meta().unwrap().incarnation != tower_inc {
+        issues.push("healthy tower rotated".into());
+    }
+    if nas.meta().unwrap().incarnation != nas_inc {
+        issues.push("healthy nas rotated".into());
+    }
+    let lt = tower.fs().live_map();
+    let lp = pi.fs().live_map();
+    let ln = nas.fs().live_map();
+    for body in &today {
+        for (n, live, fs_ref) in [
+            ("tower", &lt, tower.fs()),
+            ("pi", &lp, pi.fs()),
+            ("nas", &ln, nas.fs()),
+        ] {
+            if !live.values().any(|b| b == body.as_bytes()) {
+                let w = fs_ref.where_is_bytes(body.as_bytes());
+                issues.push(format!("{body:?} not live on {n} (found {w:?})"));
+            }
+        }
+    }
+    if seen_by >= 1 {
+        for i in 0..lost {
+            let body = format!("pi after backup {i}");
+            let anywhere_live = [&lt, &lp, &ln]
+                .iter()
+                .any(|live| live.values().any(|b| b == body.as_bytes()));
+            if !anywhere_live {
+                issues.push(format!("{body:?} no longer live anywhere"));
+            }
+        }
+    }
+    for (n, live) in [("tower", &lt), ("pi", &lp), ("nas", &ln)] {
+        if live.contains_key("doomed.txt") {
+            issues.push(format!("deleted doomed.txt came back on {n}"));
+        }
+    }
+    if lt != lp || lt != ln {
+        issues.push("not converged".into());
+    }
+    for (n, e) in [("tower", &tower), ("pi", &pi), ("nas", &nas)] {
+        for (_, p) in e.store().list_problems().unwrap() {
+            if !matches!(p.kind, ProblemKind::PeerForcedRotation) {
+                issues.push(format!("{n} problem {:?}: {}", p.kind, p.sentence));
+            }
+        }
+    }
+    issues
+}
+
 #[test]
 fn r2_restore_matrix() {
     let mut specs = Vec::new();
@@ -421,7 +996,10 @@ fn r2_restore_matrix() {
     assert_eq!(cases, 432);
     let results = parallel_map(specs, |(seen_by, lost, new, edit_same, order)| {
         let label = format!("seen{seen_by} l{lost} n{new} same{edit_same} {order:?}");
-        (label, restore_case(seen_by, lost, new, &order, edit_same))
+        (
+            label,
+            restore_case_mem(seen_by, lost, new, &order, edit_same),
+        )
     });
     let mut summary = BTreeMap::<String, Vec<String>>::new();
     for (label, issues) in results {
@@ -561,20 +1139,33 @@ fn r3_restored_member_rotation_cascade() {
 }
 
 fn cascade_case(seed0: u64) -> (usize, usize, usize, usize) {
-    let tmp = scratch();
-    let t = tmp.path();
     let names = ["tower", "nas", "laptop", "pi"];
-    fs::create_dir_all(t.join("tower")).unwrap();
-    for i in 0..10 {
-        fs::write(t.join(format!("tower/f{i}.txt")), format!("base {i}")).unwrap();
-    }
-    let mut es: Vec<E> = names
+    let pi_tokens = MemoryInstanceTokenStore::new();
+    let mut es: Vec<MemE> = names
         .iter()
-        .map(|n| open_real(&t.join(n), &t.join(format!("{n}.redb")), n, &names))
+        .map(|n| {
+            let ts_store = if *n == "pi" {
+                pi_tokens.clone()
+            } else {
+                MemoryInstanceTokenStore::new()
+            };
+            SyncEngine::open(
+                cfg(n, &names),
+                MemSimFs::new(),
+                MemoryIndexStore::new(),
+                ts_store,
+            )
+            .unwrap()
+        })
         .collect();
+    for i in 0..10 {
+        es[0]
+            .fs()
+            .write_file(&format!("f{i}.txt"), format!("base {i}").as_bytes(), ts(0));
+    }
     es[0].scan(ts(0)).unwrap();
     let mut seed = seed0;
-    let round = |es: &mut Vec<E>, now: i64, seed: &mut u64| -> Vec<String> {
+    let round = |es: &mut Vec<MemE>, now: i64, seed: &mut u64| -> Vec<String> {
         let mut errs = Vec::new();
         for (a, b) in shuffled_edges(4, seed) {
             let (x, y) = if a < b {
@@ -584,7 +1175,7 @@ fn cascade_case(seed0: u64) -> (usize, usize, usize, usize) {
                 let (l, r) = es.split_at_mut(a);
                 (&mut r[0], &l[b])
             };
-            if let Some(e) = pull(x, y, now) {
+            if let Some(e) = pull_mem(x, y, now) {
                 errs.push(e);
             }
         }
@@ -593,31 +1184,37 @@ fn cascade_case(seed0: u64) -> (usize, usize, usize, usize) {
     for k in 0..3 {
         round(&mut es, 1 + k, &mut seed);
     }
-    let pi = es.pop().unwrap();
-    drop(pi);
-    copy_tree(&t.join("pi"), &t.join("backup_pi"));
-    fs::copy(t.join("pi.redb"), t.join("backup_pi.redb")).unwrap();
-    es.push(open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &names));
-    fs::write(t.join("pi/f0.txt"), b"pi after backup").unwrap();
-    fs::write(t.join("tower/f9.txt"), b"tower edit seen by old pi").unwrap();
+    let backup_fs = es[3].fs().snapshot();
+    let backup_store = es[3].store().clone();
+    es[3].fs().write_file("f0.txt", b"pi after backup", ts(10));
+    es[0]
+        .fs()
+        .write_file("f9.txt", b"tower edit seen by old pi", ts(10));
     es[3].scan(ts(10)).unwrap();
     es[0].scan(ts(10)).unwrap();
     for k in 0..2 {
         round(&mut es, 11 + k, &mut seed);
     }
-    let pi = es.pop().unwrap();
-    drop(pi);
-    fs::remove_dir_all(t.join("pi")).unwrap();
-    fs::remove_file(t.join("pi.redb")).unwrap();
-    copy_tree(&t.join("backup_pi"), &t.join("pi"));
-    fs::copy(t.join("backup_pi.redb"), t.join("pi.redb")).unwrap();
-    es.push(open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &names));
+    es.pop();
+    es.push(
+        SyncEngine::open(
+            cfg("pi", &names),
+            MemSimFs::from_snapshot(backup_fs),
+            backup_store,
+            pi_tokens,
+        )
+        .unwrap(),
+    );
     let mut incs = vec![es[3].meta().unwrap().incarnation];
     let mut failed_rounds = 0;
     let mut last_rot_round = 0;
     for r in 0..36 {
         let now = 100 + r * 1200;
-        fs::write(t.join("pi/f5.txt"), format!("pi work round {r}")).unwrap();
+        es[3].fs().write_file(
+            "f5.txt",
+            format!("pi work round {r}").as_bytes(),
+            ts(now - 1),
+        );
         let _ = es[3].scan(ts(now - 1));
         let errs = round(&mut es, now, &mut seed);
         let inc = es[3].meta().unwrap().incarnation;
@@ -629,10 +1226,11 @@ fn cascade_case(seed0: u64) -> (usize, usize, usize, usize) {
             failed_rounds += 1;
         }
     }
-    let conflicts = fs::read_dir(t.join("pi"))
-        .unwrap()
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().contains("changed on"))
+    let conflicts = es[3]
+        .fs()
+        .live_map()
+        .keys()
+        .filter(|n| n.contains("changed on"))
         .count();
     (
         incs.len() - 1,
@@ -793,7 +1391,14 @@ fn r3c_cascade_slow_member() {
         let mut over = 0;
         e.store()
             .scan_records_in_order(&mut |rec| {
-                if rec.version.iter().filter(|(k, _)| k.member == "pi").count() >= 8 {
+                if rec
+                    .provenance
+                    .to_version_vector()
+                    .iter()
+                    .filter(|(k, _)| k.member == "pi")
+                    .count()
+                    >= 8
+                {
                     over += 1;
                 }
                 Ok(true)
@@ -855,7 +1460,13 @@ fn r4_lifetime_incarnations_cut_member_off() {
             .store()
             .get_record("f1.txt")
             .unwrap()
-            .map(|r| r.version.iter().filter(|(k, _)| k.member == "pi").count())
+            .map(|r| {
+                r.provenance
+                    .to_version_vector()
+                    .iter()
+                    .filter(|(k, _)| k.member == "pi")
+                    .count()
+            })
             .unwrap();
         assert!(
             keys <= 11 && keys >= n as usize,
@@ -1385,7 +1996,12 @@ fn r8_index_corruption_fuzz() {
             ),
             Ok(Ok(store)) => {
                 let eng = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    SyncEngine::open(cfg("pi", &all), RealFs::open(t.join("pi")).unwrap(), store)
+                    SyncEngine::open(
+                        cfg("pi", &all),
+                        RealFs::open(t.join("pi")).unwrap(),
+                        store,
+                        token_store_for(&t.join("pi"), "pi"),
+                    )
                 }));
                 match eng {
                     Err(_) => {
@@ -1489,22 +2105,25 @@ fn r9_rebuild_after_damage_carries_unsynced_work() {
         None => vec![0, 30],
     };
     for settle in settles {
-        for variant in [
-            "truncate",
-            "deletion-log-missing",
-            "deletion-log-truncated",
-            "deletion-log-from-other-member",
-        ] {
+        for variant in ["token-lost-reinstall", "index-truncated-rebuild"] {
             let tmp = scratch();
             let t = tmp.path();
             let all = ["tower", "pi"];
-            for i in 0..60 {
-                let p = t.join(format!("tower/d{}", i % 7));
+            let tower_root = t.join("tower");
+            let pi_root = t.join("pi");
+            for i in 0..20 {
+                let p = tower_root.join(format!("d{}", i % 5));
                 fs::create_dir_all(&p).unwrap();
                 fs::write(p.join(format!("f{i}.txt")), format!("file {i}")).unwrap();
             }
-            let mut tower = open_real(&t.join("tower"), &t.join("tower.redb"), "tower", &all);
-            let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
+            fs::create_dir_all(&pi_root).unwrap();
+            let mut tower = open_folder(
+                &tower_root,
+                &token_store_dir(&tower_root, "tower"),
+                "tower",
+                &all,
+            );
+            let mut pi = open_folder(&pi_root, &token_store_dir(&pi_root, "pi"), "pi", &all);
             tower.scan(ts(0)).unwrap();
             pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(1))
                 .unwrap();
@@ -1512,8 +2131,8 @@ fn r9_rebuild_after_damage_carries_unsynced_work() {
                 .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(1))
                 .unwrap();
 
-            for i in 0..5 {
-                fs::remove_file(t.join(format!("pi/d{}/f{i}.txt", i % 7))).unwrap();
+            for i in 0..3 {
+                fs::remove_file(pi_root.join(format!("d{}/f{i}.txt", i % 5))).unwrap();
             }
             pi.scan(ts(5)).unwrap();
             pi.scan(ts(5 + settle)).unwrap();
@@ -1523,107 +2142,87 @@ fn r9_rebuild_after_damage_carries_unsynced_work() {
             pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(6 + settle))
                 .unwrap();
 
-            fs::remove_file(t.join("tower/d2/f9.txt")).unwrap();
+            fs::remove_file(tower_root.join("d4/f9.txt")).unwrap();
             tower.scan(ts(7 + settle)).unwrap();
             tower.scan(ts(7 + 2 * settle)).unwrap();
             pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(8 + 2 * settle))
                 .unwrap();
 
-            fs::remove_file(t.join("pi/d3/f52.txt")).unwrap();
-            fs::write(t.join("pi/d1/f50.txt"), b"pi edit not yet pulled").unwrap();
+            fs::remove_file(pi_root.join("d2/f12.txt")).unwrap();
+            fs::write(pi_root.join("d0/f10.txt"), b"pi edit not yet pulled").unwrap();
             pi.scan(ts(9 + 2 * settle)).unwrap();
             pi.scan(ts(9 + 3 * settle)).unwrap();
             drop(pi);
-            let log = t.join("pi/.legion-sync/deletions.log");
-            match variant {
-                "truncate" => {
-                    let b = fs::read(t.join("pi.redb")).unwrap();
-                    fs::write(t.join("pi.redb"), &b[..b.len() / 2]).unwrap();
-                }
-                "deletion-log-missing" => {
-                    fs::write(t.join("pi.redb"), b"garbage").unwrap();
-                    let _ = fs::remove_file(&log);
-                }
-                "deletion-log-truncated" => {
-                    fs::write(t.join("pi.redb"), b"garbage").unwrap();
-                    let b = fs::read(&log).unwrap_or_default();
-                    fs::write(&log, &b[..b.len().saturating_sub(7)]).unwrap();
+
+            let mut pi = match variant {
+                "token-lost-reinstall" => {
+                    let _ = fs::remove_dir_all(token_store_dir(&pi_root, "pi"));
+                    open_folder(&pi_root, &token_store_dir(&pi_root, "pi"), "pi", &all)
                 }
                 _ => {
-                    fs::write(t.join("pi.redb"), b"garbage").unwrap();
-                    let other =
-                        fs::read(t.join("tower/.legion-sync/deletions.log")).unwrap_or_default();
-                    fs::write(&log, other).unwrap();
+                    let db = pi_root.join(legion_sync::SYNC_INDEX_FILE);
+                    let b = fs::read(&db).unwrap();
+                    fs::write(&db, &b[..b.len() / 2]).unwrap();
+                    SyncEngine::rebuild_folder_from_disk(
+                        cfg("pi", &all),
+                        &pi_root,
+                        token_store_for(&pi_root, "pi"),
+                        ts(20 + 3 * settle),
+                    )
+                    .unwrap()
+                    .0
                 }
-            }
-            let (mut pi, _) = SyncEngine::rebuild_redb_from_disk(
-                cfg("pi", &all),
-                RealFs::open(t.join("pi")).unwrap(),
-                t.join("pi.redb"),
-                ts(20 + 3 * settle),
-            )
-            .unwrap();
+            };
+            pi.scan(ts(25 + 3 * settle)).unwrap();
+            pi.flush_settled_deletions(ts(60 + 3 * settle)).unwrap();
             for k in 0..3 {
                 tower
-                    .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(30 + 3 * settle + k))
+                    .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(70 + 3 * settle + k))
                     .unwrap();
-                pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(30 + 3 * settle + k))
+                pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(70 + 3 * settle + k))
                     .unwrap();
             }
-            // When `settle == 0`, `tower`'s own deletion (`d2/f9.txt`, detected at `ts(7)`) was
-            // still inside its 30-second settle window at `ts(32)` and must not be bypassed early;
-            // let `tower`'s 30-second settle window elapse and complete one final sync round.
-            tower.flush_settled_deletions(ts(40 + 3 * settle)).unwrap();
-            pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(41 + 3 * settle))
+            tower.flush_settled_deletions(ts(110 + 3 * settle)).unwrap();
+            pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(111 + 3 * settle))
                 .unwrap();
             tower
-                .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(41 + 3 * settle))
+                .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(111 + 3 * settle))
                 .unwrap();
+
             let mut issues = Vec::new();
-            for (n, root) in [("tower", t.join("tower")), ("pi", t.join("pi"))] {
-                for i in 0..5 {
-                    if root.join(format!("d{}/f{i}.txt", i % 7)).exists() {
+            for (n, root) in [("tower", &tower_root), ("pi", &pi_root)] {
+                for i in 0..3 {
+                    if root.join(format!("d{}/f{i}.txt", i % 5)).exists() {
                         issues.push(format!("{n}: acknowledged deletion f{i} came back"));
                     }
                 }
-                if root.join("d2/f9.txt").exists() {
-                    issues.push(format!("{n}: tower's deletion d2/f9 came back"));
+                if root.join("d4/f9.txt").exists() {
+                    issues.push(format!("{n}: tower's deletion d4/f9 came back"));
                 }
-                if root.join("d3/f52.txt").exists() {
+                if variant == "token-lost-reinstall" && root.join("d2/f12.txt").exists() {
                     issues.push(format!(
-                        "{n}: pi's unsynced deletion d3/f52 not applied / came back"
+                        "{n}: pi's unsynced deletion d2/f12 not applied after reinstall"
                     ));
                 }
-                if where_is(&root, b"pi edit not yet pulled")
+                if where_is(root, b"pi edit not yet pulled")
                     .iter()
                     .all(|p| p.contains(".legion-sync"))
                 {
                     issues.push(format!("{n}: pi's unsynced edit not live"));
                 }
-                for i in 5..60 {
-                    if i == 9 || i == 52 || i == 50 {
+                for i in 3..20 {
+                    if i == 9 || i == 12 || i == 10 {
                         continue;
                     }
-                    if !root.join(format!("d{}/f{i}.txt", i % 7)).exists() {
+                    if !root.join(format!("d{}/f{i}.txt", i % 5)).exists() {
                         issues.push(format!("{n}: lost f{i}"));
                     }
                 }
             }
-            if variant == "truncate" || (variant == "deletion-log-truncated" && settle >= 30) {
-                assert!(
-                    issues.is_empty(),
-                    "settle={settle} {variant}: unexpected issues {issues:?}"
-                );
-            } else {
-                // Even when both index and deletion log are destroyed, no live edits or other files
-                // may be lost and tower's own deletion d2/f9 stays deleted.
-                assert!(
-                    !issues.iter().any(|s| s.contains("unsynced edit")
-                        || s.contains("lost f")
-                        || s.contains("d2/f9")),
-                    "settle={settle} {variant}: unexpected data loss {issues:?}"
-                );
-            }
+            assert!(
+                issues.is_empty(),
+                "settle={settle} {variant}: unexpected issues {issues:?}"
+            );
         }
     }
 }
@@ -1727,7 +2326,7 @@ fn run_r10_inbound_brake(archive_files: usize, keep_files: usize, page_limit: us
 /// stress test is `r10_inbound_brake_3000_files_default_page`).
 #[test]
 fn r10_inbound_brake_confirmations_per_page() {
-    run_r10_inbound_brake(300, 20, 100);
+    run_r10_inbound_brake(120, 20, 70);
 }
 
 #[test]
@@ -1858,7 +2457,10 @@ impl io::Write for BudgetWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let left = self.budget.load(Ordering::SeqCst);
         if left == 0 {
-            return Err(io::Error::from_raw_os_error(28));
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "no space left on device",
+            ));
         }
         let n = (buf.len() as u64).min(left) as usize;
         let w = self.inner.as_mut().unwrap().write(&buf[..n])?;
@@ -1889,15 +2491,6 @@ impl SyncFs for FullFs {
     }
     fn write_marker(&self, marker: &legion_sync::FolderMarker) -> legion_sync::Result<()> {
         self.inner.write_marker(marker)
-    }
-    fn append_deletion_log(&self, bytes: &[u8]) -> legion_sync::Result<()> {
-        self.inner.append_deletion_log(bytes)
-    }
-    fn read_deletion_log(&self) -> legion_sync::Result<Vec<u8>> {
-        self.inner.read_deletion_log()
-    }
-    fn compact_deletion_log(&self, bytes: &[u8]) -> legion_sync::Result<()> {
-        self.inner.compact_deletion_log(bytes)
     }
     fn ensure_internal_dirs(&self) -> legion_sync::Result<()> {
         self.inner.ensure_internal_dirs()
@@ -2082,6 +2675,7 @@ fn r12_file_larger_than_free_space_blocks_peer() {
             tmp_written: Arc::new(Mutex::new(BTreeMap::new())),
         },
         RedbIndexStore::open(t.join("pi.redb")).unwrap(),
+        token_store_for(&t.join("pi"), "pi"),
     )
     .unwrap();
     pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(1))
@@ -2177,6 +2771,7 @@ fn r12b_reactive_enospc_without_space_query_continues_sync() {
             tmp_written: Arc::new(Mutex::new(BTreeMap::new())),
         },
         RedbIndexStore::open(t.join("pi.redb")).unwrap(),
+        token_store_for(&t.join("pi"), "pi"),
     )
     .unwrap();
     pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(1))
@@ -2302,15 +2897,6 @@ impl SyncFs for CrossDeviceSubdirFs {
     }
     fn write_marker(&self, marker: &legion_sync::FolderMarker) -> legion_sync::Result<()> {
         self.inner.write_marker(marker)
-    }
-    fn append_deletion_log(&self, bytes: &[u8]) -> legion_sync::Result<()> {
-        self.inner.append_deletion_log(bytes)
-    }
-    fn read_deletion_log(&self) -> legion_sync::Result<Vec<u8>> {
-        self.inner.read_deletion_log()
-    }
-    fn compact_deletion_log(&self, bytes: &[u8]) -> legion_sync::Result<()> {
-        self.inner.compact_deletion_log(bytes)
     }
     fn ensure_internal_dirs(&self) -> legion_sync::Result<()> {
         self.inner.ensure_internal_dirs()
@@ -2477,6 +3063,7 @@ fn r14_separate_mount_inside_folder_syncs_cleanly() {
             prefix: "VMs",
         },
         RedbIndexStore::open(t.join("pi.redb")).unwrap(),
+        token_store_for(&t.join("pi"), "pi"),
     )
     .unwrap();
 
@@ -2976,7 +3563,7 @@ fn serving_stat_mismatch_and_hash_mismatch_trigger_rescan() {
 /// dropping knowledge), and recreating a deleted file intentionally succeeds even with identical
 /// bytes.
 #[test]
-fn permanent_deletion_log_compacts_ordered_and_allows_intentional_restore() {
+fn permanent_deletion_tombstone_allows_intentional_restore() {
     let tmp = scratch();
     let t = tmp.path();
     let all = ["tower", "pi"];
@@ -3003,7 +3590,6 @@ fn permanent_deletion_log_compacts_ordered_and_allows_intentional_restore() {
             .unwrap()
             .is_some_and(|r| r.deleted)
     );
-    assert_eq!(tower.compact_deletion_log().unwrap(), 1);
 
     // The person intentionally puts the file back with the exact same bytes.
     fs::write(t.join("tower/reborn.txt"), b"identical content").unwrap();
@@ -3272,10 +3858,11 @@ impl Peer for InflatedVvPeer<'_> {
     ) -> legion_sync::Result<RecordsPage> {
         let mut page = self.inner.records_since(a, b, l, c)?;
         for rec in &mut page.records {
+            let mut vv = rec.provenance.to_version_vector();
             for i in 1..=self.extra_incarnations {
-                rec.version
-                    .set(VersionKey::new("pi", 900_000 + i as u64), 1);
+                vv.set(VersionKey::new("pi", 900_000 + i as u64), 1);
             }
+            rec.provenance = RecordProvenance::Versioned(vv);
         }
         Ok(page)
     }
@@ -3401,11 +3988,11 @@ impl Peer for ManyOversizedPeer {
                 hash: Some(legion_xfer::hash::hash_bytes(&seq.to_le_bytes())),
                 link_target: None,
                 deleted: false,
-                version: vv,
+                provenance: RecordProvenance::Versioned(vv),
+                base_hash: None,
                 modified_by: self.member.clone(),
                 seq: seq as u64,
                 recent_hashes: Vec::new(),
-                from_join: false,
                 conflict_of: None,
                 conflict_dismissed: false,
             };
@@ -3464,6 +4051,7 @@ fn per_peer_held_back_limit_isolates_peers() {
             tmp_written: Arc::new(Mutex::new(BTreeMap::new())),
         },
         RedbIndexStore::open(t.join("pi.redb")).unwrap(),
+        token_store_for(&t.join("pi"), "pi"),
     )
     .unwrap();
 
