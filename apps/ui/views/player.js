@@ -7,12 +7,14 @@ import { Icon } from '../icons.js';
 import {
   clampVolume,
   classifyPlayerKey,
+  computeRenderedVideoRect,
   computeVideoZoomMetrics,
   createPictureGestureRecognizer,
   createResumeStore,
   createSpaceHoldController,
   createTurnWatcher,
   createVideoController,
+  detectVideoPipSupport,
   formatMusicDisplay,
   formatPlayerTime,
   formatPositionValueText,
@@ -352,10 +354,14 @@ export function VideoPlayer({
   onClose,
   onNavigateSibling,
   onZoomActionChange = null,
+  onPipActiveChange = null,
   onMediaLoadedMetadata,
   onMediaTime,
   onMediaPlay,
   onMediaPause,
+  onMediaEnded = null,
+  onMediaPipDismiss = null,
+  onBeforeSeek = null,
   onBeforePlay,
   onMediaError,
 }) {
@@ -364,6 +370,14 @@ export function VideoPlayer({
   const scrubBarWrapRef = useRef(null);
   const onBeforePlayRef = useRef(onBeforePlay);
   onBeforePlayRef.current = onBeforePlay;
+  const onBeforeSeekRef = useRef(onBeforeSeek);
+  onBeforeSeekRef.current = onBeforeSeek;
+  const onMediaEndedRef = useRef(onMediaEnded);
+  onMediaEndedRef.current = onMediaEnded;
+  const onMediaPipDismissRef = useRef(onMediaPipDismiss);
+  onMediaPipDismissRef.current = onMediaPipDismiss;
+  const onPipActiveChangeRef = useRef(onPipActiveChange);
+  onPipActiveChangeRef.current = onPipActiveChange;
   const onMediaErrorRef = useRef(onMediaError);
   onMediaErrorRef.current = onMediaError;
   const onZoomActionChangeRef = useRef(onZoomActionChange);
@@ -414,6 +428,12 @@ export function VideoPlayer({
   const [canFs, setCanFs] = useState(() =>
     typeof link?.canImmersive === 'function' ? Boolean(link.canImmersive({ element: viewerRef?.current })) : false,
   );
+  const [pipMode, setPipMode] = useState(null);
+  const [pipActive, setPipActive] = useState(false);
+  const pipModeRef = useRef(null);
+  pipModeRef.current = pipMode;
+  const pipActiveRef = useRef(false);
+  pipActiveRef.current = pipActive;
   const [viewportSize, setViewportSize] = useState({ width: 0, height: 0 });
   const [videoDims, setVideoDims] = useState({ width: 0, height: 0 });
   const [zoomMode, setZoomMode] = useState('fit');
@@ -487,6 +507,9 @@ export function VideoPlayer({
     const dur = Number.isFinite(v.duration) && v.duration > 0 ? v.duration : durationRef.current;
     const clamped = Math.max(0, dur > 0 ? Math.min(dur, targetTime) : targetTime);
     setCurrentTime(clamped);
+    if (onBeforeSeekRef.current?.(clamped, v) === true) {
+      return;
+    }
     try {
       v.currentTime = clamped;
     } catch {
@@ -607,28 +630,40 @@ export function VideoPlayer({
     }
   }, [mediaUrl, controller]);
 
-  // Re-evaluate full-screen availability once `<video>` and `.viewer` have mounted.
+  // Re-evaluate full-screen and picture-in-picture availability once `<video>` and `.viewer` have mounted.
   useEffect(() => {
     if (typeof link?.canImmersive === 'function') {
       setCanFs(Boolean(link.canImmersive({ element: viewerRef?.current, video: videoRef.current })));
     } else {
       setCanFs(false);
     }
+    const updatePipSupport = () => {
+      setPipMode(detectVideoPipSupport({ link, video: videoRef.current }));
+    };
+    updatePipSupport();
+    const unsub = link?.nativePip?.onSupportChange?.(() => updatePipSupport());
+    return () => {
+      if (typeof unsub === 'function') unsub();
+    };
   }, [link, viewerRef, mediaUrl]);
+
+  useEffect(() => {
+    onPipActiveChangeRef.current?.(pipActive);
+  }, [pipActive]);
 
   // Sync `inert` property on overlay container so hidden controls can never be focused or pressed.
   useEffect(() => {
     const el = overlayRef.current;
     if (!el) return;
-    el.inert = !ctrl.visible;
-    if (!ctrl.visible && document.activeElement && el.contains(document.activeElement)) {
+    el.inert = !ctrl.visible || pipActive;
+    if ((!ctrl.visible || pipActive) && document.activeElement && el.contains(document.activeElement)) {
       try {
         document.activeElement.blur();
       } catch {
         // Ignore blur errors.
       }
     }
-  }, [ctrl.visible]);
+  }, [ctrl.visible, pipActive]);
 
   // Keep overlay visible while More sheet or speed popover is open.
   useEffect(() => {
@@ -637,6 +672,8 @@ export function VideoPlayer({
 
   // Screen stays on while video plays (including across a file swap while playing); released on pause/end/close.
   const effectivePlaying = pendingPlayIntent != null ? pendingPlayIntent : ctrl.playing;
+  const effectivePlayingRef = useRef(effectivePlaying);
+  effectivePlayingRef.current = effectivePlaying;
   const holdScreenOn = Boolean(effectivePlaying);
   useEffect(() => {
     link?.keepScreenOn?.(holdScreenOn);
@@ -645,7 +682,7 @@ export function VideoPlayer({
   // On mobile native apps, hiding the overlay in portrait hides system bars too ("one state")
   // through the viewer's single full-screen controller.
   useEffect(() => {
-    if (!mobileNative || isFullscreen || !fullscreenController) {
+    if (!mobileNative || isFullscreen || pipActive || !fullscreenController) {
       return;
     }
     if (!ctrl.visible) {
@@ -653,7 +690,7 @@ export function VideoPlayer({
     } else if (fullscreenController.getState().source === 'bars') {
       fullscreenController.leave();
     }
-  }, [mobileNative, isFullscreen, ctrl.visible, fullscreenController]);
+  }, [mobileNative, isFullscreen, pipActive, ctrl.visible, fullscreenController]);
 
   const enterFullscreen = useCallback(
     async (source = 'button') => {
@@ -930,16 +967,33 @@ export function VideoPlayer({
     }, HOLD_PILL_FADE_MS);
   }, [clearClockTimeout, scheduleClockTimeout]);
 
-  // Always release keep-screen-on, timers, gestures, resume position, and `<video>` on unmount.
+  // Always release keep-screen-on, PiP state, timers, gestures, resume position, and `<video>` on unmount.
   useEffect(() => {
     return () => {
       onZoomActionChangeRef.current?.(null);
+      onPipActiveChangeRef.current?.(false);
+      link?.nativePip?.sync?.({ active: false, playing: false, width: 0, height: 0, rect: null });
       recognizerRef.current?.dispose?.();
       spaceHoldRef.current?.dispose?.();
       clearClockTimeout(zoomSettleTimerRef.current);
       clearClockTimeout(zoomChipTimerRef.current);
       clearClockTimeout(holdFadeTimerRef.current);
       const v = videoRef.current;
+      if (
+        typeof document !== 'undefined' &&
+        v &&
+        document.pictureInPictureElement === v &&
+        typeof document.exitPictureInPicture === 'function'
+      ) {
+        document.exitPictureInPicture().catch(() => {});
+      }
+      if (v && v.webkitPresentationMode === 'picture-in-picture' && typeof v.webkitSetPresentationMode === 'function') {
+        try {
+          v.webkitSetPresentationMode('inline');
+        } catch {
+          // Ignore WebKit PiP exit errors on unmount.
+        }
+      }
       if (v && Number.isFinite(v.duration) && v.duration > 0) {
         resumeStore.save(identityRef.current, v.currentTime, v.duration);
       }
@@ -956,54 +1010,60 @@ export function VideoPlayer({
     };
   }, [link, resumeStore, clearClockTimeout]);
 
-  const togglePlay = useCallback(() => {
-    const v = videoRef.current;
-    controller.notifyActivity({ show: true });
-    if (
-      v &&
-      mediaUrlRef.current &&
-      (v.paused || v.ended || v.error || v.readyState < 1) &&
-      onBeforePlayRef.current?.(v) === true
-    ) {
-      wantPlayAfterSwapRef.current = true;
-      pendingPlayIntentRef.current = true;
-      setPendingPlayIntent(true);
-      controller.setError(false);
-      controller.setLoading(true);
-      return;
-    }
-    const loadingNext = !v || !mediaUrlRef.current || v.readyState < 1;
-    if (loadingNext) {
-      const nextWant = !wantPlayAfterSwapRef.current;
-      wantPlayAfterSwapRef.current = nextWant;
-      pendingPlayIntentRef.current = nextWant;
-      setPendingPlayIntent(nextWant);
-      return;
-    }
-    wantPlayAfterSwapRef.current = false;
-    pendingPlayIntentRef.current = null;
-    setPendingPlayIntent(null);
-    if (v.paused || v.ended) {
-      if (v.ended) {
-        try {
-          v.currentTime = 0;
-        } catch {
-          // Ignore seek errors.
-        }
+  const togglePlay = useCallback(
+    ({ showOverlay = true } = {}) => {
+      const v = videoRef.current;
+      if (showOverlay) {
+        controller.notifyActivity({ show: true });
       }
-      v.play().catch((err) => {
-        if (err?.name !== 'NotAllowedError' && (v.error || v.networkState === 3)) {
-          onMediaErrorRef.current?.(v);
+      if (
+        v &&
+        mediaUrlRef.current &&
+        (v.paused || v.ended || v.error || v.readyState < 1) &&
+        onBeforePlayRef.current?.(v) === true
+      ) {
+        wantPlayAfterSwapRef.current = true;
+        pendingPlayIntentRef.current = true;
+        setPendingPlayIntent(true);
+        controller.setError(false);
+        controller.setLoading(true);
+        return;
+      }
+      const loadingNext = !v || !mediaUrlRef.current || v.readyState < 1;
+      if (loadingNext) {
+        const nextWant = !wantPlayAfterSwapRef.current;
+        wantPlayAfterSwapRef.current = nextWant;
+        pendingPlayIntentRef.current = nextWant;
+        setPendingPlayIntent(nextWant);
+        return;
+      }
+      wantPlayAfterSwapRef.current = false;
+      pendingPlayIntentRef.current = null;
+      setPendingPlayIntent(null);
+      if (v.paused || v.ended) {
+        if (v.ended) {
+          try {
+            v.currentTime = 0;
+          } catch {
+            // Ignore seek errors.
+          }
         }
-      });
-    } else {
-      v.pause();
-      controller.setPlaying(false);
-    }
-  }, [controller]);
+        linkRef.current?.iosAudio?.activateSession?.();
+        v.play().catch((err) => {
+          if (err?.name !== 'NotAllowedError' && (v.error || v.networkState === 3)) {
+            onMediaErrorRef.current?.(v);
+          }
+        });
+      } else {
+        v.pause();
+        controller.setPlaying(false);
+      }
+    },
+    [controller],
+  );
 
   const seekBy = useCallback(
-    (delta) => {
+    (delta, { showOverlay = true } = {}) => {
       const v = videoRef.current;
       const st = controller.getState();
       const base =
@@ -1014,11 +1074,224 @@ export function VideoPlayer({
             : 0;
       const dur = v && Number.isFinite(v.duration) && v.duration > 0 ? v.duration : durationRef.current;
       const next = Math.max(0, dur > 0 ? Math.min(dur, base + delta) : base + delta);
-      controller.notifyActivity({ show: true });
+      if (showOverlay) {
+        controller.notifyActivity({ show: true });
+      }
       controller.beginSeek(next);
     },
     [controller],
   );
+
+  const syncAndroidPipConfig = useCallback(() => {
+    if (!link?.nativePip) return;
+    const v = videoRef.current;
+    const st = ctrlRef.current;
+    const active = Boolean(mediaUrlRef.current && !st.error && !st.loading);
+    const playing = Boolean(active && effectivePlayingRef.current && !st.ended);
+    const width = (v?.videoWidth > 0 ? v.videoWidth : videoDims.width) || 0;
+    const height = (v?.videoHeight > 0 ? v.videoHeight : videoDims.height) || 0;
+    const rect =
+      active && v && !pipActiveRef.current
+        ? computeRenderedVideoRect(v.getBoundingClientRect(), width, height)
+        : null;
+    link.nativePip.sync({ active, playing, width, height, rect });
+  }, [link, videoDims.width, videoDims.height]);
+
+  useEffect(() => {
+    if (pipMode !== 'android' || !link?.nativePip) return;
+    syncAndroidPipConfig();
+  }, [
+    pipMode,
+    link,
+    mediaUrl,
+    effectivePlaying,
+    ctrl.loading,
+    ctrl.ended,
+    ctrl.error,
+    videoDims.width,
+    videoDims.height,
+    viewportSize.width,
+    viewportSize.height,
+    isFullscreen,
+    pipActive,
+    syncAndroidPipConfig,
+  ]);
+
+  useEffect(() => {
+    if (!link?.nativePip) return undefined;
+    const unsubChange = link.nativePip.onChange(({ active, dismissed }) => {
+      if (active) {
+        setPipActive(true);
+        setSpeedOpen(false);
+        endHold2x();
+        recognizerRef.current?.reset?.();
+        spaceHoldRef.current?.cancel?.();
+      } else {
+        setPipActive(false);
+        if (dismissed) {
+          endHold2x();
+          recognizerRef.current?.reset?.();
+          spaceHoldRef.current?.cancel?.();
+          wantPlayAfterSwapRef.current = false;
+          pendingPlayIntentRef.current = null;
+          setPendingPlayIntent(null);
+          const v = videoRef.current;
+          if (v && !v.paused) {
+            try {
+              v.pause();
+            } catch {
+              // Ignore pause errors on dismissed PiP.
+            }
+          }
+          controller.setPlaying(false);
+          link.keepScreenOn?.(false);
+          const revokePromise = onMediaPipDismissRef.current?.(v);
+          Promise.resolve(revokePromise).finally(() => {
+            link.nativePip?.ackDismiss?.();
+          });
+        } else {
+          controller.notifyActivity({ show: true });
+        }
+      }
+    });
+    const unsubAction = link.nativePip.onAction(({ action }) => {
+      if (action === 'seek_back_10') {
+        seekBy(-SEEK_STEP_S, { showOverlay: false });
+      } else if (action === 'toggle_play') {
+        togglePlay({ showOverlay: false });
+      } else if (action === 'seek_fwd_10') {
+        seekBy(SEEK_STEP_S, { showOverlay: false });
+      }
+    });
+    return () => {
+      unsubChange?.();
+      unsubAction?.();
+    };
+  }, [link, controller, endHold2x, seekBy, togglePlay]);
+
+  // Standard Web Picture-in-Picture and Safari/iOS WebKit presentation-mode events.
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return undefined;
+    const onEnterWebPip = () => {
+      setPipActive(true);
+      setSpeedOpen(false);
+      endHold2x();
+    };
+    const onLeaveWebPip = () => {
+      setPipActive(false);
+      controller.notifyActivity({ show: true });
+    };
+    const onWebkitPresentation = () => {
+      const inPip = v.webkitPresentationMode === 'picture-in-picture';
+      setPipActive(inPip);
+      if (inPip) {
+        setSpeedOpen(false);
+        endHold2x();
+      } else {
+        controller.notifyActivity({ show: true });
+      }
+    };
+    v.addEventListener('enterpictureinpicture', onEnterWebPip);
+    v.addEventListener('leavepictureinpicture', onLeaveWebPip);
+    v.addEventListener('webkitpresentationmodechanged', onWebkitPresentation);
+    return () => {
+      v.removeEventListener('enterpictureinpicture', onEnterWebPip);
+      v.removeEventListener('leavepictureinpicture', onLeaveWebPip);
+      v.removeEventListener('webkitpresentationmodechanged', onWebkitPresentation);
+    };
+  }, [controller, endHold2x, mediaUrl]);
+
+  const handleTogglePip = useCallback(async () => {
+    const mode = pipModeRef.current;
+    const v = videoRef.current;
+    if (!mode || !v) return;
+    setSpeedOpen(false);
+    if (mode === 'android') {
+      syncAndroidPipConfig();
+      await link?.nativePip?.enter?.();
+      return;
+    }
+    if (mode === 'web') {
+      try {
+        if (typeof document !== 'undefined' && document.pictureInPictureElement === v) {
+          await document.exitPictureInPicture();
+        } else {
+          await v.requestPictureInPicture();
+        }
+      } catch {
+        // Ignore platform rejections (e.g. metadata still loading).
+      }
+      return;
+    }
+    if (mode === 'webkit') {
+      try {
+        const nextMode = v.webkitPresentationMode === 'picture-in-picture' ? 'inline' : 'picture-in-picture';
+        v.webkitSetPresentationMode(nextMode);
+      } catch {
+        // Ignore WebKit presentation mode rejections.
+      }
+    }
+  }, [link, syncAndroidPipConfig]);
+
+  // Desktop & Browser MediaSession metadata and actions while video plays.
+  useEffect(() => {
+    if (mobileNative || typeof navigator === 'undefined' || !navigator.mediaSession) return undefined;
+    const ms = navigator.mediaSession;
+    const setHandler = (action, fn) => {
+      try {
+        ms.setActionHandler(action, fn);
+      } catch {
+        // Ignore unsupported actions in some browsers.
+      }
+    };
+    if (!mediaUrl) return undefined;
+    if (typeof MediaMetadata === 'function') {
+      try {
+        ms.metadata = new MediaMetadata({ title: name || '' });
+      } catch {
+        // Ignore MediaMetadata errors.
+      }
+    }
+    try {
+      ms.playbackState = effectivePlaying ? 'playing' : 'paused';
+    } catch {
+      // Ignore read-only playbackState errors.
+    }
+    setHandler('play', () => {
+      const v = videoRef.current;
+      if (v && (v.paused || v.ended)) togglePlay();
+    });
+    setHandler('pause', () => {
+      const v = videoRef.current;
+      if (v && !v.paused) togglePlay();
+    });
+    setHandler('seekbackward', (details) => {
+      const offset = Number.isFinite(details?.seekOffset) && details.seekOffset > 0 ? details.seekOffset : SEEK_STEP_S;
+      seekBy(-offset);
+    });
+    setHandler('seekforward', (details) => {
+      const offset = Number.isFinite(details?.seekOffset) && details.seekOffset > 0 ? details.seekOffset : SEEK_STEP_S;
+      seekBy(offset);
+    });
+    setHandler('seekto', (details) => {
+      if (typeof details?.seekTime === 'number' && Number.isFinite(details.seekTime)) {
+        controller.beginSeek(details.seekTime);
+      }
+    });
+    setHandler('previoustrack', queue.prev && onNavigateSibling ? () => onNavigateSibling(queue.prev) : null);
+    setHandler('nexttrack', queue.next && onNavigateSibling ? () => onNavigateSibling(queue.next) : null);
+    return () => {
+      for (const action of ['play', 'pause', 'seekbackward', 'seekforward', 'seekto', 'previoustrack', 'nexttrack']) {
+        setHandler(action, null);
+      }
+      try {
+        ms.playbackState = 'none';
+      } catch {
+        // Ignore cleanup errors.
+      }
+    };
+  }, [mobileNative, mediaUrl, name, effectivePlaying, queue.prev, queue.next, togglePlay, seekBy, controller, onNavigateSibling]);
 
   const applyVolume = useCallback((nextVol) => {
     const clamped = clampVolume(nextVol);
@@ -1413,14 +1686,14 @@ export function VideoPlayer({
       ? ctrl.pendingSeekTime
       : currentTime;
   const activeVideoScale =
-    !isFullscreen || !zoomMetrics.available
+    !isFullscreen || pipActive || !zoomMetrics.available
       ? 1
       : pinchScale != null
         ? pinchScale
         : zoomMode === 'fill'
           ? zoomMetrics.fillScale
           : 1;
-  const effectiveZoomMode = isFullscreen && zoomMetrics.available ? zoomMode : 'fit';
+  const effectiveZoomMode = isFullscreen && !pipActive && zoomMetrics.available ? zoomMode : 'fit';
 
   return html`
     <div
@@ -1431,6 +1704,7 @@ export function VideoPlayer({
         ctrl.visible ? 'overlay-visible' : '',
         isFullscreen ? 'is-fullscreen' : '',
         effectiveZoomMode === 'fill' ? 'is-zoom-fill' : '',
+        pipActive ? 'pip-active' : '',
       ]
         .filter(Boolean)
         .join(' ')}
@@ -1527,11 +1801,13 @@ export function VideoPlayer({
         }}
         onPlay=${(e) => {
           if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
+          linkRef.current?.iosAudio?.activateSession?.();
           onMediaPlay?.(e.currentTarget);
           controller.setPlaying(true);
         }}
         onPlaying=${(e) => {
           if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
+          linkRef.current?.iosAudio?.activateSession?.();
           onMediaPlay?.(e.currentTarget);
           controller.setPlaying(true);
           controller.onCanPlay();
@@ -1588,6 +1864,7 @@ export function VideoPlayer({
           spaceHoldRef.current?.cancel?.();
           wantPlayAfterSwapRef.current = false;
           onMediaPause?.(e.currentTarget);
+          onMediaEndedRef.current?.(e.currentTarget);
           resumeStore.clear(identityRef.current);
           controller.setEnded(true);
         }}
@@ -1700,6 +1977,19 @@ export function VideoPlayer({
           <span class="name" role="heading" aria-level="2" aria-label=${name} title=${name}>
             <${FileNameSingle} name=${name} lines=${1} titleOnHover=${false} />
           </span>
+          ${pipMode
+            ? html`
+                <button
+                  type="button"
+                  class="btn icon player-pip-btn"
+                  aria-label=${pipActive ? 'Exit picture in picture' : 'Picture in picture'}
+                  aria-pressed=${pipActive ? 'true' : 'false'}
+                  onClick=${handleTogglePip}
+                >
+                  <${Icon} name="pip" />
+                </button>
+              `
+            : null}
           <button
             type="button"
             class="btn icon"

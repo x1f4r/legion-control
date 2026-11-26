@@ -101,6 +101,10 @@ void installWebViewCreationHooks() {
 
 - (instancetype)legion_initWithFrame:(CGRect)frame
                        configuration:(WKWebViewConfiguration *)configuration {
+  if (configuration != nil) {
+    configuration.allowsInlineMediaPlayback = YES;
+    configuration.allowsPictureInPictureMediaPlayback = YES;
+  }
   WKWebView *webView = [self legion_initWithFrame:frame configuration:configuration];
   if (webView != nil) {
     legion_ios_attach_webview((__bridge void *)webView);

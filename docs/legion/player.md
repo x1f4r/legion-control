@@ -255,9 +255,37 @@ stays active while the small player is shown and clears when dismissed. Hiding o
 desktop window (for example while transfers drain or for an update) pauses music in place so
 nothing keeps playing behind a hidden window.
 
-### Later
+### Picture in picture
 
-Picture-in-picture for video remains for a later step.
+A playing video stays visible in a small floating window when the person leaves without stopping
+it. Music never uses picture in picture.
+
+- **When it enters.** On Android, pressing Home or switching apps while a video is actively
+  playing enters picture in picture automatically; leaving while paused, loading, ended or on an
+  error does not. Everywhere the platform supports it, a picture-in-picture button sits in the
+  video player's top bar next to More. Where the platform cannot do picture in picture, the button
+  is absent (never disabled).
+- **Back inside the app** leaves full screen or closes the video as before; it never enters
+  picture in picture.
+- **Android.** `MainActivity` enables `supportsPictureInPicture`, sets the video's aspect ratio
+  clamped to Android's allowed range (`1/2.39` to `2.39/1`), supplies `sourceRectHint` from the
+  rendered video frame, enables automatic entry only while playing (`setAutoEnterEnabled` on
+  Android 12+, `onUserLeaveHint` fallback on older versions), and publishes three remote actions:
+  Back 10 seconds, Play or pause (updating its icon and label with playback state), and Forward
+  10 seconds. Inside the small window, the overlay, top bar and all other chrome hide so only the
+  picture fills the window on black. Expanding restores the player at the same position with its
+  overlay shown. Closing the small window pauses playback, releases the screen-on hold, and
+  revokes the content address so the node stream stops immediately.
+- **iPhone and iPad.** The app enables inline and picture-in-picture playback on `WKWebView`
+  (`allowsInlineMediaPlayback` and `allowsPictureInPictureMediaPlayback`), activates the
+  `.playback` audio session when video plays, and wires WebKit's `picture-in-picture` presentation
+  mode on `<video>` wherever the system allows it.
+- **Desktop and browser.** Uses the standard Picture-in-Picture API (`document.pictureInPictureEnabled`
+  and `requestPictureInPicture`), with the same top-bar button next to More (absent when
+  unsupported) and `navigator.mediaSession` actions wired while the video plays.
+- **Screen-on hold and stream lifetime.** Both follow the same rules as in full size: the screen
+  stays on only while actively playing, and the content address is revoked when playback ends or
+  when the small window is closed.
 
 ## Tests
 
@@ -269,6 +297,17 @@ Picture-in-picture for video remains for a later step.
   scrub anywhere (bar-matched travel, slower rates, 12 px cancel); 10-second seek icons centred at
   device pixel ratios 1, 2 and 3; no disabled control anywhere; queue order follows the folder's
   sort; song ends, next starts; resume and "Start over"; keys.
+- Picture in picture: on the Android emulator, starting a video and pressing Home enters the
+  pinned stack with the video's aspect ratio and only the picture visible; Back 10 s, Play/Pause
+  and Forward 10 s remote actions work; expanding returns to the player at the same position;
+  closing the small window pauses playback, stops the node stream and releases wake locks; pressing
+  Home while paused does not enter picture in picture. In the browser, the button is present only
+  when `document.pictureInPictureEnabled` is true, and entering and leaving preserve position and
+  play state.
+- Quiet when hidden or suspended: on the Android emulator with screen off and nothing playing for
+  five minutes, the node audit log records zero calls and waking triggers one refresh; in the
+  browser against `legion serve`, hiding the tab records zero calls (while an in-progress transfer
+  keeps reporting) and returning triggers one refresh.
 - Small player, single state, shuffle and repeat: leaving the song's screen keeps playing and shows
   the 56 px bar directly above the tab bar on phones and at the bottom of the main column on
   desktop with zero overlap against rows, the selection bar or tabs; absent on the song's screen,

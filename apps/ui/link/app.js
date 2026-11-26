@@ -2566,6 +2566,61 @@ export function createAppLink() {
     link.haptic = haptic;
   }
 
+  // On Android, expose native Picture-in-Picture controls over the origin-scoped bridge.
+  if (androidPlatform && typeof androidBridge()?.setPipConfig === 'function') {
+    link.nativePip = {
+      hasPip() {
+        const android = androidBridge();
+        return Boolean(android && typeof android.hasPip === 'function' && android.hasPip());
+      },
+      sync(config = {}) {
+        const android = androidBridge();
+        if (android && typeof android.setPipConfig === 'function') {
+          android.setPipConfig(config);
+        }
+      },
+      async enter() {
+        const android = androidBridge();
+        if (!android || typeof android.enterPip !== 'function') return false;
+        try {
+          return Boolean(await Promise.resolve(android.enterPip()));
+        } catch {
+          return false;
+        }
+      },
+      ackDismiss() {
+        const android = androidBridge();
+        if (android && typeof android.ackPipDismiss === 'function') {
+          android.ackPipDismiss();
+        }
+      },
+      onSupportChange(listener) {
+        if (typeof listener !== 'function' || typeof window === 'undefined') return () => {};
+        const handler = (ev) => listener(Boolean(ev?.detail?.supported));
+        window.addEventListener('legion:pip-support', handler);
+        return () => window.removeEventListener('legion:pip-support', handler);
+      },
+      onChange(listener) {
+        if (typeof listener !== 'function' || typeof window === 'undefined') return () => {};
+        const handler = (ev) => {
+          const detail = ev?.detail || {};
+          listener({ active: Boolean(detail.active), dismissed: Boolean(detail.dismissed) });
+        };
+        window.addEventListener('legion:pip-change', handler);
+        return () => window.removeEventListener('legion:pip-change', handler);
+      },
+      onAction(listener) {
+        if (typeof listener !== 'function' || typeof window === 'undefined') return () => {};
+        const handler = (ev) => {
+          const action = String(ev?.detail?.action || '');
+          if (action) listener({ action });
+        };
+        window.addEventListener('legion:pip-action', handler);
+        return () => window.removeEventListener('legion:pip-action', handler);
+      },
+    };
+  }
+
   // On iOS/iPadOS, native file-picker uploads and open-in-another-app are not yet wired; omit
   // those methods so the interface hides unsupported actions instead of showing dead controls.
   if (!iosPlatform) {

@@ -1,14 +1,25 @@
 package com.x1f4r.legion
 
 import android.app.Activity
+import android.app.PendingIntent
+import android.app.PictureInPictureParams
+import android.app.RemoteAction
 import android.Manifest
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Color
+import android.graphics.Rect
+import android.graphics.drawable.Icon
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.util.Rational
 import android.view.WindowManager
 import android.webkit.WebView
 import androidx.activity.OnBackPressedCallback
@@ -16,10 +27,12 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.RequiresApi
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.Lifecycle
 import androidx.webkit.JavaScriptReplyProxy
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
@@ -38,8 +51,30 @@ class MainActivity : TauriActivity() {
   private val pendingLocalNetworkRequests = mutableListOf<Int>()
   private val pendingNotificationCallbacks = mutableListOf<(Boolean) -> Unit>()
   private val immersiveState = ImmersiveState()
+  private val pipState = PipState()
+  private val mainHandler = Handler(Looper.getMainLooper())
+  private var pipReceiverRegistered = false
+  private var webViewKeptResumedForPip = false
+  private var pendingPipDismissCleanup = false
+  private var pendingPipDismissPauseRunnable: Runnable? = null
   @Volatile
   private var pendingOpenMusicPlayer = false
+
+  private val pipControlReceiver = object : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+      if (intent.action != ACTION_PIP_CONTROL) return
+      val action = intent.getStringExtra(EXTRA_PIP_ACTION)?.trim().orEmpty()
+      if (action.isEmpty()) return
+      val proxy = bridgeReplyProxy ?: return
+      val payload = JSONObject().apply {
+        put("type", "pip_action")
+        put("action", action)
+      }.toString()
+      runOnUiThread {
+        runCatching { proxy.postMessage(payload) }
+      }
+    }
+  }
 
   private val backCallback = object : OnBackPressedCallback(false) {
     override fun handleOnBackPressed() {
@@ -82,6 +117,112 @@ class MainActivity : TauriActivity() {
     ) == PackageManager.PERMISSION_GRANTED
   }
 
+  private fun supportsPictureInPicture(): Boolean {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return false
+    return runCatching {
+      packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)
+    }.getOrDefault(false)
+  }
+
+  @RequiresApi(Build.VERSION_CODES.O)
+  private fun buildPipActions(playing: Boolean): List<RemoteAction> {
+    fun makeAction(requestCode: Int, iconRes: Int, title: String, actionName: String): RemoteAction {
+      val intent = Intent(ACTION_PIP_CONTROL)
+        .setPackage(packageName)
+        .putExtra(EXTRA_PIP_ACTION, actionName)
+      val pending = PendingIntent.getBroadcast(
+        this,
+        requestCode,
+        intent,
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+      )
+      return RemoteAction(Icon.createWithResource(this, iconRes), title, title, pending)
+    }
+
+    val playPauseIcon = if (playing) R.drawable.ic_pip_pause else R.drawable.ic_pip_play
+    val playPauseTitle = if (playing) "Pause" else "Play"
+    return listOf(
+      makeAction(PIP_REQ_SEEK_BACK, R.drawable.ic_pip_replay_10, "Back 10 seconds", PipState.ACTION_SEEK_BACK_10),
+      makeAction(PIP_REQ_TOGGLE_PLAY, playPauseIcon, playPauseTitle, PipState.ACTION_TOGGLE_PLAY),
+      makeAction(PIP_REQ_SEEK_FWD, R.drawable.ic_pip_forward_10, "Forward 10 seconds", PipState.ACTION_SEEK_FWD_10),
+    )
+  }
+
+  @RequiresApi(Build.VERSION_CODES.O)
+  private fun buildPipParams(): PictureInPictureParams {
+    val ratio = pipState.aspectRatio()
+    val builder = PictureInPictureParams.Builder()
+      .setAspectRatio(Rational(ratio.numerator, ratio.denominator))
+      .setActions(buildPipActions(pipState.playing))
+    pipState.sourceRect?.let { rect ->
+      builder.setSourceRectHint(Rect(rect.left, rect.top, rect.right, rect.bottom))
+    }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+      builder.setAutoEnterEnabled(pipState.shouldAutoEnter())
+      builder.setSeamlessResizeEnabled(true)
+    }
+    return builder.build()
+  }
+
+  private fun applyPipParams() {
+    if (!supportsPictureInPicture()) return
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      runCatching { setPictureInPictureParams(buildPipParams()) }
+    }
+  }
+
+  private fun parsePipSourceRect(rectObj: JSONObject?): PipState.SourceRect? {
+    if (rectObj == null) return null
+    val webView = attachedWebView ?: return null
+    val loc = IntArray(2)
+    webView.getLocationOnScreen(loc)
+    val metrics = resources.displayMetrics
+    return PipState.computeSourceRect(
+      webViewLeft = loc[0],
+      webViewTop = loc[1],
+      density = metrics.density,
+      cssLeft = rectObj.optDouble("left", Double.NaN),
+      cssTop = rectObj.optDouble("top", Double.NaN),
+      cssWidth = rectObj.optDouble("width", Double.NaN),
+      cssHeight = rectObj.optDouble("height", Double.NaN),
+      screenWidth = metrics.widthPixels,
+      screenHeight = metrics.heightPixels,
+    )
+  }
+
+  private fun cancelPendingPipDismissPause() {
+    pendingPipDismissPauseRunnable?.let { mainHandler.removeCallbacks(it) }
+    pendingPipDismissPauseRunnable = null
+    pendingPipDismissCleanup = false
+  }
+
+  private fun schedulePipDismissPauseFallback() {
+    cancelPendingPipDismissPause()
+    pendingPipDismissCleanup = true
+    val runnable = Runnable {
+      pendingPipDismissPauseRunnable = null
+      pendingPipDismissCleanup = false
+      if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED) && !isInPictureInPictureMode) {
+        webViewKeptResumedForPip = false
+        attachedWebView?.onPause()
+      }
+    }
+    pendingPipDismissPauseRunnable = runnable
+    mainHandler.postDelayed(runnable, PIP_DISMISS_CLEANUP_MS)
+  }
+
+  private fun pushPipChangedToWebView(active: Boolean, dismissed: Boolean) {
+    val proxy = bridgeReplyProxy ?: return
+    val payload = JSONObject().apply {
+      put("type", "pip_changed")
+      put("active", active)
+      put("dismissed", dismissed)
+    }.toString()
+    runOnUiThread {
+      runCatching { proxy.postMessage(payload) }
+    }
+  }
+
   private fun handleBridgeMessage(raw: String, replyProxy: JavaScriptReplyProxy) {
     val msg = runCatching { JSONObject(raw) }.getOrNull() ?: return
     when (msg.optString("type")) {
@@ -94,6 +235,7 @@ class MainActivity : TauriActivity() {
           put("type", "init")
           put("insets", latestInsets.toJsonArray())
           put("hasLocalNetwork", hasLocalNetworkPermission())
+          put("hasPip", supportsPictureInPicture())
           put("model", Build.MODEL?.trim().orEmpty())
         }
         runCatching { replyProxy.postMessage(payload.toString()) }
@@ -161,6 +303,57 @@ class MainActivity : TauriActivity() {
           target.performHapticFeedback(constant)
         }
       }
+      "pip_config" -> {
+        bridgeReplyProxy = replyProxy
+        val active = msg.optBoolean("active", false)
+        val playing = msg.optBoolean("playing", false)
+        val width = msg.optInt("width", 0)
+        val height = msg.optInt("height", 0)
+        val rectObj = msg.optJSONObject("rect")
+        runOnUiThread {
+          pipState.updateConfig(
+            activeVideo = active,
+            playing = playing,
+            videoWidth = width,
+            videoHeight = height,
+            sourceRect = parsePipSourceRect(rectObj),
+          )
+          applyPipParams()
+        }
+      }
+      "enter_pip" -> {
+        bridgeReplyProxy = replyProxy
+        val requestId = msg.optInt("id", -1)
+        runOnUiThread {
+          val entered = if (
+            supportsPictureInPicture() &&
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            pipState.canEnterExplicitly() &&
+            !isInPictureInPictureMode
+          ) {
+            runCatching { enterPictureInPictureMode(buildPipParams()) }.getOrDefault(false)
+          } else {
+            isInPictureInPictureMode
+          }
+          if (requestId >= 0) {
+            val payload = JSONObject().apply {
+              put("type", "pip_enter_ack")
+              put("id", requestId)
+              put("active", entered)
+            }
+            runCatching { replyProxy.postMessage(payload.toString()) }
+          }
+        }
+      }
+      "pip_dismiss_ack" -> {
+        runOnUiThread {
+          cancelPendingPipDismissPause()
+          if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED) && !isInPictureInPictureMode) {
+            webViewKeptResumedForPip = false
+            attachedWebView?.onPause()
+          }
+        }
+      }
     }
   }
 
@@ -226,8 +419,12 @@ class MainActivity : TauriActivity() {
 
   private fun resetPlayerWindowState() {
     val transition = immersiveState.resetAll()
+    pipState.resetAll()
+    cancelPendingPipDismissPause()
+    webViewKeptResumedForPip = false
     window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     applyImmersiveTransition(transition)
+    applyPipParams()
   }
 
   fun requestNotificationPermission(callback: (Boolean) -> Unit) {
@@ -283,6 +480,15 @@ class MainActivity : TauriActivity() {
       }
     TransferBridge.setActiveActivity(this)
     AudioBridge.setActiveActivity(this)
+    if (!pipReceiverRegistered) {
+      ContextCompat.registerReceiver(
+        this,
+        pipControlReceiver,
+        IntentFilter(ACTION_PIP_CONTROL),
+        ContextCompat.RECEIVER_NOT_EXPORTED,
+      )
+      pipReceiverRegistered = true
+    }
     if (intent?.getBooleanExtra(EXTRA_OPEN_MUSIC_PLAYER, false) == true) {
       pendingOpenMusicPlayer = true
     }
@@ -404,18 +610,95 @@ class MainActivity : TauriActivity() {
     }
   }
 
+  override fun onUserLeaveHint() {
+    super.onUserLeaveHint()
+    if (
+      Build.VERSION.SDK_INT in Build.VERSION_CODES.O until Build.VERSION_CODES.S &&
+      supportsPictureInPicture() &&
+      pipState.shouldAutoEnter() &&
+      !isInPictureInPictureMode
+    ) {
+      runCatching { enterPictureInPictureMode(buildPipParams()) }
+    }
+  }
+
+  override fun onPause() {
+    super.onPause()
+    if (isInPictureInPictureMode || pipState.inPip || (supportsPictureInPicture() && pipState.shouldAutoEnter())) {
+      // WryActivity.onPause() calls WebView.onPause(), which would freeze video playback inside
+      // Picture-in-Picture mode. Keep the WebView resumed while entering or running in PiP;
+      // onStop() pauses it cleanly if the activity leaves without entering PiP (e.g. power off).
+      attachedWebView?.onResume()
+      webViewKeptResumedForPip = true
+    }
+  }
+
+  override fun onStop() {
+    super.onStop()
+    if (!isInPictureInPictureMode && !pipState.inPip && !pendingPipDismissCleanup && webViewKeptResumedForPip) {
+      webViewKeptResumedForPip = false
+      attachedWebView?.onPause()
+    }
+  }
+
+  override fun onPictureInPictureModeChanged(
+    isInPictureInPictureMode: Boolean,
+    newConfig: Configuration,
+  ) {
+    super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+    if (isInPictureInPictureMode) {
+      pipState.onPipEntered()
+      cancelPendingPipDismissPause()
+      attachedWebView?.onResume()
+      webViewKeptResumedForPip = true
+      window.decorView.setBackgroundColor(Color.BLACK)
+      attachedWebView?.setBackgroundColor(Color.BLACK)
+      pushPipChangedToWebView(active = true, dismissed = false)
+      applyPipParams()
+    } else {
+      val exitKind = pipState.onPipExited(lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED))
+      val dismissed = exitKind == PipState.ExitKind.DISMISSED
+      if (dismissed) {
+        applyKeepScreenOn(false)
+        applyPipParams()
+        schedulePipDismissPauseFallback()
+      } else {
+        cancelPendingPipDismissPause()
+        webViewKeptResumedForPip = false
+        if (immersiveState.active) {
+          reapplyImmersiveBarsIfActive()
+        } else {
+          applySystemBarStyle(newConfig)
+        }
+        ViewCompat.requestApplyInsets(window.decorView)
+      }
+      pushPipChangedToWebView(active = false, dismissed = dismissed)
+    }
+  }
+
   override fun onResume() {
     super.onResume()
+    cancelPendingPipDismissPause()
+    webViewKeptResumedForPip = false
     PluginManager.activity = this
     TransferBridge.setActiveActivity(this)
     AudioBridge.setActiveActivity(this)
     attachedWebView?.let { syncBackNavigation(it) }
     reapplyImmersiveBarsIfActive()
+    if (pipState.activeVideo) {
+      applyPipParams()
+    }
   }
 
   override fun onDestroy() {
+    cancelPendingPipDismissPause()
+    if (pipReceiverRegistered) {
+      runCatching { unregisterReceiver(pipControlReceiver) }
+      pipReceiverRegistered = false
+    }
     window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     immersiveState.resetAll()
+    pipState.resetAll()
     if (TransferBridge.currentActivity() === this) {
       TransferBridge.setActiveActivity(null)
     }
@@ -436,7 +719,10 @@ class MainActivity : TauriActivity() {
 
   override fun onConfigurationChanged(newConfig: Configuration) {
     super.onConfigurationChanged(newConfig)
-    if (immersiveState.active) {
+    if (isInPictureInPictureMode || pipState.inPip) {
+      window.decorView.setBackgroundColor(Color.BLACK)
+      attachedWebView?.setBackgroundColor(Color.BLACK)
+    } else if (immersiveState.active) {
       reapplyImmersiveBarsIfActive()
     } else {
       applySystemBarStyle(newConfig)
@@ -445,6 +731,11 @@ class MainActivity : TauriActivity() {
   }
 
   private fun applySystemBarStyle(config: Configuration) {
+    if (isInPictureInPictureMode || pipState.inPip) {
+      window.decorView.setBackgroundColor(Color.BLACK)
+      attachedWebView?.setBackgroundColor(Color.BLACK)
+      return
+    }
     if (immersiveState.active) {
       reapplyImmersiveBarsIfActive()
       return
@@ -479,6 +770,12 @@ class MainActivity : TauriActivity() {
 
   companion object {
     const val EXTRA_OPEN_MUSIC_PLAYER = "com.x1f4r.legion.OPEN_MUSIC_PLAYER"
+    private const val ACTION_PIP_CONTROL = "com.x1f4r.legion.PIP_CONTROL"
+    private const val EXTRA_PIP_ACTION = "action"
+    private const val PIP_REQ_SEEK_BACK = 1001
+    private const val PIP_REQ_TOGGLE_PLAY = 1002
+    private const val PIP_REQ_SEEK_FWD = 1003
+    private const val PIP_DISMISS_CLEANUP_MS = 500L
     @Volatile
     private var pluginsInitializedOnce = false
     @Volatile
@@ -496,6 +793,7 @@ class MainActivity : TauriActivity() {
         if (!bridge || typeof bridge.postMessage !== 'function') return;
         var cachedInsets = null;
         var hasLocalNetwork = null;
+        var hasPip = false;
         var deviceModel = '';
         var nextId = 1;
         var pending = {};
@@ -523,6 +821,10 @@ class MainActivity : TauriActivity() {
           if (!msg || typeof msg !== 'object') return;
           if (msg.type === 'init') {
             if (typeof msg.hasLocalNetwork === 'boolean') hasLocalNetwork = msg.hasLocalNetwork;
+            if (typeof msg.hasPip === 'boolean') {
+              hasPip = msg.hasPip;
+              window.dispatchEvent(new CustomEvent('legion:pip-support', { detail: { supported: hasPip } }));
+            }
             if (typeof msg.model === 'string') deviceModel = msg.model;
             if (msg.insets) applyInsets(msg.insets);
           } else if (msg.type === 'insets') {
@@ -535,12 +837,20 @@ class MainActivity : TauriActivity() {
               delete pending[msg.id];
               resolve(granted);
             }
-          } else if (msg.type === 'immersive_ack' || msg.type === 'keep_screen_on_ack') {
+          } else if (msg.type === 'immersive_ack' || msg.type === 'keep_screen_on_ack' || msg.type === 'pip_enter_ack') {
             var resolveAck = pending[msg.id];
             if (resolveAck) {
               delete pending[msg.id];
               resolveAck(Boolean(msg.active));
             }
+          } else if (msg.type === 'pip_changed') {
+            window.dispatchEvent(new CustomEvent('legion:pip-change', {
+              detail: { active: Boolean(msg.active), dismissed: Boolean(msg.dismissed) }
+            }));
+          } else if (msg.type === 'pip_action') {
+            window.dispatchEvent(new CustomEvent('legion:pip-action', {
+              detail: { action: String(msg.action || '') }
+            }));
           } else if (msg.type === 'open_music_player') {
             window.dispatchEvent(new Event('legion:open-music-player'));
           }
@@ -549,6 +859,9 @@ class MainActivity : TauriActivity() {
         window.__LEGION_ANDROID__ = {
           hasLocalNetwork: function(){
             return hasLocalNetwork;
+          },
+          hasPip: function(){
+            return hasPip;
           },
           deviceModel: function(){
             return deviceModel;
@@ -598,6 +911,47 @@ class MainActivity : TauriActivity() {
                 resolve(false);
               }
             });
+          },
+          setPipConfig: function(cfg){
+            try {
+              var payload = {
+                type: 'pip_config',
+                active: Boolean(cfg && cfg.active),
+                playing: Boolean(cfg && cfg.playing),
+                width: Number(cfg && cfg.width) || 0,
+                height: Number(cfg && cfg.height) || 0
+              };
+              if (cfg && cfg.rect && typeof cfg.rect === 'object') {
+                payload.rect = {
+                  left: Number(cfg.rect.left),
+                  top: Number(cfg.rect.top),
+                  width: Number(cfg.rect.width),
+                  height: Number(cfg.rect.height)
+                };
+              }
+              bridge.postMessage(JSON.stringify(payload));
+            } catch (_) {
+              // Ignore if bridge is unavailable.
+            }
+          },
+          enterPip: function(){
+            return new Promise(function(resolve){
+              var id = nextId++;
+              pending[id] = resolve;
+              try {
+                bridge.postMessage(JSON.stringify({ type: 'enter_pip', id: id }));
+              } catch (_) {
+                delete pending[id];
+                resolve(false);
+              }
+            });
+          },
+          ackPipDismiss: function(){
+            try {
+              bridge.postMessage(JSON.stringify({ type: 'pip_dismiss_ack' }));
+            } catch (_) {
+              // Ignore if bridge is unavailable.
+            }
           },
           haptic: function(kind){
             if (kind !== 'tick' && kind !== 'tap') return;

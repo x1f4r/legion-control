@@ -14,6 +14,7 @@ import {
   buildShuffledOrder,
   clampVolume,
   classifyPlayerKey,
+  computeRenderedVideoRect,
   computeResumePosition,
   computeVideoZoomMetrics,
   createFullscreenController,
@@ -24,6 +25,7 @@ import {
   createTurnWatcher,
   createVideoController,
   cycleRepeatMode,
+  detectVideoPipSupport,
   DOUBLE_TAP_WINDOW_MS,
   extractTagsMap,
   formatMiniPlayerDisplay,
@@ -1740,6 +1742,8 @@ test('iOS/iPadOS background audio declares UIBackgroundModes audio, links AVFoun
   assert.match(mainMm, /legion_install_ios_audio_bridge\(\)/);
   assert.match(mainMm, /legion_ios_audio_attach_webview/);
   assert.match(mainMm, /legion_ios_audio_reset\(\)/);
+  assert.match(mainMm, /allowsInlineMediaPlayback\s*=\s*YES/);
+  assert.match(mainMm, /allowsPictureInPictureMediaPlayback\s*=\s*YES/);
 
   assert.match(audioSwift, /AVAudioSession\.sharedInstance\(\)/);
   assert.match(audioSwift, /\.setCategory\(\.playback/);
@@ -1851,4 +1855,86 @@ test('createMusicController preserves started playback when loadedmetadata fires
   assert.equal(ctrl.getState().playing, false);
 
   ctrl.dispose();
+});
+
+test('detectVideoPipSupport distinguishes Android native, Web PiP, WebKit PiP, and unsupported environments', () => {
+  const webVideo = { disablePictureInPicture: false, requestPictureInPicture: () => Promise.resolve() };
+  const webkitVideo = {
+    webkitSupportsPresentationMode: (m) => m === 'picture-in-picture',
+    webkitSetPresentationMode: () => {},
+  };
+
+  // Android native PiP takes precedence when nativePip is attached.
+  assert.equal(
+    detectVideoPipSupport({ link: { nativePip: { hasPip: () => true } }, video: webVideo, doc: { pictureInPictureEnabled: true } }),
+    'android',
+  );
+  assert.equal(
+    detectVideoPipSupport({ link: { nativePip: { hasPip: () => false } }, video: webVideo, doc: { pictureInPictureEnabled: true } }),
+    null,
+  );
+  // Android Tauri app without nativePip bridge must never fall back to Web PiP.
+  assert.equal(
+    detectVideoPipSupport({ link: { kind: 'app' }, video: webVideo, doc: { pictureInPictureEnabled: true }, isAndroid: true }),
+    null,
+  );
+
+  // Desktop & Browser Web PiP.
+  assert.equal(
+    detectVideoPipSupport({ link: { kind: 'http' }, video: webVideo, doc: { pictureInPictureEnabled: true }, isAndroid: false }),
+    'web',
+  );
+  assert.equal(
+    detectVideoPipSupport({ link: { kind: 'http' }, video: webVideo, doc: { pictureInPictureEnabled: false }, isAndroid: false }),
+    null,
+  );
+  assert.equal(
+    detectVideoPipSupport({
+      link: { kind: 'http' },
+      video: { ...webVideo, disablePictureInPicture: true },
+      doc: { pictureInPictureEnabled: true },
+      isAndroid: false,
+    }),
+    null,
+  );
+
+  // iOS / Safari WebKit presentation mode.
+  assert.equal(
+    detectVideoPipSupport({ link: { kind: 'app' }, video: webkitVideo, doc: { pictureInPictureEnabled: false }, isAndroid: false }),
+    'webkit',
+  );
+  assert.equal(
+    detectVideoPipSupport({
+      link: { kind: 'app' },
+      video: { ...webkitVideo, webkitSupportsPresentationMode: () => false },
+      doc: { pictureInPictureEnabled: false },
+      isAndroid: false,
+    }),
+    null,
+  );
+});
+
+test('computeRenderedVideoRect accounts for object-fit contain letterboxing and pillarboxing', () => {
+  // 16:9 video in portrait 400x800 box -> letterboxed vertically (400x225 centered at top=287.5).
+  const letterbox = computeRenderedVideoRect({ left: 0, top: 0, width: 400, height: 800 }, 1920, 1080);
+  assert.equal(letterbox.left, 0);
+  assert.equal(letterbox.width, 400);
+  assert.ok(Math.abs(letterbox.height - 225) < 0.01);
+  assert.ok(Math.abs(letterbox.top - 287.5) < 0.01);
+
+  // 9:16 portrait video in 800x400 landscape box -> pillarboxed horizontally (225x400 centered at left=287.5).
+  const pillarbox = computeRenderedVideoRect({ left: 10, top: 20, width: 800, height: 400 }, 1080, 1920);
+  assert.equal(pillarbox.top, 20);
+  assert.equal(pillarbox.height, 400);
+  assert.ok(Math.abs(pillarbox.width - 225) < 0.01);
+  assert.ok(Math.abs(pillarbox.left - 297.5) < 0.01);
+
+  // Missing dimensions fall back to the box rect; empty boxes return null.
+  assert.deepEqual(computeRenderedVideoRect({ left: 5, top: 6, width: 300, height: 200 }, 0, 0), {
+    left: 5,
+    top: 6,
+    width: 300,
+    height: 200,
+  });
+  assert.equal(computeRenderedVideoRect({ left: 0, top: 0, width: 0, height: 200 }, 1920, 1080), null);
 });

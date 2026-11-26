@@ -2501,3 +2501,97 @@ test('createAppLink exposes iosAudio when iOS legionAudio handler exists and rou
     else delete globalThis.navigator;
   }
 });
+
+test('createAppLink exposes nativePip only on Android bridge and routes config, enter, ackDismiss, and events', async () => {
+  const prevWindow = globalThis.window;
+  const prevNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  const listeners = new Map();
+  const configs = [];
+  let acked = 0;
+  let enterCount = 0;
+  let supported = true;
+
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { userAgent: 'Mozilla/5.0 (Linux; Android 15; Pixel) AppleWebKit/537.36' },
+  });
+  globalThis.window = {
+    addEventListener(name, fn) {
+      if (!listeners.has(name)) listeners.set(name, new Set());
+      listeners.get(name).add(fn);
+    },
+    removeEventListener(name, fn) {
+      listeners.get(name)?.delete(fn);
+    },
+    __LEGION_ANDROID__: {
+      setImmersive: () => Promise.resolve(true),
+      hasPip: () => supported,
+      setPipConfig: (cfg) => configs.push(cfg),
+      enterPip: () => {
+        enterCount += 1;
+        return Promise.resolve(true);
+      },
+      ackPipDismiss: () => {
+        acked += 1;
+      },
+    },
+    __TAURI__: { core: { invoke: () => Promise.resolve({}) } },
+  };
+
+  const dispatch = (name, detail) => {
+    for (const fn of listeners.get(name) || []) {
+      fn({ detail });
+    }
+  };
+
+  try {
+    const link = createAppLink();
+    assert.ok(link.nativePip, 'Android app link must expose nativePip');
+    assert.equal(link.nativePip.hasPip(), true);
+
+    const supportEvents = [];
+    const changeEvents = [];
+    const actionEvents = [];
+    const u1 = link.nativePip.onSupportChange((v) => supportEvents.push(v));
+    const u2 = link.nativePip.onChange((ev) => changeEvents.push(ev));
+    const u3 = link.nativePip.onAction((ev) => actionEvents.push(ev));
+
+    link.nativePip.sync({ active: true, playing: true, width: 1280, height: 720, rect: { left: 0, top: 10, width: 400, height: 225 } });
+    assert.equal(await link.nativePip.enter(), true);
+    link.nativePip.ackDismiss();
+
+    dispatch('legion:pip-support', { supported: false });
+    dispatch('legion:pip-change', { active: true, dismissed: false });
+    dispatch('legion:pip-action', { action: 'seek_fwd_10' });
+    dispatch('legion:pip-change', { active: false, dismissed: true });
+
+    u1();
+    u2();
+    u3();
+
+    assert.equal(configs.length, 1);
+    assert.equal(configs[0].playing, true);
+    assert.equal(enterCount, 1);
+    assert.equal(acked, 1);
+    assert.deepEqual(supportEvents, [false]);
+    assert.deepEqual(changeEvents, [
+      { active: true, dismissed: false },
+      { active: false, dismissed: true },
+    ]);
+    assert.deepEqual(actionEvents, [{ action: 'seek_fwd_10' }]);
+
+    // Desktop link must not expose nativePip.
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: { userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36' },
+    });
+    globalThis.window = { __TAURI__: { core: { invoke: () => Promise.resolve({}) } } };
+    const desktopLink = createAppLink();
+    assert.equal(desktopLink.nativePip, undefined);
+  } finally {
+    if (prevWindow === undefined) delete globalThis.window;
+    else globalThis.window = prevWindow;
+    if (prevNavigator) Object.defineProperty(globalThis, 'navigator', prevNavigator);
+    else delete globalThis.navigator;
+  }
+});

@@ -1491,6 +1491,85 @@ export function createTurnWatcher({
   };
 }
 
+// ── Picture-in-picture capability & geometry helpers ─────────────────────────────────────────
+
+/**
+ * Returns the real picture-in-picture implementation available for `<video>` on the current
+ * platform: `'android'`, `'web'`, `'webkit'`, or `null` when unsupported (so callers omit the
+ * button instead of showing a dead or disabled control).
+ */
+export function detectVideoPipSupport({
+  link = null,
+  video = null,
+  doc = typeof document !== 'undefined' ? document : null,
+  isAndroid = typeof navigator !== 'undefined' && /Android/i.test(String(navigator.userAgent || '')),
+} = {}) {
+  if (link?.nativePip) {
+    return link.nativePip.hasPip?.() ? 'android' : null;
+  }
+  if (link?.kind === 'app' && isAndroid) {
+    return null;
+  }
+  if (
+    doc &&
+    doc.pictureInPictureEnabled === true &&
+    video &&
+    !video.disablePictureInPicture &&
+    typeof video.requestPictureInPicture === 'function'
+  ) {
+    return 'web';
+  }
+  if (
+    video &&
+    typeof video.webkitSupportsPresentationMode === 'function' &&
+    typeof video.webkitSetPresentationMode === 'function' &&
+    video.webkitSupportsPresentationMode('picture-in-picture') === true
+  ) {
+    return 'webkit';
+  }
+  return null;
+}
+
+/**
+ * Computes the rendered picture rectangle inside a `<video>` element using `object-fit: contain`,
+ * returning `{ left, top, width, height }` in CSS pixels for Android's `sourceRectHint`.
+ */
+export function computeRenderedVideoRect(boxRect, videoWidth, videoHeight) {
+  if (
+    !boxRect ||
+    !Number.isFinite(boxRect.left) ||
+    !Number.isFinite(boxRect.top) ||
+    !Number.isFinite(boxRect.width) ||
+    !Number.isFinite(boxRect.height) ||
+    boxRect.width <= 1 ||
+    boxRect.height <= 1
+  ) {
+    return null;
+  }
+  if (!Number.isFinite(videoWidth) || !Number.isFinite(videoHeight) || videoWidth <= 0 || videoHeight <= 0) {
+    return {
+      left: boxRect.left,
+      top: boxRect.top,
+      width: boxRect.width,
+      height: boxRect.height,
+    };
+  }
+  const boxRatio = boxRect.width / boxRect.height;
+  const videoRatio = videoWidth / videoHeight;
+  let width = boxRect.width;
+  let height = boxRect.height;
+  let left = boxRect.left;
+  let top = boxRect.top;
+  if (videoRatio > boxRatio) {
+    height = boxRect.width / videoRatio;
+    top = boxRect.top + (boxRect.height - height) / 2;
+  } else if (videoRatio < boxRatio) {
+    width = boxRect.height * videoRatio;
+    left = boxRect.left + (boxRect.width - width) / 2;
+  }
+  return { left, top, width, height };
+}
+
 export {
   applyPinchResistance,
   computeVideoZoomMetrics,
