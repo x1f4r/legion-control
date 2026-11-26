@@ -609,28 +609,48 @@ mod tests {
         }
     }
 
-    fn spawn_sleeper() -> Child {
+    fn spawn_sleeper() -> (Child, ProcessId) {
         let exe = sleeper_executable();
         #[cfg(unix)]
-        {
-            Command::new(exe)
-                .arg("60")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap()
-        }
+        let mut child = Command::new(&exe)
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
         #[cfg(windows)]
-        {
-            Command::new(exe)
-                .args(["-n", "61", "127.0.0.1"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap()
-        }
+        let mut child = Command::new(&exe)
+            .args(["-n", "61", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        // Wait until the child finishes `exec` and reports `exe` in the OS
+        // process table. Under CPU load, `Command::spawn` can return before
+        // `/proc/<pid>/exe` switches from the test binary to `sleep`, which
+        // would make `verify_same_executable` sweep a live fixture record.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let id = loop {
+            if let Ok(Some(id)) = procid::of_pid(child.id())
+                && procid::verify_same_executable(&id, &exe)
+            {
+                break id;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "timed out waiting for sleeper child (pid {}) to complete exec of {}",
+                    child.id(),
+                    exe.display()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        (child, id)
     }
 
     fn write_record(dir: &Path, file: &str, record: &DeviceSessionRecord) -> PathBuf {
@@ -647,11 +667,8 @@ mod tests {
         let sess_dir = sessions_dir(&paths);
         let boot = procid::boot_id().unwrap();
 
-        let mut victim = spawn_sleeper();
-        let victim_id = procid::of_pid(victim.id()).unwrap().unwrap();
-
-        let mut bystander = spawn_sleeper();
-        let bystander_id = procid::of_pid(bystander.id()).unwrap().unwrap();
+        let (mut victim, victim_id) = spawn_sleeper();
+        let (mut bystander, bystander_id) = spawn_sleeper();
 
         // 1. Live session belonging to `pixel` (must be terminated), with a forged `parent_sshd`
         //    pointing at the non-sshd `bystander` (which MUST NOT be signalled!).
@@ -814,10 +831,8 @@ mod tests {
         let id1 = "11".repeat(16);
         let id2 = "22".repeat(16);
 
-        let mut victim = spawn_sleeper();
-        let victim_id = procid::of_pid(victim.id()).unwrap().unwrap();
-        let mut survivor = spawn_sleeper();
-        let survivor_id = procid::of_pid(survivor.id()).unwrap().unwrap();
+        let (mut victim, victim_id) = spawn_sleeper();
+        let (mut survivor, survivor_id) = spawn_sleeper();
 
         let victim_file = write_record(
             &sess_dir,
