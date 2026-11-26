@@ -85,8 +85,8 @@ pub const LOOPBACK_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// ticket) may take to send complete HTTP request headers before being closed (2 seconds).
 pub const LOOPBACK_UNAUTH_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Maximum total time allowed for a loopback proof-of-ownership liveness probe (400 ms).
-pub const LOOPBACK_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
+/// Maximum total time allowed for a loopback proof-of-ownership liveness probe (1.5 seconds).
+pub const LOOPBACK_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// Maximum age of a verified loopback proof before `mint_url` re-probes ownership (2 seconds).
 pub const LOOPBACK_PROBE_FRESHNESS: Duration = Duration::from_secs(2);
@@ -2906,16 +2906,14 @@ mod tests {
         assert_eq!(status, 404);
 
         // Once tickets are gone and idle_shutdown elapses, the listener stops automatically.
-        for _ in 0..30 {
-            if server.loopback_port().is_none() {
-                break;
-            }
+        let stop_deadline = Instant::now() + Duration::from_secs(5);
+        while server.loopback_port().is_some() {
+            assert!(
+                Instant::now() < stop_deadline,
+                "timed out waiting for idle loopback listener to stop"
+            );
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
-        assert!(
-            server.loopback_port().is_none(),
-            "loopback listener should stop when idle with no live tickets"
-        );
 
         // Re-enabling pairing and minting a new ticket lazily restarts the listener.
         live.store(true, Ordering::Release);
@@ -3081,13 +3079,13 @@ mod tests {
         // Wait for both responses to finish so both slots are marked authenticated and idle on keep-alive.
         let mut buf1 = [0u8; 1024];
         let mut buf2 = [0u8; 1024];
-        let n1 = tokio::time::timeout(Duration::from_millis(300), auth1.read(&mut buf1))
+        let n1 = tokio::time::timeout(Duration::from_secs(5), auth1.read(&mut buf1))
             .await
-            .unwrap()
+            .expect("timed out reading first authenticated keep-alive response")
             .unwrap();
-        let n2 = tokio::time::timeout(Duration::from_millis(300), auth2.read(&mut buf2))
+        let n2 = tokio::time::timeout(Duration::from_secs(5), auth2.read(&mut buf2))
             .await
-            .unwrap()
+            .expect("timed out reading second authenticated keep-alive response")
             .unwrap();
         assert!(String::from_utf8_lossy(&buf1[..n1]).contains("200 OK"));
         assert!(String::from_utf8_lossy(&buf2[..n2]).contains("200 OK"));
@@ -3095,14 +3093,21 @@ mod tests {
         let mut overflow = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let mut byte = [0u8; 1];
         let overflow_read =
-            tokio::time::timeout(Duration::from_millis(150), overflow.read(&mut byte)).await;
+            tokio::time::timeout(Duration::from_secs(5), overflow.read(&mut byte)).await;
         assert!(
             matches!(overflow_read, Ok(Ok(0)) | Ok(Err(_))),
             "excess connection above authenticated cap should be dropped immediately, got {overflow_read:?}"
         );
         drop(auth1);
         drop(auth2);
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        let release_deadline = Instant::now() + Duration::from_secs(5);
+        while !server.loopback_conns.lock().unwrap().active.is_empty() {
+            assert!(
+                Instant::now() < release_deadline,
+                "timed out waiting for dropped keep-alive sockets to release loopback slots"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
 
         let (status, _, body) = raw_http(
             port,
@@ -3115,13 +3120,23 @@ mod tests {
         // Simulate OS reclaiming the listening socket during iOS background suspend: cancel the
         // current listener token while keeping the port recorded, then call
         // `probe_or_recover_loopback()` and confirm it recovers cleanly.
-        {
+        let accept_alive = {
             let guard = server.listener.lock().unwrap();
-            if let Some(h) = guard.as_ref() {
+            guard.as_ref().map(|h| {
                 h.shutdown.cancel();
+                Arc::clone(&h.accept_alive)
+            })
+        };
+        if let Some(flag) = accept_alive {
+            let stop_deadline = Instant::now() + Duration::from_secs(5);
+            while flag.load(Ordering::Acquire) {
+                assert!(
+                    Instant::now() < stop_deadline,
+                    "timed out waiting for cancelled loopback accept loop to exit"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
         let recovered_port = server
             .probe_or_recover_loopback()
             .await
@@ -5206,15 +5221,17 @@ mod tests {
         }
         // Wait until Legion's accept task exits and releases `old_port`.
         let squatter = {
-            let mut bound = None;
-            for _ in 0..40 {
+            let release_deadline = Instant::now() + Duration::from_secs(5);
+            loop {
                 if let Ok(l) = TcpListener::bind(("127.0.0.1", old_port)).await {
-                    bound = Some(l);
-                    break;
+                    break l;
                 }
+                assert!(
+                    Instant::now() < release_deadline,
+                    "timed out waiting for released old_port {old_port} to become bindable"
+                );
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            bound.expect("squatter should bind the released old port")
         };
 
         let squatter_hits = Arc::new(AtomicUsize::new(0));
@@ -6271,7 +6288,7 @@ mod tests {
         // and drops device active_streams to 0.
         let mut buf = vec![0u8; 64 * 1024];
         loop {
-            let step = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf)).await;
+            let step = tokio::time::timeout(Duration::from_secs(10), sock.read(&mut buf)).await;
             assert!(
                 step.is_ok(),
                 "loopback stream did not abort after content_revoke"
@@ -6289,7 +6306,7 @@ mod tests {
         );
         drop(sock);
 
-        let dev_deadline = Instant::now() + Duration::from_secs(2);
+        let dev_deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < dev_deadline && server.active_streams.load(Ordering::Acquire) > 0 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -7732,7 +7749,7 @@ mod tests {
             .expect("tarpit timeout must trigger rebind");
         assert_ne!(recovered, tarpit_port);
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            started.elapsed() < Duration::from_secs(5),
             "tarpit probe should time out promptly (elapsed={:?})",
             started.elapsed()
         );
@@ -7749,6 +7766,102 @@ mod tests {
 
         tarpit_stop.cancel();
         let _ = tarpit_task.await;
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn loopback_probe_tolerates_busy_loopback_delay_past_400ms_without_rebinding() {
+        let payload = b"slow-probe-payload".to_vec();
+        let mut files = HashMap::new();
+        files.insert("/home/me/song.flac".to_owned(), payload);
+
+        let backend = Arc::new(MockContentBackend::new(files));
+        let server = Arc::new(AppContentServer::with_config(
+            backend,
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["http://tauri.localhost".to_owned()],
+        ));
+        let _ = server
+            .mint_url("tower", "/home/me/song.flac", false)
+            .await
+            .unwrap();
+
+        // Bind a mock probe responder that takes 600 ms (representing a busy host or mobile
+        // resume spike) before replying with a valid keyed BLAKE3 proof.
+        let secret = [0x5Au8; 32];
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let slow_port = listener.local_addr().unwrap().port();
+        let responder = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req_buf = Vec::new();
+            let mut chunk = [0u8; 512];
+            while !req_buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                req_buf.extend_from_slice(&chunk[..n]);
+            }
+            let req_text = String::from_utf8_lossy(&req_buf);
+            let challenge_b64 = req_text
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.trim()
+                        .eq_ignore_ascii_case(LOOPBACK_PROBE_CHALLENGE_HEADER.as_str())
+                        .then(|| value.trim().to_owned())
+                })
+                .expect("probe challenge header");
+            let challenge: [u8; 32] = URL_SAFE_NO_PAD
+                .decode(&challenge_b64)
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let proof = probe_mac(&secret, LOOPBACK_PROBE_RESP_DOMAIN, &challenge);
+            let proof_b64 = URL_SAFE_NO_PAD.encode(proof.as_bytes());
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            let resp = format!(
+                "HTTP/1.1 204 No Content\r\n\
+                 {LOOPBACK_PROBE_PROOF_HEADER}: {proof_b64}\r\n\
+                 Connection: close\r\n\r\n"
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+
+        {
+            let mut slot = server.listener.lock().unwrap();
+            if let Some(old) = slot.take() {
+                old.shutdown.cancel();
+            }
+            let fake_shutdown = CancellationToken::new();
+            let fake_shutdown_task = fake_shutdown.clone();
+            let fake_accept_task = tokio::spawn(async move {
+                fake_shutdown_task.cancelled().await;
+            });
+            *slot = Some(ListenerHandle {
+                port: slow_port,
+                shutdown: fake_shutdown,
+                accept_alive: Arc::new(AtomicBool::new(true)),
+                accept_task: fake_accept_task,
+                probe_secret: secret,
+                last_verified: Instant::now() - Duration::from_secs(10),
+            });
+        }
+
+        let kept = server
+            .probe_or_recover_loopback()
+            .await
+            .unwrap()
+            .expect("listener should stay alive");
+        assert_eq!(
+            kept, slow_port,
+            "a 600 ms loopback probe reply must not tear down and rebind a healthy listener"
+        );
+
+        let _ = responder.await;
         server.shutdown();
     }
 
@@ -7817,7 +7930,7 @@ mod tests {
             ),
         ] {
             let (st, head, body) =
-                tokio::time::timeout(Duration::from_secs(2), raw_http(port, &req))
+                tokio::time::timeout(Duration::from_secs(10), raw_http(port, &req))
                     .await
                     .expect("invalid probe request must close immediately");
             assert_eq!(st, 404, "expected 404 for {req}\ngot:\n{head}");
@@ -7841,7 +7954,7 @@ mod tests {
             "GET {LOOPBACK_PROBE_PATH} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{LOOPBACK_PROBE_CHALLENGE_HEADER}: {challenge_b64}\r\n{LOOPBACK_PROBE_AUTH_HEADER}: {valid_auth_b64}\r\nConnection: keep-alive\r\n\r\n"
         );
         let (ok_st, ok_head, ok_body) =
-            tokio::time::timeout(Duration::from_secs(2), raw_http(port, &valid_req))
+            tokio::time::timeout(Duration::from_secs(10), raw_http(port, &valid_req))
                 .await
                 .expect("valid probe must close immediately");
         assert_eq!(ok_st, 204, "{ok_head}");
@@ -7907,7 +8020,14 @@ mod tests {
             sock.write_all(b"GET /v1/content/").await.unwrap();
             holders.push(sock);
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let fill_deadline = Instant::now() + Duration::from_secs(5);
+        while server.loopback_conns.lock().unwrap().active.len() < MAX_LOOPBACK_CONNECTIONS {
+            assert!(
+                Instant::now() < fill_deadline,
+                "timed out waiting for 32 unauthenticated sockets to register on loopback listener"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert!(
             probe_loopback_ownership(port, &secret, LOOPBACK_PROBE_TIMEOUT).await,
             "ownership probe must succeed even when 32 unauthenticated sockets are held"

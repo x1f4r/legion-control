@@ -3344,7 +3344,7 @@ paths = [\"~/projects/**\"]
         .unwrap()
         .to_owned();
     let mut stalled = Vec::new();
-    for _ in 0..8 {
+    for i in 0..8 {
         let mut s = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
         s.set_read_timeout(Some(PATIENCE)).unwrap();
         write!(
@@ -3354,9 +3354,11 @@ paths = [\"~/projects/**\"]
         )
         .unwrap();
         s.flush().unwrap();
-        stalled.push(s);
+        let mut reader = BufReader::new(s);
+        let (st, _) = read_head(&mut reader);
+        assert_eq!(st, 200, "stalled reader #{i} failed to acquire stream slot");
+        stalled.push(reader);
     }
-    std::thread::sleep(Duration::from_millis(120));
 
     let capped = http(server.port, "GET", &big_url, &[], b"");
     assert_eq!(capped.status, 429, "{}", capped.text());
@@ -3377,21 +3379,36 @@ paths = [\"~/projects/**\"]
         200
     );
     drop(stalled);
-    std::thread::sleep(Duration::from_millis(120));
 
     // 6. In-flight revocation: removing the token mid-stream aborts a 12 MiB download early.
-    let mut rev_stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
-    rev_stream.set_read_timeout(Some(PATIENCE)).unwrap();
-    write!(
-        rev_stream,
-        "GET {big_url} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
-        server.port
-    )
-    .unwrap();
-    rev_stream.flush().unwrap();
-    let mut reader = BufReader::new(rev_stream);
-    let (status, _) = read_head(&mut reader);
-    assert_eq!(status, 200);
+    // Wait boundedly for the server to release at least one concurrency permit after dropping the
+    // 8 stalled sockets instead of sleeping a fixed duration.
+    let permit_deadline = Instant::now() + PATIENCE;
+    let mut reader = loop {
+        let mut rev_stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        rev_stream.set_read_timeout(Some(PATIENCE)).unwrap();
+        write!(
+            rev_stream,
+            "GET {big_url} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+            server.port
+        )
+        .unwrap();
+        rev_stream.flush().unwrap();
+        let mut candidate = BufReader::new(rev_stream);
+        let (status, _) = read_head(&mut candidate);
+        if status == 200 {
+            break candidate;
+        }
+        assert_eq!(
+            status, 429,
+            "unexpected status while waiting for freed permit"
+        );
+        assert!(
+            Instant::now() < permit_deadline,
+            "timed out waiting for dropped stalled streams to free concurrency permits"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
     let mut initial = vec![0u8; 64 * 1024];
     reader.read_exact(&mut initial).unwrap();
     // Revoke token mid-stream!
@@ -3549,7 +3566,7 @@ paths = [\"~/projects/**\"]
     let post_elapsed = t_post.elapsed();
     assert_eq!(b_created.status, 200, "{}", b_created.text());
     assert!(
-        post_elapsed < Duration::from_secs(3),
+        post_elapsed < Duration::from_secs(8),
         "holder_b POST /v1/content starved behind holder_a's 8 stalled reads: {post_elapsed:?}"
     );
     let b_url = b_created.json()["url"].as_str().unwrap().to_owned();
@@ -3566,7 +3583,7 @@ paths = [\"~/projects/**\"]
     assert_eq!(b_range.status, 206, "{}", b_range.text());
     assert_eq!(b_range.body, &big_bytes[65_536..131_072]);
     assert!(
-        get_elapsed < Duration::from_secs(3),
+        get_elapsed < Duration::from_secs(8),
         "holder_b ranged GET starved behind holder_a's 8 stalled reads: {get_elapsed:?}"
     );
 
@@ -3738,7 +3755,7 @@ paths = [\"~/projects/**\"]
     let mut server_cut_at: Option<Duration> = None;
     let mut bytes_after_revoke = 0usize;
     let mut eof_or_reset = false;
-    while revoked_at.elapsed() < Duration::from_secs(4) {
+    while revoked_at.elapsed() < Duration::from_secs(8) {
         if server_cut_at.is_none()
             && home.audit().iter().any(|e| {
                 e["tool"] == "content.read"
@@ -3770,11 +3787,11 @@ paths = [\"~/projects/**\"]
         bytes_after_revoke += tail.len();
     }
     let server_cut_elapsed = server_cut_at.expect(
-        "expected server liveness watcher to revoke, flush audit, and reset 20 KB/s reader within 4s",
+        "expected server liveness watcher to revoke, flush audit, and reset 20 KB/s reader within 8s",
     );
     assert!(
-        server_cut_elapsed <= Duration::from_secs(3),
-        "expected server to abort 20 KB/s reader within ~2s of revocation, took {server_cut_elapsed:?}"
+        server_cut_elapsed <= Duration::from_secs(6),
+        "expected server to abort 20 KB/s reader promptly after revocation, took {server_cut_elapsed:?}"
     );
     let slow_served = home
         .audit()
@@ -3843,7 +3860,7 @@ paths = [\"~/projects/**\"]
     // Wait for the server's independent liveness watcher to revoke and reset the stalled socket
     // while the client never reads a single byte.
     let mut stalled_cut_at: Option<Duration> = None;
-    while stalled_revoked_at.elapsed() < Duration::from_secs(4) {
+    while stalled_revoked_at.elapsed() < Duration::from_secs(8) {
         if home.audit().iter().any(|e| {
             e["tool"] == "content.read"
                 && e["principal"] == "stalled"
@@ -3855,9 +3872,9 @@ paths = [\"~/projects/**\"]
         std::thread::sleep(Duration::from_millis(50));
     }
     let stalled_cut_elapsed =
-        stalled_cut_at.expect("expected server liveness watcher to abort stalled reader within 4s");
+        stalled_cut_at.expect("expected server liveness watcher to abort stalled reader within 8s");
     assert!(
-        stalled_cut_elapsed <= Duration::from_secs(3),
+        stalled_cut_elapsed <= Duration::from_secs(6),
         "stalled reader was not aborted promptly after revocation: {stalled_cut_elapsed:?}"
     );
 

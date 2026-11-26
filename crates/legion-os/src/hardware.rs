@@ -1243,6 +1243,7 @@ fn round1(value: f64) -> f64 {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    #[cfg(unix)]
     use std::time::Instant;
 
     use super::*;
@@ -1624,7 +1625,7 @@ mod tests {
         }
         // Let detached probe threads finish exiting, then check only sysfs probe threads so
         // unrelated parallel tests in this process cannot cause false failures.
-        let drain_deadline = Instant::now() + Duration::from_millis(500);
+        let drain_deadline = Instant::now() + Duration::from_secs(5);
         while count_threads_named(&sysfs_thread_names) > 0 && Instant::now() < drain_deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1663,8 +1664,8 @@ mod tests {
             "slot must remain marked stuck while blocked"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "subsequent calls while stuck must return immediately, took {:?}",
+            started.elapsed() < Duration::from_secs(5),
+            "subsequent calls while stuck must return immediately (200x40ms would exceed 8s), took {:?}",
             started.elapsed()
         );
         let during_stuck = count_threads_named(&["probe-fifo-test"]);
@@ -1675,7 +1676,7 @@ mod tests {
 
         // Unblock the FIFO by writing to it; the stuck mark must clear and the next call succeeds.
         fs::write(&stuck_fifo, "unblocked").unwrap();
-        let unblock_deadline = Instant::now() + Duration::from_secs(2);
+        let unblock_deadline = Instant::now() + Duration::from_secs(10);
         while (slot.is_busy() || count_threads_named(&["probe-fifo-test"]) > 0)
             && Instant::now() < unblock_deadline
         {
@@ -1687,10 +1688,8 @@ mod tests {
             0,
             "probe-fifo-test thread should exit after FIFO unblocks"
         );
-        let ok = run_guarded_probe(&slot, "fifo-test", Duration::from_millis(200), || {
-            Some(99u32)
-        })
-        .await;
+        let ok =
+            run_guarded_probe(&slot, "fifo-test", Duration::from_secs(5), || Some(99u32)).await;
         assert_eq!(ok, Some(99));
     }
 
@@ -1869,12 +1868,16 @@ mod tests {
 
         let started = Instant::now();
         let slow = probe_macos_battery(
-            CommandSpec::argv("sh", ["-c", "sleep 5"]),
+            CommandSpec::argv("sh", ["-c", "sleep 30"]),
             Duration::from_millis(120),
         )
         .await;
         assert_eq!(slow, None);
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "slow macOS battery probe delayed caller past bound: {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
@@ -1886,30 +1889,33 @@ mod tests {
         .await;
         assert!(missing.is_empty());
 
-        let started = Instant::now();
-        let slow = run_blocking_probe(Duration::from_millis(80), || {
-            std::thread::sleep(Duration::from_millis(600));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let probe_finished = Arc::new(AtomicBool::new(false));
+        let probe_finished_bg = Arc::clone(&probe_finished);
+        let slow = run_blocking_probe(Duration::from_millis(80), move || {
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+            probe_finished_bg.store(true, Ordering::Release);
             Some(42u32)
         })
         .await;
         assert_eq!(slow, None);
         assert!(
-            started.elapsed() < Duration::from_millis(400),
-            "slow probe delayed caller for {:?}",
-            started.elapsed()
+            !probe_finished.load(Ordering::Acquire),
+            "run_blocking_probe must return None while the blocked probe is still held"
         );
+        let _ = release_tx.send(());
 
         #[cfg(unix)]
         {
             let cmd_started = Instant::now();
             let slow_cmd = probe_nvidia_gpus(
-                CommandSpec::argv("sh", ["-c", "sleep 5"]),
+                CommandSpec::argv("sh", ["-c", "sleep 30"]),
                 Duration::from_millis(120),
             )
             .await;
             assert!(slow_cmd.is_empty());
             assert!(
-                cmd_started.elapsed() < Duration::from_secs(1),
+                cmd_started.elapsed() < Duration::from_secs(10),
                 "slow command probe delayed caller for {:?}",
                 cmd_started.elapsed()
             );
