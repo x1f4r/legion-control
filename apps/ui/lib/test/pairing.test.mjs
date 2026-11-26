@@ -294,11 +294,11 @@ test('confirmed conflict detail offers restore pairing via pinned-key probe whil
       pair() {
         return Promise.reject({
           code: 'conflict',
-          message: 'This device is already paired with tower as device:pixel.',
+          message: 'This device is already paired with tower as device:my-phone.',
           machine: 'tower',
           details: {
-            existing_principal: 'device:pixel',
-            existing_device: 'pixel',
+            existing_principal: 'device:my-phone',
+            existing_device: 'my-phone',
             node: 'tower',
           },
         });
@@ -308,7 +308,7 @@ test('confirmed conflict detail offers restore pairing via pinned-key probe whil
         return Promise.resolve({
           ready: true,
           nodes: [{ node: 'tower' }],
-          last_paired: { node: 'tower', device: 'pixel', role: 'operator', synced: [], not_synced: [] },
+          last_paired: { node: 'tower', device: 'my-phone', role: 'operator', synced: [], not_synced: [] },
         });
       },
     },
@@ -322,7 +322,7 @@ test('confirmed conflict detail offers restore pairing via pinned-key probe whil
   assert.equal(first.outcome.kind, 'already_paired');
   assert.equal(
     ctrl.getState().notice?.title,
-    'This phone is already paired with tower as device:pixel.',
+    'This phone is already paired with tower as device:my-phone.',
   );
   assert.equal(ctrl.getState().notice?.restorable, true);
   assert.equal(ctrl.getState().invite, invite);
@@ -330,7 +330,7 @@ test('confirmed conflict detail offers restore pairing via pinned-key probe whil
   const restored = await ctrl.restorePair();
   assert.equal(restored.ok, true);
   assert.equal(restored.restored, true);
-  assert.deepEqual(restoreCalls, [{ inv: invite, existingPrincipal: 'device:pixel', name: 'phone' }]);
+  assert.deepEqual(restoreCalls, [{ inv: invite, existingPrincipal: 'device:my-phone', name: 'phone' }]);
   assert.equal(pairedEvents.length, 1);
   assert.equal(pairedEvents[0].node, 'tower');
   assert.equal(ctrl.getState().invite, '');

@@ -4430,7 +4430,7 @@ role = "home_writer"
 [roles.observer]
 allow = ["effect:read"]
 
-[principals."device:pixel"]
+[principals."device:phone"]
 role = "observer"
 device = "0123456789abcdef0123456789abcdef"
 
@@ -4439,7 +4439,7 @@ role = "observer"
 "#,
         );
         assert_eq!(
-            valid.device_owner("device:pixel"),
+            valid.device_owner("device:phone"),
             Some("0123456789abcdef0123456789abcdef")
         );
         assert_eq!(valid.device_owner("device:legacy"), None);
@@ -4470,7 +4470,7 @@ device = "0123456789abcdef0123456789abcdef"
 [roles.observer]
 allow = ["effect:read"]
 
-[principals."device:pixel"]
+[principals."device:phone"]
 role = "observer"
 device = "not-a-hex-id"
 "#,

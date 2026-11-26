@@ -8249,7 +8249,7 @@ mod tests {
                             user: "me".to_owned(),
                             host_keys: vec![tower_key.to_owned()],
                         },
-                        Some("device:pixel".to_owned()),
+                        Some("device:phone".to_owned()),
                     )],
                     ..LinkConfig::default()
                 },
@@ -8328,7 +8328,7 @@ mod tests {
                         link: self.link.clone(),
                         link_node: machine.to_owned(),
                         machine: machine.to_owned(),
-                        principal: "device:pixel".to_owned(),
+                        principal: "device:phone".to_owned(),
                         holder: "fleet:1".to_owned(),
                         learned_identity: None,
                     })
@@ -8592,7 +8592,7 @@ mod tests {
                     link: self.link.clone(),
                     link_node: machine.to_owned(),
                     machine: machine.to_owned(),
-                    principal: "device:pixel".to_owned(),
+                    principal: "device:phone".to_owned(),
                     holder,
                     learned_identity: None,
                 })
@@ -8759,7 +8759,7 @@ mod tests {
                         user: "me".to_owned(),
                         host_keys: vec![tower_key],
                     },
-                    Some("device:pixel".to_owned()),
+                    Some("device:phone".to_owned()),
                 )],
                 ..LinkConfig::default()
             },
@@ -9342,7 +9342,7 @@ mod tests {
                     link: self.link.clone(),
                     link_node: machine.to_owned(),
                     machine: machine.to_owned(),
-                    principal: "device:pixel".to_owned(),
+                    principal: "device:phone".to_owned(),
                     holder: "fleet:1".to_owned(),
                     learned_identity: None,
                 })
@@ -9484,7 +9484,7 @@ mod tests {
                         user: "me".to_owned(),
                         host_keys: vec![tower_key.to_owned()],
                     },
-                    Some("device:pixel".to_owned()),
+                    Some("device:phone".to_owned()),
                 )],
                 ..LinkConfig::default()
             },
@@ -10570,7 +10570,7 @@ mod tests {
                     link: self.link.clone(),
                     link_node: machine.to_owned(),
                     machine: machine.to_owned(),
-                    principal: "device:pixel".to_owned(),
+                    principal: "device:phone".to_owned(),
                     holder: "fleet:1".to_owned(),
                     learned_identity: None,
                 })
@@ -10774,7 +10774,7 @@ mod tests {
                 user: "me".to_owned(),
                 host_keys: vec![tower_key.to_owned()],
             },
-            Some("device:pixel".to_owned()),
+            Some("device:phone".to_owned()),
         ));
         let link = Link::with_opener(cfg, LinkOptions::default(), opener);
         let backend: Arc<dyn Backend> = Arc::new(UpdaterCloseRelayBackend {

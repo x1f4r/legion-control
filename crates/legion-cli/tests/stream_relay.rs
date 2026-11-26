@@ -2243,13 +2243,13 @@ fn configure_gate_device(home: &Home, node_name: &str, pairing_id: &str, role_ru
     home.write_config(
         "policy.toml",
         &format!(
-            "default = \"owner\"\n\n[principals.\"device:pixel\"]\nrole = \"device_role\"\ndevice = \"{pairing_id}\"\n\n[roles.device_role]\n{role_rules}\n"
+            "default = \"owner\"\n\n[principals.\"device:handset\"]\nrole = \"device_role\"\ndevice = \"{pairing_id}\"\n\n[roles.device_role]\n{role_rules}\n"
         ),
     );
     home.write_config(
         "devices.toml",
         &format!(
-            "version = 1\n\n[devices.{pairing_id}]\nname = \"pixel\"\nprincipal = \"device:pixel\"\nrole = \"device_role\"\npublic_key = \"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea\"\npaired_at = \"2026-11-01T00:00:00Z\"\npaired_on = \"{node_name}\"\nupdated_at = \"2026-11-01T00:00:00Z\"\nupdated_on = \"{node_name}\"\nname_updated_at = \"2026-11-01T00:00:00Z\"\nname_updated_on = \"{node_name}\"\nrole_updated_at = \"2026-11-01T00:00:00Z\"\nrole_updated_on = \"{node_name}\"\n"
+            "version = 1\n\n[devices.{pairing_id}]\nname = \"handset\"\nprincipal = \"device:handset\"\nrole = \"device_role\"\npublic_key = \"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea\"\npaired_at = \"2026-11-01T00:00:00Z\"\npaired_on = \"{node_name}\"\nupdated_at = \"2026-11-01T00:00:00Z\"\nupdated_on = \"{node_name}\"\nname_updated_at = \"2026-11-01T00:00:00Z\"\nname_updated_on = \"{node_name}\"\nrole_updated_at = \"2026-11-01T00:00:00Z\"\nrole_updated_on = \"{node_name}\"\n"
         ),
     );
     // Reconcile authorized_keys from devices.toml so `legion gate` accepts the paired key.
@@ -2278,9 +2278,9 @@ fn spawn_gate_stream(home: &Home, pairing_id: &str) -> Child {
             "--home",
             lh.to_str().unwrap(),
             "--as",
-            "device:pixel",
+            "device:handset",
             "--device",
-            "pixel",
+            "handset",
             "--pairing",
             pairing_id,
         ])
@@ -2301,7 +2301,7 @@ fn write_device_role_policy(home: &Home, pairing_id: &str, role_rules: &str) {
     home.write_config(
         "policy.toml",
         &format!(
-            "default = \"owner\"\n\n[principals.\"device:pixel\"]\nrole = \"device_role\"\ndevice = \"{pairing_id}\"\n\n[roles.device_role]\n{role_rules}\n"
+            "default = \"owner\"\n\n[principals.\"device:handset\"]\nrole = \"device_role\"\ndevice = \"{pairing_id}\"\n\n[roles.device_role]\n{role_rules}\n"
         ),
     );
 }

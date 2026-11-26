@@ -653,13 +653,13 @@ mod tests {
         let mut bystander = spawn_sleeper();
         let bystander_id = procid::of_pid(bystander.id()).unwrap().unwrap();
 
-        // 1. Live session belonging to `pixel` (must be terminated), with a forged `parent_sshd`
+        // 1. Live session belonging to `handset` (must be terminated), with a forged `parent_sshd`
         //    pointing at the non-sshd `bystander` (which MUST NOT be signalled!).
         let victim_file = write_record(
             &sess_dir,
-            &format!("pixel-{}-{}.json", victim_id.pid, victim_id.start_time),
+            &format!("handset-{}-{}.json", victim_id.pid, victim_id.start_time),
             &DeviceSessionRecord {
-                device: "pixel".to_owned(),
+                device: "handset".to_owned(),
                 pairing_id: None,
                 principal: "phone".to_owned(),
                 pid: victim_id.pid,
@@ -670,16 +670,16 @@ mod tests {
                 parent_sshd: Some(bystander_id),
             },
         );
-        // 1b. Forged `SshConnection` record for `pixel` pointing at the non-sshd `bystander`
+        // 1b. Forged `SshConnection` record for `handset` pointing at the non-sshd `bystander`
         //     (must be swept without signalling bystander).
         let forged_conn_file = write_record(
             &sess_dir,
             &format!(
-                "conn-pixel-{}-{}.json",
+                "conn-handset-{}-{}.json",
                 bystander_id.pid, bystander_id.start_time
             ),
             &DeviceSessionRecord {
-                device: "pixel".to_owned(),
+                device: "handset".to_owned(),
                 pairing_id: None,
                 principal: "phone".to_owned(),
                 pid: bystander_id.pid,
@@ -690,13 +690,13 @@ mod tests {
                 parent_sshd: None,
             },
         );
-        // 2. Recycled-PID record for `pixel` pointing at bystander's PID with a wrong start_time
+        // 2. Recycled-PID record for `handset` pointing at bystander's PID with a wrong start_time
         //    (must be swept without touching bystander).
         let recycled_file = write_record(
             &sess_dir,
-            "pixel-recycled.json",
+            "handset-recycled.json",
             &DeviceSessionRecord {
-                device: "pixel".to_owned(),
+                device: "handset".to_owned(),
                 pairing_id: None,
                 principal: "phone".to_owned(),
                 pid: bystander_id.pid,
@@ -707,13 +707,13 @@ mod tests {
                 parent_sshd: None,
             },
         );
-        // 3. Prior-boot record for `pixel` pointing at bystander's exact ProcessId with another
+        // 3. Prior-boot record for `handset` pointing at bystander's exact ProcessId with another
         //    boot id (must be swept without touching bystander).
         let old_boot_file = write_record(
             &sess_dir,
-            "pixel-oldboot.json",
+            "handset-oldboot.json",
             &DeviceSessionRecord {
-                device: "pixel".to_owned(),
+                device: "handset".to_owned(),
                 pairing_id: None,
                 principal: "phone".to_owned(),
                 pid: bystander_id.pid,
@@ -750,7 +750,7 @@ mod tests {
         let sleeper_exe = sleeper_executable();
         let ended = terminate_device_sessions_with_exe(
             &paths,
-            &SessionTarget::new("pixel", None),
+            &SessionTarget::new("handset", None),
             Duration::from_secs(2),
             Some(&sleeper_exe),
         )
@@ -822,13 +822,13 @@ mod tests {
         let victim_file = write_record(
             &sess_dir,
             &format!(
-                "pixel-{id1}-{}-{}.json",
+                "handset-{id1}-{}-{}.json",
                 victim_id.pid, victim_id.start_time
             ),
             &DeviceSessionRecord {
-                device: "pixel".to_owned(),
+                device: "handset".to_owned(),
                 pairing_id: Some(id1.clone()),
-                principal: "device:pixel".to_owned(),
+                principal: "device:handset".to_owned(),
                 pid: victim_id.pid,
                 start_time: victim_id.start_time,
                 boot_id: boot.clone(),
@@ -840,13 +840,13 @@ mod tests {
         let survivor_file = write_record(
             &sess_dir,
             &format!(
-                "pixel-{id2}-{}-{}.json",
+                "handset-{id2}-{}-{}.json",
                 survivor_id.pid, survivor_id.start_time
             ),
             &DeviceSessionRecord {
-                device: "pixel".to_owned(),
+                device: "handset".to_owned(),
                 pairing_id: Some(id2.clone()),
-                principal: "device:pixel-2".to_owned(),
+                principal: "device:handset-2".to_owned(),
                 pid: survivor_id.pid,
                 start_time: survivor_id.start_time,
                 boot_id: boot,
@@ -859,7 +859,7 @@ mod tests {
         let sleeper_exe = sleeper_executable();
         let ended = terminate_device_sessions_with_exe(
             &paths,
-            &SessionTarget::new("pixel", Some(id1)),
+            &SessionTarget::new("handset", Some(id1)),
             Duration::from_secs(2),
             Some(&sleeper_exe),
         )
@@ -890,7 +890,7 @@ mod tests {
 
         let recorded_path = {
             let guard =
-                DeviceSessionGuard::register(&paths, "pixel", Some(&"aa".repeat(16)), "phone")
+                DeviceSessionGuard::register(&paths, "handset", Some(&"aa".repeat(16)), "phone")
                     .unwrap();
             let dir_mode = std::fs::metadata(&sess_dir).unwrap().permissions().mode() & 0o777;
             let file_mode = std::fs::metadata(guard.path())

@@ -5616,7 +5616,7 @@ default = \"owner\"
 [roles.observer]
 allow = [\"effect:read\"]
 
-[principals.\"device:pixel\"]
+[principals.\"device:handset\"]
 role = \"observer\"
 device = \"11111111111111111111111111111111\"
 ",
@@ -5633,9 +5633,9 @@ device = \"11111111111111111111111111111111\"
         initial.devices.insert(
             id_existing.clone(),
             FleetDevice {
-                name: "pixel".to_owned(),
+                name: "handset".to_owned(),
                 public_key: ed25519_public_key_from_seed(&[11u8; 32]),
-                principal: "device:pixel".to_owned(),
+                principal: "device:handset".to_owned(),
                 role: Some("observer".to_owned()),
                 paired_at: "2026-11-24T10:00:00Z".to_owned(),
                 paired_on: "box-a".to_owned(),
@@ -5709,8 +5709,8 @@ device = \"11111111111111111111111111111111\"
         revoke.removed.insert(
             id_existing.clone(),
             DeviceTombstone {
-                name: "pixel".to_owned(),
-                principal: "device:pixel".to_owned(),
+                name: "handset".to_owned(),
+                principal: "device:handset".to_owned(),
                 fingerprint: None,
                 paired_at: Some("2026-11-24T10:00:00Z".to_owned()),
                 paired_on: Some("box-a".to_owned()),
@@ -5935,7 +5935,7 @@ role = \"phone_admin\"
         std::fs::write(
             paths.config_file("policy.toml"),
             format!(
-                "default = \"owner\"\n\n[roles.observer]\nallow = [\"effect:read\"]\n\n[principals.\"device:pixel\"]\nrole = \"observer\"\ndevice = \"{id}\"\n"
+                "default = \"owner\"\n\n[roles.observer]\nallow = [\"effect:read\"]\n\n[principals.\"device:handset\"]\nrole = \"observer\"\ndevice = \"{id}\"\n"
             ),
         )
         .unwrap();
@@ -5949,9 +5949,9 @@ role = \"phone_admin\"
         initial.devices.insert(
             id.clone(),
             FleetDevice {
-                name: "pixel".to_owned(),
+                name: "handset".to_owned(),
                 public_key: ed25519_public_key_from_seed(&[55u8; 32]),
-                principal: "device:pixel".to_owned(),
+                principal: "device:handset".to_owned(),
                 role: Some("observer".to_owned()),
                 paired_at: "2026-11-24T10:00:00Z".to_owned(),
                 paired_on: "box-a".to_owned(),
@@ -5974,8 +5974,8 @@ role = \"phone_admin\"
         revoke.removed.insert(
             id.clone(),
             DeviceTombstone {
-                name: "pixel".to_owned(),
-                principal: "device:pixel".to_owned(),
+                name: "handset".to_owned(),
+                principal: "device:handset".to_owned(),
                 fingerprint: None,
                 paired_at: Some("2026-11-24T10:00:00Z".to_owned()),
                 paired_on: Some("box-a".to_owned()),
@@ -6008,7 +6008,7 @@ role = \"phone_admin\"
         //    devices.toml has the tombstone AND session termination/sweep STILL runs.
         let sess_dir = paths.state_dir().join("device-sessions");
         std::fs::create_dir_all(&sess_dir).unwrap();
-        let marker_session = sess_dir.join("pixel-999999-1.json");
+        let marker_session = sess_dir.join("handset-999999-1.json");
         std::fs::write(&marker_session, b"{\"stale\":true}\n").unwrap();
         std::fs::create_dir(&auth_keys).unwrap();
 

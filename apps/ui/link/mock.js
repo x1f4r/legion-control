@@ -746,8 +746,8 @@ export function createMockLink(mode = '') {
 
   let incomingDevices = [
     {
-      name: 'Pixel 10',
-      principal: 'device:pixel-10',
+      name: 'My phone',
+      principal: 'device:my-phone',
       role: 'owner',
       fingerprint: 'SHA256:4kP9vR2mN8xQ1wL6tY3bZ5cH7jD0sF9eA2uK4mV8nX0',
       added: isoAgo(86400 * 12),
@@ -779,7 +779,7 @@ export function createMockLink(mode = '') {
         uptime_s: 11 * 3600 + 26 * 60,
         boot_id: '7b51c60a-0d29-42b0-9c52-88b6d5a10001',
         cpu: {
-          model: 'Ryzen 9 9950X3D',
+          model: 'Ryzen 7 7700X',
           cores: 32,
           usage_pct: 71.0,
           load: [3.2, 2.9, 2.4],
@@ -789,7 +789,7 @@ export function createMockLink(mode = '') {
         disks: [{ mount: '/', fs: 'btrfs', total: 2.8e12, available: 2.553e12 }],
         gpus: [
           {
-            name: 'RTX 5080',
+            name: 'RTX 4070',
             vendor: 'nvidia',
             memory_total: 16e9,
             memory_used: 9.1e9,
@@ -979,7 +979,7 @@ export function createMockLink(mode = '') {
             os: { family: 'linux', name: 'Debian', version: '13', kernel: '6.12.0', arch: 'aarch64' },
             uptime_s: 41 * 86400 + 3600,
             boot_id: 'a011c60a-0d29-42b0-9c52-88b6d5a10002',
-            cpu: { model: 'Cortex-A76', cores: 4, usage_pct: 6.0, load: [0.18, 0.22, 0.2], temperature_c: 48.2 },
+            cpu: { model: 'Cortex-A72', cores: 4, usage_pct: 6.0, load: [0.18, 0.22, 0.2], temperature_c: 48.2 },
             memory: { total: 8e9, used: 2.5e9, available: 5.5e9, swap_total: 2e9, swap_used: 0 },
             disks: [{ mount: '/', fs: 'ext4', total: 128e9, available: isAmber ? 3.8e9 : 71.7e9 }],
             gpus: [],
@@ -1008,8 +1008,8 @@ export function createMockLink(mode = '') {
         os: { family: 'macos', name: 'macOS', version: '15.4', kernel: '24.4.0', arch: 'aarch64' },
         uptime_s: 3 * 86400 + 1800,
         boot_id: 'c200c60a-0d29-42b0-9c52-88b6d5a10003',
-        cpu: { model: 'Apple M4 Max', cores: 16, usage_pct: 12.0, load: [1.4, 1.2, 1.1] },
-        memory: { total: 128e9, used: 99.8e9, available: 28.2e9, swap_total: 0, swap_used: 0 },
+        cpu: { model: 'Apple M2 Pro', cores: 12, usage_pct: 12.0, load: [1.4, 1.2, 1.1] },
+        memory: { total: 32e9, used: 22.4e9, available: 9.6e9, swap_total: 0, swap_used: 0 },
         disks: [{ mount: '/', fs: 'apfs', total: 2e12, available: 140e9 }],
         gpus: [],
         battery: {
@@ -1094,8 +1094,8 @@ export function createMockLink(mode = '') {
         os: { family: 'linux', name: 'Linux', version: '7.2', kernel: '7.2.0', arch: 'x86_64' },
         uptime_s: 5 * 86400 + 2400,
         boot_id: 'f100c60a-0d29-42b0-9c52-88b6d5a10099',
-        cpu: { model: 'Ryzen 9 9950X', cores: 32, usage_pct: 18.0, load: [0.9, 0.8, 0.7], temperature_c: 54.0 },
-        memory: { total: 128e9, used: 34e9, available: 94e9, swap_total: 0, swap_used: 0 },
+        cpu: { model: 'Ryzen 7 7700X', cores: 16, usage_pct: 18.0, load: [0.9, 0.8, 0.7], temperature_c: 54.0 },
+        memory: { total: 64e9, used: 34e9, available: 30e9, swap_total: 0, swap_used: 0 },
         disks: [{ mount: '/', fs: 'btrfs', total: 4e12, available: 1.8e12 }],
         gpus: [],
       },
@@ -1153,7 +1153,7 @@ export function createMockLink(mode = '') {
         hostname: wakeTarget,
         os: { family: 'linux', name: 'Linux', version: '6.12', arch: 'x86_64' },
         uptime_s: 12,
-        cpu: { model: 'Ryzen 9 5900HX', cores: 16, usage_pct: 14.0, load: [0.18, 0.14, 0.1], temperature_c: 51.0 },
+        cpu: { model: 'Core i7-13700H', cores: 14, usage_pct: 14.0, load: [0.18, 0.14, 0.1], temperature_c: 51.0 },
         memory: { total: 32e9, used: 6e9, available: 26e9, swap_total: 8e9, swap_used: 0 },
         disks: [{ mount: '/', fs: 'ext4', total: 1000e9, available: 580e9 }],
         gpus: [
@@ -2148,7 +2148,7 @@ export function createMockLink(mode = '') {
     if (isFleet || isPair) {
       lastPaired = {
         node: 'tower',
-        device: 'Pixel 10',
+        device: 'My phone',
         role: 'operator',
         synced: ['pi'],
         not_synced: isPartial
@@ -2239,7 +2239,7 @@ export function createMockLink(mode = '') {
   }
 
   async function deviceName() {
-    return 'Pixel 10';
+    return 'My phone';
   }
 
   async function scanInvite() {

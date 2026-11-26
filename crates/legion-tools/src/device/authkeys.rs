@@ -2362,7 +2362,7 @@ mod tests {
             Path::new(r"C:\Users\me\O'Neil\My Légion\legion.exe"),
             "agent:example",
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000",
-            "pixel",
+            "handset",
             "0123456789abcdef0123456789abcdef",
             &PinnedHome::Root(PathBuf::from(r"C:\Users\me\O'Neil\Legion Home")),
             Some("O'Neil"),
@@ -2383,7 +2383,7 @@ mod tests {
                 home: Some(PinnedHome::Root(h)),
                 account: Some(a),
                 ..
-            } if name == "pixel"
+            } if name == "handset"
                 && principal == "agent:example"
                 && pairing_id == "0123456789abcdef0123456789abcdef"
                 && h == Path::new(r"C:\Users\me\O'Neil\Legion Home")
@@ -2414,7 +2414,7 @@ mod tests {
             Path::new(r"C:\Users\me\O'Neil\legion.exe"),
             "agent:example",
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000",
-            "pixel",
+            "handset",
             "0123456789abcdef0123456789abcdef",
             &PinnedHome::Root(PathBuf::from(r"C:\Users\me\Legion Home")),
             Some("me"),
@@ -2439,7 +2439,7 @@ mod tests {
                 home: Some(PinnedHome::Root(h)),
                 account: Some(a),
                 ..
-            } if name == "pixel"
+            } if name == "handset"
                 && principal == "agent:example"
                 && pairing_id == "0123456789abcdef0123456789abcdef"
                 && h == Path::new(r"C:\Users\me\Legion Home")
@@ -2451,7 +2451,7 @@ mod tests {
             Path::new("/home/me/.local/bin/legion"),
             "phone",
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000",
-            "pixel",
+            "handset",
             "0123456789abcdef0123456789abcdef",
             &PinnedHome::Split {
                 config_dir: PathBuf::from("/home/me/.config/legion"),
@@ -2480,7 +2480,7 @@ mod tests {
                 pairing_id,
                 home: Some(PinnedHome::Split { config_dir, state_dir }),
                 ..
-            } if name == "pixel"
+            } if name == "handset"
                 && principal == "phone"
                 && pairing_id == "0123456789abcdef0123456789abcdef"
                 && config_dir == Path::new("/home/me/.config/legion")
@@ -2508,7 +2508,7 @@ mod tests {
 
     #[test]
     fn foreign_lines_comments_and_missing_trailing_newline_are_preserved_byte_for_byte() {
-        let initial = b"# Header comment\n\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000 me@laptop\nrestrict,command=\"/home/me/legion gate --as phone --device pixel --pairing 0123456789abcdef0123456789abcdef --home /home/me/legion\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI1111111111111111111111111111111111111111111 legion-device:pixel\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI2222222222222222222222222222222222222222222 final-no-newline";
+        let initial = b"# Header comment\n\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000 me@laptop\nrestrict,command=\"/home/me/legion gate --as phone --device handset --pairing 0123456789abcdef0123456789abcdef --home /home/me/legion\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI1111111111111111111111111111111111111111111 legion-device:handset\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI2222222222222222222222222222222222222222222 final-no-newline";
         let mut parsed = AuthKeysFile::parse_for_host(initial, ForcedCommandShell::Posix, false);
         assert_eq!(parsed.lines.len(), 5);
         assert_eq!(parsed.lines[0].kind, LineKind::Foreign);
@@ -2516,14 +2516,14 @@ mod tests {
         assert_eq!(parsed.lines[2].kind, LineKind::Foreign);
         assert!(matches!(
             &parsed.lines[3].kind,
-            LineKind::Device { name, principal, .. } if name == "pixel" && principal == "phone"
+            LineKind::Device { name, principal, .. } if name == "handset" && principal == "phone"
         ));
         assert_eq!(parsed.lines[4].kind, LineKind::Foreign);
 
         // Removing the device line preserves every other line byte for byte, including the missing
         // trailing newline on the final foreign line.
         assert!(parsed.retain(
-            |line| !matches!(&line.kind, LineKind::Device { name, .. } if name == "pixel")
+            |line| !matches!(&line.kind, LineKind::Device { name, .. } if name == "handset")
         ));
         let expected = b"# Header comment\n\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000 me@laptop\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI2222222222222222222222222222222222222222222 final-no-newline";
         assert_eq!(parsed.to_bytes(), expected);
@@ -2981,48 +2981,48 @@ Match Group users
             format!("{key} legion-device:handwritten\n"),
             // Hand-written forced command missing `restrict`.
             format!(
-                "command=\"/home/me/legion gate --as phone --device pixel\" {key} legion-device:pixel\n"
+                "command=\"/home/me/legion gate --as phone --device handset\" {key} legion-device:handset\n"
             ),
             // `restrict` only inside a quoted option value, not as a bare option.
             format!(
-                "environment=\"FOO=restrict\",command=\"/home/me/legion gate --as phone --device pixel\" {key} legion-device:pixel\n"
+                "environment=\"FOO=restrict\",command=\"/home/me/legion gate --as phone --device handset\" {key} legion-device:handset\n"
             ),
             // Earlier-branch line missing `--device <name>` or `--pairing <id>` is not recognised.
             format!(
                 "restrict,command=\"/home/me/legion gate --as phone\" {key} legion-device:legacy\n"
             ),
             format!(
-                "restrict,command=\"/home/me/legion gate --as phone --device pixel --home /home/me/legion\" {key} legion-device:pixel\n"
+                "restrict,command=\"/home/me/legion gate --as phone --device handset --home /home/me/legion\" {key} legion-device:handset\n"
             ),
             // Mismatched `--device` vs comment name.
             format!(
-                "restrict,command=\"/home/me/legion gate --as phone --device other --pairing 0123456789abcdef0123456789abcdef --home /home/me/legion\" {key} legion-device:pixel\n"
+                "restrict,command=\"/home/me/legion gate --as phone --device other --pairing 0123456789abcdef0123456789abcdef --home /home/me/legion\" {key} legion-device:handset\n"
             ),
             // Invalid `--pairing` value.
             format!(
-                "restrict,command=\"/home/me/legion gate --as phone --device pixel --pairing not-hex --home /home/me/legion\" {key} legion-device:pixel\n"
+                "restrict,command=\"/home/me/legion gate --as phone --device handset --pairing not-hex --home /home/me/legion\" {key} legion-device:handset\n"
             ),
             // Shell chaining / metacharacters appended to gate command.
             format!(
-                "restrict,command=\"/home/me/legion gate --as phone --device pixel --pairing 0123456789abcdef0123456789abcdef; id\" {key} legion-device:pixel\n"
+                "restrict,command=\"/home/me/legion gate --as phone --device handset --pairing 0123456789abcdef0123456789abcdef; id\" {key} legion-device:handset\n"
             ),
             format!(
-                "restrict,command=\"/home/me/legion gate --as phone --device pixel --pairing 0123456789abcdef0123456789abcdef && id\" {key} legion-device:pixel\n"
+                "restrict,command=\"/home/me/legion gate --as phone --device handset --pairing 0123456789abcdef0123456789abcdef && id\" {key} legion-device:handset\n"
             ),
             // Unknown flag or extra positional argument.
             format!(
-                "restrict,command=\"/home/me/legion gate --as phone --device pixel --pairing 0123456789abcdef0123456789abcdef --unknown\" {key} legion-device:pixel\n"
+                "restrict,command=\"/home/me/legion gate --as phone --device handset --pairing 0123456789abcdef0123456789abcdef --unknown\" {key} legion-device:handset\n"
             ),
             format!(
-                "restrict,command=\"/home/me/legion gate --as phone --device pixel --pairing 0123456789abcdef0123456789abcdef extra\" {key} legion-device:pixel\n"
+                "restrict,command=\"/home/me/legion gate --as phone --device handset --pairing 0123456789abcdef0123456789abcdef extra\" {key} legion-device:handset\n"
             ),
             // Duplicate `command=` option.
             format!(
-                "restrict,command=\"/bin/sh\",command=\"/home/me/legion gate --as phone --device pixel --pairing 0123456789abcdef0123456789abcdef\" {key} legion-device:pixel\n"
+                "restrict,command=\"/bin/sh\",command=\"/home/me/legion gate --as phone --device handset --pairing 0123456789abcdef0123456789abcdef\" {key} legion-device:handset\n"
             ),
             // Wrong executable (not legion).
             format!(
-                "restrict,command=\"/usr/bin/other gate --as phone --device pixel --pairing 0123456789abcdef0123456789abcdef\" {key} legion-device:pixel\n"
+                "restrict,command=\"/usr/bin/other gate --as phone --device handset --pairing 0123456789abcdef0123456789abcdef\" {key} legion-device:handset\n"
             ),
             // Hand-written invite comment without restrict or with mismatched --enrol id.
             format!("{key} legion-invite:abc123\n"),
@@ -3032,7 +3032,7 @@ Match Group users
             ),
             // Device comment paired with --enrol command, or invite comment paired with --as command.
             format!(
-                "restrict,command=\"/home/me/legion gate --enrol pixel\" {key} legion-device:pixel\n"
+                "restrict,command=\"/home/me/legion gate --enrol handset\" {key} legion-device:handset\n"
             ),
             format!(
                 "restrict,command=\"/home/me/legion gate --as phone --device abc123 --pairing 0123456789abcdef0123456789abcdef\" {key} legion-invite:abc123\n"
@@ -3054,7 +3054,7 @@ Match Group users
             Path::new("/home/me/.local/bin/legion"),
             "phone",
             key,
-            "pixel",
+            "handset",
             "0123456789abcdef0123456789abcdef",
             &PinnedHome::Root(PathBuf::from("/home/me/legion")),
             None,
@@ -3069,7 +3069,7 @@ Match Group users
         assert!(matches!(
             &parsed_dev.lines[0].kind,
             LineKind::Device { name, pairing_id, .. }
-                if name == "pixel" && pairing_id == "0123456789abcdef0123456789abcdef"
+                if name == "handset" && pairing_id == "0123456789abcdef0123456789abcdef"
         ));
     }
 
@@ -3079,41 +3079,41 @@ Match Group users
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI0000000000000000000000000000000000000000000";
         let pid = "0123456789abcdef0123456789abcdef";
         let valid_dev_cmd = format!(
-            "/home/me/legion gate --as phone --device pixel --pairing {pid} --home /home/me/legion"
+            "/home/me/legion gate --as phone --device handset --pairing {pid} --home /home/me/legion"
         );
         let valid_inv_cmd = "/home/me/legion gate --enrol abc123 --home /home/me/legion";
 
         let attacks = [
             // Re-enabling options after `restrict`.
             format!(
-                "restrict,port-forwarding,command=\"{valid_dev_cmd}\" {key} legion-device:pixel\n"
+                "restrict,port-forwarding,command=\"{valid_dev_cmd}\" {key} legion-device:handset\n"
             ),
-            format!("restrict,pty,command=\"{valid_dev_cmd}\" {key} legion-device:pixel\n"),
+            format!("restrict,pty,command=\"{valid_dev_cmd}\" {key} legion-device:handset\n"),
             format!(
-                "restrict,permitopen=\"127.0.0.1:80\",command=\"{valid_dev_cmd}\" {key} legion-device:pixel\n"
-            ),
-            format!(
-                "restrict,agent-forwarding,command=\"{valid_dev_cmd}\" {key} legion-device:pixel\n"
+                "restrict,permitopen=\"127.0.0.1:80\",command=\"{valid_dev_cmd}\" {key} legion-device:handset\n"
             ),
             format!(
-                "restrict,X11-forwarding,command=\"{valid_dev_cmd}\" {key} legion-device:pixel\n"
+                "restrict,agent-forwarding,command=\"{valid_dev_cmd}\" {key} legion-device:handset\n"
+            ),
+            format!(
+                "restrict,X11-forwarding,command=\"{valid_dev_cmd}\" {key} legion-device:handset\n"
             ),
             // `cert-authority`, `environment=`, or `from=` alongside `restrict`.
             format!(
-                "cert-authority,restrict,command=\"{valid_dev_cmd}\" {key} legion-device:pixel\n"
+                "cert-authority,restrict,command=\"{valid_dev_cmd}\" {key} legion-device:handset\n"
             ),
             format!(
-                "restrict,environment=\"FOO=1\",command=\"{valid_dev_cmd}\" {key} legion-device:pixel\n"
+                "restrict,environment=\"FOO=1\",command=\"{valid_dev_cmd}\" {key} legion-device:handset\n"
             ),
             format!(
-                "restrict,from=\"10.0.0.1\",command=\"{valid_dev_cmd}\" {key} legion-device:pixel\n"
+                "restrict,from=\"10.0.0.1\",command=\"{valid_dev_cmd}\" {key} legion-device:handset\n"
             ),
             format!(
                 "restrict,expiry-time=\"202611241215\",port-forwarding,command=\"{valid_inv_cmd}\" {key} legion-invite:abc123\n"
             ),
             // Reordered or differently cased or unquoted options.
-            format!("command=\"{valid_dev_cmd}\",restrict {key} legion-device:pixel\n"),
-            format!("RESTRICT,command=\"{valid_dev_cmd}\" {key} legion-device:pixel\n"),
+            format!("command=\"{valid_dev_cmd}\",restrict {key} legion-device:handset\n"),
+            format!("RESTRICT,command=\"{valid_dev_cmd}\" {key} legion-device:handset\n"),
             format!(
                 "restrict,command=\"{valid_inv_cmd}\",expiry-time=\"202611241215\" {key} legion-invite:abc123\n"
             ),
@@ -3122,7 +3122,7 @@ Match Group users
             ),
             // Wrong option set for the kind (device with expiry-time; invite without or malformed expiry-time).
             format!(
-                "restrict,expiry-time=\"202611241215\",command=\"{valid_dev_cmd}\" {key} legion-device:pixel\n"
+                "restrict,expiry-time=\"202611241215\",command=\"{valid_dev_cmd}\" {key} legion-device:handset\n"
             ),
             format!("restrict,command=\"{valid_inv_cmd}\" {key} legion-invite:abc123\n"),
             format!(
@@ -3133,23 +3133,23 @@ Match Group users
             ),
             // Double-quoted POSIX command / shell substitutions / stray backslashes.
             format!(
-                "restrict,command=\"\\\"/home/me/legion\\\" gate --as phone --device pixel --pairing {pid} --home /home/me/legion\" {key} legion-device:pixel\n"
+                "restrict,command=\"\\\"/home/me/legion\\\" gate --as phone --device handset --pairing {pid} --home /home/me/legion\" {key} legion-device:handset\n"
             ),
             format!(
-                "restrict,command=\"/home/me/legion gate --as phone --device pixel --pairing {pid} --home \\\"$HOME/legion\\\"\" {key} legion-device:pixel\n"
+                "restrict,command=\"/home/me/legion gate --as phone --device handset --pairing {pid} --home \\\"$HOME/legion\\\"\" {key} legion-device:handset\n"
             ),
             format!(
-                "restrict,command=\"/home/me/legion gate --as phone --device pixel --pairing {pid} --home \\\"/tmp/$(id)\\\"\" {key} legion-device:pixel\n"
+                "restrict,command=\"/home/me/legion gate --as phone --device handset --pairing {pid} --home \\\"/tmp/$(id)\\\"\" {key} legion-device:handset\n"
             ),
             format!(
-                "restrict,command=\"/home/me/legion gate --as phone --device pixel --pairing {pid} --home /home/me/a\\\\b\" {key} legion-device:pixel\n"
+                "restrict,command=\"/home/me/legion gate --as phone --device handset --pairing {pid} --home /home/me/a\\\\b\" {key} legion-device:handset\n"
             ),
             // Windows cmd.exe env var expansion or POSIX shell substitution inside double quotes.
             format!(
-                "restrict,command=\"\\\"C:\\Users\\%USERNAME%\\legion.exe\\\" gate --as phone --device pixel --pairing {pid} --home C:\\Users\\me\\legion\" {key} legion-device:pixel\n"
+                "restrict,command=\"\\\"C:\\Users\\%USERNAME%\\legion.exe\\\" gate --as phone --device handset --pairing {pid} --home C:\\Users\\me\\legion\" {key} legion-device:handset\n"
             ),
             format!(
-                "restrict,command=\"C:\\Users\\me\\legion.exe gate --as phone --device pixel --pairing {pid} --home \\\"C:\\Users\\%USERNAME%\\legion\\\"\" {key} legion-device:pixel\n"
+                "restrict,command=\"C:\\Users\\me\\legion.exe gate --as phone --device handset --pairing {pid} --home \\\"C:\\Users\\%USERNAME%\\legion\\\"\" {key} legion-device:handset\n"
             ),
             // Reproduced on Linux: Windows cmd-shaped path carrying backticks or `$` would be
             // executed by bash if treated as a managed device line on a Unix host.
@@ -3161,16 +3161,16 @@ Match Group users
             ),
             // Non-canonical command shapes: `--flag=value`, extra spaces, reordered flags, missing home.
             format!(
-                "restrict,command=\"/home/me/legion gate --as=phone --device pixel --pairing {pid} --home /home/me/legion\" {key} legion-device:pixel\n"
+                "restrict,command=\"/home/me/legion gate --as=phone --device handset --pairing {pid} --home /home/me/legion\" {key} legion-device:handset\n"
             ),
             format!(
-                "restrict,command=\"/home/me/legion  gate --as phone --device pixel --pairing {pid} --home /home/me/legion\" {key} legion-device:pixel\n"
+                "restrict,command=\"/home/me/legion  gate --as phone --device handset --pairing {pid} --home /home/me/legion\" {key} legion-device:handset\n"
             ),
             format!(
-                "restrict,command=\"/home/me/legion gate --home /home/me/legion --as phone --device pixel --pairing {pid}\" {key} legion-device:pixel\n"
+                "restrict,command=\"/home/me/legion gate --home /home/me/legion --as phone --device handset --pairing {pid}\" {key} legion-device:handset\n"
             ),
             format!(
-                "restrict,command=\"/home/me/legion gate --as phone --device pixel --pairing {pid}\" {key} legion-device:pixel\n"
+                "restrict,command=\"/home/me/legion gate --as phone --device handset --pairing {pid}\" {key} legion-device:handset\n"
             ),
             format!(
                 "restrict,expiry-time=\"202611241215\",command=\"/home/me/legion gate --enrol abc123\" {key} legion-invite:abc123\n"
@@ -3200,7 +3200,7 @@ Match Group users
             Path::new("/home/me/legion"),
             "phone",
             key,
-            "pixel",
+            "handset",
             pid,
             &PinnedHome::Root(PathBuf::from("/home/me/legion-home")),
             None,
@@ -3211,7 +3211,7 @@ Match Group users
             Path::new(r"C:\Users\me\legion.exe"),
             "phone",
             key,
-            "pixel",
+            "handset",
             pid,
             &PinnedHome::Root(PathBuf::from(r"C:\Users\me\legion-home")),
             None,
@@ -3222,7 +3222,7 @@ Match Group users
             Path::new(r"C:\Users\me\My Legion\legion.exe"),
             "phone",
             key,
-            "pixel",
+            "handset",
             pid,
             &PinnedHome::Root(PathBuf::from(r"C:\Users\me\Legion Home")),
             None,
@@ -3233,7 +3233,7 @@ Match Group users
             Path::new(r"C:\Users\me\My Legion\legion.exe"),
             "phone",
             key,
-            "pixel",
+            "handset",
             pid,
             &PinnedHome::Root(PathBuf::from(r"C:\Users\me\Legion Home")),
             None,
@@ -3343,7 +3343,7 @@ Match Group users
             &fake_exe,
             "phone",
             key,
-            "pixel",
+            "handset",
             pairing_a,
             &PinnedHome::from_paths(&paths_a),
             None,
@@ -3354,7 +3354,7 @@ Match Group users
 
         // Exact match succeeds.
         assert!(
-            verify_device_authorized(&paths_a, &node_file, "pixel", pairing_a, "phone", None)
+            verify_device_authorized(&paths_a, &node_file, "handset", pairing_a, "phone", None)
                 .is_ok()
         );
 
@@ -3366,19 +3366,19 @@ Match Group users
             ErrorCode::Denied
         );
         assert_eq!(
-            verify_device_authorized(&paths_a, &node_file, "pixel", pairing_a, "owner", None)
+            verify_device_authorized(&paths_a, &node_file, "handset", pairing_a, "owner", None)
                 .unwrap_err()
                 .code,
             ErrorCode::Denied
         );
         assert_eq!(
-            verify_device_authorized(&paths_a, &node_file, "pixel", pairing_b, "phone", None)
+            verify_device_authorized(&paths_a, &node_file, "handset", pairing_b, "phone", None)
                 .unwrap_err()
                 .code,
             ErrorCode::Denied
         );
         assert_eq!(
-            verify_device_authorized(&paths_b, &node_file, "pixel", pairing_a, "phone", None)
+            verify_device_authorized(&paths_b, &node_file, "handset", pairing_a, "phone", None)
                 .unwrap_err()
                 .code,
             ErrorCode::Denied
@@ -3387,7 +3387,7 @@ Match Group users
             verify_device_authorized(
                 &paths_a,
                 &node_file,
-                "pixel",
+                "handset",
                 pairing_a,
                 "phone",
                 Some("alice")
@@ -3402,7 +3402,7 @@ Match Group users
             &fake_exe,
             "phone",
             key,
-            "pixel",
+            "handset",
             pairing_b,
             &PinnedHome::from_paths(&paths_a),
             None,
@@ -3411,20 +3411,21 @@ Match Group users
         .unwrap();
         std::fs::write(&auth_path, format!("{line_repaired}\n")).unwrap();
         assert_eq!(
-            verify_device_authorized(&paths_a, &node_file, "pixel", pairing_a, "phone", None)
+            verify_device_authorized(&paths_a, &node_file, "handset", pairing_a, "phone", None)
                 .unwrap_err()
                 .code,
             ErrorCode::Denied
         );
         assert!(
-            verify_device_authorized(&paths_a, &node_file, "pixel", pairing_b, "phone", None)
+            verify_device_authorized(&paths_a, &node_file, "handset", pairing_b, "phone", None)
                 .is_ok()
         );
 
         // Removing the line immediately causes refusal.
         std::fs::write(&auth_path, "# empty\n").unwrap();
-        let err = verify_device_authorized(&paths_a, &node_file, "pixel", pairing_b, "phone", None)
-            .unwrap_err();
+        let err =
+            verify_device_authorized(&paths_a, &node_file, "handset", pairing_b, "phone", None)
+                .unwrap_err();
         assert_eq!(err.code, ErrorCode::Denied);
         assert!(
             err.message.contains("no longer authorized"),

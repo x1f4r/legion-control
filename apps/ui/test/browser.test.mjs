@@ -704,7 +704,7 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
       await p.goto(`${server.url}/?mock=multi#/settings/connections`, { waitUntil: 'domcontentloaded' });
       await p.getByText('Paired machines').waitFor();
       await p.getByText('Devices that may come in').waitFor();
-      await p.getByText('Pixel 10').waitFor();
+      await p.getByText('My phone').waitFor();
       assert.equal(await p.getByText(/Pair with a second machine so this device still works/).count(), 0);
       await maybeShot(p, `mock-${label}-dark-connections`);
 
@@ -767,7 +767,7 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
       await p.waitForFunction(
         () => {
           const el = document.querySelector('label.field input');
-          return el && el.value === 'Pixel 10';
+          return el && el.value === 'My phone';
         },
         null,
         { timeout: 5000 },
@@ -988,7 +988,7 @@ test('fleet connections routes, identity-change acceptance, pairing sync notice,
     // "Devices that may come in" in plain mode shows plain access wording, NEVER `device:...`.
     const connectionsText = await p.locator('main.main').innerText();
     assert.ok(
-      !connectionsText.includes('device:pixel-10'),
+      !connectionsText.includes('device:my-phone'),
       `Raw device principal leaked in plain Connections: ${connectionsText}`,
     );
     await assertNoToolNames(p, 'fleet connections plain');

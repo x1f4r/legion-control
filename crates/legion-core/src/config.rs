@@ -837,8 +837,8 @@ mod tests {
             "tower"
         );
         assert_eq!(
-            NodeName::from_host_name("Me's MacBook").as_str(),
-            "me-s-macbook"
+            NodeName::from_host_name("Me's Laptop").as_str(),
+            "me-s-laptop"
         );
         assert_eq!(NodeName::from_host_name("").as_str(), "localhost");
         assert_eq!(NodeName::from_host_name("ALL").as_str(), "localhost");

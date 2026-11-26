@@ -406,13 +406,13 @@ mod tests {
         assert_eq!(sanitise_device_name("a".repeat(60).as_str()).len(), 32);
 
         let mut existing = HashSet::new();
-        let first = unique_device_name("Pixel", &existing);
-        assert_eq!(first, "pixel");
+        let first = unique_device_name("Handset", &existing);
+        assert_eq!(first, "handset");
         existing.insert(first);
-        let second = unique_device_name("Pixel", &existing);
-        assert_eq!(second, "pixel-2");
+        let second = unique_device_name("Handset", &existing);
+        assert_eq!(second, "handset-2");
         existing.insert(second);
-        assert_eq!(unique_device_name("PIXEL!!", &existing), "pixel-3");
+        assert_eq!(unique_device_name("HANDSET!!", &existing), "handset-3");
     }
 
     #[test]

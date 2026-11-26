@@ -2654,13 +2654,13 @@ mod tests {
         data.upsert_meta(StoredNodeMeta {
             node: "tower".to_owned(),
             role: Some("operator".to_owned()),
-            device: Some("pixel-phone".to_owned()),
+            device: Some("my-phone".to_owned()),
             role_checked_at: None,
         });
         data.upsert_meta(StoredNodeMeta {
             node: "pi".to_owned(),
             role: Some("observer".to_owned()),
-            device: Some("pixel-phone".to_owned()),
+            device: Some("my-phone".to_owned()),
             role_checked_at: None,
         });
         store.save(&data)?;
@@ -2675,9 +2675,9 @@ mod tests {
 
         let unpaired = backend.unpair("tower".to_owned()).await?;
         assert_eq!(unpaired.node, "tower");
-        assert_eq!(unpaired.device, "pixel-phone");
+        assert_eq!(unpaired.device, "my-phone");
         assert!(unpaired.message.contains("legion device.remove"));
-        assert!(unpaired.message.contains("pixel-phone"));
+        assert!(unpaired.message.contains("my-phone"));
 
         let after = backend.state().await?;
         assert_eq!(after.nodes.len(), 1);
@@ -3533,13 +3533,13 @@ mod tests {
                 user: "me".to_owned(),
                 host_keys: vec![key_a.clone()],
             },
-            Some("device:pixel".to_owned()),
+            Some("device:phone".to_owned()),
         ));
         initial.current_node = Some("tower".to_owned());
         initial.upsert_meta(StoredNodeMeta {
             node: "tower".to_owned(),
             role: Some("owner".to_owned()),
-            device: Some("pixel".to_owned()),
+            device: Some("phone".to_owned()),
             role_checked_at: None,
         });
         store.save(&initial)?;
@@ -3807,7 +3807,7 @@ mod tests {
                 user: "me".to_owned(),
                 host_keys: vec![key_a],
             },
-            Some("device:pixel".to_owned()),
+            Some("device:phone".to_owned()),
         ));
         initial.link.upsert_node(pi);
         store.save(&initial)?;
@@ -3884,9 +3884,9 @@ mod tests {
                 user: "me".to_owned(),
                 host_keys: vec!["ssh-ed25519 AAAA".to_owned()],
             },
-            principal: "device:pixel".to_owned(),
+            principal: "device:phone".to_owned(),
             role: "owner".to_owned(),
-            device: "pixel".to_owned(),
+            device: "phone".to_owned(),
             fleet,
             not_synced_to: vec!["pi".to_owned()],
             sync_command: Some("legion fleet.sync".to_owned()),
@@ -4539,7 +4539,7 @@ mod tests {
                     user: "me".to_owned(),
                     host_keys: vec![DeviceKey::from_seed([82u8; 32]).public_key_line("studio")?],
                 },
-                Some("device:pixel".to_owned()),
+                Some("device:phone".to_owned()),
             );
             guard.data.link.upsert_node(paired_studio);
             guard.set_fresh_epoch("studio");
