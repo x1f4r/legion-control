@@ -178,13 +178,17 @@ pub(crate) fn create_private_dir_all(dir: &Path) -> io::Result<()> {
 }
 
 fn private_open_options() -> OpenOptions {
-    let mut opts = OpenOptions::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
+        let mut opts = OpenOptions::new();
         opts.mode(0o600);
+        opts
     }
-    opts
+    #[cfg(not(unix))]
+    {
+        OpenOptions::new()
+    }
 }
 
 impl AuditLog {
