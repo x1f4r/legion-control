@@ -117,6 +117,8 @@ test('shouldRunStep combines --only and --skip prefix filters', () => {
   assert.equal(shouldRunStep('b6 meta.doctor', ['a', 'b'], []), true);
   assert.equal(shouldRunStep('c1 meta.version', ['a', 'b'], []), false);
   assert.equal(shouldRunStep('b6 meta.doctor', ['a', 'b'], ['b6']), false);
+  assert.equal(shouldRunStep('g5 through the gated key', ['a', 'b', 'f1', 'g1', 'g5'], []), true);
+  assert.equal(shouldRunStep('g2 through the gated key', ['a', 'b', 'f1', 'g1', 'g5'], []), false);
 });
 
 test('buildTestPng produces a valid PNG recognized by hasImageMagic and validateThumbReply', () => {

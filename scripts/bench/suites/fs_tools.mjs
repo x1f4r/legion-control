@@ -103,7 +103,7 @@ function chunkArray(arr, size) {
   return out;
 }
 
-export async function runFsToolsSuite({ scratchRoot, fixtures, variants, runsOverride }) {
+export async function runFsToolsSuite({ scratchRoot, fixtures, variants, runsOverride, casesFilter = null }) {
   const cases = [
     {
       id: 'fs-list-10k-500',
@@ -258,8 +258,9 @@ export async function runFsToolsSuite({ scratchRoot, fixtures, variants, runsOve
     },
   ];
 
+  const selectedCases = casesFilter ? cases.filter((c) => casesFilter.has(c.id)) : cases;
   const rows = [];
-  for (const c of cases) {
+  for (const c of selectedCases) {
     console.error(`[bench:fs-tools] ${c.name} (${c.runs} runs x ${variants.length} variant(s))...`);
     const samplesByVariant = new Map(variants.map((v) => [v.id, []]));
     for (let iter = 0; iter < c.runs; iter += 1) {

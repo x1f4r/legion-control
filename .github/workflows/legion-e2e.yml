@@ -373,7 +373,7 @@ jobs:
             --far-port 2222
           )
           if [ "$E2E_SANDBOX_ONLY" = "true" ]; then
-            args+=(--only a,b)
+            args+=(--only a,b,f1,g1,g5)
           else
             args+=(--real-power)
           fi
@@ -400,7 +400,7 @@ jobs:
             '--far-shell', $env:E2E_SHELL
           )
           if ($env:E2E_SANDBOX_ONLY -eq 'true') {
-            $argsList += @('--only', 'a,b')
+            $argsList += @('--only', 'a,b,f1,g1,g5')
           } else {
             $argsList += '--real-power'
           }

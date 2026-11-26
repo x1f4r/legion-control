@@ -158,9 +158,10 @@ export function writeThrowawayNode({ legionHome, userHome, name, fleetToml = '',
   fs.mkdirSync(path.join(legionHome, 'state'), { recursive: true });
   fs.mkdirSync(userHome, { recursive: true });
 
+  const system = { linux: 'linux', darwin: 'macos', win32: 'windows' }[process.platform] || 'linux';
   fs.writeFileSync(
     path.join(legionHome, 'config', 'node.toml'),
-    `name = ${JSON.stringify(name)}\nsystem = "linux"\nbusy = "none"\n`,
+    `name = ${JSON.stringify(name)}\nsystem = ${JSON.stringify(system)}\nbusy = "none"\n`,
   );
 
   const policy = [

@@ -659,30 +659,29 @@ step('b5 init --on far names the far node, in the LEGION_HOME sshd gives it', ()
   check(fs.readFileSync(path.join(nearHome, 'config', 'node.toml'), 'utf8').includes('near'), 'the near node.toml changed');
 });
 
+function assertActiveDecodeSandbox(doctor, where) {
+  const sandbox = doctor.checks.find(c => c.name === 'decode worker sandbox');
+  check(
+    sandbox && sandbox.ok === true && !sandbox.warning && /sandbox active\b/i.test(sandbox.detail ?? ''),
+    `meta.doctor on ${where} did not report an active decode worker sandbox`,
+    sandbox ?? doctor.checks,
+  );
+  return sandbox.detail;
+}
+
 step('b6 meta.doctor on near now pings far too', () => {
   const doctor = ok('meta.doctor', {});
   fs.writeFileSync(path.join(artifacts, 'doctor-near.json'), JSON.stringify(doctor, null, 2));
   const failing = doctor.checks.filter(c => !c.ok);
   check(doctor.ok === true && failing.length === 0, 'meta.doctor reported problems', failing);
   check(doctor.checks.some(c => /far/.test(`${c.name} ${c.detail}`)), 'meta.doctor did not check far', doctor.checks);
-  const nearSandbox = doctor.checks.find(c => c.name === 'decode worker sandbox');
-  check(
-    nearSandbox && nearSandbox.ok === true && !nearSandbox.warning && /sandbox active\b/i.test(nearSandbox.detail ?? ''),
-    'meta.doctor on near did not report an active decode worker sandbox',
-    nearSandbox ?? doctor.checks,
-  );
+  assertActiveDecodeSandbox(doctor, 'near');
   const farDoctor = ok('meta.doctor', {}, { on: 'far' });
   fs.writeFileSync(path.join(artifacts, 'doctor-far.json'), JSON.stringify(farDoctor, null, 2));
   check(farDoctor.node === 'far', 'meta.doctor --on far did not run on far', farDoctor);
   const farFailing = farDoctor.checks.filter(c => !c.ok);
   check(farFailing.length === 0, 'meta.doctor --on far reported problems', farFailing);
-  const farSandbox = farDoctor.checks.find(c => c.name === 'decode worker sandbox');
-  check(
-    farSandbox && farSandbox.ok === true && !farSandbox.warning && /sandbox active\b/i.test(farSandbox.detail ?? ''),
-    'meta.doctor --on far did not report an active decode worker sandbox',
-    farSandbox ?? farDoctor.checks,
-  );
-  return farSandbox.detail;
+  return assertActiveDecodeSandbox(farDoctor, 'far');
 });
 
 step('b7 fs.thumb --on far decodes a real PNG through the sandboxed worker over sshd', () => {
@@ -992,6 +991,30 @@ step('g4 the gated key refuses to run an arbitrary command', () => {
     check(result.stderr.includes('legion gate:') && !result.stdout.includes('pwned'), `ssh ${opts.gate} ${command} was not refused by legion gate`, result.entry);
   }
 }, ['f1']);
+
+step('g5 through the gated key (sshd forced command), meta.doctor reports an active decode worker sandbox and fs.thumb decodes a real PNG', () => {
+  const gateDoctor = ok('meta.doctor', { quick: true }, { on: 'fargate' });
+  fs.writeFileSync(path.join(artifacts, 'doctor-fargate.json'), JSON.stringify(gateDoctor, null, 2));
+  check(gateDoctor.node === 'far', 'meta.doctor --on fargate did not run on far', gateDoctor);
+  const gateFailing = gateDoctor.checks.filter(c => !c.ok);
+  check(gateFailing.length === 0, 'meta.doctor --on fargate reported problems', gateFailing);
+  const sandboxDetail = assertActiveDecodeSandbox(gateDoctor, 'fargate');
+
+  const requestedSize = 128;
+  const localPng = path.join(data, 'gate-sandbox-probe.png');
+  fs.writeFileSync(localPng, buildTestPng(80, 48));
+  const remotePng = `${farRoot}/projects/gate-sandbox-probe.png`;
+  const sent = cp(localPng, `fargate:${remotePng}`);
+  check(sent.files_sent === 1, 'legion cp through fargate did not copy probe PNG', sent);
+  const thumb = ok('fs.thumb', { paths: [remotePng], size: requestedSize }, { on: 'fargate' });
+  let verified;
+  try {
+    verified = validateThumbReply(thumb, requestedSize);
+  } catch (err) {
+    throw new Failure(redactSecrets(`${err.message}\n${JSON.stringify(thumb, null, 2)}`));
+  }
+  return `${sandboxDetail} | ${verified.mime} ${verified.width}x${verified.height} (${verified.byteLength} bytes)`;
+}, ['g1']);
 
 // Device pairing over real sshd: on Unix, far points [devices] at the throwaway sshd's files; on
 // Windows, [devices] is left unset so far exercises %ProgramData%\ssh\administrators_authorized_keys
