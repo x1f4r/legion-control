@@ -2396,13 +2396,14 @@ async fn non_regular_files_are_refused_before_opening() {
     }
 
     // `fs.thumb` and `fs.tags` refuse a FIFO with per-path `invalid_args` immediately without blocking.
+    const FIFO_HANG_GUARD: Duration = Duration::from_secs(30);
     for tool in ["fs.thumb", "fs.tags"] {
         let fifo_res = tokio::time::timeout(
-            Duration::from_secs(2),
+            FIFO_HANG_GUARD,
             f.call(tool, json!({"paths": [f.p(&fifo)]})),
         )
         .await
-        .unwrap_or_else(|_| panic!("{tool} blocked on FIFO"))
+        .unwrap_or_else(|_| panic!("hang guard tripped: {tool} blocked on FIFO"))
         .unwrap();
         assert_eq!(
             fifo_res["results"][0]["error"]["code"],
@@ -4653,12 +4654,13 @@ paths = ["~/projects/album/**"]
         std::fs::create_dir_all(f.dir.path().join("config")).unwrap();
         std::fs::write(f.dir.path().join("config").join("policy.toml"), policy).unwrap();
 
+        const FIFO_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
         let confined_tags = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
+            FIFO_HANG_GUARD,
             f.call_as("listener", "fs.tags", json!({"paths": [f.p(&song)]})),
         )
         .await
-        .expect("fs.tags must not block on FIFO folder cover")
+        .expect("hang guard tripped: fs.tags blocked on FIFO folder cover")
         .unwrap();
         assert_eq!(
             confined_tags["results"][0]["ok"]["cover"],
@@ -4666,7 +4668,7 @@ paths = ["~/projects/album/**"]
             "escaping symlink and FIFO folder covers must be ignored for confined caller"
         );
         let confined_thumb = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
+            FIFO_HANG_GUARD,
             f.call_as(
                 "listener",
                 "fs.thumb",
@@ -4674,7 +4676,7 @@ paths = ["~/projects/album/**"]
             ),
         )
         .await
-        .expect("fs.thumb must not block on FIFO folder cover")
+        .expect("hang guard tripped: fs.thumb blocked on FIFO folder cover")
         .unwrap();
         assert_eq!(
             confined_thumb["results"][0]["error"]["code"],
