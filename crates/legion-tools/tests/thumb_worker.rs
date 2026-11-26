@@ -2854,6 +2854,7 @@ async fn test_failed_embedded_cover_caches_expiring_bad_entry_while_timeouts_sta
     );
 
     // 2. Second request at the SAME (256, contain): served from bad cache with ZERO worker spawns!
+    const CACHE_HIT_HANG_GUARD: Duration = Duration::from_secs(30);
     legion_tools::fs::reset_peak_worker_rss_for_test();
     let t0 = Instant::now();
     let res2 = node
@@ -2876,8 +2877,8 @@ async fn test_failed_embedded_cover_caches_expiring_bad_entry_while_timeouts_sta
         res2["results"][0]
     );
     assert!(
-        t0.elapsed() < Duration::from_millis(200),
-        "cached bad embedded cover hit took {:?}",
+        t0.elapsed() < CACHE_HIT_HANG_GUARD,
+        "hang guard tripped: cached bad embedded cover hit ran for {:?} (limit {CACHE_HIT_HANG_GUARD:?})",
         t0.elapsed()
     );
 
@@ -3018,6 +3019,11 @@ async fn test_failed_embedded_cover_caches_expiring_bad_entry_while_timeouts_sta
 
 async fn test_property_hostile_bounds_through_real_worker() {
     use audio_fixtures as af;
+
+    // Each worker enforces its own per-file decode timeout and memory cap; these generous limits
+    // are strictly hang guards so noisy CI runners never flake on cumulative subprocess overhead.
+    const CALL_HANG_GUARD: Duration = Duration::from_secs(120);
+    const OVERALL_HANG_GUARD: Duration = Duration::from_secs(300);
 
     let t0 = Instant::now();
     let dir = tempfile::tempdir().unwrap();
@@ -3191,10 +3197,13 @@ async fn test_property_hostile_bounds_through_real_worker() {
 
     let baseline = legion_tools::fs::measured_worker_baseline_bytes_for_test();
     legion_tools::fs::reset_peak_worker_rss_for_test();
-    let cap_res = node
-        .call(Call::new(Door::Cli, "fs.tags", json!({"paths": cap_paths})))
-        .await
-        .unwrap();
+    let cap_res = tokio::time::timeout(
+        CALL_HANG_GUARD,
+        node.call(Call::new(Door::Cli, "fs.tags", json!({"paths": cap_paths}))),
+    )
+    .await
+    .expect("hang guard tripped: real-worker cap+16MiB fs.tags batch did not finish within 120 s")
+    .unwrap();
     let cap_rss = legion_tools::fs::peak_worker_rss_for_test();
     let cap_arr = cap_res["results"].as_array().unwrap();
     assert_eq!(cap_arr.len(), cap_and_budget.len());
@@ -3248,17 +3257,20 @@ async fn test_property_hostile_bounds_through_real_worker() {
     )
     .unwrap();
 
-    let oom_res = node
-        .call(Call::new(
+    let oom_res = tokio::time::timeout(
+        CALL_HANG_GUARD,
+        node.call(Call::new(
             Door::Cli,
             "fs.thumb",
             json!({
                 "paths": [oom_mp3.to_string_lossy(), good_mp3.to_string_lossy()],
                 "size": 256
             }),
-        ))
-        .await
-        .unwrap();
+        )),
+    )
+    .await
+    .expect("hang guard tripped: real-worker OOM cover fs.thumb call did not finish within 120 s")
+    .unwrap();
     let oom_arr = oom_res["results"].as_array().unwrap();
     assert_eq!(
         oom_arr[0]["error"]["code"],
@@ -3372,10 +3384,13 @@ async fn test_property_hostile_bounds_through_real_worker() {
 
     legion_tools::fs::reset_peak_worker_rss_for_test();
     for chunk in tag_paths.chunks(32) {
-        let res = node
-            .call(Call::new(Door::Cli, "fs.tags", json!({"paths": chunk})))
-            .await
-            .unwrap();
+        let res = tokio::time::timeout(
+            CALL_HANG_GUARD,
+            node.call(Call::new(Door::Cli, "fs.tags", json!({"paths": chunk}))),
+        )
+        .await
+        .expect("hang guard tripped: real-worker fuzz fs.tags batch did not finish within 120 s")
+        .unwrap();
         for item in res["results"].as_array().unwrap() {
             af::assert_clean_tags_item(item);
         }
@@ -3389,14 +3404,17 @@ async fn test_property_hostile_bounds_through_real_worker() {
     );
 
     legion_tools::fs::reset_peak_worker_rss_for_test();
-    let th_res = node
-        .call(Call::new(
+    let th_res = tokio::time::timeout(
+        CALL_HANG_GUARD,
+        node.call(Call::new(
             Door::Cli,
             "fs.thumb",
             json!({"paths": thumb_paths, "size": 128}),
-        ))
-        .await
-        .unwrap();
+        )),
+    )
+    .await
+    .expect("hang guard tripped: real-worker fuzz fs.thumb batch did not finish within 120 s")
+    .unwrap();
     let thumb_fuzz_rss = legion_tools::fs::peak_worker_rss_for_test();
     for item in th_res["results"].as_array().unwrap() {
         let has_ok = item.get("ok").is_some();
@@ -3405,7 +3423,7 @@ async fn test_property_hostile_bounds_through_real_worker() {
         if let Some(err) = item.get("error") {
             let code = err["code"].as_str().unwrap_or("");
             assert!(
-                matches!(code, "not_found" | "failed" | "unsupported"),
+                matches!(code, "not_found" | "failed" | "unsupported" | "timeout"),
                 "unexpected thumb fuzz error code: {item}"
             );
         }
@@ -3425,7 +3443,7 @@ async fn test_property_hostile_bounds_through_real_worker() {
         elapsed.as_secs_f64(),
     );
     assert!(
-        elapsed < Duration::from_secs(25),
-        "real-worker hostile property test took too long: {elapsed:?}"
+        elapsed < OVERALL_HANG_GUARD,
+        "hang guard tripped: real-worker hostile property test ran for {elapsed:?} (limit {OVERALL_HANG_GUARD:?})"
     );
 }

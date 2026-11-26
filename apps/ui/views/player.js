@@ -8,7 +8,10 @@ import { extractThumbMap } from '../lib/files.js';
 import {
   clampVolume,
   classifyPlayerKey,
+  computeVideoZoomMetrics,
+  createPictureGestureRecognizer,
   createResumeStore,
+  createSpaceHoldController,
   createTurnWatcher,
   createVideoController,
   extractTagsMap,
@@ -16,14 +19,21 @@ import {
   formatPlayerTime,
   formatPositionValueText,
   formatRemainingTime,
+  formatScrubDelta,
   formatSpeed,
+  GESTURE_EDGE_MARGIN_PX,
+  HOLD_PILL_FADE_MS,
+  HOLD_PLAYBACK_RATE,
   PLAYBACK_SPEEDS,
   preferredVideoOrientation,
   queueNeighbors,
+  readZoomPreference,
   SEEK_STEP_S,
   shouldMusicPrevRestart,
-  tapZoneForPosition,
   VOLUME_STEP,
+  writeZoomPreference,
+  ZOOM_CHIP_DURATION_MS,
+  ZOOM_SETTLE_MS,
 } from '../lib/player.js';
 import { thumbCacheKey } from '../lib/thumb-cache.js';
 
@@ -88,6 +98,7 @@ export function PositionSlider({
   currentTime = 0,
   duration = 0,
   bufferedEnd = 0,
+  externalDragging = false,
   onDragStart,
   onDragMove,
   onCommitSeek,
@@ -100,6 +111,7 @@ export function PositionSlider({
   const [dragging, setDragging] = useState(false);
   const [dragTime, setDragTime] = useState(0);
 
+  const isVisualDragging = dragging || Boolean(externalDragging);
   const safeDuration = Number.isFinite(duration) && duration > 0 ? duration : 0;
   const displayTime = dragging
     ? dragTime
@@ -196,7 +208,7 @@ export function PositionSlider({
   return html`
     <div
       ref=${trackRef}
-      class=${dragging ? 'player-scrub dragging' : 'player-scrub'}
+      class=${isVisualDragging ? 'player-scrub dragging' : 'player-scrub'}
       role="slider"
       tabIndex="0"
       aria-label="Position"
@@ -339,6 +351,7 @@ export function VideoPlayer({
   onOpenMore,
   onClose,
   onNavigateSibling,
+  onZoomActionChange = null,
   onMediaLoadedMetadata,
   onMediaTime,
   onMediaPlay,
@@ -347,10 +360,14 @@ export function VideoPlayer({
   onMediaError,
 }) {
   const videoRef = useRef(null);
+  const wrapRef = useRef(null);
+  const scrubBarWrapRef = useRef(null);
   const onBeforePlayRef = useRef(onBeforePlay);
   onBeforePlayRef.current = onBeforePlay;
   const onMediaErrorRef = useRef(onMediaError);
   onMediaErrorRef.current = onMediaError;
+  const onZoomActionChangeRef = useRef(onZoomActionChange);
+  onZoomActionChangeRef.current = onZoomActionChange;
   const bindVideoRef = useCallback(
     (el) => {
       videoRef.current = el;
@@ -359,7 +376,6 @@ export function VideoPlayer({
     [mediaRef],
   );
   const overlayRef = useRef(null);
-  const stageTapRef = useRef(null);
   const resumeStore = useMemo(() => createResumeStore(safeStorage()), []);
   const identity = useMemo(
     () => ({ machine, path, size: entry?.size, mtime: entry?.mtime }),
@@ -398,6 +414,20 @@ export function VideoPlayer({
   const [canFs, setCanFs] = useState(() =>
     typeof link?.canImmersive === 'function' ? Boolean(link.canImmersive({ element: viewerRef?.current })) : false,
   );
+  const [viewportSize, setViewportSize] = useState({ width: 0, height: 0 });
+  const [videoDims, setVideoDims] = useState({ width: 0, height: 0 });
+  const [zoomMode, setZoomMode] = useState('fit');
+  const [pinchScale, setPinchScale] = useState(null);
+  const [zoomSettling, setZoomSettling] = useState(false);
+  const [zoomChip, setZoomChip] = useState(null);
+  const [holdActive, setHoldActive] = useState(false);
+  const [holdPillMounted, setHoldPillMounted] = useState(false);
+  const [scrubHud, setScrubHud] = useState(null);
+
+  const zoomMetrics = useMemo(
+    () => computeVideoZoomMetrics(videoDims.width, videoDims.height, viewportSize.width, viewportSize.height),
+    [videoDims.width, videoDims.height, viewportSize.width, viewportSize.height],
+  );
 
   const fsState = fullscreenState || { active: false, source: null, pushedHistory: false, inFlight: false };
   const isFullscreen = Boolean(fsState.active && (fsState.source === 'button' || fsState.source === 'rotation'));
@@ -432,6 +462,23 @@ export function VideoPlayer({
   const [pendingPlayIntent, setPendingPlayIntent] = useState(null);
   const pendingPlayIntentRef = useRef(null);
   pendingPlayIntentRef.current = pendingPlayIntent;
+  const playbackRateRef = useRef(playbackRate);
+  playbackRateRef.current = playbackRate;
+  const zoomMetricsRef = useRef(zoomMetrics);
+  zoomMetricsRef.current = zoomMetrics;
+  const zoomModeRef = useRef(zoomMode);
+  zoomModeRef.current = zoomMode;
+  const zoomAutoAppliedRef = useRef(false);
+  const zoomSettleTimerRef = useRef(null);
+  const zoomChipTimerRef = useRef(null);
+  const holdActiveRef = useRef(false);
+  const holdFadeTimerRef = useRef(null);
+  const ctrlRef = useRef(ctrl);
+  ctrlRef.current = ctrl;
+  const recognizerRef = useRef(null);
+  const spaceHoldRef = useRef(null);
+  const linkRef = useRef(link);
+  linkRef.current = link;
 
   const commitSeekOnMedia = useCallback((targetTime, seq) => {
     activeSeekSeqRef.current = seq;
@@ -509,10 +556,20 @@ export function VideoPlayer({
       setPendingPlayIntent(null);
     }
     resumedAppliedRef.current = false;
+    zoomAutoAppliedRef.current = false;
+    recognizerRef.current?.reset?.();
+    spaceHoldRef.current?.cancel?.();
+    setVideoDims({ width: 0, height: 0 });
+    setZoomMode('fit');
+    setPinchScale(null);
+    setZoomSettling(false);
+    setZoomChip(null);
+    setScrubHud(null);
     setCurrentTime(0);
     setDuration(entry?.duration_s > 0 ? entry.duration_s : 0);
     setBufferedEnd(0);
     setSpeedOpen(false);
+    controller.setDragging(false);
     controller.setError(false);
     controller.setLoading(true);
     controller.dismissResumeChip();
@@ -703,6 +760,8 @@ export function VideoPlayer({
   useEffect(() => {
     if (typeof link?.onWindowHidden !== 'function') return undefined;
     return link.onWindowHidden(() => {
+      recognizerRef.current?.reset?.();
+      spaceHoldRef.current?.cancel?.();
       wantPlayAfterSwapRef.current = false;
       pendingPlayIntentRef.current = null;
       setPendingPlayIntent(null);
@@ -719,9 +778,167 @@ export function VideoPlayer({
     });
   }, [link, controller]);
 
-  // Always release keep-screen-on, save resume position, and clear `<video>` on unmount.
+  // Measure the player viewport continuously for zoom-to-fill geometry.
+  useEffect(() => {
+    const el = wrapRef.current;
+    if (!el) return undefined;
+    const measure = () => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        setViewportSize((prev) =>
+          Math.abs(prev.width - rect.width) < 0.5 && Math.abs(prev.height - rect.height) < 0.5
+            ? prev
+            : { width: rect.width, height: rect.height },
+        );
+      }
+    };
+    measure();
+    if (typeof ResizeObserver === 'function') {
+      const ro = new ResizeObserver(measure);
+      ro.observe(el);
+      return () => ro.disconnect();
+    }
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  }, []);
+
+  const scheduleClockTimeout = useCallback((fn, ms) => {
+    const c = getPlayerClock();
+    if (c?.setTimeout) return { clock: c, id: c.setTimeout(fn, ms) };
+    return { clock: null, id: window.setTimeout(fn, ms) };
+  }, []);
+
+  const clearClockTimeout = useCallback((handle) => {
+    if (!handle) return;
+    if (handle.clock?.clearTimeout) handle.clock.clearTimeout(handle.id);
+    else window.clearTimeout(handle.id);
+  }, []);
+
+  const showZoomChipFor = useCallback(
+    (label) => {
+      clearClockTimeout(zoomChipTimerRef.current);
+      setZoomChip(label);
+      zoomChipTimerRef.current = scheduleClockTimeout(() => {
+        zoomChipTimerRef.current = null;
+        setZoomChip(null);
+      }, ZOOM_CHIP_DURATION_MS);
+    },
+    [clearClockTimeout, scheduleClockTimeout],
+  );
+
+  const runZoomSettleAnimation = useCallback(() => {
+    clearClockTimeout(zoomSettleTimerRef.current);
+    setZoomSettling(true);
+    zoomSettleTimerRef.current = scheduleClockTimeout(() => {
+      zoomSettleTimerRef.current = null;
+      setZoomSettling(false);
+    }, ZOOM_SETTLE_MS);
+  }, [clearClockTimeout, scheduleClockTimeout]);
+
+  const commitZoomMode = useCallback(
+    (nextMode, { animate = true, announce = true, haptic = true } = {}) => {
+      const target = nextMode === 'fill' && isFullscreenRef.current && zoomMetricsRef.current.available ? 'fill' : 'fit';
+      setPinchScale(null);
+      setZoomMode(target);
+      zoomModeRef.current = target;
+      writeZoomPreference(safeStorage(), target);
+      if (animate) runZoomSettleAnimation();
+      if (announce) {
+        showZoomChipFor(target === 'fill' ? 'Zoomed to fill' : 'Original');
+      }
+      if (haptic) {
+        linkRef.current?.haptic?.('tick');
+      }
+    },
+    [runZoomSettleAnimation, showZoomChipFor],
+  );
+
+  const handleToggleZoom = useCallback(() => {
+    if (!isFullscreenRef.current || !zoomMetricsRef.current.available) return;
+    const next = zoomModeRef.current === 'fill' ? 'fit' : 'fill';
+    commitZoomMode(next, { animate: true, announce: true, haptic: true });
+  }, [commitZoomMode]);
+
+  // Reset zoom outside full screen; auto-apply remembered fill on entering full screen iff <= 15% crop.
+  useLayoutEffect(() => {
+    if (!isFullscreen) {
+      zoomAutoAppliedRef.current = false;
+      setPinchScale(null);
+      setZoomSettling(false);
+      setZoomMode('fit');
+      zoomModeRef.current = 'fit';
+      return;
+    }
+    if (videoDims.width <= 0 || videoDims.height <= 0 || viewportSize.width <= 0 || viewportSize.height <= 0) {
+      return;
+    }
+    if (!zoomMetrics.available) {
+      setZoomMode('fit');
+      zoomModeRef.current = 'fit';
+      return;
+    }
+    if (!zoomAutoAppliedRef.current) {
+      zoomAutoAppliedRef.current = true;
+      const remembered = readZoomPreference(safeStorage());
+      const next = remembered === 'fill' && zoomMetrics.canAutoApplyFill ? 'fill' : 'fit';
+      setZoomMode(next);
+      zoomModeRef.current = next;
+    }
+  }, [isFullscreen, videoDims.width, videoDims.height, viewportSize.width, viewportSize.height, zoomMetrics.available, zoomMetrics.canAutoApplyFill]);
+
+  // Expose zoom action to FilesViewer's More sheet under the exact same conditions as Z.
+  useEffect(() => {
+    if (typeof onZoomActionChangeRef.current !== 'function') return;
+    if (isFullscreen && zoomMetrics.available) {
+      onZoomActionChangeRef.current({
+        available: true,
+        mode: zoomMode,
+        toggle: handleToggleZoom,
+      });
+    } else {
+      onZoomActionChangeRef.current(null);
+    }
+  }, [isFullscreen, zoomMetrics.available, zoomMode, handleToggleZoom]);
+
+  const startHold2x = useCallback(() => {
+    if (holdActiveRef.current) return;
+    const v = videoRef.current;
+    const st = ctrlRef.current;
+    if (!v || !mediaUrlRef.current || v.paused || v.ended || st.loading || st.error) return;
+    if (playbackRateRef.current >= HOLD_PLAYBACK_RATE) return;
+    clearClockTimeout(holdFadeTimerRef.current);
+    holdFadeTimerRef.current = null;
+    holdActiveRef.current = true;
+    setHoldActive(true);
+    setHoldPillMounted(true);
+    v.playbackRate = HOLD_PLAYBACK_RATE;
+    linkRef.current?.haptic?.('tick');
+  }, [clearClockTimeout]);
+
+  const endHold2x = useCallback(() => {
+    if (!holdActiveRef.current) return;
+    holdActiveRef.current = false;
+    setHoldActive(false);
+    const v = videoRef.current;
+    if (v) {
+      v.playbackRate = playbackRateRef.current;
+    }
+    clearClockTimeout(holdFadeTimerRef.current);
+    holdFadeTimerRef.current = scheduleClockTimeout(() => {
+      holdFadeTimerRef.current = null;
+      setHoldPillMounted(false);
+    }, HOLD_PILL_FADE_MS);
+  }, [clearClockTimeout, scheduleClockTimeout]);
+
+  // Always release keep-screen-on, timers, gestures, resume position, and `<video>` on unmount.
   useEffect(() => {
     return () => {
+      onZoomActionChangeRef.current?.(null);
+      recognizerRef.current?.dispose?.();
+      spaceHoldRef.current?.dispose?.();
+      clearClockTimeout(zoomSettleTimerRef.current);
+      clearClockTimeout(zoomChipTimerRef.current);
+      clearClockTimeout(holdFadeTimerRef.current);
       const v = videoRef.current;
       if (v && Number.isFinite(v.duration) && v.duration > 0) {
         resumeStore.save(identityRef.current, v.currentTime, v.duration);
@@ -737,7 +954,7 @@ export function VideoPlayer({
         }
       }
     };
-  }, [link, resumeStore]);
+  }, [link, resumeStore, clearClockTimeout]);
 
   const togglePlay = useCallback(() => {
     const v = videoRef.current;
@@ -829,12 +1046,19 @@ export function VideoPlayer({
     }
   }, [volume]);
 
-  const applyRate = useCallback((rate) => {
-    setPlaybackRate(rate);
-    setSpeedOpen(false);
-    const v = videoRef.current;
-    if (v) v.playbackRate = rate;
-  }, []);
+  const applyRate = useCallback(
+    (rate) => {
+      setPlaybackRate(rate);
+      playbackRateRef.current = rate;
+      setSpeedOpen(false);
+      if (rate >= HOLD_PLAYBACK_RATE && holdActiveRef.current) {
+        endHold2x();
+      }
+      const v = videoRef.current;
+      if (v && !holdActiveRef.current) v.playbackRate = rate;
+    },
+    [endHold2x],
+  );
 
   const handleStartOver = useCallback(() => {
     resumeStore.clear(identityRef.current);
@@ -880,6 +1104,33 @@ export function VideoPlayer({
     };
   }, []);
 
+  // Desktop Space hold-for-2x controller (short press toggles play/pause; > 350 ms holds 2x).
+  if (!spaceHoldRef.current) {
+    spaceHoldRef.current = createSpaceHoldController({
+      clock: getPlayerClock(),
+      canHold: () => {
+        const v = videoRef.current;
+        const st = ctrlRef.current;
+        return Boolean(
+          v &&
+            mediaUrlRef.current &&
+            v.readyState >= 1 &&
+            !v.paused &&
+            !v.ended &&
+            !st.loading &&
+            !st.error &&
+            playbackRateRef.current < HOLD_PLAYBACK_RATE,
+        );
+      },
+      onTogglePlay: () => {
+        controller.notifyActivity({ show: true });
+        togglePlay();
+      },
+      onHoldStart: () => startHold2x(),
+      onHoldEnd: () => endHold2x(),
+    });
+  }
+
   // Keyboard shortcuts (desktop & browser).
   useEffect(() => {
     function onKeyDown(e) {
@@ -913,6 +1164,18 @@ export function VideoPlayer({
       if (!action) return;
       e.preventDefault();
       e.stopImmediatePropagation?.();
+
+      if (action === 'toggle_play' && (e.key === ' ' || e.key === 'Spacebar')) {
+        spaceHoldRef.current?.onKeyDown({ repeat: Boolean(e.repeat) });
+        return;
+      }
+      if (action === 'toggle_zoom') {
+        if (isFullscreenRef.current && zoomMetricsRef.current.available) {
+          handleToggleZoom();
+        }
+        return;
+      }
+
       controller.notifyActivity({ show: true });
 
       switch (action) {
@@ -958,8 +1221,26 @@ export function VideoPlayer({
           break;
       }
     }
+
+    function onKeyUp(e) {
+      if (e.key === ' ' || e.key === 'Spacebar') {
+        spaceHoldRef.current?.onKeyUp();
+      }
+    }
+
+    function onWindowBlur() {
+      spaceHoldRef.current?.cancel();
+      recognizerRef.current?.reset();
+    }
+
     window.addEventListener('keydown', onKeyDown, true);
-    return () => window.removeEventListener('keydown', onKeyDown, true);
+    window.addEventListener('keyup', onKeyUp, true);
+    window.addEventListener('blur', onWindowBlur);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown, true);
+      window.removeEventListener('keyup', onKeyUp, true);
+      window.removeEventListener('blur', onWindowBlur);
+    };
   }, [
     controller,
     togglePlay,
@@ -971,72 +1252,220 @@ export function VideoPlayer({
     toggleMute,
     canFs,
     handleToggleFullscreen,
+    handleToggleZoom,
     onNavigateSibling,
     leaveFullscreen,
     onClose,
+    fullscreenController,
   ]);
 
-  // Stage pointer handlers: detect clean tap vs drag, and show overlay on desktop pointer movement.
+  // Single unified pointer recogniser for the video picture surface:
+  // tap / double-tap, pinch zoom-to-fill, press-and-hold 2x, and horizontal scrub anywhere.
+  if (!recognizerRef.current) {
+    recognizerRef.current = createPictureGestureRecognizer({
+      clock: getPlayerClock(),
+      edgeMarginPx: GESTURE_EDGE_MARGIN_PX,
+      getBounds: () => {
+        const rect = wrapRef.current?.getBoundingClientRect?.() || { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
+        let safeBottom = 0;
+        try {
+          safeBottom = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--safe-area-inset-bottom')) || 0;
+        } catch {
+          safeBottom = 0;
+        }
+        return {
+          left: rect.left,
+          top: rect.top,
+          width: rect.width,
+          height: rect.height,
+          bottomMarginPx: Math.max(GESTURE_EDGE_MARGIN_PX, safeBottom),
+        };
+      },
+      isLayerVisible: () => Boolean(ctrlRef.current.visible),
+      canHold: () => {
+        const v = videoRef.current;
+        const st = ctrlRef.current;
+        return Boolean(
+          v &&
+            mediaUrlRef.current &&
+            !v.paused &&
+            !v.ended &&
+            !st.loading &&
+            !st.error &&
+            playbackRateRef.current < HOLD_PLAYBACK_RATE,
+        );
+      },
+      canScrub: () => {
+        const v = videoRef.current;
+        const dur = v && Number.isFinite(v.duration) && v.duration > 0 ? v.duration : durationRef.current;
+        return Boolean(mediaUrlRef.current && Number.isFinite(dur) && dur > 0);
+      },
+      canPinch: () => Boolean(isFullscreenRef.current && zoomMetricsRef.current.available),
+      getZoomFillScale: () => zoomMetricsRef.current.fillScale,
+      getZoomMode: () => zoomModeRef.current,
+      getScrubBarWidth: () => {
+        const track = scrubBarWrapRef.current?.querySelector?.('.player-scrub-track');
+        const trackRect = track?.getBoundingClientRect?.();
+        if (trackRect && trackRect.width > 0) return trackRect.width;
+        const wrapRect = wrapRef.current?.getBoundingClientRect?.();
+        return wrapRect && wrapRect.width > 0 ? wrapRect.width : 1;
+      },
+      getCurrentTime: () => {
+        const st = controllerRef.current?.getState?.();
+        if (st?.pendingSeekTime != null) return st.pendingSeekTime;
+        const v = videoRef.current;
+        return v && Number.isFinite(v.currentTime) ? v.currentTime : currentTimeRef.current;
+      },
+      getDuration: () => {
+        const v = videoRef.current;
+        return v && Number.isFinite(v.duration) && v.duration > 0 ? v.duration : durationRef.current;
+      },
+      onTap: (zone) => {
+        controller.handlePictureTap(zone);
+      },
+      onHoldStart: () => startHold2x(),
+      onHoldEnd: () => endHold2x(),
+      onScrubStart: (p) => {
+        controller.setDragging(true);
+        setScrubHud({ time: p.time, delta: p.delta, rate: p.rate, rateLabel: p.rateLabel });
+      },
+      onScrubMove: (p) => {
+        setScrubHud({ time: p.time, delta: p.delta, rate: p.rate, rateLabel: p.rateLabel });
+        if (p.rateChanged) {
+          linkRef.current?.haptic?.('tick');
+        }
+      },
+      onScrubEnd: (p) => {
+        setScrubHud(null);
+        controller.setDragging(false);
+        if (p.committed) {
+          controller.beginSeek(p.time);
+        }
+      },
+      onScrubCancel: () => {
+        setScrubHud(null);
+        controller.setDragging(false);
+      },
+      onPinchStart: ({ startScale }) => {
+        clearClockTimeout(zoomSettleTimerRef.current);
+        setZoomSettling(false);
+        setPinchScale(startScale);
+      },
+      onPinchMove: ({ scale }) => {
+        setPinchScale(scale);
+      },
+      onPinchEnd: ({ targetMode, changed }) => {
+        if (changed) {
+          commitZoomMode(targetMode, { animate: true, announce: true, haptic: true });
+        } else {
+          setPinchScale(null);
+          runZoomSettleAnimation();
+        }
+      },
+      onPinchCancel: () => {
+        setPinchScale(null);
+        runZoomSettleAnimation();
+      },
+    });
+  }
+
   function onStagePointerDown(e) {
     if (e.button > 0) return;
     if (speedOpen) {
       setSpeedOpen(false);
       return;
     }
-    stageTapRef.current = { id: e.pointerId, x: e.clientX, y: e.clientY, moved: false };
-  }
-
-  function onStagePointerMove(e) {
-    if (e.pointerType === 'mouse' && !stageTapRef.current) {
-      controller.notifyActivity({ show: true });
-      return;
-    }
-    const tap = stageTapRef.current;
-    if (tap && tap.id === e.pointerId) {
-      if (Math.hypot(e.clientX - tap.x, e.clientY - tap.y) > 12) {
-        tap.moved = true;
+    const accepted = recognizerRef.current?.onPointerDown(e);
+    if (accepted) {
+      try {
+        e.currentTarget.setPointerCapture?.(e.pointerId);
+      } catch {
+        // Ignore synthetic pointer events without an active capture id.
       }
     }
   }
 
+  function onStagePointerMove(e) {
+    const recState = recognizerRef.current?.getState?.();
+    if (e.pointerType === 'mouse' && e.buttons === 0 && recState?.state === 'idle') {
+      controller.notifyActivity({ show: true });
+      return;
+    }
+    recognizerRef.current?.onPointerMove(e);
+  }
+
   function onStagePointerUp(e) {
-    const tap = stageTapRef.current;
-    if (!tap || tap.id !== e.pointerId) return;
-    stageTapRef.current = null;
-    if (tap.moved) return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    const zone = tapZoneForPosition(e.clientX, rect.left, rect.width);
-    controller.handlePictureTap(zone);
+    recognizerRef.current?.onPointerUp(e);
+    try {
+      e.currentTarget.releasePointerCapture?.(e.pointerId);
+    } catch {
+      // Ignore synthetic pointer events.
+    }
   }
 
-  function onStagePointerCancel() {
-    stageTapRef.current = null;
+  function onStagePointerCancel(e) {
+    recognizerRef.current?.onPointerCancel(e);
   }
 
-  const displayTime = ctrl.pendingSeekTime != null ? ctrl.pendingSeekTime : currentTime;
+  const displayTime = scrubHud
+    ? scrubHud.time
+    : ctrl.pendingSeekTime != null
+      ? ctrl.pendingSeekTime
+      : currentTime;
+  const activeVideoScale =
+    !isFullscreen || !zoomMetrics.available
+      ? 1
+      : pinchScale != null
+        ? pinchScale
+        : zoomMode === 'fill'
+          ? zoomMetrics.fillScale
+          : 1;
+  const effectiveZoomMode = isFullscreen && zoomMetrics.available ? zoomMode : 'fit';
 
   return html`
     <div
-      class=${['player-video-wrap', ctrl.cursorHidden ? 'cursor-hidden' : '', isFullscreen ? 'is-fullscreen' : '']
+      ref=${wrapRef}
+      class=${[
+        'player-video-wrap',
+        ctrl.cursorHidden ? 'cursor-hidden' : '',
+        ctrl.visible ? 'overlay-visible' : '',
+        isFullscreen ? 'is-fullscreen' : '',
+        effectiveZoomMode === 'fill' ? 'is-zoom-fill' : '',
+      ]
         .filter(Boolean)
         .join(' ')}
       onPointerMove=${(e) => {
-        if (e.pointerType === 'mouse') controller.notifyActivity({ show: true });
+        if (e.pointerType === 'mouse' && e.buttons === 0 && recognizerRef.current?.getState?.().state === 'idle') {
+          controller.notifyActivity({ show: true });
+        }
       }}
+      onContextMenu=${(e) => e.preventDefault()}
     >
       <video
         ref=${bindVideoRef}
-        class="viewer-video"
+        class=${zoomSettling ? 'viewer-video zoom-settling' : 'viewer-video'}
+        style=${activeVideoScale !== 1 ? { transform: `scale(${activeVideoScale})` } : undefined}
+        data-zoom-mode=${effectiveZoomMode}
+        data-zoom-scale=${activeVideoScale.toFixed(4)}
         playsinline
         preload="metadata"
         aria-label=${name}
+        onResize=${(e) => {
+          const v = e.currentTarget;
+          if (v.videoWidth > 0 && v.videoHeight > 0) {
+            setVideoDims({ width: v.videoWidth, height: v.videoHeight });
+          }
+        }}
         onLoadedMetadata=${(e) => {
           const v = e.currentTarget;
           if (!mediaUrlRef.current || !v.getAttribute('src')) return;
+          if (v.videoWidth > 0 && v.videoHeight > 0) {
+            setVideoDims({ width: v.videoWidth, height: v.videoHeight });
+          }
           const dur = Number.isFinite(v.duration) && v.duration > 0 ? v.duration : entry?.duration_s || 0;
           if (dur > 0) setDuration(dur);
           setBufferedEnd(readBufferedEnd(v));
-          v.playbackRate = playbackRate;
+          v.playbackRate = holdActiveRef.current ? HOLD_PLAYBACK_RATE : playbackRateRef.current;
           const recovered = Boolean(onMediaLoadedMetadata?.(v));
           if (!recovered && !resumedAppliedRef.current && dur > 0) {
             resumedAppliedRef.current = true;
@@ -1079,8 +1508,16 @@ export function VideoPlayer({
           }
         }}
         onLoadedData=${(e) => {
-          if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
-          setBufferedEnd(readBufferedEnd(e.currentTarget));
+          const v = e.currentTarget;
+          if (!mediaUrlRef.current || !v.getAttribute('src')) return;
+          if (v.videoWidth > 0 && v.videoHeight > 0) {
+            setVideoDims((prev) =>
+              prev.width === v.videoWidth && prev.height === v.videoHeight
+                ? prev
+                : { width: v.videoWidth, height: v.videoHeight },
+            );
+          }
+          setBufferedEnd(readBufferedEnd(v));
           controller.onCanPlay();
         }}
         onCanPlay=${(e) => {
@@ -1102,6 +1539,8 @@ export function VideoPlayer({
         onPause=${(e) => {
           const v = e.currentTarget;
           if (!mediaUrlRef.current || !v.getAttribute('src')) return;
+          endHold2x();
+          spaceHoldRef.current?.cancel?.();
           onMediaPause?.(v);
           if (Number.isFinite(v.duration) && v.duration > 0) {
             resumeStore.save(identityRef.current, v.currentTime, v.duration);
@@ -1145,6 +1584,8 @@ export function VideoPlayer({
         }}
         onEnded=${(e) => {
           if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
+          endHold2x();
+          spaceHoldRef.current?.cancel?.();
           wantPlayAfterSwapRef.current = false;
           onMediaPause?.(e.currentTarget);
           resumeStore.clear(identityRef.current);
@@ -1152,6 +1593,8 @@ export function VideoPlayer({
         }}
         onError=${(e) => {
           if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
+          endHold2x();
+          spaceHoldRef.current?.cancel?.();
           wantPlayAfterSwapRef.current = false;
           if (onMediaError && onMediaError(e.currentTarget) === true) return;
           controller.setError(true);
@@ -1165,6 +1608,39 @@ export function VideoPlayer({
         onPointerUp=${onStagePointerUp}
         onPointerCancel=${onStagePointerCancel}
       />
+
+      ${holdPillMounted
+        ? html`
+            <div
+              class=${holdActive ? 'player-hold-pill' : 'player-hold-pill fading'}
+              role="status"
+              aria-label="Playing at 2× speed"
+            >
+              <span>2×</span>
+              <${Icon} name="fast-forward" />
+            </div>
+          `
+        : null}
+
+      ${zoomChip
+        ? html`
+            <div class="player-zoom-chip" role="status">
+              ${zoomChip}
+            </div>
+          `
+        : null}
+
+      ${scrubHud
+        ? html`
+            <div class="player-scrub-hud" role="status" aria-live="off">
+              <div class="player-scrub-hud-time">${formatPlayerTime(scrubHud.time)}</div>
+              <div class="player-scrub-hud-delta">${formatScrubDelta(scrubHud.delta)}</div>
+              ${scrubHud.rateLabel
+                ? html`<div class="player-scrub-hud-rate">${scrubHud.rateLabel}</div>`
+                : null}
+            </div>
+          `
+        : null}
 
       ${ctrl.seekFlash
         ? html`
@@ -1235,7 +1711,11 @@ export function VideoPlayer({
           </button>
         </div>
 
-        <div class="player-center" aria-label="Playback controls">
+        <div
+          class=${scrubHud ? 'player-center scrubbing-hidden' : 'player-center'}
+          aria-label="Playback controls"
+          aria-hidden=${scrubHud ? 'true' : undefined}
+        >
           <button
             type="button"
             class="btn icon player-center-btn"
@@ -1262,11 +1742,12 @@ export function VideoPlayer({
           </button>
         </div>
 
-        <div class="player-bottom">
+        <div class="player-bottom" ref=${scrubBarWrapRef}>
           <${PositionSlider}
             currentTime=${displayTime}
             duration=${duration}
             bufferedEnd=${bufferedEnd}
+            externalDragging=${Boolean(scrubHud)}
             onInteract=${() => controller.notifyActivity({ show: true })}
             onDragStart=${() => controller.setDragging(true)}
             onDragMove=${(t) => {

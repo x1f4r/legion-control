@@ -1,0 +1,113 @@
+# Maintainer: x1f4r <106302360+x1f4r@users.noreply.github.com>
+pkgname=legion-app
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Desktop controller for Legion nodes and fleets'
+arch=('x86_64' 'aarch64')
+url='https://github.com/x1f4r/legion-control'
+license=('MIT')
+depends=(
+  'cairo'
+  'dbus'
+  'gdk-pixbuf2'
+  'glib2'
+  'glibc'
+  'gtk3'
+  'hicolor-icon-theme'
+  'libgcc'
+  'libsoup3'
+  'webkit2gtk-4.1'
+)
+makedepends=('cargo')
+optdepends=(
+  'legion: manage this machine directly over a local pipe'
+  'gst-plugins-base: in-app audio and video playback'
+  'gst-plugins-good: in-app audio and video playback'
+)
+options=('!debug' '!lto')
+source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/legion-v${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "${srcdir}/legion-control-legion-v${pkgver}"
+  export CARGO_HOME="${CARGO_HOME:-${srcdir}/.cargo}"
+  cargo fetch \
+    --manifest-path apps/legion-app/src-tauri/Cargo.toml \
+    --locked \
+    --target "$(rustc -vV | sed -n 's/host: //p')"
+
+  local build_rev="${LEGION_BUILD_REV:-}"
+  local tarball="${srcdir}/${pkgname}-${pkgver}.tar.gz"
+  if [[ -z "$build_rev" && -f "$tarball" ]]; then
+    build_rev="$({ gzip -dc "$tarball" 2>/dev/null || true; } | head -c 1024 | LC_ALL=C grep -aoE 'comment=[0-9a-f]{40}' | head -n 1 | cut -d= -f2 || true)"
+  fi
+  if [[ -z "$build_rev" ]] && command -v git >/dev/null 2>&1; then
+    build_rev="$(git ls-remote "${url}.git" "refs/tags/legion-v${pkgver}^{}" "refs/tags/legion-v${pkgver}" 2>/dev/null | awk '
+      /\^\{\}$/ { peeled = $1 }
+      !/\^\{\}$/ && !plain { plain = $1 }
+      END { print (peeled ? peeled : plain) }
+    ' || true)"
+  fi
+  if [[ -n "$build_rev" ]]; then
+    printf '%s\n' "$build_rev" > "${srcdir}/.legion-build-rev"
+  fi
+}
+
+build() {
+  cd "${srcdir}/legion-control-legion-v${pkgver}"
+  export CARGO_HOME="${CARGO_HOME:-${srcdir}/.cargo}"
+  export CARGO_TARGET_DIR="${srcdir}/target"
+
+  if [[ -z "${LEGION_BUILD_REV:-}" && -s "${srcdir}/.legion-build-rev" ]]; then
+    LEGION_BUILD_REV="$(<"${srcdir}/.legion-build-rev")"
+    export LEGION_BUILD_REV
+  elif [[ -z "${LEGION_BUILD_REV:-}" && -f "${srcdir}/${pkgname}-${pkgver}.tar.gz" ]]; then
+    local pax_rev
+    pax_rev="$({ gzip -dc "${srcdir}/${pkgname}-${pkgver}.tar.gz" 2>/dev/null || true; } | head -c 1024 | LC_ALL=C grep -aoE 'comment=[0-9a-f]{40}' | head -n 1 | cut -d= -f2 || true)"
+    if [[ -n "$pax_rev" ]]; then
+      export LEGION_BUILD_REV="$pax_rev"
+    fi
+  fi
+  if [[ "${LEGION_BUILD_REV:-}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+    LEGION_BUILD_REV="${LEGION_BUILD_REV:0:12}"
+    export LEGION_BUILD_REV
+  fi
+
+  local remap_flags=""
+  if [[ -n "${HOME:-}" ]]; then
+    remap_flags+="--remap-path-prefix=${HOME}=/build/home "
+  fi
+  remap_flags+="--remap-path-prefix=${CARGO_HOME}=/cargo --remap-path-prefix=${srcdir}=/build"
+  export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }${remap_flags}"
+
+  # Enable tauri/custom-protocol so Tauri embeds the staged frontend in the release binary
+  # instead of referencing $srcdir on disk.
+  cargo build \
+    --manifest-path apps/legion-app/src-tauri/Cargo.toml \
+    --features tauri/custom-protocol \
+    --frozen \
+    --release
+}
+
+package() {
+  cd "${srcdir}/legion-control-legion-v${pkgver}"
+  install -Dm755 "${srcdir}/target/release/legion-app" "${pkgdir}/usr/bin/legion-app"
+  install -Dm644 apps/legion-app/src-tauri/icons/32x32.png \
+    "${pkgdir}/usr/share/icons/hicolor/32x32/apps/legion-app.png"
+  install -Dm644 apps/legion-app/src-tauri/icons/128x128.png \
+    "${pkgdir}/usr/share/icons/hicolor/128x128/apps/legion-app.png"
+  install -Dm644 apps/legion-app/src-tauri/icons/128x128@2x.png \
+    "${pkgdir}/usr/share/icons/hicolor/256x256@2/apps/legion-app.png"
+  install -Dm644 /dev/stdin "${pkgdir}/usr/share/applications/legion-app.desktop" <<'DESKTOP'
+[Desktop Entry]
+Categories=Utility;
+Comment=Desktop controller for Legion nodes and fleets.
+Exec=legion-app
+StartupWMClass=legion-app
+Icon=legion-app
+Name=Legion
+Terminal=false
+Type=Application
+DESKTOP
+  install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

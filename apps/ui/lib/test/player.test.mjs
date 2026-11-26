@@ -8,12 +8,16 @@ import { extractThumbMap } from '../files.js';
 import { canBrowserImmersive, createBrowserImmersive } from '../immersive-browser.js';
 import { createAppLink, detectAppImmersiveCapability } from '../../link/app.js';
 import {
+  applyPinchResistance,
   buildMediaQueue,
   clampVolume,
   classifyPlayerKey,
   computeResumePosition,
+  computeVideoZoomMetrics,
   createFullscreenController,
+  createPictureGestureRecognizer,
   createResumeStore,
+  createSpaceHoldController,
   createTurnWatcher,
   createVideoController,
   DOUBLE_TAP_WINDOW_MS,
@@ -22,24 +26,32 @@ import {
   formatPlayerTime,
   formatPositionValueText,
   formatRemainingTime,
+  formatScrubDelta,
   formatSpeed,
+  GESTURE_EDGE_MARGIN_PX,
+  GESTURE_HOLD_DELAY_MS,
+  GESTURE_MOVE_SLOP_PX,
   isNearEnd,
   isResumeEligible,
   OVERLAY_HIDE_DELAY_MS,
   PLAYBACK_SPEEDS,
   preferredVideoOrientation,
   queueNeighbors,
+  readZoomPreference,
+  resolvePinchZoomTarget,
   RESUME_CHIP_DURATION_MS,
   RESUME_MAX_ENTRIES,
   RESUME_MIN_DURATION_S,
   RESUME_SAVE_INTERVAL_MS,
   RESUME_STORAGE_KEY,
+  scrubRateForOffset,
   shouldMusicPrevRestart,
   STALL_SPINNER_DELAY_MS,
   stripFileExtension,
   tapZoneForPosition,
   TURN_LEAVE_GUARD_MS,
   TURN_SETTLE_MS,
+  writeZoomPreference,
 } from '../player.js';
 
 function createFakeClock(startMs = 1_000_000) {
@@ -1096,6 +1108,8 @@ test('iOS/iPadOS bridge attaches at WKWebView creation, fixes requestGeometryUpd
   assert.match(swiftSrc, /legion_ios_attach_webview/);
   assert.match(swiftSrc, /legion_ios_reset_player_state/);
   assert.match(swiftSrc, /injectionTime:\s*\.atDocumentStart/);
+  assert.match(swiftSrc, /case "haptic":/);
+  assert.match(swiftSrc, /UIImpactFeedbackGenerator/);
   assert.match(mainMmSrc, /initWithFrame:configuration:/);
   assert.match(mainMmSrc, /webViewWebContentProcessDidTerminate:/);
 
@@ -1129,6 +1143,7 @@ test('iOS/iPadOS bridge attaches at WKWebView creation, fixes requestGeometryUpd
     };
     const linkNoHandler = createAppLink();
     assert.equal(linkNoHandler.canImmersive(), false);
+    assert.equal(linkNoHandler.haptic, undefined);
     assert.deepEqual(await linkNoHandler.immersive(true, { orientation: 'landscape' }), {
       active: false,
       mode: 'none',
@@ -1149,14 +1164,17 @@ test('iOS/iPadOS bridge attaches at WKWebView creation, fixes requestGeometryUpd
     };
     const linkWithHandler = createAppLink();
     assert.equal(linkWithHandler.canImmersive(), true);
+    assert.equal(typeof linkWithHandler.haptic, 'function');
     assert.deepEqual(await linkWithHandler.immersive(true, { orientation: 'landscape' }), {
       active: true,
       mode: 'ios',
     });
     assert.equal(await linkWithHandler.keepScreenOn(true), true);
+    linkWithHandler.haptic('tick');
     assert.deepEqual(posted, [
       { type: 'immersive', on: true, orientation: 'landscape' },
       { type: 'keep_screen_on', on: true },
+      { type: 'haptic', kind: 'tick' },
     ]);
     assert.deepEqual(invoked, []);
   } finally {
@@ -1165,4 +1183,361 @@ test('iOS/iPadOS bridge attaches at WKWebView creation, fixes requestGeometryUpd
     if (prevNavDesc) Object.defineProperty(globalThis, 'navigator', prevNavDesc);
     else delete globalThis.navigator;
   }
+});
+
+test('picture gesture recogniser covers every table row, 1 px / 1 ms thresholds, edges, and second-finger preemption', () => {
+  const clock = createFakeClock();
+  let layerVisible = true;
+  let playing = true;
+  let speed = 1;
+  let fullscreen = true;
+  let zoomMode = 'fit';
+  let fillScale = 1.25;
+  let currentTime = 100;
+  const duration = 600;
+  const barWidth = 600;
+  const bounds = { left: 0, top: 0, width: 400, height: 800, bottomMarginPx: 24 };
+
+  const events = [];
+  const rec = createPictureGestureRecognizer({
+    clock,
+    edgeMarginPx: GESTURE_EDGE_MARGIN_PX,
+    getBounds: () => bounds,
+    isLayerVisible: () => layerVisible,
+    canHold: () => playing && speed < 2,
+    canScrub: () => duration > 0,
+    canPinch: () => fullscreen && fillScale > 1.03,
+    getZoomFillScale: () => fillScale,
+    getZoomMode: () => zoomMode,
+    getScrubBarWidth: () => barWidth,
+    getCurrentTime: () => currentTime,
+    getDuration: () => duration,
+    onTap: (zone) => events.push({ type: 'tap', zone }),
+    onHoldStart: () => events.push({ type: 'hold_start' }),
+    onHoldEnd: () => events.push({ type: 'hold_end' }),
+    onScrubStart: (p) => events.push({ type: 'scrub_start', ...p }),
+    onScrubMove: (p) => events.push({ type: 'scrub_move', ...p }),
+    onScrubEnd: (p) => events.push({ type: 'scrub_end', ...p }),
+    onScrubCancel: () => events.push({ type: 'scrub_cancel' }),
+    onPinchStart: (p) => events.push({ type: 'pinch_start', ...p }),
+    onPinchMove: (p) => events.push({ type: 'pinch_move', ...p }),
+    onPinchEnd: (p) => events.push({ type: 'pinch_end', ...p }),
+    onPinchCancel: () => events.push({ type: 'pinch_cancel' }),
+  });
+
+  // 1. Edge exclusion: 24 px from left, right, or bottom starts nothing; 25 px starts normally.
+  for (const [x, y] of [
+    [24, 400],
+    [376, 400],
+    [200, 776],
+  ]) {
+    assert.equal(rec.onPointerDown({ pointerId: 1, pointerType: 'touch', clientX: x, clientY: y }), false);
+    rec.onPointerUp({ pointerId: 1, pointerType: 'touch', clientX: x, clientY: y });
+  }
+  assert.deepEqual(events, []);
+
+  for (const [x, y, expectedZone] of [
+    [25, 400, 'left'],
+    [375, 400, 'right'],
+    [200, 775, 'center'],
+  ]) {
+    assert.equal(rec.onPointerDown({ pointerId: 1, pointerType: 'touch', clientX: x, clientY: y }), true);
+    clock.advance(50);
+    rec.onPointerUp({ pointerId: 1, pointerType: 'touch', clientX: x, clientY: y });
+    assert.deepEqual(events.pop(), { type: 'tap', zone: expectedZone });
+  }
+
+  // 2. Time threshold: 349 ms within 12 px is a tap; 350 ms within 12 px is a hold, release is NOT a tap.
+  rec.onPointerDown({ pointerId: 1, pointerType: 'touch', clientX: 200, clientY: 300 });
+  rec.onPointerMove({ pointerId: 1, pointerType: 'touch', clientX: 212, clientY: 300 });
+  clock.advance(GESTURE_HOLD_DELAY_MS - 1);
+  assert.equal(rec.getState().state, 'pending');
+  rec.onPointerUp({ pointerId: 1, pointerType: 'touch', clientX: 212, clientY: 300 });
+  assert.deepEqual(events, [{ type: 'tap', zone: 'center' }]);
+  events.length = 0;
+
+  rec.onPointerDown({ pointerId: 1, pointerType: 'touch', clientX: 200, clientY: 300 });
+  rec.onPointerMove({ pointerId: 1, pointerType: 'touch', clientX: 212, clientY: 300 });
+  clock.advance(GESTURE_HOLD_DELAY_MS);
+  assert.equal(rec.getState().state, 'hold');
+  rec.onPointerUp({ pointerId: 1, pointerType: 'touch', clientX: 212, clientY: 300 });
+  assert.deepEqual(events, [{ type: 'hold_start' }, { type: 'hold_end' }]);
+  events.length = 0;
+
+  // Staying still >= 350 ms while paused or at 2x neither starts hold nor fires tap on release.
+  playing = false;
+  rec.onPointerDown({ pointerId: 1, pointerType: 'touch', clientX: 200, clientY: 300 });
+  clock.advance(350);
+  rec.onPointerUp({ pointerId: 1, pointerType: 'touch', clientX: 200, clientY: 300 });
+  assert.deepEqual(events, []);
+  playing = true;
+  speed = 2;
+  rec.onPointerDown({ pointerId: 1, pointerType: 'touch', clientX: 200, clientY: 300 });
+  clock.advance(350);
+  rec.onPointerUp({ pointerId: 1, pointerType: 'touch', clientX: 200, clientY: 300 });
+  assert.deepEqual(events, []);
+  speed = 1;
+
+  // 3. Distance threshold (12 vs 13 px) and angle threshold (29° vs 31°).
+  rec.onPointerDown({ pointerId: 1, pointerType: 'touch', clientX: 200, clientY: 300 });
+  rec.onPointerMove({ pointerId: 1, pointerType: 'touch', clientX: 213, clientY: 300 });
+  assert.equal(rec.getState().state, 'scrub');
+  rec.onPointerUp({ pointerId: 1, pointerType: 'touch', clientX: 213, clientY: 300 });
+  assert.equal(events.filter((e) => e.type === 'tap').length, 0);
+  assert.equal(events.at(-1).type, 'scrub_end');
+  assert.equal(events.at(-1).committed, true);
+  assert.equal(events.at(-1).time, 113);
+  events.length = 0;
+
+  const rad29 = (29 * Math.PI) / 180;
+  rec.onPointerDown({ pointerId: 1, pointerType: 'touch', clientX: 200, clientY: 300 });
+  rec.onPointerMove({ pointerId: 1, pointerType: 'touch', clientX: 200 + 20 * Math.cos(rad29), clientY: 300 + 20 * Math.sin(rad29) });
+  assert.equal(rec.getState().state, 'scrub');
+  rec.onPointerCancel({ pointerId: 1 });
+  events.length = 0;
+
+  const rad31 = (31 * Math.PI) / 180;
+  rec.onPointerDown({ pointerId: 1, pointerType: 'touch', clientX: 200, clientY: 300 });
+  rec.onPointerMove({ pointerId: 1, pointerType: 'touch', clientX: 200 + 20 * Math.cos(rad31), clientY: 300 + 20 * Math.sin(rad31) });
+  assert.equal(rec.getState().state, 'ignored');
+  rec.onPointerUp({ pointerId: 1, pointerType: 'touch', clientX: 200 + 20 * Math.cos(rad31), clientY: 300 + 20 * Math.sin(rad31) });
+  assert.deepEqual(events, []);
+
+  // 4. Vertical drag and sideways drag with layer hidden -> nothing, never turns into a tap.
+  rec.onPointerDown({ pointerId: 1, pointerType: 'touch', clientX: 200, clientY: 300 });
+  rec.onPointerMove({ pointerId: 1, pointerType: 'touch', clientX: 200, clientY: 340 });
+  rec.onPointerUp({ pointerId: 1, pointerType: 'touch', clientX: 200, clientY: 340 });
+  assert.deepEqual(events, []);
+
+  layerVisible = false;
+  rec.onPointerDown({ pointerId: 1, pointerType: 'touch', clientX: 200, clientY: 300 });
+  rec.onPointerMove({ pointerId: 1, pointerType: 'touch', clientX: 260, clientY: 300 });
+  rec.onPointerUp({ pointerId: 1, pointerType: 'touch', clientX: 260, clientY: 300 });
+  assert.deepEqual(events, []);
+  layerVisible = true;
+
+  // 5. Second finger during scrub turns it into pinch, cancels scrub without seeking, and release is not a tap.
+  rec.onPointerDown({ pointerId: 1, pointerType: 'touch', clientX: 150, clientY: 300 });
+  rec.onPointerMove({ pointerId: 1, pointerType: 'touch', clientX: 210, clientY: 300 });
+  assert.equal(rec.getState().state, 'scrub');
+  rec.onPointerDown({ pointerId: 2, pointerType: 'touch', clientX: 300, clientY: 300 });
+  assert.equal(rec.getState().state, 'pinch');
+  assert.ok(events.some((e) => e.type === 'scrub_cancel'));
+  assert.equal(events.some((e) => e.type === 'scrub_end'), false);
+  clock.advance(40);
+  rec.onPointerMove({ pointerId: 2, pointerType: 'touch', clientX: 340, clientY: 300 });
+  rec.onPointerUp({ pointerId: 2, pointerType: 'touch', clientX: 340, clientY: 300 });
+  rec.onPointerUp({ pointerId: 1, pointerType: 'touch', clientX: 210, clientY: 300 });
+  assert.equal(events.filter((e) => e.type === 'tap').length, 0);
+  assert.equal(events.filter((e) => e.type === 'scrub_end').length, 0);
+  const pinchEnd = events.find((e) => e.type === 'pinch_end');
+  assert.equal(pinchEnd?.targetMode, 'fill');
+  assert.equal(pinchEnd?.changed, true);
+  events.length = 0;
+
+  // 6. Second finger during hold ends hold and switches to pinch.
+  rec.onPointerDown({ pointerId: 1, pointerType: 'touch', clientX: 150, clientY: 300 });
+  clock.advance(350);
+  assert.equal(rec.getState().state, 'hold');
+  rec.onPointerDown({ pointerId: 2, pointerType: 'touch', clientX: 250, clientY: 300 });
+  assert.equal(rec.getState().state, 'pinch');
+  assert.deepEqual(events.slice(0, 3).map((e) => e.type), ['hold_start', 'hold_end', 'pinch_start']);
+  rec.onPointerUp({ pointerId: 2, pointerType: 'touch', clientX: 250, clientY: 300 });
+  rec.onPointerUp({ pointerId: 1, pointerType: 'touch', clientX: 150, clientY: 300 });
+  assert.equal(events.filter((e) => e.type === 'tap').length, 0);
+  events.length = 0;
+
+  // 7. Mouse participates in press-and-hold and sideways drag scrub (ignores right click and edge margins).
+  assert.equal(rec.onPointerDown({ pointerId: 9, pointerType: 'mouse', button: 2, clientX: 200, clientY: 300 }), false);
+  assert.equal(rec.onPointerDown({ pointerId: 9, pointerType: 'mouse', button: 0, clientX: 10, clientY: 300 }), true);
+  clock.advance(350);
+  assert.equal(rec.getState().state, 'hold');
+  rec.onPointerUp({ pointerId: 9, pointerType: 'mouse', button: 0, clientX: 10, clientY: 300 });
+  assert.deepEqual(events, [{ type: 'hold_start' }, { type: 'hold_end' }]);
+  events.length = 0;
+
+  rec.onPointerDown({ pointerId: 9, pointerType: 'mouse', button: 0, clientX: 100, clientY: 300 });
+  rec.onPointerMove({ pointerId: 9, pointerType: 'mouse', clientX: 160, clientY: 300 });
+  rec.onPointerUp({ pointerId: 9, pointerType: 'mouse', clientX: 160, clientY: 300 });
+  assert.equal(events.at(-1).type, 'scrub_end');
+  assert.equal(events.at(-1).committed, true);
+  assert.equal(events.at(-1).time, 160);
+
+  rec.dispose();
+});
+
+test('scrub anywhere maps bar travel, applies three slower vertical rates and back, and cancels within 12 px', () => {
+  const clock = createFakeClock();
+  const moves = [];
+  const ends = [];
+  const rec = createPictureGestureRecognizer({
+    clock,
+    isLayerVisible: () => true,
+    canScrub: () => true,
+    getScrubBarWidth: () => 600,
+    getCurrentTime: () => 120,
+    getDuration: () => 600,
+    onScrubMove: (p) => moves.push(p),
+    onScrubEnd: (p) => ends.push(p),
+  });
+
+  // Rate boundaries: 80 vs 81, 160 vs 161, 240 vs 241.
+  assert.deepEqual(scrubRateForOffset(80), { rate: 1, label: null });
+  assert.deepEqual(scrubRateForOffset(81), { rate: 0.5, label: 'Half speed' });
+  assert.deepEqual(scrubRateForOffset(160), { rate: 0.5, label: 'Half speed' });
+  assert.deepEqual(scrubRateForOffset(161), { rate: 0.25, label: 'Quarter speed' });
+  assert.deepEqual(scrubRateForOffset(240), { rate: 0.25, label: 'Quarter speed' });
+  assert.deepEqual(scrubRateForOffset(241), { rate: 0.1, label: 'Fine' });
+  assert.equal(formatScrubDelta(35), '+0:35');
+  assert.equal(formatScrubDelta(-12), '−0:12');
+
+  rec.onPointerDown({ pointerId: 1, pointerType: 'touch', clientX: 100, clientY: 100 });
+  rec.onPointerMove({ pointerId: 1, pointerType: 'touch', clientX: 160, clientY: 100 });
+  rec.onPointerMove({ pointerId: 1, pointerType: 'touch', clientX: 160, clientY: 181 });
+  assert.equal(moves.at(-1).rateLabel, 'Half speed');
+  assert.equal(moves.at(-1).rateChanged, true);
+  rec.onPointerMove({ pointerId: 1, pointerType: 'touch', clientX: 200, clientY: 181 });
+  rec.onPointerMove({ pointerId: 1, pointerType: 'touch', clientX: 200, clientY: 261 });
+  assert.equal(moves.at(-1).rateLabel, 'Quarter speed');
+  assert.equal(moves.at(-1).rateChanged, true);
+  rec.onPointerMove({ pointerId: 1, pointerType: 'touch', clientX: 240, clientY: 261 });
+  rec.onPointerMove({ pointerId: 1, pointerType: 'touch', clientX: 240, clientY: 341 });
+  assert.equal(moves.at(-1).rateLabel, 'Fine');
+  assert.equal(moves.at(-1).rateChanged, true);
+  rec.onPointerMove({ pointerId: 1, pointerType: 'touch', clientX: 290, clientY: 341 });
+  rec.onPointerMove({ pointerId: 1, pointerType: 'touch', clientX: 290, clientY: 260 });
+  assert.equal(moves.at(-1).rateLabel, 'Half speed');
+  assert.equal(moves.at(-1).rateChanged, true);
+  rec.onPointerMove({ pointerId: 1, pointerType: 'touch', clientX: 310, clientY: 260 });
+  rec.onPointerMove({ pointerId: 1, pointerType: 'touch', clientX: 310, clientY: 180 });
+  assert.equal(moves.at(-1).rateLabel, null);
+  assert.equal(moves.at(-1).rateChanged, true);
+  rec.onPointerMove({ pointerId: 1, pointerType: 'touch', clientX: 320, clientY: 180 });
+  rec.onPointerUp({ pointerId: 1, pointerType: 'touch', clientX: 320, clientY: 180 });
+  assert.equal(ends.length, 1);
+  assert.equal(ends[0].committed, true);
+  assert.ok(Math.abs(ends[0].time - 235) < 0.001);
+  assert.ok(Math.abs(ends[0].delta - 115) < 0.001);
+
+  // Returning to within 12 px of origin cancels without seeking; 13 px commits.
+  ends.length = 0;
+  rec.onPointerDown({ pointerId: 2, pointerType: 'touch', clientX: 100, clientY: 100 });
+  rec.onPointerMove({ pointerId: 2, pointerType: 'touch', clientX: 180, clientY: 100 });
+  rec.onPointerMove({ pointerId: 2, pointerType: 'touch', clientX: 112, clientY: 100 });
+  rec.onPointerUp({ pointerId: 2, pointerType: 'touch', clientX: 112, clientY: 100 });
+  assert.equal(ends[0].committed, false);
+  assert.equal(ends[0].time, 120);
+
+  ends.length = 0;
+  rec.onPointerDown({ pointerId: 3, pointerType: 'touch', clientX: 100, clientY: 100 });
+  rec.onPointerMove({ pointerId: 3, pointerType: 'touch', clientX: 180, clientY: 100 });
+  rec.onPointerMove({ pointerId: 3, pointerType: 'touch', clientX: 113, clientY: 100 });
+  rec.onPointerUp({ pointerId: 3, pointerType: 'touch', clientX: 113, clientY: 100 });
+  assert.equal(ends[0].committed, true);
+  assert.ok(Math.abs(ends[0].time - 133) < 0.001);
+  rec.dispose();
+});
+
+test('zoom to fill enforces 3% availability, 15% auto-apply rule, resistance, nearer vs velocity settle, storage, and Z key', () => {
+  const exact3 = computeVideoZoomMetrics(1030, 1000, 1000, 1000);
+  assert.equal(exact3.available, false);
+  assert.equal(exact3.fillScale, 1);
+
+  const over3 = computeVideoZoomMetrics(1035, 1000, 1000, 1000);
+  assert.equal(over3.available, true);
+  assert.ok(Math.abs(over3.fillScale - 1.035) < 0.0001);
+  assert.equal(over3.canAutoApplyFill, true);
+
+  // 16:9 on 18.5:9 screen (~13.5% crop <= 15% -> auto-applies remembered fill).
+  const moderateWide = computeVideoZoomMetrics(1920, 1080, 2220, 1080);
+  assert.equal(moderateWide.available, true);
+  assert.ok(moderateWide.hiddenFraction < 0.15);
+  assert.equal(moderateWide.canAutoApplyFill, true);
+
+  // 4:3 film on a tall phone in landscape (~38% crop > 15% -> available to pinch, but starts whole).
+  const fourByThreeOnTallPhone = computeVideoZoomMetrics(1440, 1080, 2340, 1080);
+  assert.equal(fourByThreeOnTallPhone.available, true);
+  assert.ok(fourByThreeOnTallPhone.hiddenFraction > 0.15);
+  assert.equal(fourByThreeOnTallPhone.canAutoApplyFill, false);
+
+  // Pinch resistance stays 1:1 in range and resists gently beyond either end.
+  assert.equal(applyPinchResistance(1.12, 1.25), 1.12);
+  assert.ok(applyPinchResistance(0.6, 1.25) < 1 && applyPinchResistance(0.6, 1.25) > 0.9);
+  assert.ok(applyPinchResistance(1.8, 1.25) > 1.25 && applyPinchResistance(1.8, 1.25) < 1.4);
+
+  // Nearer state decides when velocity is low; fast velocity decides even before midpoint.
+  assert.equal(resolvePinchZoomTarget({ scale: 1.1, fillScale: 1.25, velocity: 0 }), 'fit');
+  assert.equal(resolvePinchZoomTarget({ scale: 1.15, fillScale: 1.25, velocity: 0 }), 'fill');
+  assert.equal(resolvePinchZoomTarget({ scale: 1.05, fillScale: 1.25, velocity: 0.8 }), 'fill');
+  assert.equal(resolvePinchZoomTarget({ scale: 1.22, fillScale: 1.25, velocity: -0.8 }), 'fit');
+
+  const store = createMemoryStorage();
+  assert.equal(readZoomPreference(store), 'fit');
+  writeZoomPreference(store, 'fill');
+  assert.equal(readZoomPreference(store), 'fill');
+  writeZoomPreference(store, 'fit');
+  assert.equal(readZoomPreference(store), 'fit');
+
+  // Z key toggles zoom ONLY in video full screen.
+  assert.equal(classifyPlayerKey({ key: 'z' }, { mode: 'video', isFullscreen: true }), 'toggle_zoom');
+  assert.equal(classifyPlayerKey({ key: 'Z' }, { mode: 'video', isFullscreen: true }), 'toggle_zoom');
+  assert.equal(classifyPlayerKey({ key: 'z' }, { mode: 'video', isFullscreen: false }), null);
+  assert.equal(classifyPlayerKey({ key: 'z' }, { mode: 'audio', isFullscreen: true }), null);
+});
+
+test('desktop Space hold engages 2x at 350 ms without toggling play/pause and short press < 350 ms toggles normally', () => {
+  const clock = createFakeClock();
+  let playing = true;
+  let speed = 1.5;
+  const log = [];
+  const space = createSpaceHoldController({
+    clock,
+    canHold: () => playing && speed < 2,
+    onTogglePlay: () => {
+      playing = !playing;
+      log.push({ type: 'toggle', playing });
+    },
+    onHoldStart: () => log.push({ type: 'hold_start', restoreTo: speed }),
+    onHoldEnd: () => log.push({ type: 'hold_end', restored: speed }),
+  });
+
+  // Short press (349 ms) toggles play/pause on release.
+  space.onKeyDown({ repeat: false });
+  clock.advance(349);
+  assert.equal(space.isHolding(), false);
+  space.onKeyUp();
+  assert.deepEqual(log, [{ type: 'toggle', playing: false }]);
+  log.length = 0;
+
+  // Pressing Space while paused toggles immediately and holding does NOT engage 2x.
+  space.onKeyDown({ repeat: false });
+  clock.advance(400);
+  space.onKeyDown({ repeat: true });
+  assert.equal(space.isHolding(), false);
+  space.onKeyUp();
+  assert.deepEqual(log, [{ type: 'toggle', playing: true }]);
+  log.length = 0;
+
+  // Holding Space >= 350 ms while playing at 1.5x engages 2x; key repeats are ignored; release restores 1.5x without pausing.
+  space.onKeyDown({ repeat: false });
+  clock.advance(350);
+  assert.equal(space.isHolding(), true);
+  space.onKeyDown({ repeat: true });
+  space.onKeyUp();
+  assert.equal(space.isHolding(), false);
+  assert.equal(playing, true);
+  assert.deepEqual(log, [
+    { type: 'hold_start', restoreTo: 1.5 },
+    { type: 'hold_end', restored: 1.5 },
+  ]);
+  log.length = 0;
+
+  // Absent when chosen speed is already 2x (toggles immediately, never holds).
+  speed = 2;
+  space.onKeyDown({ repeat: false });
+  clock.advance(400);
+  assert.equal(space.isHolding(), false);
+  space.onKeyUp();
+  assert.deepEqual(log, [{ type: 'toggle', playing: false }]);
+  space.dispose();
 });

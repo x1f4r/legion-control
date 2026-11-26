@@ -2587,3 +2587,625 @@ browserTest(
     }
   },
 );
+
+browserTest(
+  'Player: zoom to fill, hold for 2x, scrub anywhere, and haptics work end-to-end',
+  { timeout: 120_000 },
+  async (_t, tracker) => {
+    const server = await startStaticUiServer();
+    const browser = await launchBrowser({ autoplay: true });
+    const consoleErrors = [];
+    const pageErrors = [];
+
+    try {
+      const context = await browser.newContext({
+        viewport: { width: 1000, height: 600 },
+        colorScheme: 'dark',
+      });
+
+      await context.addInitScript(() => {
+        let now = 1_000_000;
+        let nextId = 1;
+        const timers = new Map();
+        window.__LEGION_TEST_PLAYER_CLOCK__ = {
+          now: () => now,
+          setTimeout(fn, ms) {
+            const id = nextId++;
+            timers.set(id, { at: now + Math.max(0, ms), fn });
+            return id;
+          },
+          clearTimeout(id) {
+            timers.delete(id);
+          },
+          advance(ms) {
+            const target = now + ms;
+            let guard = 0;
+            while (guard < 10_000) {
+              guard += 1;
+              let soonestId = null;
+              let soonest = null;
+              for (const [id, item] of timers.entries()) {
+                if (item.at <= target && (!soonest || item.at < soonest.at)) {
+                  soonest = item;
+                  soonestId = id;
+                }
+              }
+              if (!soonest) break;
+              timers.delete(soonestId);
+              now = soonest.at;
+              soonest.fn();
+            }
+            now = target;
+          },
+        };
+      });
+
+      const page = tracker.attach(await context.newPage(), {
+        label: 'player-gestures',
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
+
+      async function resizeAndSettle(width, height, stepLabel) {
+        tracker.setStep(stepLabel);
+        await page.setViewportSize({ width, height });
+        await tracker.waitForFn(
+          page,
+          ({ w, h }) => window.innerWidth === w && window.innerHeight === h,
+          { w: width, h: height },
+          `viewport ${width}x${height} (${stepLabel})`,
+        );
+        await waitForLayoutSettled(page, 2);
+      }
+
+      tracker.setStep('open Arrival.mp4 for gestures');
+      await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
+        waitUntil: 'domcontentloaded',
+      });
+      const arrivalCell = page.locator('.grid a.cell[aria-label="Arrival.mp4"]');
+      await tracker.waitForLocator(arrivalCell, 'Arrival.mp4 grid cell');
+      await arrivalCell.click();
+
+      const videoEl = page.locator('.viewer video.viewer-video[src]');
+      await tracker.waitForLocator(videoEl, 'Arrival.mp4 video[src]');
+      await waitForMediaReady(videoEl, 'Arrival.mp4 metadata', { tracker, minReadyState: 1 });
+      await tracker.waitForFn(
+        page,
+        () => {
+          const v = document.querySelector('.viewer video.viewer-video');
+          return Boolean(v && v.readyState >= 1 && Number.isFinite(v.duration) && v.duration > 1 && v.videoWidth > 0);
+        },
+        null,
+        'Arrival.mp4 dimensions and duration',
+      );
+
+      // Check touch-action: none on picture surface.
+      const touchAction = await page.evaluate(() => getComputedStyle(document.querySelector('.player-stage-hit')).touchAction);
+      assert.equal(touchAction, 'none');
+
+      // Read intrinsic video aspect ratio and set a viewport where fill differs by ~12% (available and <= 15% crop).
+      const dims = await page.evaluate(() => {
+        const v = document.querySelector('.viewer video.viewer-video');
+        return { w: v.videoWidth, h: v.videoHeight };
+      });
+      const videoAspect = dims.w / dims.h;
+      const moderateWidth = Math.round(600 * videoAspect * 1.12);
+      await resizeAndSettle(moderateWidth, 600, 'moderate crop viewport');
+
+      // 1. Zoom to fill does NOT exist outside full screen (`Z` and More do nothing / omit it).
+      tracker.setStep('zoom unavailable outside full screen');
+      await page.keyboard.press('z');
+      assert.equal(await page.locator('.viewer video').getAttribute('data-zoom-mode'), 'fit');
+      await page.locator('.viewer button[aria-label="More options"]').click();
+      await tracker.waitForLocator(page.locator('.sheet'), 'More sheet outside full screen');
+      await tracker.waitForFn(
+        page,
+        () => document.activeElement?.classList?.contains('sheet'),
+        null,
+        'More sheet focused',
+      );
+      assert.equal(await page.locator('.sheet button', { hasText: /Zoom to fill|Fit to screen/ }).count(), 0);
+      await page.keyboard.press('Escape');
+      await tracker.waitForLocator(page.locator('.sheet'), 'More sheet closed', { state: 'hidden' });
+
+      // Enter full screen -> `Z` toggles to fill, shows "Zoomed to fill" for 1.2 s, fires haptic tick, remembers choice.
+      tracker.setStep('enter full screen and toggle zoom with Z');
+      await page.locator('.viewer button[aria-label="Full screen"]').click();
+      await tracker.waitForLocator(page.locator('.viewer button[aria-label="Exit full screen"]'), 'Exit full screen button');
+      await page.evaluate(() => {
+        window.__LEGION_MOCK_HAPTIC_CALLS__.length = 0;
+      });
+      await page.keyboard.press('z');
+      await tracker.waitForLocator(
+        page.locator('.player-zoom-chip', { hasText: 'Zoomed to fill' }),
+        'Zoomed to fill chip',
+      );
+      const afterZFill = await page.evaluate(() => ({
+        mode: document.querySelector('.viewer video').getAttribute('data-zoom-mode'),
+        scale: Number(document.querySelector('.viewer video').getAttribute('data-zoom-scale')),
+        stored: localStorage.getItem('legion.player.zoom.v1'),
+        haptics: window.__LEGION_MOCK_HAPTIC_CALLS__.map((h) => h.kind),
+      }));
+      assert.equal(afterZFill.mode, 'fill');
+      assert.ok(afterZFill.scale > 1.08);
+      assert.equal(afterZFill.stored, 'fill');
+      assert.deepEqual(afterZFill.haptics, ['tick']);
+
+      // Chip hides after 1200 ms.
+      tracker.setStep('zoom chip hides after 1200ms');
+      await page.evaluate(() => {
+        window.__LEGION_TEST_PLAYER_CLOCK__.advance(1200);
+      });
+      await tracker.waitForLocator(page.locator('.player-zoom-chip'), 'zoom chip hidden after 1200ms', {
+        state: 'hidden',
+      });
+
+      // More sheet offers "Fit to screen" while zoomed, clicking toggles back to "Original".
+      tracker.setStep('More sheet Fit to screen');
+      await page.locator('.viewer button[aria-label="More options"]').click();
+      const fitBtn = page.locator('.sheet button', { hasText: 'Fit to screen' });
+      await tracker.waitForLocator(fitBtn, 'Fit to screen button');
+      await fitBtn.click();
+      await tracker.waitForLocator(page.locator('.player-zoom-chip', { hasText: 'Original' }), 'Original zoom chip');
+      assert.equal(await page.locator('.viewer video').getAttribute('data-zoom-mode'), 'fit');
+
+      // Pinch outward settles on fill, fires haptic tick, remembers fill.
+      tracker.setStep('pinch outward zooms to fill');
+      await page.evaluate(() => {
+        window.__LEGION_MOCK_HAPTIC_CALLS__.length = 0;
+        const stage = document.querySelector('.player-stage-hit');
+        const fire = (type, id, x, y) =>
+          stage.dispatchEvent(
+            new PointerEvent(type, { pointerId: id, pointerType: 'touch', clientX: x, clientY: y, bubbles: true }),
+          );
+        fire('pointerdown', 11, 260, 300);
+        fire('pointerdown', 12, 340, 300);
+        window.__LEGION_TEST_PLAYER_CLOCK__.advance(60);
+        fire('pointermove', 11, 220, 300);
+        fire('pointermove', 12, 380, 300);
+        fire('pointerup', 12, 380, 300);
+        fire('pointerup', 11, 220, 300);
+      });
+      await tracker.waitForFn(
+        page,
+        () => document.querySelector('.viewer video')?.getAttribute('data-zoom-mode') === 'fill',
+        null,
+        'video zoom mode fill after pinch',
+      );
+      assert.deepEqual(
+        await page.evaluate(() => window.__LEGION_MOCK_HAPTIC_CALLS__.map((h) => h.kind)),
+        ['tick'],
+      );
+
+      // Leave full screen -> resets to fit; re-enter full screen with <= 15% crop -> auto-applies remembered fill.
+      tracker.setStep('remembered fill re-applies on full screen');
+      await page.keyboard.press('f');
+      await tracker.waitForLocator(page.locator('.viewer button[aria-label="Full screen"]'), 'Full screen button after exit');
+      assert.equal(await page.locator('.viewer video').getAttribute('data-zoom-mode'), 'fit');
+      await page.keyboard.press('f');
+      await tracker.waitForLocator(page.locator('.viewer button[aria-label="Exit full screen"]'), 'Exit full screen button re-entry');
+      assert.equal(await page.locator('.viewer video').getAttribute('data-zoom-mode'), 'fill');
+
+      // Resize so fill would crop > 15% (like 4:3 on a tall phone) -> re-entering full screen starts whole ('fit').
+      await page.keyboard.press('f');
+      await tracker.waitForLocator(page.locator('.viewer button[aria-label="Full screen"]'), 'Full screen button before >15% crop');
+      await resizeAndSettle(Math.round(600 * videoAspect * 1.45), 600, '>15% crop viewport');
+      await page.keyboard.press('f');
+      await tracker.waitForLocator(page.locator('.viewer button[aria-label="Exit full screen"]'), 'Exit full screen on >15% crop');
+      assert.equal(await page.locator('.viewer video').getAttribute('data-zoom-mode'), 'fit');
+
+      // Resize within 3% of video aspect -> zoom is absent (Z and More offer nothing).
+      await resizeAndSettle(Math.round(600 * videoAspect * 1.02), 600, 'within 3% aspect viewport');
+      await page.keyboard.press('z');
+      assert.equal(await page.locator('.viewer video').getAttribute('data-zoom-mode'), 'fit');
+      await page.locator('.viewer button[aria-label="More options"]').click();
+      await tracker.waitForLocator(page.locator('.sheet'), 'More sheet within 3% aspect');
+      await tracker.waitForFn(
+        page,
+        () => document.activeElement?.classList?.contains('sheet'),
+        null,
+        'More sheet focused within 3% aspect',
+      );
+      assert.equal(await page.locator('.sheet button', { hasText: /Zoom to fill|Fit to screen/ }).count(), 0);
+      await page.keyboard.press('Escape');
+      await tracker.waitForLocator(page.locator('.sheet'), 'More sheet hidden within 3% aspect', { state: 'hidden' });
+
+      // Restore roomy landscape viewport for hold and scrub tests.
+      await resizeAndSettle(1000, 600, 'restore landscape viewport');
+
+      // 2. Hold for 2x: choose 1.5x, play, hide overlay -> pointer hold 350 ms engages 2x, pill shown,
+      //    overlay stays hidden, release restores 1.5x (not 1x) and fades pill in 120 ms.
+      tracker.setStep('hold for 2x while playing');
+      await page.locator('.player-speed-btn').click();
+      await tracker.waitForLocator(page.locator('.player-speed-menu button', { hasText: '1.5×' }), '1.5x speed menu item');
+      await page.locator('.player-speed-menu button', { hasText: '1.5×' }).click();
+      await page.locator('.viewer button[aria-label="Play"]').click();
+      await tracker.waitForLocator(page.locator('.viewer button[aria-label="Pause"]'), 'Pause button after Play');
+
+      // Hide overlay via single tap on stage center.
+      await page.evaluate(() => {
+        const stage = document.querySelector('.player-stage-hit');
+        stage.dispatchEvent(
+          new PointerEvent('pointerdown', { pointerId: 21, pointerType: 'touch', clientX: 500, clientY: 300, bubbles: true }),
+        );
+        window.__LEGION_TEST_PLAYER_CLOCK__.advance(40);
+        stage.dispatchEvent(
+          new PointerEvent('pointerup', { pointerId: 21, pointerType: 'touch', clientX: 500, clientY: 300, bubbles: true }),
+        );
+      });
+      await tracker.waitForFn(
+        page,
+        () => document.querySelector('.player-overlay')?.classList.contains('hidden'),
+        null,
+        'overlay hidden after tap',
+      );
+
+      await page.evaluate(() => {
+        window.__LEGION_MOCK_HAPTIC_CALLS__.length = 0;
+        const stage = document.querySelector('.player-stage-hit');
+        stage.dispatchEvent(
+          new PointerEvent('pointerdown', { pointerId: 22, pointerType: 'touch', clientX: 500, clientY: 300, bubbles: true }),
+        );
+        window.__LEGION_TEST_PLAYER_CLOCK__.advance(350);
+      });
+      await tracker.waitForLocator(page.locator('.player-hold-pill'), '2x hold pill visible');
+      const duringHold = await page.evaluate(() => ({
+        rate: document.querySelector('.viewer video').playbackRate,
+        pillText: document.querySelector('.player-hold-pill')?.textContent?.trim() || '',
+        pillHasSvg: Boolean(document.querySelector('.player-hold-pill svg')),
+        overlayHidden: document.querySelector('.player-overlay').classList.contains('hidden'),
+        haptics: window.__LEGION_MOCK_HAPTIC_CALLS__.map((h) => h.kind),
+      }));
+      assert.equal(duringHold.rate, 2);
+      assert.equal(duringHold.pillText, '2×');
+      assert.equal(duringHold.pillHasSvg, true);
+      assert.equal(duringHold.overlayHidden, true, 'Hold for 2x must keep hidden layer hidden');
+      assert.deepEqual(duringHold.haptics, ['tick']);
+
+      await page.evaluate(() => {
+        const stage = document.querySelector('.player-stage-hit');
+        stage.dispatchEvent(
+          new PointerEvent('pointerup', { pointerId: 22, pointerType: 'touch', clientX: 500, clientY: 300, bubbles: true }),
+        );
+      });
+      await tracker.waitForFn(
+        page,
+        () => document.querySelector('.viewer video')?.playbackRate === 1.5,
+        null,
+        'playbackRate restored to 1.5x after pointer release',
+      );
+      assert.equal(await page.evaluate(() => document.querySelector('.player-overlay').classList.contains('hidden')), true);
+      await page.evaluate(() => {
+        window.__LEGION_TEST_PLAYER_CLOCK__.advance(120);
+      });
+      await tracker.waitForLocator(page.locator('.player-hold-pill'), '2x hold pill gone after 120ms', {
+        state: 'hidden',
+      });
+
+      // Desktop Space hold (>350 ms) engages 2x and release restores 1.5x without pausing; short Space pauses.
+      tracker.setStep('Space hold for 2x and short Space pause');
+      await page.evaluate(() => {
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true }));
+        window.__LEGION_TEST_PLAYER_CLOCK__.advance(350);
+      });
+      await tracker.waitForLocator(page.locator('.player-hold-pill'), '2x pill during Space hold');
+      assert.equal(await page.evaluate(() => document.querySelector('.viewer video').playbackRate), 2);
+      await page.evaluate(() => {
+        window.dispatchEvent(new KeyboardEvent('keyup', { key: ' ', bubbles: true, cancelable: true }));
+        window.__LEGION_TEST_PLAYER_CLOCK__.advance(120);
+      });
+      await tracker.waitForLocator(page.locator('.player-hold-pill'), '2x pill gone after Space keyup', {
+        state: 'hidden',
+      });
+      const afterSpaceHold = await page.evaluate(() => ({
+        rate: document.querySelector('.viewer video').playbackRate,
+        paused: document.querySelector('.viewer video').paused,
+      }));
+      assert.equal(afterSpaceHold.rate, 1.5);
+      assert.equal(afterSpaceHold.paused, false);
+
+      // Short Space press pauses video, and holding while paused does NOT show 2x pill.
+      await page.keyboard.press('Space');
+      await tracker.waitForLocator(page.locator('.viewer button[aria-label="Play"]'), 'Play button after short Space pause');
+      await page.evaluate(() => {
+        const stage = document.querySelector('.player-stage-hit');
+        stage.dispatchEvent(
+          new PointerEvent('pointerdown', { pointerId: 23, pointerType: 'touch', clientX: 500, clientY: 300, bubbles: true }),
+        );
+        window.__LEGION_TEST_PLAYER_CLOCK__.advance(400);
+      });
+      await waitForLayoutSettled(page, 2);
+      assert.equal(await page.locator('.player-hold-pill').count(), 0);
+      await page.evaluate(() => {
+        document.querySelector('.player-stage-hit').dispatchEvent(
+          new PointerEvent('pointerup', { pointerId: 23, pointerType: 'touch', clientX: 500, clientY: 300, bubbles: true }),
+        );
+      });
+
+      // 3. Scrub anywhere: with layer visible, sideways drag shows centre HUD, hides centre buttons,
+      //    applies Half / Quarter / Fine rates with haptics, commits ONE seek on release, cancels within 12 px,
+      //    and a second finger during scrub drops the scrub without changing position.
+      tracker.setStep('scrub anywhere gesture and precision bands');
+      const scrubResult = await page.evaluate(async () => {
+        const settleFrames = (count = 2) =>
+          new Promise((resolve) => {
+            let done = false;
+            const finish = () => {
+              if (done) return;
+              done = true;
+              clearTimeout(timer);
+              resolve();
+            };
+            const timer = setTimeout(finish, 2000);
+            let remaining = Math.max(1, count);
+            const tick = () => {
+              remaining -= 1;
+              if (remaining <= 0) finish();
+              else requestAnimationFrame(tick);
+            };
+            requestAnimationFrame(tick);
+          });
+
+        const v = document.querySelector('.viewer video');
+        let seekCount = 0;
+        const origDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'currentTime');
+        let lastSeekTo = null;
+        Object.defineProperty(v, 'currentTime', {
+          configurable: true,
+          get() {
+            return origDesc.get.call(this);
+          },
+          set(val) {
+            seekCount += 1;
+            lastSeekTo = val;
+            return origDesc.set.call(this, val);
+          },
+        });
+        window.__LEGION_MOCK_HAPTIC_CALLS__.length = 0;
+        const stage = document.querySelector('.player-stage-hit');
+        const fire = (type, id, x, y) =>
+          stage.dispatchEvent(
+            new PointerEvent(type, { pointerId: id, pointerType: 'touch', clientX: x, clientY: y, bubbles: true }),
+          );
+
+        fire('pointerdown', 31, 300, 150);
+        fire('pointermove', 31, 380, 150);
+        await settleFrames(2);
+        const hudNormal = {
+          time: document.querySelector('.player-scrub-hud-time')?.textContent || '',
+          delta: document.querySelector('.player-scrub-hud-delta')?.textContent || '',
+          rate: document.querySelector('.player-scrub-hud-rate')?.textContent || null,
+          centerHidden: document.querySelector('.player-center').classList.contains('scrubbing-hidden'),
+          seekCountMidDrag: seekCount,
+        };
+
+        // Pull down > 80 px -> Half speed, > 160 px -> Quarter speed, > 240 px -> Fine, back to normal.
+        fire('pointermove', 31, 380, 240);
+        await settleFrames(2);
+        const rateHalf = document.querySelector('.player-scrub-hud-rate')?.textContent || null;
+        fire('pointermove', 31, 380, 320);
+        await settleFrames(2);
+        const rateQuarter = document.querySelector('.player-scrub-hud-rate')?.textContent || null;
+        fire('pointermove', 31, 380, 400);
+        await settleFrames(2);
+        const rateFine = document.querySelector('.player-scrub-hud-rate')?.textContent || null;
+        fire('pointermove', 31, 380, 150);
+        await settleFrames(2);
+        const rateBack = document.querySelector('.player-scrub-hud-rate')?.textContent || null;
+
+        // Release -> commits ONE seek.
+        fire('pointerup', 31, 380, 150);
+        await settleFrames(2);
+        const afterRelease = {
+          seekCount,
+          lastSeekTo,
+          hudGone: !document.querySelector('.player-scrub-hud'),
+          hapticsCount: window.__LEGION_MOCK_HAPTIC_CALLS__.length,
+        };
+
+        // Second scrub that returns within 12 px of origin commits ZERO seeks.
+        const beforeCancelSeek = seekCount;
+        fire('pointerdown', 32, 300, 150);
+        fire('pointermove', 32, 390, 150);
+        fire('pointermove', 32, 310, 150);
+        fire('pointerup', 32, 310, 150);
+        await settleFrames(2);
+        const seeksAfterCancel = seekCount - beforeCancelSeek;
+
+        // Third scrub interrupted by second finger (pinch) commits ZERO seeks.
+        const beforePinchSeek = seekCount;
+        fire('pointerdown', 33, 300, 150);
+        fire('pointermove', 33, 420, 150);
+        fire('pointerdown', 34, 520, 150);
+        fire('pointerup', 34, 520, 150);
+        fire('pointerup', 33, 420, 150);
+        await settleFrames(2);
+        const seeksAfterPinch = seekCount - beforePinchSeek;
+
+        delete v.currentTime;
+        return { hudNormal, rateHalf, rateQuarter, rateFine, rateBack, afterRelease, seeksAfterCancel, seeksAfterPinch };
+      });
+
+      assert.equal(scrubResult.hudNormal.centerHidden, true);
+      assert.equal(scrubResult.hudNormal.seekCountMidDrag, 0);
+      assert.match(scrubResult.hudNormal.delta, /^\+/);
+      assert.equal(scrubResult.hudNormal.rate, null);
+      assert.equal(scrubResult.rateHalf, 'Half speed');
+      assert.equal(scrubResult.rateQuarter, 'Quarter speed');
+      assert.equal(scrubResult.rateFine, 'Fine');
+      assert.equal(scrubResult.rateBack, null);
+      assert.equal(scrubResult.afterRelease.seekCount, 1);
+      assert.equal(scrubResult.afterRelease.hudGone, true);
+      assert.equal(scrubResult.afterRelease.hapticsCount, 4);
+      assert.equal(scrubResult.seeksAfterCancel, 0);
+      assert.equal(scrubResult.seeksAfterPinch, 0);
+
+      assert.deepEqual(consoleErrors, [], `Console errors: ${consoleErrors.join('; ')}`);
+      assert.deepEqual(pageErrors, [], `Page errors: ${pageErrors.join('; ')}`);
+      await context.close();
+    } finally {
+      await browser.close();
+      await server.stop();
+    }
+  },
+);
+
+browserTest(
+  'Player: 10-second seek icon digits are centred inside their circles within 0.5 px at DPR 1, 2, and 3',
+  { timeout: 90_000 },
+  async (_t, tracker) => {
+    const server = await startStaticUiServer();
+    const browser = await launchBrowser();
+    const consoleErrors = [];
+    const pageErrors = [];
+
+    try {
+      for (const dpr of [1, 2, 3]) {
+        const context = await browser.newContext({
+          viewport: { width: 900, height: 640 },
+          deviceScaleFactor: dpr,
+          colorScheme: 'dark',
+        });
+        const page = tracker.attach(await context.newPage(), {
+          label: `seek-icon-dpr-${dpr}`,
+          collectConsole: consoleErrors,
+          collectPage: pageErrors,
+        });
+        tracker.setStep(`measure 10s seek icons at DPR ${dpr}`);
+        await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
+          waitUntil: 'domcontentloaded',
+        });
+        const arrivalCell = page.locator('.grid a.cell[aria-label="Arrival.mp4"]');
+        await tracker.waitForLocator(arrivalCell, `Arrival.mp4 grid cell (DPR ${dpr})`);
+        await arrivalCell.click();
+        await tracker.waitForLocator(
+          page.locator('.viewer button[aria-label="Back 10 seconds"]'),
+          `Back 10 seconds button (DPR ${dpr})`,
+        );
+        await tracker.waitForLocator(
+          page.locator('.viewer button[aria-label="Forward 10 seconds"]'),
+          `Forward 10 seconds button (DPR ${dpr})`,
+        );
+        await waitForLayoutSettled(page, 2);
+
+        const measurements = await page.evaluate(async (scaleFactor) => {
+          const targets = [
+            { label: 'Back 10 seconds', symbolId: 'i-skip-back-10' },
+            { label: 'Forward 10 seconds', symbolId: 'i-skip-fwd-10' },
+          ];
+
+          async function rasterBBox(svgMarkup, cssW, cssH, dprVal) {
+            const pxW = Math.round(cssW * dprVal);
+            const pxH = Math.round(cssH * dprVal);
+            const img = new Image();
+            img.width = pxW;
+            img.height = pxH;
+            const url = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgMarkup)}`;
+            await new Promise((resolve, reject) => {
+              let settled = false;
+              const finish = (ok, err) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                if (ok) resolve();
+                else reject(err);
+              };
+              const timer = setTimeout(() => finish(false, new Error('Timed out rasterizing SVG icon')), 10_000);
+              img.onload = () => finish(true);
+              img.onerror = (err) => finish(false, err instanceof Error ? err : new Error('Failed to load SVG icon'));
+              img.src = url;
+            });
+            const canvas = document.createElement('canvas');
+            canvas.width = pxW;
+            canvas.height = pxH;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0, pxW, pxH);
+            const data = ctx.getImageData(0, 0, pxW, pxH).data;
+            let minX = pxW;
+            let minY = pxH;
+            let maxX = -1;
+            let maxY = -1;
+            for (let y = 0; y < pxH; y += 1) {
+              for (let x = 0; x < pxW; x += 1) {
+                const alpha = data[(y * pxW + x) * 4 + 3];
+                if (alpha > 8) {
+                  if (x < minX) minX = x;
+                  if (x > maxX) maxX = x;
+                  if (y < minY) minY = y;
+                  if (y > maxY) maxY = y;
+                }
+              }
+            }
+            return {
+              cx: (minX + maxX + 1) / 2 / dprVal,
+              cy: (minY + maxY + 1) / 2 / dprVal,
+            };
+          }
+
+          const out = [];
+          for (const t of targets) {
+            const btn = document.querySelector(`.viewer button[aria-label="${t.label}"]`);
+            const svg = btn.querySelector('svg');
+            const rect = svg.getBoundingClientRect();
+            const style = getComputedStyle(svg);
+            const sym = document.getElementById(t.symbolId);
+            const viewBox = sym.getAttribute('viewBox') || '0 0 24 24';
+            const [, , vbW, vbH] = viewBox.split(/\s+/).map(Number);
+
+            // 1. Exact SVG vector geometry centre mapped into the live button's CSS pixel size.
+            const probe = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+            probe.setAttribute('viewBox', viewBox);
+            probe.setAttribute('width', String(rect.width));
+            probe.setAttribute('height', String(rect.height));
+            probe.style.position = 'fixed';
+            probe.style.left = '-9999px';
+            probe.innerHTML = sym.innerHTML;
+            document.body.appendChild(probe);
+            const circleBox = probe.querySelector('[data-part="circle"]').getBBox();
+            const digitsBox = probe.querySelector('[data-part="digits"]').getBBox();
+            probe.remove();
+
+            const sx = rect.width / vbW;
+            const sy = rect.height / vbH;
+            const geomDx = ((digitsBox.x + digitsBox.width / 2) - (circleBox.x + circleBox.width / 2)) * sx;
+            const geomDy = ((digitsBox.y + digitsBox.height / 2) - (circleBox.y + circleBox.height / 2)) * sy;
+
+            // 2. Actual rasterized pixel ink bounding box at live CSS size * DPR.
+            const baseAttrs = `xmlns="http://www.w3.org/2000/svg" viewBox="${viewBox}" width="${rect.width}" height="${rect.height}" fill="none" stroke="#ffffff" stroke-width="${style.strokeWidth}" stroke-linecap="${style.strokeLinecap}" stroke-linejoin="${style.strokeLinejoin}"`;
+            const circleHtml = sym.querySelector('[data-part="circle"]').outerHTML;
+            const digitsHtml = sym.querySelector('[data-part="digits"]').outerHTML;
+            const circlePx = await rasterBBox(`<svg ${baseAttrs}>${circleHtml}</svg>`, rect.width, rect.height, scaleFactor);
+            const digitsPx = await rasterBBox(`<svg ${baseAttrs}>${digitsHtml}</svg>`, rect.width, rect.height, scaleFactor);
+
+            out.push({
+              label: t.label,
+              dpr: scaleFactor,
+              geomDx,
+              geomDy,
+              pixelDx: digitsPx.cx - circlePx.cx,
+              pixelDy: digitsPx.cy - circlePx.cy,
+            });
+          }
+          return out;
+        }, dpr);
+
+        for (const m of measurements) {
+          assert.ok(
+            Math.abs(m.geomDx) <= 0.5 && Math.abs(m.geomDy) <= 0.5,
+            `${m.label} @${dpr}x vector offset too large: dx=${m.geomDx.toFixed(3)}, dy=${m.geomDy.toFixed(3)}`,
+          );
+          assert.ok(
+            Math.abs(m.pixelDx) <= 0.5 && Math.abs(m.pixelDy) <= 0.5,
+            `${m.label} @${dpr}x pixel offset too large: dx=${m.pixelDx.toFixed(3)}, dy=${m.pixelDy.toFixed(3)}`,
+          );
+        }
+        await context.close();
+      }
+      assert.deepEqual(consoleErrors, [], `Console errors: ${consoleErrors.join('; ')}`);
+      assert.deepEqual(pageErrors, [], `Page errors: ${pageErrors.join('; ')}`);
+    } finally {
+      await browser.close();
+      await server.stop();
+    }
+  },
+);

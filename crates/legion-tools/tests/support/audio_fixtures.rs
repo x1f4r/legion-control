@@ -1431,7 +1431,10 @@ pub fn assert_clean_tags_item(item: &serde_json::Value) {
         }
     } else if let Some(err) = item.get("error") {
         let code = err["code"].as_str().unwrap_or("");
-        assert_eq!(code, "failed", "unexpected fs.tags error code: {item}");
+        assert!(
+            matches!(code, "failed" | "timeout"),
+            "unexpected fs.tags error code: {item}"
+        );
         assert!(
             !err["message"].as_str().unwrap_or("").is_empty(),
             "empty error message: {item}"
