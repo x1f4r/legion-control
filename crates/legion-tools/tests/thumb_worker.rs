@@ -3885,14 +3885,18 @@ async fn test_worker_sandbox_blocks_files_network_and_process_spawn() {
             assert_sandbox_blocked("worker open_file(/etc/passwd)", &out_passwd);
         }
 
-        let out_bind = run_selftest_child(policy.clone(), "worker", "tcp_bind", None, None).await;
-        eprintln!(
-            "SANDBOX_NET_BIND: exit={:?} signal={:?} stderr={}",
-            out_bind.exit_code,
-            out_bind.signal,
-            out_bind.stderr.text.trim()
-        );
-        assert_sandbox_blocked("worker tcp_bind", &out_bind);
+        #[cfg(not(windows))]
+        let out_bind = {
+            let out = run_selftest_child(policy.clone(), "worker", "tcp_bind", None, None).await;
+            eprintln!(
+                "SANDBOX_NET_BIND: exit={:?} signal={:?} stderr={}",
+                out.exit_code,
+                out.signal,
+                out.stderr.text.trim()
+            );
+            assert_sandbox_blocked("worker tcp_bind", &out);
+            out
+        };
 
         let out_connect = run_selftest_child(
             policy.clone(),
@@ -3903,12 +3907,31 @@ async fn test_worker_sandbox_blocks_files_network_and_process_spawn() {
         )
         .await;
         eprintln!(
-            "SANDBOX_NET_CONNECT: exit={:?} signal={:?} stderr={}",
+            "SANDBOX_NET_CONNECT(host loopback): exit={:?} signal={:?} stderr={}",
             out_connect.exit_code,
             out_connect.signal,
             out_connect.stderr.text.trim()
         );
-        assert_sandbox_blocked("worker tcp_connect", &out_connect);
+        assert_sandbox_blocked("worker tcp_connect(host loopback)", &out_connect);
+
+        #[cfg(windows)]
+        {
+            let out_ext = run_selftest_child(
+                policy.clone(),
+                "worker",
+                "tcp_connect",
+                Some("192.0.2.1:80"),
+                None,
+            )
+            .await;
+            eprintln!(
+                "SANDBOX_NET_CONNECT(external): exit={:?} signal={:?} stderr={}",
+                out_ext.exit_code,
+                out_ext.signal,
+                out_ext.stderr.text.trim()
+            );
+            assert_sandbox_blocked("worker tcp_connect(external)", &out_ext);
+        }
 
         #[cfg(target_os = "linux")]
         {
@@ -4266,6 +4289,7 @@ async fn test_ffmpeg_sandbox_blocks_network_and_unauthorized_files() {
 
     // Check whether full isolation holds (always true on Linux + macOS; true on Windows when
     // AppContainer launched).
+    #[cfg(not(windows))]
     let out_bind = run_selftest_child(policy.clone(), "ffmpeg-box", "tcp_bind", None, None).await;
     let out_connect = run_selftest_child(
         policy.clone(),
@@ -4331,8 +4355,27 @@ async fn test_ffmpeg_sandbox_blocks_network_and_unauthorized_files() {
         let report: legion_os::sandbox::SandboxReport =
             serde_json::from_str(probe_out.stdout.text.trim()).expect("parse report");
         if report.complete {
-            assert_sandbox_blocked("Windows ffmpeg-box AppContainer tcp_bind", &out_bind);
-            assert_sandbox_blocked("Windows ffmpeg-box AppContainer tcp_connect", &out_connect);
+            let out_ext = run_selftest_child(
+                policy.clone(),
+                "ffmpeg-box",
+                "tcp_connect",
+                Some("192.0.2.1:80"),
+                None,
+            )
+            .await;
+            eprintln!(
+                "FFMPEG_SANDBOX_NET(loopback): {} | (external): {}",
+                out_connect.stderr.text.trim(),
+                out_ext.stderr.text.trim(),
+            );
+            assert_sandbox_blocked(
+                "Windows ffmpeg-box AppContainer tcp_connect(loopback)",
+                &out_connect,
+            );
+            assert_sandbox_blocked(
+                "Windows ffmpeg-box AppContainer tcp_connect(external)",
+                &out_ext,
+            );
             assert_sandbox_blocked("Windows ffmpeg-box AppContainer sibling read", &out_sibling);
             assert_sandbox_blocked("Windows ffmpeg-box AppContainer secret read", &out_other);
         }
