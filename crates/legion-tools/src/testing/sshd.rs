@@ -172,7 +172,7 @@ impl TestSshd {
                 .spawn()
                 .map_err(|e| format!("spawn {}: {e}", sshd_bin.display()))?;
 
-            match wait_for_listen(&mut child, port, Duration::from_secs(5)) {
+            match wait_for_listen(&mut child, port, Duration::from_secs(15)) {
                 Ok(()) => {
                     return Ok(Some(TestSshd {
                         dir,
