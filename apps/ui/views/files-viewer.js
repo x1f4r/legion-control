@@ -138,6 +138,10 @@ export function FilesViewer({
   capsStore = null,
   caps,
   thumbCache = null,
+  musicController = null,
+  musicState = null,
+  transitionFromRect = null,
+  onConsumeTransitionRect = null,
   onRegisterPopState = null,
   deviceNoun = 'phone',
   technical = false,
@@ -166,7 +170,6 @@ export function FilesViewer({
 
   const [chromeHidden, setChromeHidden] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
-  const [musicPlaybackRate, setMusicPlaybackRate] = useState(1);
   const [videoZoomAction, setVideoZoomAction] = useState(null);
   const [fullscreenState, setFullscreenState] = useState({
     active: false,
@@ -204,6 +207,7 @@ export function FilesViewer({
   const category = isBinaryTs ? 'video' : rawCategory;
   const skipMediaPlayer =
     !isBinaryTs && (category === 'video' || category === 'audio') && tableMode === 'fallback';
+  const managedAudio = Boolean(category === 'audio' && !skipMediaPlayer && musicController);
   const preferThumbPreview =
     category === 'image' &&
     tableMode === 'thumb_or_fallback' &&
@@ -224,7 +228,10 @@ export function FilesViewer({
         };
   const mediaUrl = activeMedia.url;
   const mediaLoading = activeMedia.loading;
-  const mediaError = activeMedia.error;
+  const activeMusicMatches = Boolean(
+    managedAudio && musicState?.loaded && musicState.machine === machine && musicState.path === path,
+  );
+  const mediaError = managedAudio ? (activeMusicMatches ? musicState.mediaError : null) : activeMedia.error;
 
   const activeText =
     textState.key === fileKey
@@ -382,8 +389,10 @@ export function FilesViewer({
       abortRef.current.abort();
       abortRef.current = null;
     }
-    stopMediaElements();
-    revokeActiveMintedUrl();
+    if (!managedAudio) {
+      stopMediaElements();
+      revokeActiveMintedUrl();
+    }
     if (fullscreenController.getState().active) {
       await fullscreenController.leave();
     }
@@ -868,8 +877,37 @@ export function FilesViewer({
     }
   }, [hasContentUrl, fileKey]);
 
+  // Delegate playable audio tracks to the single app-wide music controller so closing the
+  // song's screen never stops playback and opening the same song resumes in place.
+  const siblingsRef = useRef(siblings);
+  siblingsRef.current = siblings;
+  const entryRef = useRef(effectiveEntry);
+  entryRef.current = effectiveEntry;
+  const capsRef = useRef(caps);
+  capsRef.current = caps;
+  useLayoutEffect(() => {
+    if (!managedAudio || !musicController) return;
+    musicController.openTrack({
+      machine,
+      path,
+      entry: entryRef.current,
+      siblings: siblingsRef.current,
+      caps: capsRef.current,
+    });
+  }, [
+    managedAudio,
+    musicController,
+    machine,
+    path,
+    caps?.known,
+    caps?.hasContentUrl,
+    caps?.hasTags,
+    caps?.hasAudioThumb,
+  ]);
+
   // Load media URL, machine preview, or text content whenever machine/path/mode changes.
   useEffect(() => {
+    if (managedAudio) return undefined;
     if (abortRef.current) abortRef.current.abort();
     const ctrl = new AbortController();
     abortRef.current = ctrl;
@@ -1163,6 +1201,7 @@ export function FilesViewer({
       revokeActiveMintedUrl();
     };
   }, [
+    managedAudio,
     machine,
     path,
     category,
@@ -1294,6 +1333,10 @@ export function FilesViewer({
   }
 
   function handleRetryMedia() {
+    if (managedAudio && musicController) {
+      musicController.retry();
+      return;
+    }
     recoveryRef.current = { key: fileKey, lastAttemptAt: 0, inFlight: false };
     pendingResumeRef.current = null;
     setRetryNonce((n) => n + 1);
@@ -1313,6 +1356,9 @@ export function FilesViewer({
 
   function noteMediaPlay(expectedKey, el) {
     if (!el || activeFileKeyRef.current !== expectedKey) return;
+    if (category === 'video') {
+      musicController?.pause?.();
+    }
     if (playbackRef.current.key !== expectedKey) {
       playbackRef.current = { key: expectedKey, time: el.currentTime || 0, wantPlay: true };
     } else {
@@ -1896,7 +1942,7 @@ export function FilesViewer({
     !skipMediaPlayer &&
     (category === 'image' || category === 'video' || category === 'audio') &&
     !mediaError &&
-    Boolean(mediaUrl);
+    (managedAudio ? Boolean(musicState?.loaded) : Boolean(mediaUrl));
   const stageIsFallbackCard = !isShowingText && !isShowingInlineMedia;
 
   function renderFallbackCard(heading, body, { showRetry = false, hideActions = false, hint = '' } = {}) {
@@ -2486,8 +2532,10 @@ export function FilesViewer({
               onMediaTime=${(el) => noteMediaTime(expectedKey, el)}
               onMediaPlay=${(el) => noteMediaPlay(expectedKey, el)}
               onMediaPause=${(el) => noteMediaPause(expectedKey, el)}
-              onBeforePlay=${(el) =>
-                expectedUrl ? handleBeforeResumePlay('video', expectedKey, expectedUrl, el) : false}
+              onBeforePlay=${(el) => {
+                musicController?.pause?.();
+                return expectedUrl ? handleBeforeResumePlay('video', expectedKey, expectedUrl, el) : false;
+              }}
               onMediaError=${(el) =>
                 expectedUrl ? handleMediaElementError('video', expectedKey, expectedUrl, el) : false}
             />
@@ -2496,32 +2544,14 @@ export function FilesViewer({
         : useMusicPlayer
           ? html`
               <${MusicPlayer}
-                machine=${machine}
-                path=${path}
-                entry=${effectiveEntry}
+                musicController=${musicController}
+                musicState=${musicState}
                 name=${name}
-                mediaUrl=${expectedUrl}
-                mediaLoading=${mediaLoading || !expectedUrl}
-                mediaRef=${audioRef}
-                autoPlayNextRef=${musicAutoPlayRef}
-                siblings=${siblings}
-                link=${link}
-                capsStore=${capsStore}
-                caps=${caps}
-                thumbCache=${thumbCache}
                 moreOpen=${moreOpen}
-                playbackRate=${musicPlaybackRate}
+                transitionFromRect=${transitionFromRect}
+                onConsumeTransitionRect=${onConsumeTransitionRect}
                 onOpenMore=${() => setMoreOpen(true)}
                 onClose=${handleClose}
-                onNavigateSibling=${onNavigateSibling}
-                onMediaLoadedMetadata=${(el) => applyPendingResume(expectedKey, expectedUrl, el)}
-                onMediaTime=${(el) => noteMediaTime(expectedKey, el)}
-                onMediaPlay=${(el) => noteMediaPlay(expectedKey, el)}
-                onMediaPause=${(el) => noteMediaPause(expectedKey, el)}
-                onBeforePlay=${(el) =>
-                  expectedUrl ? handleBeforeResumePlay('audio', expectedKey, expectedUrl, el) : false}
-                onMediaError=${(el) =>
-                  expectedUrl ? handleMediaElementError('audio', expectedKey, expectedUrl, el) : false}
               />
               ${openBanner ? html`<div class="player-open-banner-wrap">${openBanner}</div>` : null}
             `
@@ -2633,8 +2663,8 @@ export function FilesViewer({
                             key=${rate}
                             type="button"
                             class="chip-btn"
-                            aria-pressed=${rate === musicPlaybackRate ? 'true' : 'false'}
-                            onClick=${() => setMusicPlaybackRate(rate)}
+                            aria-pressed=${rate === (musicState?.playbackRate ?? 1) ? 'true' : 'false'}
+                            onClick=${() => musicController?.setPlaybackRate?.(rate)}
                           >
                             ${formatSpeed(rate)}
                           </button>

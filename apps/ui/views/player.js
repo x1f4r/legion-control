@@ -4,7 +4,6 @@
 
 import { html, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
 import { Icon } from '../icons.js';
-import { extractThumbMap } from '../lib/files.js';
 import {
   clampVolume,
   classifyPlayerKey,
@@ -14,7 +13,6 @@ import {
   createSpaceHoldController,
   createTurnWatcher,
   createVideoController,
-  extractTagsMap,
   formatMusicDisplay,
   formatPlayerTime,
   formatPositionValueText,
@@ -24,6 +22,8 @@ import {
   GESTURE_EDGE_MARGIN_PX,
   HOLD_PILL_FADE_MS,
   HOLD_PLAYBACK_RATE,
+  MINI_PLAYER_COVER_RADIUS_PX,
+  MINI_PLAYER_TRANSITION_MS,
   PLAYBACK_SPEEDS,
   preferredVideoOrientation,
   queueNeighbors,
@@ -35,7 +35,6 @@ import {
   ZOOM_CHIP_DURATION_MS,
   ZOOM_SETTLE_MS,
 } from '../lib/player.js';
-import { thumbCacheKey } from '../lib/thumb-cache.js';
 
 function safeStorage() {
   try {
@@ -1851,521 +1850,128 @@ export function VideoPlayer({
 
 // ── Music Player ─────────────────────────────────────────────────────────────────────────────
 
+function prefersReducedMotion() {
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
+  try {
+    return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  } catch {
+    return false;
+  }
+}
+
 export function MusicPlayer({
-  machine,
-  path,
-  entry,
+  musicController,
+  musicState,
   name,
-  mediaUrl,
-  mediaLoading = false,
-  mediaRef = null,
-  autoPlayNextRef: externalAutoPlayRef = null,
-  siblings = [],
-  link,
-  capsStore = null,
-  caps,
-  thumbCache = null,
   moreOpen = false,
-  playbackRate = 1,
+  transitionFromRect = null,
+  onConsumeTransitionRect = null,
   onOpenMore,
   onClose,
-  onNavigateSibling,
-  onMediaLoadedMetadata,
-  onMediaTime,
-  onMediaPlay,
-  onMediaPause,
-  onBeforePlay,
-  onMediaError,
 }) {
-  const audioRef = useRef(null);
-  const onBeforePlayRef = useRef(onBeforePlay);
-  onBeforePlayRef.current = onBeforePlay;
-  const onMediaErrorRef = useRef(onMediaError);
-  onMediaErrorRef.current = onMediaError;
-  const bindAudioRef = useCallback(
-    (el) => {
-      audioRef.current = el;
-      if (mediaRef) mediaRef.current = el;
-    },
-    [mediaRef],
-  );
-  const resumeStore = useMemo(() => createResumeStore(safeStorage()), []);
-  const identity = useMemo(
-    () => ({ machine, path, size: entry?.size, mtime: entry?.mtime }),
-    [machine, path, entry?.size, entry?.mtime],
-  );
-  const identityRef = useRef(identity);
-  identityRef.current = identity;
-
-  const queue = useMemo(() => queueNeighbors(siblings, path, 'audio'), [siblings, path]);
-  const queueRef = useRef(queue);
-  queueRef.current = queue;
   const showVolume = useMemo(() => !isMobileTouchDevice(), []);
-
-  const [tags, setTags] = useState(null);
-  const [coverUrl, setCoverUrl] = useState(() => {
-    if (!thumbCache) return null;
-    const largeKey = thumbCacheKey(machine, path, entry?.mtime || '', 1024);
-    const largeHit = thumbCache.get(largeKey);
-    if (largeHit && !largeHit.failed) return largeHit.url;
-    const smallKey = thumbCacheKey(machine, path, entry?.mtime || '', 128);
-    const smallHit = thumbCache.get(smallKey);
-    if (smallHit && !smallHit.failed) return smallHit.url;
-    return null;
-  });
-  const [playing, setPlaying] = useState(false);
-  const [currentTime, setCurrentTime] = useState(0);
-  const [duration, setDuration] = useState(entry?.duration_s > 0 ? entry.duration_s : 0);
-  const [bufferedEnd, setBufferedEnd] = useState(0);
-  const [pendingSeekTime, setPendingSeekTime] = useState(null);
-  const [stalled, setStalled] = useState(false);
-  const [resumeChip, setResumeChip] = useState(null);
-  const [volume, setVolume] = useState(1);
-  const [muted, setMuted] = useState(false);
-
-  const localAutoPlayNextRef = useRef(null);
-  const autoPlayNextRef = externalAutoPlayRef || localAutoPlayNextRef;
-  const resumedAppliedRef = useRef(false);
-  const stallTimerRef = useRef(null);
-  const chipTimerRef = useRef(null);
-  const durationRef = useRef(duration);
-  durationRef.current = duration;
-  const currentTimeRef = useRef(currentTime);
-  currentTimeRef.current = currentTime;
-  const mediaUrlRef = useRef(mediaUrl);
-  mediaUrlRef.current = mediaUrl;
-  const pathRef = useRef(path);
-  pathRef.current = path;
-  const prevIdentityRef = useRef(identity);
+  const screenRef = useRef(null);
+  const coverBoxRef = useRef(null);
   const moreOpenRef = useRef(moreOpen);
   moreOpenRef.current = moreOpen;
 
-  const display = useMemo(() => formatMusicDisplay(tags, name), [tags, name]);
+  const stateRef = useRef(musicState);
+  stateRef.current = musicState;
 
-  // Sync `<audio>` src cleanly via layout effect so Preact never writes `src=""` while the next
-  // track's URL is being minted.
+  const display = useMemo(
+    () => formatMusicDisplay(musicState?.tags, musicState?.name || name),
+    [musicState?.tags, musicState?.name, name],
+  );
+
+  // Shared-element feel when opening from the small player: the cover grows into place over
+  // 220 ms, while reduced motion cuts immediately with no animation.
   useLayoutEffect(() => {
-    const a = audioRef.current;
-    if (!a) return;
-    if (mediaUrl) {
-      if (a.getAttribute('src') !== mediaUrl) {
-        a.setAttribute('src', mediaUrl);
-      }
-    } else if (a.hasAttribute('src')) {
-      try {
-        a.pause();
-        a.removeAttribute('src');
-        a.load();
-      } catch {
-        // Ignore teardown errors.
-      }
-    }
-  }, [mediaUrl]);
+    if (!transitionFromRect) return;
+    onConsumeTransitionRect?.();
+    if (prefersReducedMotion()) return;
+    const coverBox = coverBoxRef.current;
+    const screen = screenRef.current;
+    if (!coverBox || typeof coverBox.animate !== 'function') return;
+    const toRect = coverBox.getBoundingClientRect();
+    if (!toRect || toRect.width <= 0 || toRect.height <= 0 || transitionFromRect.width <= 0) return;
 
-  // Apply playbackRate changes (set via More sheet) to `<audio>` immediately and on effect flush.
-  if (audioRef.current && audioRef.current.playbackRate !== playbackRate) {
-    audioRef.current.playbackRate = playbackRate;
-  }
-  useEffect(() => {
-    const a = audioRef.current;
-    if (a) a.playbackRate = playbackRate;
-  }, [playbackRate]);
+    const dx = transitionFromRect.left - toRect.left;
+    const dy = transitionFromRect.top - toRect.top;
+    const sx = Math.max(0.05, transitionFromRect.width / toRect.width);
+    const sy = Math.max(0.05, transitionFromRect.height / toRect.height);
+    const startRadius = `${Math.round((MINI_PLAYER_COVER_RADIUS_PX / sx) * 10) / 10}px`;
 
-  // Reset per-track state when switching songs inside the same mounted player instance.
-  useEffect(() => {
-    const prevId = prevIdentityRef.current;
-    if (prevId && (prevId.machine !== machine || prevId.path !== path)) {
-      if (durationRef.current > 0) {
-        const sameFileLocalRename =
-          prevId.path === path &&
-          (prevId.machine === 'local' || prevId.machine === 'This computer') &&
-          machine &&
-          machine !== 'local' &&
-          machine !== 'This computer';
-        resumeStore.save(
-          sameFileLocalRename ? { ...prevId, machine } : prevId,
-          currentTimeRef.current,
-          durationRef.current,
-        );
-      }
-      prevIdentityRef.current = identityRef.current;
-    } else {
-      prevIdentityRef.current = identityRef.current;
-    }
-    resumedAppliedRef.current = false;
-    setTags(null);
-    setCurrentTime(0);
-    setDuration(entry?.duration_s > 0 ? entry.duration_s : 0);
-    setBufferedEnd(0);
-    setPendingSeekTime(null);
-    setStalled(false);
-    setResumeChip(null);
-    if (stallTimerRef.current) {
-      clearTimeout(stallTimerRef.current);
-      stallTimerRef.current = null;
-    }
-    if (chipTimerRef.current) {
-      clearTimeout(chipTimerRef.current);
-      chipTimerRef.current = null;
-    }
-    if (thumbCache) {
-      const largeHit = thumbCache.get(thumbCacheKey(machine, path, entry?.mtime || '', 1024));
-      const smallHit = thumbCache.get(thumbCacheKey(machine, path, entry?.mtime || '', 128));
-      setCoverUrl(
-        largeHit && !largeHit.failed ? largeHit.url : smallHit && !smallHit.failed ? smallHit.url : null,
+    try {
+      coverBox.animate(
+        [
+          {
+            transformOrigin: 'top left',
+            transform: `translate3d(${dx}px, ${dy}px, 0) scale(${sx}, ${sy})`,
+            borderRadius: startRadius,
+          },
+          {
+            transformOrigin: 'top left',
+            transform: 'translate3d(0, 0, 0) scale(1, 1)',
+            borderRadius: 'var(--radius)',
+          },
+        ],
+        {
+          duration: MINI_PLAYER_TRANSITION_MS,
+          easing: 'cubic-bezier(0.2, 0.8, 0.2, 1)',
+        },
       );
-    } else {
-      setCoverUrl(null);
+      if (screen && typeof screen.animate === 'function') {
+        screen.animate([{ opacity: 0.92 }, { opacity: 1 }], {
+          duration: MINI_PLAYER_TRANSITION_MS,
+          easing: 'ease-out',
+        });
+      }
+    } catch {
+      // Ignore WAAPI errors in minimal test environments.
     }
-  }, [machine, path, entry?.mtime, thumbCache, resumeStore]);
+  }, [transitionFromRect, onConsumeTransitionRect]);
 
-  // Load tags (`fs.tags`) and high-res cover (`fs.thumb`) via per-machine capabilities, silently
-  // falling back to filename + music tile on machines that lack them.
-  useEffect(() => {
-    const ctrl = new AbortController();
-    let alive = true;
-
-    const runCall = (tool, args) =>
-      capsStore
-        ? capsStore.call(tool, args, { on: machine, signal: ctrl.signal }).then((r) => r.value)
-        : link.call(tool, args, { on: machine, signal: ctrl.signal });
-
-    const loadCover = async () => {
-      if (!caps?.hasAudioThumb) return;
-      const reqSize = Math.min(1024, caps?.thumbMaxSize || 512);
-      const cacheKey = thumbCacheKey(machine, path, entry?.mtime || '', reqSize);
-      const cached = thumbCache?.get(cacheKey);
-      if (cached) {
-        if (alive && !cached.failed) setCoverUrl(cached.url);
-        return;
-      }
-      try {
-        const res = await runCall('fs.thumb', { paths: [path], size: reqSize, fit: 'contain' });
-        if (!alive || ctrl.signal.aborted) return;
-        const map = extractThumbMap(res);
-        const item = map[path];
-        if (item?.content && item?.mime) {
-          const url = `data:${item.mime};base64,${item.content}`;
-          thumbCache?.set(cacheKey, { url });
-          setCoverUrl(url);
-        } else {
-          thumbCache?.set(cacheKey, { failed: true });
-        }
-      } catch {
-        // Older machines or songs without embedded/folder covers stay on the music tile quietly.
-      }
-    };
-
-    (async () => {
-      let hasCoverHint = null;
-      if (caps?.hasTags) {
-        try {
-          const res = await runCall('fs.tags', { paths: [path] });
-          if (!alive || ctrl.signal.aborted) return;
-          const map = extractTagsMap(res);
-          const item = map[path];
-          if (item?.ok) {
-            setTags(item.ok);
-            if (typeof item.ok.duration_s === 'number' && item.ok.duration_s > 0 && durationRef.current <= 0) {
-              setDuration(item.ok.duration_s);
-            }
-            hasCoverHint = Boolean(item.ok.cover);
-          }
-        } catch {
-          // Silently show filename when tags are unavailable.
-        }
-      }
-      if (!alive || ctrl.signal.aborted) return;
-      if (hasCoverHint !== false) {
-        await loadCover();
-      }
-    })();
-
-    return () => {
-      alive = false;
-      ctrl.abort();
-    };
-  }, [machine, path, entry?.mtime, caps?.hasTags, caps?.hasAudioThumb, caps?.thumbMaxSize, capsStore, link, thumbCache]);
-
-  // Pause in place and clear pending autoplay if the desktop window is hidden/closed.
-  useEffect(() => {
-    if (typeof link?.onWindowHidden !== 'function') return undefined;
-    return link.onWindowHidden(() => {
-      autoPlayNextRef.current = null;
-      const a = audioRef.current;
-      if (a && !a.paused) {
-        try {
-          a.pause();
-        } catch {
-          // Ignore pause errors.
-        }
-      }
-      setPlaying(false);
-    });
-  }, [link, autoPlayNextRef]);
-
-  // Save resume position & clean up timers/audio on unmount.
-  useEffect(() => {
-    return () => {
-      if (stallTimerRef.current) clearTimeout(stallTimerRef.current);
-      if (chipTimerRef.current) clearTimeout(chipTimerRef.current);
-      const a = audioRef.current;
-      if (a && Number.isFinite(a.duration) && a.duration > 0) {
-        resumeStore.save(identityRef.current, a.currentTime, a.duration);
-      }
-      if (a) {
-        try {
-          a.pause();
-          a.removeAttribute('src');
-          a.load();
-        } catch {
-          // Ignore teardown errors.
-        }
-      }
-    };
-  }, [resumeStore]);
-
-  const startStallTimer = useCallback(() => {
-    if (stallTimerRef.current) clearTimeout(stallTimerRef.current);
-    stallTimerRef.current = window.setTimeout(() => {
-      stallTimerRef.current = null;
-      setStalled(true);
-    }, 400);
-  }, []);
-
-  const clearStallTimer = useCallback(() => {
-    if (stallTimerRef.current) {
-      clearTimeout(stallTimerRef.current);
-      stallTimerRef.current = null;
-    }
-    setStalled(false);
-  }, []);
+  const togglePlay = useCallback(() => {
+    musicController?.togglePlay?.();
+  }, [musicController]);
 
   const commitSeek = useCallback(
     (targetTime) => {
-      const a = audioRef.current;
-      const dur = a && Number.isFinite(a.duration) && a.duration > 0 ? a.duration : durationRef.current;
-      const clamped = Math.max(0, dur > 0 ? Math.min(dur, targetTime) : targetTime);
-      setPendingSeekTime(clamped);
-      setCurrentTime(clamped);
-      startStallTimer();
-      if (a) {
-        try {
-          a.currentTime = clamped;
-        } catch {
-          // Ignore seek before ready.
-        }
-      }
+      musicController?.seek?.(targetTime);
     },
-    [startStallTimer],
+    [musicController],
   );
 
-  const togglePlay = useCallback(() => {
-    const a = audioRef.current;
-    if (
-      a &&
-      mediaUrlRef.current &&
-      (a.paused || a.ended || a.error || a.readyState < 1) &&
-      onBeforePlayRef.current?.(a) === true
-    ) {
-      autoPlayNextRef.current = { path: pathRef.current, play: true };
-      setPlaying(true);
-      return;
-    }
-    const loadingNext = !a || !mediaUrlRef.current || a.readyState < 1;
-    if (loadingNext) {
-      const currentWant = Boolean(
-        autoPlayNextRef.current?.play &&
-          (!autoPlayNextRef.current.path || autoPlayNextRef.current.path === pathRef.current),
-      );
-      const nextWant = !currentWant;
-      autoPlayNextRef.current = nextWant ? { path: pathRef.current, play: true } : null;
-      setPlaying(nextWant);
-      return;
-    }
-    if (a.paused || a.ended) {
-      if (a.ended) {
-        try {
-          a.currentTime = 0;
-        } catch {
-          // Ignore seek errors.
-        }
-      }
-      a.play().catch((err) => {
-        if (err?.name !== 'NotAllowedError' && (a.error || a.networkState === 3)) {
-          onMediaErrorRef.current?.(a);
-        }
-      });
-    } else {
-      autoPlayNextRef.current = null;
-      a.pause();
-      setPlaying(false);
-      setPendingSeekTime(null);
-      clearStallTimer();
-    }
-  }, [autoPlayNextRef, clearStallTimer]);
-
   const handlePrev = useCallback(() => {
-    const a = audioRef.current;
-    const t = pendingSeekTime != null ? pendingSeekTime : a && Number.isFinite(a.currentTime) ? a.currentTime : currentTimeRef.current;
-    if (!queueRef.current.prev || shouldMusicPrevRestart(t)) {
-      commitSeek(0);
-      return;
-    }
-    if (onNavigateSibling) {
-      const wantContinue = Boolean(
-        (mediaUrlRef.current && a && !a.paused) ||
-          (autoPlayNextRef.current?.play &&
-            (!autoPlayNextRef.current.path || autoPlayNextRef.current.path === pathRef.current)),
-      );
-      autoPlayNextRef.current = wantContinue ? { path: queueRef.current.prev.path, play: true } : null;
-      onNavigateSibling(queueRef.current.prev);
-    }
-  }, [pendingSeekTime, commitSeek, onNavigateSibling, autoPlayNextRef]);
+    musicController?.prev?.();
+  }, [musicController]);
 
   const handleNext = useCallback(() => {
-    const a = audioRef.current;
-    if (queueRef.current.next && onNavigateSibling) {
-      const wantContinue = Boolean(
-        (mediaUrlRef.current && a && !a.paused) ||
-          (autoPlayNextRef.current?.play &&
-            (!autoPlayNextRef.current.path || autoPlayNextRef.current.path === pathRef.current)),
-      );
-      autoPlayNextRef.current = wantContinue ? { path: queueRef.current.next.path, play: true } : null;
-      onNavigateSibling(queueRef.current.next);
-    }
-  }, [onNavigateSibling, autoPlayNextRef]);
+    musicController?.next?.();
+  }, [musicController]);
+
+  const handleToggleShuffle = useCallback(() => {
+    musicController?.toggleShuffle?.();
+  }, [musicController]);
+
+  const handleCycleRepeat = useCallback(() => {
+    musicController?.cycleRepeat?.();
+  }, [musicController]);
 
   const handleStartOver = useCallback(() => {
-    resumeStore.clear(identityRef.current);
-    setResumeChip(null);
-    if (chipTimerRef.current) {
-      clearTimeout(chipTimerRef.current);
-      chipTimerRef.current = null;
-    }
-    commitSeek(0);
-  }, [resumeStore, commitSeek]);
+    musicController?.startOver?.();
+  }, [musicController]);
 
-  const applyVolume = useCallback((nextVol) => {
-    const clamped = clampVolume(nextVol);
-    setVolume(clamped);
-    setMuted(clamped === 0);
-    const a = audioRef.current;
-    if (a) {
-      a.volume = clamped;
-      a.muted = clamped === 0;
-    }
-  }, []);
+  const applyVolume = useCallback(
+    (nextVol) => {
+      musicController?.setVolume?.(nextVol);
+    },
+    [musicController],
+  );
 
   const toggleMute = useCallback(() => {
-    const a = audioRef.current;
-    if (!a) return;
-    if (a.muted || a.volume === 0) {
-      const restored = volume > 0 ? volume : 1;
-      a.muted = false;
-      a.volume = restored;
-      setMuted(false);
-      setVolume(restored);
-    } else {
-      a.muted = true;
-      setMuted(true);
-    }
-  }, [volume]);
-
-  // Platform media keys & lock-screen player (`navigator.mediaSession`).
-  useEffect(() => {
-    const ms = typeof navigator !== 'undefined' ? navigator.mediaSession : null;
-    if (!ms) return undefined;
-    try {
-      if (typeof window !== 'undefined' && typeof window.MediaMetadata === 'function') {
-        ms.metadata = new window.MediaMetadata({
-          title: display.title,
-          artist: tags?.artist || '',
-          album: tags?.album || '',
-          artwork: coverUrl ? [{ src: coverUrl }] : [],
-        });
-      }
-    } catch {
-      // Ignore MediaMetadata errors on unsupported platforms.
-    }
-    const safeSet = (action, handler) => {
-      try {
-        ms.setActionHandler(action, handler);
-      } catch {
-        // Some browsers do not support every action name.
-      }
-    };
-    safeSet('play', () => {
-      const a = audioRef.current;
-      if (!a || a.paused || a.ended || a.error || a.readyState < 1) {
-        togglePlay();
-      }
-    });
-    safeSet('pause', () => audioRef.current?.pause?.());
-    safeSet('previoustrack', handlePrev);
-    safeSet('nexttrack', queue.next ? handleNext : null);
-    safeSet('seekto', (details) => {
-      if (typeof details?.seekTime === 'number' && Number.isFinite(details.seekTime)) {
-        commitSeek(details.seekTime);
-      }
-    });
-    safeSet('seekbackward', (details) => {
-      const offset = typeof details?.seekOffset === 'number' && details.seekOffset > 0 ? details.seekOffset : SEEK_STEP_S;
-      commitSeek(Math.max(0, currentTimeRef.current - offset));
-    });
-    safeSet('seekforward', (details) => {
-      const offset = typeof details?.seekOffset === 'number' && details.seekOffset > 0 ? details.seekOffset : SEEK_STEP_S;
-      commitSeek(currentTimeRef.current + offset);
-    });
-
-    return () => {
-      for (const action of ['play', 'pause', 'previoustrack', 'nexttrack', 'seekto', 'seekbackward', 'seekforward']) {
-        safeSet(action, null);
-      }
-    };
-  }, [display.title, tags?.artist, tags?.album, coverUrl, queue.prev, queue.next, handlePrev, handleNext, commitSeek, togglePlay]);
-
-  useEffect(() => {
-    const ms = typeof navigator !== 'undefined' ? navigator.mediaSession : null;
-    if (!ms) return;
-    try {
-      ms.playbackState = playing ? 'playing' : 'paused';
-      if (typeof ms.setPositionState === 'function' && Number.isFinite(duration) && duration > 0) {
-        ms.setPositionState({
-          duration,
-          playbackRate,
-          position: Math.max(0, Math.min(duration, currentTime)),
-        });
-      }
-    } catch {
-      // Ignore position state clamping errors.
-    }
-  }, [playing, duration, playbackRate, currentTime]);
-
-  // Clear MediaSession metadata, playbackState, and handlers completely when the music player closes.
-  useEffect(() => {
-    return () => {
-      const ms = typeof navigator !== 'undefined' ? navigator.mediaSession : null;
-      if (!ms) return;
-      for (const action of ['play', 'pause', 'previoustrack', 'nexttrack', 'seekto', 'seekbackward', 'seekforward']) {
-        try {
-          ms.setActionHandler(action, null);
-        } catch {
-          // Ignore unsupported action names.
-        }
-      }
-      try {
-        ms.metadata = null;
-      } catch {
-        // Ignore browsers that reject null metadata.
-      }
-      try {
-        ms.playbackState = 'none';
-      } catch {
-        // Ignore playbackState errors.
-      }
-    };
-  }, []);
+    musicController?.toggleMute?.();
+  }, [musicController]);
 
   // Keyboard shortcuts (desktop & browser).
   useEffect(() => {
@@ -2376,21 +1982,22 @@ export function MusicPlayer({
       if (!action) return;
       e.preventDefault();
       e.stopImmediatePropagation?.();
+      const st = stateRef.current || {};
       switch (action) {
         case 'toggle_play':
           togglePlay();
           break;
         case 'seek_back':
-          commitSeek(Math.max(0, currentTimeRef.current - SEEK_STEP_S));
+          commitSeek(Math.max(0, (st.currentTime || 0) - SEEK_STEP_S));
           break;
         case 'seek_forward':
-          commitSeek(currentTimeRef.current + SEEK_STEP_S);
+          commitSeek((st.currentTime || 0) + SEEK_STEP_S);
           break;
         case 'volume_up':
-          if (showVolume) applyVolume((muted ? 0 : volume) + VOLUME_STEP);
+          if (showVolume) applyVolume((st.muted ? 0 : st.volume ?? 1) + VOLUME_STEP);
           break;
         case 'volume_down':
-          if (showVolume) applyVolume((muted ? 0 : volume) - VOLUME_STEP);
+          if (showVolume) applyVolume((st.muted ? 0 : st.volume ?? 1) - VOLUME_STEP);
           break;
         case 'toggle_mute':
           if (showVolume) toggleMute();
@@ -2410,14 +2017,33 @@ export function MusicPlayer({
     }
     window.addEventListener('keydown', onKeyDown, true);
     return () => window.removeEventListener('keydown', onKeyDown, true);
-  }, [togglePlay, commitSeek, showVolume, applyVolume, muted, volume, toggleMute, handleNext, handlePrev, onClose]);
+  }, [togglePlay, commitSeek, showVolume, applyVolume, toggleMute, handleNext, handlePrev, onClose]);
 
-  const displayTime = pendingSeekTime != null ? pendingSeekTime : currentTime;
+  const queue = musicState?.queue || { items: [], index: -1, prev: null, next: null };
+  const coverUrl = musicState?.coverUrl || null;
+  const playing = Boolean(musicState?.playing);
+  const duration = Number.isFinite(musicState?.duration) ? musicState.duration : 0;
+  const currentTime = Number.isFinite(musicState?.currentTime) ? musicState.currentTime : 0;
+  const bufferedEnd = Number.isFinite(musicState?.bufferedEnd) ? musicState.bufferedEnd : 0;
+  const displayTime = musicState?.pendingSeekTime != null ? musicState.pendingSeekTime : currentTime;
+  const busy = Boolean(musicState?.stalled || musicState?.mediaLoading);
+  const resumeChip = musicState?.resumeChip || null;
+  const shuffle = Boolean(musicState?.shuffle);
+  const repeat = musicState?.repeat || 'off';
+  const volume = musicState?.volume ?? 1;
+  const muted = Boolean(musicState?.muted);
+
   const prevIsRestart = !queue.prev || shouldMusicPrevRestart(displayTime);
   const showNext = Boolean(queue.next);
+  const repeatLabel =
+    repeat === 'folder'
+      ? 'Repeat folder (tap for repeat one)'
+      : repeat === 'one'
+        ? 'Repeat one song (tap to turn off)'
+        : 'Repeat off (tap to repeat folder)';
 
   return html`
-    <div class=${coverUrl ? 'music-screen has-cover' : 'music-screen'}>
+    <div ref=${screenRef} class=${coverUrl ? 'music-screen has-cover' : 'music-screen'}>
       ${coverUrl
         ? html`
             <div class="music-backdrop" aria-hidden="true">
@@ -2440,7 +2066,7 @@ export function MusicPlayer({
 
       <div class="music-body">
         <div class="music-cover-wrap">
-          <div class="music-cover-box">
+          <div ref=${coverBoxRef} class="music-cover-box">
             ${coverUrl
               ? html`<img class="music-cover" src=${coverUrl} alt=${display.title} />`
               : html`
@@ -2486,6 +2112,17 @@ export function MusicPlayer({
             <div class="music-transport-slot">
               <button
                 type="button"
+                class=${shuffle ? 'btn icon music-mode-btn active' : 'btn icon music-mode-btn'}
+                aria-label=${shuffle ? 'Shuffle on' : 'Shuffle off'}
+                aria-pressed=${shuffle ? 'true' : 'false'}
+                onClick=${handleToggleShuffle}
+              >
+                <${Icon} name="shuffle" />
+              </button>
+            </div>
+            <div class="music-transport-slot">
+              <button
+                type="button"
                 class="btn icon music-ctl-btn"
                 aria-label=${prevIsRestart ? 'Restart track' : 'Previous track'}
                 onClick=${handlePrev}
@@ -2500,7 +2137,7 @@ export function MusicPlayer({
                 aria-label=${playing ? 'Pause' : 'Play'}
                 onClick=${togglePlay}
               >
-                ${stalled || mediaLoading
+                ${busy
                   ? html`<span class="music-spinner" aria-hidden="true"></span>`
                   : html`<${Icon} name=${playing ? 'pause' : 'play'} />`}
               </button>
@@ -2519,6 +2156,18 @@ export function MusicPlayer({
                   `
                 : null}
             </div>
+            <div class="music-transport-slot">
+              <button
+                type="button"
+                class=${repeat !== 'off' ? 'btn icon music-mode-btn active' : 'btn icon music-mode-btn'}
+                aria-label=${repeatLabel}
+                aria-pressed=${repeat !== 'off' ? 'true' : 'false'}
+                data-repeat=${repeat}
+                onClick=${handleCycleRepeat}
+              >
+                <${Icon} name=${repeat === 'one' ? 'repeat-1' : 'repeat'} />
+              </button>
+            </div>
           </div>
 
           ${showVolume
@@ -2535,130 +2184,6 @@ export function MusicPlayer({
             : null}
         </div>
       </div>
-
-      <audio
-        ref=${bindAudioRef}
-        preload="metadata"
-        aria-label=${display.title}
-        onLoadedMetadata=${(e) => {
-          const a = e.currentTarget;
-          if (!mediaUrlRef.current || !a.getAttribute('src')) return;
-          const dur = Number.isFinite(a.duration) && a.duration > 0 ? a.duration : entry?.duration_s || 0;
-          if (dur > 0) setDuration(dur);
-          setBufferedEnd(readBufferedEnd(a));
-          a.playbackRate = playbackRate;
-          const recovered = Boolean(onMediaLoadedMetadata?.(a));
-          if (!recovered && !resumedAppliedRef.current && dur > 0) {
-            resumedAppliedRef.current = true;
-            const saved = resumeStore.load(identityRef.current, dur);
-            if (saved != null) {
-              try {
-                a.currentTime = saved;
-                setCurrentTime(saved);
-              } catch {
-                // Ignore seek before ready.
-              }
-              setResumeChip({ position: saved });
-              chipTimerRef.current = window.setTimeout(() => {
-                chipTimerRef.current = null;
-                setResumeChip(null);
-              }, 5000);
-            }
-          }
-          const pendingAuto = autoPlayNextRef.current;
-          autoPlayNextRef.current = null;
-          if (!recovered) {
-            if (pendingAuto?.play && (!pendingAuto.path || pendingAuto.path === path)) {
-              a.play().catch(() => {});
-            } else {
-              if (!a.paused) {
-                try {
-                  a.pause();
-                } catch {
-                  // Ignore pause errors.
-                }
-              }
-              setPlaying(false);
-            }
-          }
-        }}
-        onPlay=${(e) => {
-          if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
-          onMediaPlay?.(e.currentTarget);
-          setPlaying(true);
-        }}
-        onPlaying=${(e) => {
-          if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
-          onMediaPlay?.(e.currentTarget);
-          setPlaying(true);
-          clearStallTimer();
-        }}
-        onPause=${(e) => {
-          const a = e.currentTarget;
-          if (!mediaUrlRef.current || !a.getAttribute('src')) return;
-          onMediaPause?.(a);
-          if (Number.isFinite(a.duration) && a.duration > 0) {
-            resumeStore.save(identityRef.current, a.currentTime, a.duration);
-          }
-          setPlaying(false);
-        }}
-        onWaiting=${() => {
-          if (mediaUrlRef.current) startStallTimer();
-        }}
-        onCanPlay=${(e) => {
-          if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
-          setBufferedEnd(readBufferedEnd(e.currentTarget));
-          clearStallTimer();
-        }}
-        onSeeked=${(e) => {
-          const a = e.currentTarget;
-          if (!mediaUrlRef.current || !a.getAttribute('src')) return;
-          onMediaTime?.(a);
-          setPendingSeekTime(null);
-          setCurrentTime(Number.isFinite(a.currentTime) ? a.currentTime : 0);
-          setBufferedEnd(readBufferedEnd(a));
-          clearStallTimer();
-          if (Number.isFinite(a.duration) && a.duration > 0) {
-            resumeStore.save(identityRef.current, a.currentTime, a.duration);
-          }
-        }}
-        onTimeUpdate=${(e) => {
-          const a = e.currentTarget;
-          if (!mediaUrlRef.current || !a.getAttribute('src')) return;
-          onMediaTime?.(a);
-          if (pendingSeekTime != null) return;
-          const t = Number.isFinite(a.currentTime) ? a.currentTime : 0;
-          setCurrentTime(t);
-          setBufferedEnd(readBufferedEnd(a));
-          if (Number.isFinite(a.duration) && a.duration > 0) {
-            const now = getPlayerClock()?.now?.() ?? Date.now();
-            resumeStore.savePeriodic(identityRef.current, t, a.duration, now);
-          }
-        }}
-        onProgress=${(e) => {
-          if (mediaUrlRef.current && e.currentTarget.getAttribute('src')) {
-            setBufferedEnd(readBufferedEnd(e.currentTarget));
-          }
-        }}
-        onEnded=${(e) => {
-          if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
-          onMediaPause?.(e.currentTarget);
-          resumeStore.clear(identityRef.current);
-          clearStallTimer();
-          if (queueRef.current.next && onNavigateSibling) {
-            autoPlayNextRef.current = { path: queueRef.current.next.path, play: true };
-            onNavigateSibling(queueRef.current.next);
-          } else {
-            setPlaying(false);
-          }
-        }}
-        onError=${(e) => {
-          if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
-          clearStallTimer();
-          setPlaying(false);
-          if (onMediaError) onMediaError(e.currentTarget);
-        }}
-      />
     </div>
   `;
 }

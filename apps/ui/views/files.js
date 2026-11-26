@@ -2517,6 +2517,8 @@ export function FilesView({
   settings,
   deviceNoun,
   thumbCache,
+  musicController = null,
+  musicState = null,
   filesState,
   filesActions,
   wakePendingSet = null,
@@ -2948,6 +2950,14 @@ export function FilesView({
             }
           }
           filesActions.endSelect();
+          if (
+            musicController &&
+            musicState?.loaded &&
+            musicState.machine === machine &&
+            items.some((i) => i.path === musicState.path)
+          ) {
+            musicController.dismiss();
+          }
           if (route.viewer && items.some((i) => i.path === route.viewer.path)) {
             filesActions.closeViewer();
           }
@@ -2963,7 +2973,7 @@ export function FilesView({
         },
       });
     },
-    [machineCapsFor, onRequestConfirm, capsStore, folderChanges, link, filesActions, route.viewer, loadFavourites, onToast],
+    [machineCapsFor, onRequestConfirm, capsStore, folderChanges, link, filesActions, route.viewer, loadFavourites, onToast, musicController, musicState],
   );
 
   // Wire bulk selection actions triggered from the shell dock.
@@ -3465,6 +3475,8 @@ export function FilesView({
               caps=${viewerCaps}
               capsStore=${capsStore}
               thumbCache=${thumbCache}
+              musicController=${musicController}
+              musicState=${musicState}
               onRegisterPopState=${onRegisterPopState}
               deviceNoun=${deviceNoun}
               technical=${technical}
@@ -3607,6 +3619,14 @@ export function FilesView({
               onRenamed=${(nextPath) => {
                 if (!folderChanges) setReloadToken((n) => n + 1);
                 loadFavourites();
+                if (
+                  musicController &&
+                  musicState?.loaded &&
+                  musicState.machine === sheet.machine &&
+                  musicState.path === sheet.entry.path
+                ) {
+                  musicController.dismiss();
+                }
                 if (route.viewer && route.viewer.path === sheet.entry.path) {
                   const href = routeHref({ ...route, viewer: { machine: sheet.machine, path: nextPath } });
                   window.history.replaceState(window.history.state, '', href);

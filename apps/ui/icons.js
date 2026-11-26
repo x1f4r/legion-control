@@ -156,6 +156,23 @@ export function IconSprite() {
         <path d="M4.1 9.2h3.5l4.5-3.7v13L7.6 14.8H4.1z" />
         <path d="m15.6 9.2 5.2 5.6M20.8 9.2l-5.2 5.6" />
       </symbol>
+      <symbol id="i-shuffle" viewBox="0 0 24 24">
+        <path d="M3.1 7.5h3.5l6.4 9h5.6M3.1 16.5h3.5l6.4-9h5.6" />
+        <path d="M16.2 4.9 18.8 7.5l-2.6 2.6M16.2 13.9l2.6 2.6-2.6 2.6" />
+      </symbol>
+      <symbol id="i-repeat" viewBox="0 0 24 24">
+        <path d="M4.5 10.6V8.8a2.5 2.5 0 0 1 2.5-2.5h12.5" />
+        <path d="M16.9 3.7 19.5 6.3l-2.6 2.6" />
+        <path d="M19.5 13.4v1.8a2.5 2.5 0 0 1-2.5 2.5H4.5" />
+        <path d="M7.1 20.3 4.5 17.7l2.6-2.6" />
+      </symbol>
+      <symbol id="i-repeat-1" viewBox="0 0 24 24">
+        <path d="M4.5 10.6V8.8a2.5 2.5 0 0 1 2.5-2.5h12.5" />
+        <path d="M16.9 3.7 19.5 6.3l-2.6 2.6" />
+        <path d="M19.5 13.4v1.8a2.5 2.5 0 0 1-2.5 2.5H4.5" />
+        <path d="M7.1 20.3 4.5 17.7l2.6-2.6" />
+        <path d="M10.9 10.7 12.3 9.5v5" stroke-width="1.9" />
+      </symbol>
     </svg>
   `;
 }
