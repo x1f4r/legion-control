@@ -694,6 +694,12 @@ across sooner when others are off.
   `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` (while `ReplaceFileW` and `redb` rely on NTFS
   journaling and file flushes). On filesystems without atomic file exchange, claim-then-rename
   briefly leaves the replaced path absent while non-replacing rename catches concurrent creates.
+- **Copying or backing up a running sync folder:** On Linux and macOS, copying a folder while
+  Legion is running can capture an in-flight `.legion-sync/index.redb` that either opens cleanly
+  after rotating its identity or stops as damaged without changing live files until explicitly
+  rebuilt as a join. On Windows, the open index holds byte-range locks so a plain file copy fails
+  or skips `.legion-sync/index.redb` unless Legion is stopped or a volume snapshot is used, leaving
+  live files intact and causing the copy to stop as damaged until rebuilt as a join.
 
 The engine lives in its own crate, `legion-sync`, behind filesystem, store, token-store, and peer
 traits, driven by a deterministic simulator across mixed OS rules, partitions, crashes, power-loss

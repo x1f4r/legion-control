@@ -199,13 +199,45 @@ fn h(bytes: &[u8]) -> Hash {
     hash_bytes(bytes)
 }
 
-fn copy_tree(src: &Path, dst: &Path) {
+/// Models copying a sync folder while Legion is stopped (caller must drop any open `SyncEngine`
+/// on `src` first because Windows holds byte-range locks on open `.legion-sync/index.redb`).
+fn copy_folder_while_stopped(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).unwrap();
     for e in fs::read_dir(src).unwrap().flatten() {
         let ft = e.file_type().unwrap();
         let to = dst.join(e.file_name());
         if ft.is_dir() {
-            copy_tree(&e.path(), &to);
+            copy_folder_while_stopped(&e.path(), &to);
+        } else if ft.is_symlink() {
+            #[cfg(unix)]
+            {
+                let t = fs::read_link(e.path()).unwrap();
+                std::os::unix::fs::symlink(t, to).unwrap();
+            }
+        } else {
+            fs::copy(e.path(), &to).unwrap();
+            let m = fs::metadata(e.path()).unwrap().modified().unwrap();
+            let f = fs::OpenOptions::new().write(true).open(&to).unwrap();
+            f.set_times(fs::FileTimes::new().set_modified(m)).unwrap();
+        }
+    }
+}
+
+/// Models copying only live user files, skipping `.legion-sync` so an open
+/// `.legion-sync/index.redb` is never touched while Legion is running.
+fn copy_user_files_excluding_internal(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).unwrap();
+    for e in fs::read_dir(src).unwrap().flatten() {
+        if e.file_name()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(".legion-sync")
+        {
+            continue;
+        }
+        let ft = e.file_type().unwrap();
+        let to = dst.join(e.file_name());
+        if ft.is_dir() {
+            copy_user_files_excluding_internal(&e.path(), &to);
         } else if ft.is_symlink() {
             #[cfg(unix)]
             {
@@ -334,8 +366,8 @@ fn probe_a4_member_restored_from_backup_preserves_new_edits_and_new_files() {
     pull(&mut a, &b).unwrap();
 
     drop(b);
-    copy_tree(&mb.root, &tmp.path().join("b-backup-folder"));
-    copy_tree(mb.db.parent().unwrap(), &tmp.path().join("b-backup-index"));
+    copy_folder_while_stopped(&mb.root, &tmp.path().join("b-backup-folder"));
+    copy_folder_while_stopped(mb.db.parent().unwrap(), &tmp.path().join("b-backup-index"));
     let mut b = mb.open();
 
     for i in 2..=6 {
@@ -353,8 +385,8 @@ fn probe_a4_member_restored_from_backup_preserves_new_edits_and_new_files() {
     drop(b);
     fs::remove_dir_all(&mb.root).unwrap();
     fs::remove_dir_all(mb.db.parent().unwrap()).unwrap();
-    copy_tree(&tmp.path().join("b-backup-folder"), &mb.root);
-    copy_tree(&tmp.path().join("b-backup-index"), mb.db.parent().unwrap());
+    copy_folder_while_stopped(&tmp.path().join("b-backup-folder"), &mb.root);
+    copy_folder_while_stopped(&tmp.path().join("b-backup-index"), mb.db.parent().unwrap());
     let mut b = mb.open();
 
     sleep_ms(20);
@@ -489,8 +521,7 @@ fn probe_a8_joining_with_old_copy_does_not_resurrect_deleted_or_conflict_stale()
     ma.write("old-draft.txt", b"deleted long ago");
     ma.write("notes.txt", b"notes v1");
     a.scan(now()).unwrap();
-    copy_tree(&ma.root, &tmp.path().join("d-folder"));
-    let _ = fs::remove_dir_all(tmp.path().join("d-folder/.legion-sync"));
+    copy_user_files_excluding_internal(&ma.root, &tmp.path().join("d-folder"));
 
     fs::remove_file(ma.root.join("old-draft.txt")).unwrap();
     sleep_ms(20);

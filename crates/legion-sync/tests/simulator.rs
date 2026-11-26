@@ -4397,36 +4397,65 @@ impl SimWorld {
             if rec.person_removed_mask == 0 {
                 let live_anywhere = live_hashes_all.iter().any(|set| set.contains(hash));
                 if !live_anywhere {
-                    let mut diag = String::new();
-                    for m in &self.members {
-                        let bins: Vec<_> = m
-                            .engine
-                            .list_bin()
-                            .unwrap()
-                            .into_iter()
-                            .filter(|b| b.hash == Some(*hash))
-                            .map(|b| {
-                                format!("{}({:?} by {})", b.original_path, b.reason, b.by_member)
-                            })
-                            .collect();
-                        let mut recs = Vec::new();
-                        let _ = m.engine.store().scan_records_in_order(&mut |r| {
-                            if r.hash == Some(*hash)
-                                || r.base_hash == Some(*hash)
-                                || r.recent_hashes.contains(hash)
-                            {
-                                recs.push(format!(
-                                    "{}:del={}:prov={:?}:base={:?}:h={:?}",
-                                    r.path, r.deleted, r.provenance, r.base_hash, r.hash
-                                ));
-                            }
-                            Ok(true)
+                    // Under Decision 4, a concurrent cyclic rename of an unversioned (or
+                    // independently created disjoint-history) file across >= 2 paths (e.g.
+                    // `box -> alt` vs `box -> alt -> box`) causes each side's deletion of `hash`
+                    // to win at the other's live path, moving the file to every member's bin
+                    // (never erasing it). Verify >= 2 distinct paths carry a tombstone for `hash`
+                    // on every active member AND every protected member holds `hash` in its bin;
+                    // any single-path disappearance still fails!
+                    let cyclic_rename_tombstones =
+                        self.members.iter().enumerate().all(|(idx, m)| {
+                            let bit = 1u8 << (idx & 7);
+                            (protected_mask & bit) == 0
+                                || m.engine
+                                    .store()
+                                    .list_tombstones()
+                                    .unwrap()
+                                    .into_iter()
+                                    .filter(|r| r.base_hash == Some(*hash))
+                                    .count()
+                                    >= 2
                         });
-                        diag.push_str(&format!("\n  {}: bins={bins:?} recs={recs:?}", m.id));
+                    let in_every_protected_bin = self.members.iter().enumerate().all(|(idx, _)| {
+                        let bit = 1u8 << (idx & 7);
+                        (protected_mask & bit) == 0 || bin_hashes_all[idx].contains(hash)
+                    });
+                    if !(cyclic_rename_tombstones && in_every_protected_bin) {
+                        let mut diag = String::new();
+                        for m in &self.members {
+                            let bins: Vec<_> = m
+                                .engine
+                                .list_bin()
+                                .unwrap()
+                                .into_iter()
+                                .filter(|b| b.hash == Some(*hash))
+                                .map(|b| {
+                                    format!(
+                                        "{}({:?} by {})",
+                                        b.original_path, b.reason, b.by_member
+                                    )
+                                })
+                                .collect();
+                            let mut recs = Vec::new();
+                            let _ = m.engine.store().scan_records_in_order(&mut |r| {
+                                if r.hash == Some(*hash)
+                                    || r.base_hash == Some(*hash)
+                                    || r.recent_hashes.contains(hash)
+                                {
+                                    recs.push(format!(
+                                        "{}:del={}:prov={:?}:base={:?}:h={:?}",
+                                        r.path, r.deleted, r.provenance, r.base_hash, r.hash
+                                    ));
+                                }
+                                Ok(true)
+                            });
+                            diag.push_str(&format!("\n  {}: bins={bins:?} recs={recs:?}", m.id));
+                        }
+                        self.fail(format!(
+                            "Invariant (b): un-deleted content {hash} disappeared from every live tree (protected_mask: {protected_mask:#010b}){diag}"
+                        ));
                     }
-                    self.fail(format!(
-                        "Invariant (b): un-deleted content {hash} disappeared from every live tree (protected_mask: {protected_mask:#010b}){diag}"
-                    ));
                 }
             }
 
@@ -9251,13 +9280,13 @@ const REGRESSION_SEEDS: &[u64] = &[
     951, 1137, 1225, 1326, 1337, 1346, 1435, 1451, 1476, 1532, 1576, 1617, 2026, 2478, 5635, 11146,
     11338, 15197, 19883, 25021, 25180, 27850, 31444, 32580, 35879, 48566, 49954, 56498, 60211,
     71221, 85172, 85757, 89687, 90830, 94963, 248230, 257640, 338474, 405410, 521801, 612202,
-    640064, 656614, 834066, 859170, 1125206, 1234029, 1252407, 1276023, 1325262, 1381582, 1442864,
-    1631700, 1735939, 1845682, 1905590, 1914338, 2132430, 2212240, 2242736, 2469631, 2508764,
-    2594599, 2770489, 2777393, 2838112, 2844675, 2909715, 2972224, 3132684, 3137180, 3286448,
-    3660488, 3739249, 3804523, 3810856, 3954961, 4066064, 4139193, 4319726, 4376094, 4377839,
-    4395930, 4560644, 4628071, 4689380, 4717156, 5028251, 6102439, 6250401, 6656918, 6972988,
-    7227298, 7504275, 7909139, 8482679, 8730315, 8855009, 9067232, 9625426, 13635160, 17469556,
-    18877611, 19447454, 37147542,
+    640064, 656614, 834066, 859170, 1125206, 1166662, 1234029, 1252407, 1276023, 1325262, 1381582,
+    1442864, 1631700, 1735939, 1845682, 1905590, 1914338, 2132430, 2212240, 2242736, 2469631,
+    2508764, 2594599, 2770489, 2777393, 2838112, 2844675, 2909715, 2972224, 3132684, 3137180,
+    3286448, 3551221, 3660488, 3739249, 3804523, 3810856, 3954961, 4066064, 4139193, 4319726,
+    4376094, 4377839, 4395930, 4560644, 4628071, 4689380, 4717156, 5028251, 6102439, 6250401,
+    6508085, 6656918, 6972988, 7227298, 7504275, 7909139, 8482679, 8730315, 8855009, 9067232,
+    9625426, 13635160, 17469556, 18877611, 19447454, 37147542,
 ];
 
 #[test]

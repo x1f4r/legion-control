@@ -25,14 +25,39 @@ use safety_common::*;
 
 type E = SyncEngine<RealFs, RedbIndexStore>;
 
-fn copy_tree(src: &Path, dst: &Path) {
+/// Models copying a sync folder while Legion is stopped (caller must drop any open `SyncEngine`
+/// on `src` first because Windows holds byte-range locks on open `.legion-sync/index.redb`).
+fn copy_folder_while_stopped(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).unwrap();
     for entry in fs::read_dir(src).unwrap() {
         let entry = entry.unwrap();
         let ty = entry.file_type().unwrap();
         let to = dst.join(entry.file_name());
         if ty.is_dir() {
-            copy_tree(&entry.path(), &to);
+            copy_folder_while_stopped(&entry.path(), &to);
+        } else if ty.is_file() {
+            fs::copy(entry.path(), &to).unwrap();
+        }
+    }
+}
+
+/// Models copying only live user files (for example onto a USB stick), skipping `.legion-sync`
+/// so an open `.legion-sync/index.redb` is never touched while Legion is running.
+fn copy_user_files_excluding_internal(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).unwrap();
+    for entry in fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(".legion-sync")
+        {
+            continue;
+        }
+        let ty = entry.file_type().unwrap();
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_user_files_excluding_internal(&entry.path(), &to);
         } else if ty.is_file() {
             fs::copy(entry.path(), &to).unwrap();
         }
@@ -108,8 +133,7 @@ fn review5_a_rebuild_every_member_after_deletions_never_resurrects() {
         pi.scan(ts(0)).unwrap();
         assert!(sync_all(&mut [&mut tower, &mut pi], 1).is_empty());
 
-        copy_tree(&t.join("tower"), &t.join("usb"));
-        fs::remove_dir_all(t.join("usb/.legion-sync")).unwrap();
+        copy_user_files_excluding_internal(&t.join("tower"), &t.join("usb"));
 
         fs::remove_file(t.join("pi/tax.pdf")).unwrap();
         pi.scan(ts(10)).unwrap();
@@ -245,7 +269,7 @@ fn review5_b_restore_with_only_applied_records_lost_recovers_cleanly() {
 
         drop(pi);
         fs::copy(t.join("pi.redb"), t.join("pi.redb.bak")).unwrap();
-        copy_tree(&t.join("pi"), &t.join("pi.bak"));
+        copy_folder_while_stopped(&t.join("pi"), &t.join("pi.bak"));
         let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
 
         for i in 0..3 {

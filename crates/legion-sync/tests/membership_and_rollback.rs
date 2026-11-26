@@ -171,14 +171,27 @@ fn m2_skipped_deletion_acknowledged_then_resurrected() {
     );
 }
 
-fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
-    let st = std::process::Command::new("cp")
-        .arg("-a")
-        .arg(src)
-        .arg(dst)
-        .status()
-        .unwrap();
-    assert!(st.success());
+/// Models copying a sync folder while Legion is stopped (caller must drop any open `SyncEngine`
+/// on `src` first because Windows holds byte-range locks on open `.legion-sync/index.redb`).
+fn copy_folder_while_stopped(src: &std::path::Path, dst: &std::path::Path) {
+    fs::create_dir_all(dst).unwrap();
+    for entry in fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let ty = entry.file_type().unwrap();
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_folder_while_stopped(&from, &to);
+        } else if ty.is_file() {
+            let meta = fs::metadata(&from).unwrap();
+            fs::copy(&from, &to).unwrap();
+            if let Ok(mtime) = meta.modified()
+                && let Ok(file) = fs::OpenOptions::new().write(true).open(&to)
+            {
+                let _ = file.set_modified(mtime);
+            }
+        }
+    }
 }
 
 /// pi is restored from a backup (folder and index together), makes a few changes, and tower
@@ -203,7 +216,7 @@ fn m3_restored_backup_few_changes_silently_lost() {
     // Backup of pi (folder + index) taken now.
     drop(pi);
     fs::create_dir_all(t.join("backup")).unwrap();
-    copy_tree(&t.join("pi"), &t.join("backup/pi"));
+    copy_folder_while_stopped(&t.join("pi"), &t.join("backup/pi"));
     fs::copy(t.join("pi.redb"), t.join("backup/pi.redb")).unwrap();
     let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
     // pi keeps working; tower sees those changes.
@@ -219,7 +232,7 @@ fn m3_restored_backup_few_changes_silently_lost() {
     // Disk dies; the person restores pi from the backup.
     drop(pi);
     fs::remove_dir_all(t.join("pi")).unwrap();
-    copy_tree(&t.join("backup/pi"), &t.join("pi"));
+    copy_folder_while_stopped(&t.join("backup/pi"), &t.join("pi"));
     fs::copy(t.join("backup/pi.redb"), t.join("pi.redb")).unwrap();
     let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
     // The person writes 15 new documents before the machines meet.
@@ -329,7 +342,7 @@ fn m5_restored_backup_new_edits_replaced_by_old() {
         .unwrap();
     drop(pi);
     fs::create_dir_all(t.join("backup")).unwrap();
-    copy_tree(&t.join("pi"), &t.join("backup/pi"));
+    copy_folder_while_stopped(&t.join("pi"), &t.join("backup/pi"));
     fs::copy(t.join("pi.redb"), t.join("backup/pi.redb")).unwrap();
     let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
     for round in 0..3 {
@@ -349,7 +362,7 @@ fn m5_restored_backup_new_edits_replaced_by_old() {
         .unwrap();
     drop(pi);
     fs::remove_dir_all(t.join("pi")).unwrap();
-    copy_tree(&t.join("backup/pi"), &t.join("pi"));
+    copy_folder_while_stopped(&t.join("backup/pi"), &t.join("pi"));
     fs::copy(t.join("backup/pi.redb"), t.join("pi.redb")).unwrap();
     let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
     for i in 0..5 {
@@ -407,7 +420,7 @@ fn m6_restored_backup_more_changes_than_gap() {
         .unwrap();
     drop(pi);
     fs::create_dir_all(t.join("backup")).unwrap();
-    copy_tree(&t.join("pi"), &t.join("backup/pi"));
+    copy_folder_while_stopped(&t.join("pi"), &t.join("backup/pi"));
     fs::copy(t.join("pi.redb"), t.join("backup/pi.redb")).unwrap();
     let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
     for round in 0..3 {
@@ -427,7 +440,7 @@ fn m6_restored_backup_more_changes_than_gap() {
         .unwrap();
     drop(pi);
     fs::remove_dir_all(t.join("pi")).unwrap();
-    copy_tree(&t.join("backup/pi"), &t.join("pi"));
+    copy_folder_while_stopped(&t.join("backup/pi"), &t.join("pi"));
     fs::copy(t.join("backup/pi.redb"), t.join("pi.redb")).unwrap();
     let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
     for i in 0..20 {
@@ -489,7 +502,7 @@ fn m7_restored_backup_edit_first_then_more() {
         .unwrap();
     drop(pi);
     fs::create_dir_all(t.join("backup")).unwrap();
-    copy_tree(&t.join("pi"), &t.join("backup/pi"));
+    copy_folder_while_stopped(&t.join("pi"), &t.join("backup/pi"));
     fs::copy(t.join("pi.redb"), t.join("backup/pi.redb")).unwrap();
     let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
     for round in 0..3 {
@@ -509,7 +522,7 @@ fn m7_restored_backup_edit_first_then_more() {
         .unwrap();
     drop(pi);
     fs::remove_dir_all(t.join("pi")).unwrap();
-    copy_tree(&t.join("backup/pi"), &t.join("pi"));
+    copy_folder_while_stopped(&t.join("backup/pi"), &t.join("pi"));
     fs::copy(t.join("backup/pi.redb"), t.join("pi.redb")).unwrap();
     let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
     for i in 0..5 {

@@ -459,6 +459,7 @@ fn bench_real_disk_root() -> tempfile::TempDir {
 }
 
 #[test]
+#[ignore = "real-disk 1k apply throughput benchmark; run in --release with --ignored --nocapture"]
 fn apply_throughput_1k_small_files_real_disk() {
     let now = Timestamp::new(1_795_608_000, 0);
     let tmp = bench_real_disk_root();

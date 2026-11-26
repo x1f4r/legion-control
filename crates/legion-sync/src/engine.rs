@@ -182,6 +182,10 @@ impl SyncEngine<RealFs, RedbIndexStore> {
     /// deletes any unreadable database file, creates a fresh folder-local index, writes a fresh
     /// instance token and folder marker, restores `.legion-sync/bin` sidecars, and scans live
     /// files on disk as an unversioned true join.
+    ///
+    /// Any open [`SyncEngine`] holding `<root>/.legion-sync/index.redb` must be dropped before
+    /// calling this method (on Windows, open database files hold byte-range locks that prevent
+    /// removing or replacing the file by path).
     pub fn rebuild_folder_from_disk(
         config: FolderConfig,
         root: impl AsRef<Path>,
@@ -200,6 +204,9 @@ impl<F: SyncFs> SyncEngine<F, RedbIndexStore> {
     /// any corrupt database file, creates a fresh index, writes a fresh instance token and marker,
     /// restores bin metadata sidecars from `.legion-sync/bin`, and scans live files on disk as an
     /// unversioned true join.
+    ///
+    /// Any open [`SyncEngine`] or [`RedbIndexStore`] holding `db_path` must be dropped before
+    /// calling this method.
     pub fn rebuild_redb_from_disk(
         config: FolderConfig,
         fs: F,
@@ -210,7 +217,7 @@ impl<F: SyncFs> SyncEngine<F, RedbIndexStore> {
         config.validate()?;
         fs.check_not_nested()?;
         if let Some(m) = fs.read_marker()?
-            && (m.folder_id != config.id || m.member_id != config.local_member)
+            && m.folder_id != config.id
         {
             return Err(SyncError::FolderUnavailable {
                 folder_id: config.id,
@@ -286,7 +293,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                     None => {
                         let existing_marker = fs.read_marker()?;
                         if let Some(ref m) = existing_marker
-                            && (m.folder_id != config.id || m.member_id != config.local_member)
+                            && m.folder_id != config.id
                         {
                             return Err(SyncError::FolderUnavailable {
                                 folder_id: config.id.clone(),
@@ -642,7 +649,7 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
         self.fs.check_not_nested()?;
         let existing_marker = self.fs.read_marker()?;
         if let Some(ref m) = existing_marker
-            && (m.folder_id != self.config.id || m.member_id != self.config.local_member)
+            && m.folder_id != self.config.id
         {
             return Err(SyncError::FolderUnavailable {
                 folder_id: self.config.id.clone(),

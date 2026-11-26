@@ -898,8 +898,11 @@ fn reconcile_concurrent_versioned(
     // causal history and diverged (e.g. an intentional re-creation after an earlier deletion), a
     // real live change continues to beat a concurrent deletion.
     let disjoint_histories = !lv.shares_any_key(rv);
+    let local_matches_conflict_copy = derive_conflict_of(local, meta).is_some();
+    let remote_matches_conflict_copy = derive_conflict_of(remote, meta).is_some();
     if !local.deleted && remote.deleted {
         if disjoint_histories
+            && !local_matches_conflict_copy
             && local.kind == EntryKind::File
             && remote.kind == EntryKind::File
             && local.hash.is_some()
@@ -929,6 +932,7 @@ fn reconcile_concurrent_versioned(
     }
     if local.deleted && !remote.deleted {
         if disjoint_histories
+            && !remote_matches_conflict_copy
             && local.kind == EntryKind::File
             && remote.kind == EntryKind::File
             && remote.hash.is_some()
@@ -998,8 +1002,6 @@ fn reconcile_concurrent_versioned(
     // (`base_hash == other.hash`), the other side holds nothing this edit has not seen: the edit
     // wins without a conflict copy and takes over both sides' version keys.
     // (Live conflict copies remain protected against silent overwrite.)
-    let local_matches_conflict_copy = derive_conflict_of(local, meta).is_some();
-    let remote_matches_conflict_copy = derive_conflict_of(remote, meta).is_some();
     if disjoint_histories && !local_matches_conflict_copy && !remote_matches_conflict_copy {
         let remote_built_on_local = local.kind == EntryKind::File
             && remote.kind == EntryKind::File

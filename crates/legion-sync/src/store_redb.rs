@@ -218,7 +218,8 @@ impl RedbIndexStore {
                             return Err(unsupported_durable_index_err(&path_label, io_err));
                         }
                         Err(redb::DatabaseError::Storage(redb::StorageError::Io(io_err)))
-                            if io_err.raw_os_error().is_some() =>
+                            if io_err.raw_os_error().is_some()
+                                && io_err.kind() != std::io::ErrorKind::UnexpectedEof =>
                         {
                             return Err(SyncError::from_io(Some(path_label.clone()), io_err));
                         }

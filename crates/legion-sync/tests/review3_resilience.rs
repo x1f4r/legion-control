@@ -70,7 +70,9 @@ where
     done.into_iter().map(|(_, r)| r).collect()
 }
 
-fn copy_tree(src: &Path, dst: &Path) {
+/// Models copying a sync folder while Legion is stopped (caller must drop any open `SyncEngine`
+/// on `src` first because Windows holds byte-range locks on open `.legion-sync/index.redb`).
+fn copy_folder_while_stopped(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).unwrap();
     for entry in fs::read_dir(src).unwrap() {
         let entry = entry.unwrap();
@@ -78,7 +80,37 @@ fn copy_tree(src: &Path, dst: &Path) {
         let from = entry.path();
         let to = dst.join(entry.file_name());
         if ty.is_dir() {
-            copy_tree(&from, &to);
+            copy_folder_while_stopped(&from, &to);
+        } else if ty.is_file() {
+            let meta = fs::metadata(&from).unwrap();
+            fs::copy(&from, &to).unwrap();
+            if let Ok(mtime) = meta.modified()
+                && let Ok(file) = fs::OpenOptions::new().write(true).open(&to)
+            {
+                let _ = file.set_modified(mtime);
+            }
+        }
+    }
+}
+
+/// Models copying only live user files (for example onto a USB stick), skipping `.legion-sync`
+/// so an open `.legion-sync/index.redb` is never touched while Legion is running.
+fn copy_user_files_excluding_internal(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).unwrap();
+    for entry in fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(".legion-sync")
+        {
+            continue;
+        }
+        let ty = entry.file_type().unwrap();
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_user_files_excluding_internal(&from, &to);
         } else if ty.is_file() {
             let meta = fs::metadata(&from).unwrap();
             fs::copy(&from, &to).unwrap();
@@ -204,8 +236,7 @@ fn r1_collected_deletion_resurrected_via_non_originator() {
     sync_all(&mut [&mut tower, &mut pi, &mut nas], 1);
     assert!(t.join("pi/tax-2019.pdf").exists());
 
-    copy_tree(&t.join("pi"), &t.join("usb"));
-    fs::remove_dir_all(t.join("usb/.legion-sync")).unwrap();
+    copy_user_files_excluding_internal(&t.join("pi"), &t.join("usb"));
 
     fs::remove_file(t.join("tower/tax-2019.pdf")).unwrap();
     tower.scan(ts(10)).unwrap();
@@ -276,7 +307,7 @@ fn restore_case(
         }
     }
     drop(pi);
-    copy_tree(&t.join("pi"), &t.join("backup_pi"));
+    copy_folder_while_stopped(&t.join("pi"), &t.join("backup_pi"));
     fs::copy(t.join("pi.redb"), t.join("backup_pi.redb")).unwrap();
     let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
     for i in 0..lost {
@@ -305,7 +336,7 @@ fn restore_case(
     drop(pi);
     fs::remove_dir_all(t.join("pi")).unwrap();
     fs::remove_file(t.join("pi.redb")).unwrap();
-    copy_tree(&t.join("backup_pi"), &t.join("pi"));
+    copy_folder_while_stopped(&t.join("backup_pi"), &t.join("pi"));
     fs::copy(t.join("backup_pi.redb"), t.join("pi.redb")).unwrap();
     let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
     let mut today = Vec::new();
@@ -1084,7 +1115,7 @@ fn r3_restored_member_rotation_cascade() {
     }
     let pi = es.pop().unwrap();
     drop(pi);
-    copy_tree(&t.join("pi"), &t.join("backup_pi"));
+    copy_folder_while_stopped(&t.join("pi"), &t.join("backup_pi"));
     fs::copy(t.join("pi.redb"), t.join("backup_pi.redb")).unwrap();
     es.push(open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &names));
     fs::write(t.join("pi/f0.txt"), b"pi after backup").unwrap();
@@ -1099,7 +1130,7 @@ fn r3_restored_member_rotation_cascade() {
     drop(pi);
     fs::remove_dir_all(t.join("pi")).unwrap();
     fs::remove_file(t.join("pi.redb")).unwrap();
-    copy_tree(&t.join("backup_pi"), &t.join("pi"));
+    copy_folder_while_stopped(&t.join("backup_pi"), &t.join("pi"));
     fs::copy(t.join("backup_pi.redb"), t.join("pi.redb")).unwrap();
     es.push(open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &names));
 
@@ -1322,7 +1353,7 @@ fn r3c_cascade_slow_member() {
     }
     let pi = es.pop().unwrap();
     drop(pi);
-    copy_tree(&t.join("pi"), &t.join("backup_pi"));
+    copy_folder_while_stopped(&t.join("pi"), &t.join("backup_pi"));
     fs::copy(t.join("pi.redb"), t.join("backup_pi.redb")).unwrap();
     es.push(open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &names));
     fs::write(t.join("tower/f9.txt"), b"tower edit seen by old pi").unwrap();
@@ -1337,7 +1368,7 @@ fn r3c_cascade_slow_member() {
     drop(pi);
     fs::remove_dir_all(t.join("pi")).unwrap();
     fs::remove_file(t.join("pi.redb")).unwrap();
-    copy_tree(&t.join("backup_pi"), &t.join("pi"));
+    copy_folder_while_stopped(&t.join("backup_pi"), &t.join("pi"));
     fs::copy(t.join("backup_pi.redb"), t.join("pi.redb")).unwrap();
     es.push(open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &names));
     let mut incs = vec![es[3].meta().unwrap().incarnation];
@@ -3239,7 +3270,7 @@ fn two_restored_case(seed0: u64) -> Vec<String> {
     drop(nas);
     drop(pi);
     for n in ["pi", "nas"] {
-        copy_tree(&t.join(n), &t.join(format!("backup_{n}")));
+        copy_folder_while_stopped(&t.join(n), &t.join(format!("backup_{n}")));
         fs::copy(
             t.join(format!("{n}.redb")),
             t.join(format!("backup_{n}.redb")),
@@ -3270,7 +3301,7 @@ fn two_restored_case(seed0: u64) -> Vec<String> {
     for n in ["pi", "nas"] {
         fs::remove_dir_all(t.join(n)).unwrap();
         fs::remove_file(t.join(format!("{n}.redb"))).unwrap();
-        copy_tree(&t.join(format!("backup_{n}")), &t.join(n));
+        copy_folder_while_stopped(&t.join(format!("backup_{n}")), &t.join(n));
         fs::copy(
             t.join(format!("backup_{n}.redb")),
             t.join(format!("{n}.redb")),
@@ -3369,8 +3400,7 @@ fn r17_two_joiners_with_same_old_copy_resurrect() {
             pull(&mut pi, &tower, 1 + k);
             pull(&mut tower, &pi, 1 + k);
         }
-        copy_tree(&t.join("tower"), &t.join("usb"));
-        fs::remove_dir_all(t.join("usb/.legion-sync")).unwrap();
+        copy_user_files_excluding_internal(&t.join("tower"), &t.join("usb"));
         fs::remove_file(t.join("tower/old-tax-return.pdf")).unwrap();
         tower.scan(ts(10)).unwrap();
         for k in 0..3 {
@@ -3390,8 +3420,8 @@ fn r17_two_joiners_with_same_old_copy_resurrect() {
             e.add_member("laptop1").unwrap();
             e.add_member("laptop2").unwrap();
         }
-        copy_tree(&t.join("usb"), &t.join("laptop1"));
-        copy_tree(&t.join("usb"), &t.join("laptop2"));
+        copy_folder_while_stopped(&t.join("usb"), &t.join("laptop1"));
+        copy_folder_while_stopped(&t.join("usb"), &t.join("laptop2"));
         let mut l1 = open_real(&t.join("laptop1"), &t.join("l1.redb"), "laptop1", &all4);
         let mut l2 = open_real(&t.join("laptop2"), &t.join("l2.redb"), "laptop2", &all4);
         l1.scan(ts(20)).unwrap();

@@ -24,18 +24,67 @@ use safety_common::*;
 
 type E = SyncEngine<RealFs, RedbIndexStore>;
 
-fn copy_tree(src: &Path, dst: &Path) {
+/// Models copying a sync folder while Legion is stopped (caller must drop any open `SyncEngine`
+/// on `src` first because Windows holds byte-range locks on open `.legion-sync/index.redb`).
+fn copy_folder_while_stopped(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).unwrap();
     for entry in fs::read_dir(src).unwrap() {
         let entry = entry.unwrap();
         let ty = entry.file_type().unwrap();
         let to = dst.join(entry.file_name());
         if ty.is_dir() {
-            copy_tree(&entry.path(), &to);
+            copy_folder_while_stopped(&entry.path(), &to);
         } else if ty.is_file() {
             fs::copy(entry.path(), &to).unwrap();
         }
     }
+}
+
+/// Result of modeling a plain file copy of a sync folder while Legion is still running.
+struct LiveCopyOutcome {
+    index_locked_skipped: bool,
+}
+
+/// Models copying a sync folder while Legion is still running (`SyncEngine` holds
+/// `.legion-sync/index.redb` open). On Windows, byte-range locks on the open database cause plain
+/// file copies to fail with sharing/lock violations (OS errors 32/33); like a real copy tool
+/// skipping locked files, this records `index_locked_skipped` and omits `.legion-sync/index.redb`
+/// while copying all live files and `marker.json`.
+fn copy_folder_while_running(src: &Path, dst: &Path) -> LiveCopyOutcome {
+    fn rec(src: &Path, dst: &Path, outcome: &mut LiveCopyOutcome) {
+        fs::create_dir_all(dst).unwrap();
+        for entry in fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let ty = entry.file_type().unwrap();
+            let from = entry.path();
+            let to = dst.join(entry.file_name());
+            if ty.is_dir() {
+                rec(&from, &to, outcome);
+            } else if ty.is_file() {
+                let norm = from.to_string_lossy().replace('\\', "/");
+                let is_index = norm.ends_with(".legion-sync/index.redb");
+                match fs::copy(&from, &to) {
+                    Ok(_) => {}
+                    Err(err) if is_index => {
+                        let is_lock_or_perm = err.kind() == std::io::ErrorKind::PermissionDenied
+                            || matches!(err.raw_os_error(), Some(32 | 33));
+                        assert!(
+                            is_lock_or_perm,
+                            "unexpected error copying open index while running: {err}"
+                        );
+                        let _ = fs::remove_file(&to);
+                        outcome.index_locked_skipped = true;
+                    }
+                    Err(err) => panic!("failed copying live file {}: {err}", from.display()),
+                }
+            }
+        }
+    }
+    let mut outcome = LiveCopyOutcome {
+        index_locked_skipped: false,
+    };
+    rec(src, dst, &mut outcome);
+    outcome
 }
 
 fn pull(a: &mut E, b: &E, now: i64) -> Option<String> {
@@ -208,7 +257,7 @@ fn r6_p2_folder_restore_does_not_win_over_newer_edit_or_deletion() {
     assert!(sync_all(&mut [&mut tower, &mut pi], 1).is_empty());
 
     drop(pi);
-    copy_tree(&t.join("pi"), &t.join("pi.bak"));
+    copy_folder_while_stopped(&t.join("pi"), &t.join("pi.bak"));
     let mut pi = open_member(t, "pi", &all);
 
     fs::write(t.join("tower/a.txt"), b"a version 2, newer").unwrap();
@@ -255,7 +304,7 @@ fn r6_p3_restore_lost_exactly_last_record_then_one_edit() {
         assert!(sync_all(&mut [&mut tower, &mut pi], 1).is_empty());
 
         drop(pi);
-        copy_tree(&t.join("pi"), &t.join("pi.bak"));
+        copy_folder_while_stopped(&t.join("pi"), &t.join("pi.bak"));
         let mut pi = open_member(t, "pi", &all);
         fs::write(t.join("pi/q.txt"), b"lost on pi, kept on tower").unwrap();
         pi.scan(ts(10)).unwrap();
@@ -318,14 +367,14 @@ fn r6_p4_two_members_restored_from_different_times() {
     assert!(sync_all(&mut [&mut tower, &mut pi], 1).is_empty());
 
     drop(tower);
-    copy_tree(&t.join("tower"), &t.join("tower.bak"));
+    copy_folder_while_stopped(&t.join("tower"), &t.join("tower.bak"));
     let mut tower = open_member(t, "tower", &all);
     fs::write(t.join("tower/t1.txt"), b"t1").unwrap();
     tower.scan(ts(10)).unwrap();
     assert!(sync_all(&mut [&mut tower, &mut pi], 11).is_empty());
 
     drop(pi);
-    copy_tree(&t.join("pi"), &t.join("pi.bak"));
+    copy_folder_while_stopped(&t.join("pi"), &t.join("pi.bak"));
     let mut pi = open_member(t, "pi", &all);
     fs::write(t.join("pi/p1.txt"), b"p1").unwrap();
     pi.scan(ts(20)).unwrap();
@@ -638,7 +687,7 @@ fn copy_folder_with_internal_store_to_second_member_and_run_both() {
 
     // Copy the entire folder INCLUDING `.legion-sync/index.redb` and `marker.json` to laptop!
     drop(tower);
-    copy_tree(&t.join("tower"), &t.join("laptop"));
+    copy_folder_while_stopped(&t.join("tower"), &t.join("laptop"));
 
     let mut tower = open_member(t, "tower", &all);
     let mut laptop = open_member(t, "laptop", &all);
@@ -810,7 +859,7 @@ fn restore_folder_to_older_state_then_edits_before_first_exchange() {
         assert!(sync_all(&mut [&mut tower, &mut pi], 2).is_empty());
 
         drop(pi);
-        copy_tree(&t.join("pi"), &t.join("pi.bak"));
+        copy_folder_while_stopped(&t.join("pi"), &t.join("pi.bak"));
         let mut pi = open_member(t, "pi", &all);
 
         for i in 0..lost {
@@ -1095,5 +1144,222 @@ fn refuse_folder_when_durable_index_commits_unavailable() {
         }
         Err(other) => panic!("expected SyncError::Unsupported, got {other:?}"),
         Ok(_) => panic!("expected read-only index open to be refused with SyncError::Unsupported"),
+    }
+}
+
+/// Models copying a sync folder while Legion is running across platforms:
+/// 1. Live copy of an open `SyncEngine` folder (`copy_folder_while_running`): on Windows the open
+///    `.legion-sync/index.redb` is byte-range locked and skipped by a plain copy; on Linux/macOS
+///    the copy captures either a clean or in-flight file.
+/// 2. Deterministic Windows locked-copy model (live files + `marker.json`, no `index.redb`).
+/// 3. Deterministic torn/partial `.legion-sync/index.redb` copies (0-byte, 256-byte header, half
+///    file, and torn splice of two commits / corrupt page tail).
+///
+/// In every case, for both same-member and second-member copies, opening the copy NEVER panics or
+/// half-trusts corrupt data: it either opens cleanly (rotating identity via Decision 2) or stops
+/// as `SyncError::IndexDamaged` leaving live files untouched, and explicit
+/// `SyncEngine::rebuild_folder_from_disk` recovers cleanly as a Decision 3 true join.
+#[test]
+fn copy_folder_while_running_handles_locked_and_torn_index() {
+    let tmp = scratch();
+    let t = tmp.path();
+    let all = ["tower", "laptop"];
+
+    // Prepare tower with live files, a settled deletion, and two commits of `index.redb` so we
+    // can also build a deterministic torn mid-write copy splicing bytes from two commits.
+    let mut tower = open_member(t, "tower", &all);
+    tower.scan(ts(0)).unwrap();
+    fs::write(t.join("tower/keep.txt"), b"keep v1").unwrap();
+    fs::write(t.join("tower/deleted.txt"), b"must stay gone").unwrap();
+    tower.scan(ts(1)).unwrap();
+    drop(tower);
+    let older_index_bytes = fs::read(t.join("tower").join(SYNC_INDEX_FILE)).unwrap();
+
+    let mut tower = open_member(t, "tower", &all);
+    fs::remove_file(t.join("tower/deleted.txt")).unwrap();
+    fs::write(t.join("tower/keep.txt"), b"keep v2").unwrap();
+    tower.scan(ts(10)).unwrap();
+    tower.flush_settled_deletions(ts(50)).unwrap();
+    let tower_inc = tower.meta().unwrap().incarnation;
+
+    // 1. Live copy while `tower` holds `.legion-sync/index.redb` open!
+    let live_copy = t.join("live_copy_laptop");
+    let live_outcome = copy_folder_while_running(&t.join("tower"), &live_copy);
+    assert_eq!(fs::read(live_copy.join("keep.txt")).unwrap(), b"keep v2");
+    assert!(!live_copy.join("deleted.txt").exists());
+    let live_open = std::panic::catch_unwind(|| {
+        SyncEngine::open_folder(
+            cfg("laptop", &all),
+            &live_copy,
+            token_store_for(&live_copy, "laptop"),
+        )
+    })
+    .expect("opening live-copied folder must never panic");
+    let mut laptop_live = match live_open {
+        Ok(eng) => {
+            assert!(
+                !live_outcome.index_locked_skipped,
+                "missing index.redb beside marker must stop as IndexDamaged, not open silently"
+            );
+            assert_ne!(
+                eng.meta().unwrap().incarnation,
+                tower_inc,
+                "clean live copy on second member must rotate incarnation"
+            );
+            assert!(!eng.meta().unwrap().join_mode);
+            assert!(
+                eng.store()
+                    .get_record("deleted.txt")
+                    .unwrap()
+                    .is_some_and(|r| r.deleted),
+                "clean live copy must preserve deletion history across rotation"
+            );
+            eng
+        }
+        Err(SyncError::IndexDamaged { .. }) => {
+            assert_eq!(fs::read(live_copy.join("keep.txt")).unwrap(), b"keep v2");
+            let (eng, _) = SyncEngine::rebuild_folder_from_disk(
+                cfg("laptop", &all),
+                &live_copy,
+                token_store_for(&live_copy, "laptop"),
+                ts(60),
+            )
+            .unwrap();
+            eng
+        }
+        Err(other) => panic!("unexpected error opening live-copied folder: {other:?}"),
+    };
+    fs::write(live_copy.join("from_laptop.txt"), b"written on laptop").unwrap();
+    laptop_live.scan(ts(61)).unwrap();
+    // Converge with tower: `keep.txt` stays `keep v2`, `from_laptop.txt` arrives, and
+    // `deleted.txt` stays deleted on both.
+    assert!(sync_all(&mut [&mut tower, &mut laptop_live], 70).is_empty());
+    assert_eq!(fs::read(t.join("tower/keep.txt")).unwrap(), b"keep v2");
+    assert_eq!(fs::read(live_copy.join("keep.txt")).unwrap(), b"keep v2");
+    assert_eq!(
+        fs::read(t.join("tower/from_laptop.txt")).unwrap(),
+        b"written on laptop"
+    );
+    assert!(!t.join("tower/deleted.txt").exists());
+    assert!(!live_copy.join("deleted.txt").exists());
+    drop(laptop_live);
+
+    // Grab the newer committed index bytes while stopped to construct deterministic torn cases.
+    drop(tower);
+    let newer_index_bytes = fs::read(t.join("tower").join(SYNC_INDEX_FILE)).unwrap();
+    let stopped_snapshot = t.join("stopped_snapshot");
+    copy_folder_while_stopped(&t.join("tower"), &stopped_snapshot);
+
+    // 2 & 3. Deterministic locked-skip (missing index.redb) and torn/partial index copies, tested
+    // for BOTH same-member (`tower`) and second-member (`laptop`) opens.
+    let cases: Vec<(&str, Option<Vec<u8>>)> = vec![
+        ("windows-locked-skip-missing-index", None),
+        ("torn-zero-bytes", Some(Vec::new())),
+        (
+            "torn-truncated-header-256b",
+            Some(newer_index_bytes[..256.min(newer_index_bytes.len())].to_vec()),
+        ),
+        (
+            "torn-half-file",
+            Some(newer_index_bytes[..newer_index_bytes.len() / 2].to_vec()),
+        ),
+        ("torn-mid-write-splice-and-corrupt-tail", {
+            let split = older_index_bytes.len().min(newer_index_bytes.len()) / 2;
+            let mut mixed = older_index_bytes[..split].to_vec();
+            mixed.extend_from_slice(&newer_index_bytes[split..]);
+            for b in mixed.iter_mut().rev().take(256) {
+                *b ^= 0xA5;
+            }
+            Some(mixed)
+        }),
+    ];
+
+    let mut tower = open_member(t, "tower", &all);
+    for (case_idx, (case_name, index_override)) in cases.iter().enumerate() {
+        for member in ["tower", "laptop"] {
+            let dst = t.join(format!("case_{case_idx}_{member}"));
+            copy_folder_while_stopped(&stopped_snapshot, &dst);
+            let dst_index = dst.join(SYNC_INDEX_FILE);
+            match index_override {
+                None => fs::remove_file(&dst_index).unwrap(),
+                Some(bytes) => fs::write(&dst_index, bytes).unwrap(),
+            }
+
+            let open_res = std::panic::catch_unwind(|| {
+                SyncEngine::open_folder(cfg(member, &all), &dst, token_store_for(&dst, member))
+            })
+            .unwrap_or_else(|_| panic!("{case_name} ({member}): panic escaped open_folder"));
+
+            match open_res {
+                Err(SyncError::IndexDamaged { .. }) => {
+                    // Nothing on disk changed while stopped as damaged.
+                    assert_eq!(fs::read(dst.join("keep.txt")).unwrap(), b"keep v2");
+                    // Also plant an old pre-deletion copy of `deleted.txt` before rebuilding as a
+                    // true join: Decision 3 + 4 must bin it on sync rather than resurrecting it.
+                    fs::write(dst.join("deleted.txt"), b"must stay gone").unwrap();
+                    let (mut rebuilt, _) = SyncEngine::rebuild_folder_from_disk(
+                        cfg(member, &all),
+                        &dst,
+                        token_store_for(&dst, member),
+                        ts(200 + case_idx as i64 * 10),
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!("{case_name} ({member}): rebuild_folder_from_disk failed: {e:?}")
+                    });
+                    assert!(
+                        !rebuilt.meta().unwrap().join_mode,
+                        "{case_name} ({member}): initial join scan must complete and clear join_mode"
+                    );
+                    assert_eq!(
+                        rebuilt
+                            .store()
+                            .get_record("keep.txt")
+                            .unwrap()
+                            .unwrap()
+                            .provenance,
+                        RecordProvenance::Unversioned
+                    );
+                    assert_eq!(
+                        rebuilt
+                            .store()
+                            .get_record("deleted.txt")
+                            .unwrap()
+                            .unwrap()
+                            .provenance,
+                        RecordProvenance::Unversioned
+                    );
+                    if member == "laptop" {
+                        assert!(
+                            sync_all(&mut [&mut tower, &mut rebuilt], 300 + case_idx as i64 * 10)
+                                .is_empty()
+                        );
+                        assert_eq!(fs::read(dst.join("keep.txt")).unwrap(), b"keep v2");
+                        assert!(!dst.join("deleted.txt").exists());
+                        assert!(!t.join("tower/deleted.txt").exists());
+                    }
+                }
+                Ok(mut opened) => {
+                    assert!(
+                        index_override.is_some()
+                            && *case_name == "torn-mid-write-splice-and-corrupt-tail",
+                        "{case_name} ({member}): corrupt/missing index unexpectedly opened Ok"
+                    );
+                    assert_ne!(
+                        opened.meta().unwrap().incarnation,
+                        tower_inc,
+                        "{case_name} ({member}): must rotate incarnation"
+                    );
+                    if member == "laptop" {
+                        assert!(
+                            sync_all(&mut [&mut tower, &mut opened], 300 + case_idx as i64 * 10)
+                                .is_empty()
+                        );
+                    }
+                }
+                Err(other) => {
+                    panic!("{case_name} ({member}): expected IndexDamaged, got {other:?}")
+                }
+            }
+        }
     }
 }
