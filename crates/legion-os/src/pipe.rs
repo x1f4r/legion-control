@@ -283,6 +283,10 @@ mod tests {
         );
     }
 
+    // Not on macOS: there a peer's shutdown of its read half is not reported to the other side
+    // while any descriptor still holds the socket open; only the last close is. The close cases
+    // above cover macOS.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn unix_socket_shutdown_both_reports_closed_immediately_even_with_dup_fd() {
         let (client, server) = UnixStream::pair().expect("unix stream pair");
