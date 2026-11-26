@@ -1077,13 +1077,15 @@ async fn test_mpeg_ts_sniffing_in_find_and_thumb() {
     let ts_video = home.join("recording.ts");
     let has_ffmpeg = std::process::Command::new("ffmpeg")
         .arg("-version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .is_ok_and(|s| s.success());
     if has_ffmpeg {
         let status = std::process::Command::new("ffmpeg")
             .args([
+                "-nostdin",
                 "-hide_banner",
                 "-loglevel",
                 "error",
@@ -1096,6 +1098,7 @@ async fn test_mpeg_ts_sniffing_in_find_and_thumb() {
                 "mpegts",
                 ts_video.to_str().unwrap(),
             ])
+            .stdin(Stdio::null())
             .status()
             .unwrap();
         assert!(status.success(), "ffmpeg failed to generate recording.ts");
@@ -1294,8 +1297,9 @@ fn build_mov_with_dref(secret_name: &str) -> Vec<u8> {
 async fn test_ffmpeg_blocks_dref_and_pixel_bomb() {
     let has_ffmpeg = std::process::Command::new("ffmpeg")
         .arg("-version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .is_ok_and(|s| s.success());
     if !has_ffmpeg {
@@ -1318,6 +1322,7 @@ async fn test_ffmpeg_blocks_dref_and_pixel_bomb() {
     let bomb_mkv = home.join("bomb.mkv");
     let status = std::process::Command::new("ffmpeg")
         .args([
+            "-nostdin",
             "-hide_banner",
             "-loglevel",
             "error",
@@ -1328,6 +1333,7 @@ async fn test_ffmpeg_blocks_dref_and_pixel_bomb() {
             "copy",
             bomb_mkv.to_str().unwrap(),
         ])
+        .stdin(Stdio::null())
         .status()
         .unwrap();
     assert!(status.success(), "ffmpeg failed to mux bomb.mkv");
@@ -1337,6 +1343,7 @@ async fn test_ffmpeg_blocks_dref_and_pixel_bomb() {
     let legit_mp4 = home.join("legit.mp4");
     let status2 = std::process::Command::new("ffmpeg")
         .args([
+            "-nostdin",
             "-hide_banner",
             "-loglevel",
             "error",
@@ -1349,6 +1356,7 @@ async fn test_ffmpeg_blocks_dref_and_pixel_bomb() {
             "yuv420p",
             legit_mp4.to_str().unwrap(),
         ])
+        .stdin(Stdio::null())
         .status()
         .unwrap();
     assert!(status2.success(), "ffmpeg failed to create legit.mp4");
@@ -1397,6 +1405,7 @@ async fn test_ffmpeg_blocks_dref_and_pixel_bomb() {
 fn ffmpeg_available() -> bool {
     std::process::Command::new("ffmpeg")
         .arg("-version")
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -1406,6 +1415,7 @@ fn ffmpeg_available() -> bool {
 fn ffmpeg_has_encoder(name: &str) -> bool {
     std::process::Command::new("ffmpeg")
         .args(["-hide_banner", "-encoders"])
+        .stdin(Stdio::null())
         .output()
         .is_ok_and(|out| {
             out.status.success() && String::from_utf8_lossy(&out.stdout).contains(name)
@@ -1425,8 +1435,9 @@ async fn test_video_suite_1080p_4k_hevc10_8k_longgop_and_portrait_rotation() {
 
     let run_ffmpeg = |args: &[&str]| {
         let status = std::process::Command::new("ffmpeg")
-            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y"])
             .args(args)
+            .stdin(Stdio::null())
             .status()
             .expect("spawn ffmpeg");
         assert!(status.success(), "ffmpeg failed with args {args:?}");

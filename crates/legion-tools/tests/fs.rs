@@ -3575,6 +3575,7 @@ async fn thumb_extracts_video_posters_when_ffmpeg_is_installed() {
     // Only run the positive ffmpeg extraction check when `ffmpeg` is present on PATH.
     let has_ffmpeg = std::process::Command::new("ffmpeg")
         .arg("-version")
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -3589,6 +3590,7 @@ async fn thumb_extracts_video_posters_when_ffmpeg_is_installed() {
     for (path, duration) in [(&clip, "2"), (&short_clip, "0.2")] {
         let status = std::process::Command::new("ffmpeg")
             .args([
+                "-nostdin",
                 "-hide_banner",
                 "-loglevel",
                 "error",
@@ -3600,6 +3602,7 @@ async fn thumb_extracts_video_posters_when_ffmpeg_is_installed() {
                 "yuv420p",
                 path.to_str().unwrap(),
             ])
+            .stdin(std::process::Stdio::null())
             .status()
             .unwrap();
         assert!(status.success(), "ffmpeg fixture failed for {path:?}");
@@ -3718,6 +3721,7 @@ async fn thumb_blocks_ffmpeg_manifest_playlist_symlink_and_http_attacks() {
 
     let has_ffmpeg = std::process::Command::new("ffmpeg")
         .arg("-version")
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -3747,6 +3751,7 @@ paths = ["~/projects/**"]
     for (path, color) in [(&secret_mp4, "red"), (&legit_mp4, "blue")] {
         let status = std::process::Command::new("ffmpeg")
             .args([
+                "-nostdin",
                 "-hide_banner",
                 "-loglevel",
                 "error",
@@ -3758,6 +3763,7 @@ paths = ["~/projects/**"]
                 "yuv420p",
                 path.to_str().unwrap(),
             ])
+            .stdin(std::process::Stdio::null())
             .status()
             .unwrap();
         assert!(status.success(), "ffmpeg fixture failed for {path:?}");
@@ -3864,6 +3870,7 @@ paths = ["~/projects/**"]
         let probe_out = f.dir.path().join("probe_without_whitelist.jpg");
         let probe_status = std::process::Command::new("ffmpeg")
             .args([
+                "-nostdin",
                 "-hide_banner",
                 "-loglevel",
                 "error",
@@ -3874,6 +3881,7 @@ paths = ["~/projects/**"]
                 "-y",
                 probe_out.to_str().unwrap(),
             ])
+            .stdin(std::process::Stdio::null())
             .status()
             .unwrap();
         assert!(
