@@ -24,7 +24,7 @@
 use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use legion_proto::ErrorCode;
 use serde::{Serialize, Serializer};
@@ -161,6 +161,32 @@ impl Drop for Held {
     }
 }
 
+/// Creates a private directory (such as a node's state directory) with mode `0o700` on Unix.
+pub(crate) fn create_private_dir_all(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
+fn private_open_options() -> OpenOptions {
+    let mut opts = OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    opts
+}
+
 impl AuditLog {
     /// The audit log under a node's state directory.
     pub fn new(paths: &Paths) -> AuditLog {
@@ -177,9 +203,9 @@ impl AuditLog {
 
     fn lock_file(&self) -> io::Result<File> {
         if let Some(dir) = self.lock.parent() {
-            std::fs::create_dir_all(dir)?;
+            create_private_dir_all(dir)?;
         }
-        OpenOptions::new()
+        private_open_options()
             .read(true)
             .write(true)
             .create(true)
@@ -202,7 +228,7 @@ impl AuditLog {
         let mut line = serde_json::to_vec(entry)?;
         line.push(b'\n');
         let _held = self.hold(false)?;
-        OpenOptions::new()
+        private_open_options()
             .append(true)
             .create(true)
             .open(&self.log)
@@ -984,5 +1010,36 @@ mod tests {
                 "plain",
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_log_lock_and_state_dir_are_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path().join("legion"));
+        let log = AuditLog::new(&paths);
+        log.append(&entry("meta.version", "owner", Outcome::Ok))
+            .unwrap();
+
+        let state_mode = std::fs::metadata(paths.state_dir())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let log_mode = std::fs::metadata(paths.audit_log())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let lock_mode = std::fs::metadata(paths.audit_lock())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(state_mode & 0o077, 0, "state dir too open: {state_mode:o}");
+        assert_eq!(log_mode & 0o077, 0, "audit.jsonl too open: {log_mode:o}");
+        assert_eq!(lock_mode & 0o077, 0, "audit.lock too open: {lock_mode:o}");
     }
 }
