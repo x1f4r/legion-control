@@ -17,11 +17,14 @@
 
 mod common;
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+/// Generous backstop used only as a hang guard on explicit hand-over waits; never a timing budget.
+const HANG_GUARD: Duration = Duration::from_secs(30);
 
 use common::{
     current_user, find_sshd, find_tool, real_legion_bin_with_sshd, strict_tempdir, toml_literal,
@@ -109,6 +112,7 @@ impl ThrowawaySshd {
                 .status()
                 .is_ok_and(|s| s.success());
 
+        let mut last_log = String::new();
         for _ in 0..3 {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
@@ -155,7 +159,7 @@ impl ThrowawaySshd {
                 .spawn()
                 .unwrap();
 
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + HANG_GUARD;
             let mut listening = false;
             while Instant::now() < deadline {
                 if child.try_wait().unwrap().is_some() {
@@ -179,8 +183,12 @@ impl ThrowawaySshd {
             }
             let _ = child.kill();
             let _ = child.wait();
+            last_log = fs::read_to_string(&log_path).unwrap_or_default();
         }
-        panic!("throwaway sshd failed to start");
+        panic!(
+            "throwaway sshd failed to start listening within {}s:\n{last_log}",
+            HANG_GUARD.as_secs()
+        );
     }
 
     fn log(&self) -> String {
@@ -512,9 +520,10 @@ async fn real_sshd_late_enrolment_confirmation_and_retry_recover_cleanly() {
     let port_arg = format!("port={}", sshd.port);
     let user_arg = format!("user={}", sshd.user);
 
-    // Scenario A: Client gives up waiting for confirmation while the node finishes enrolling
-    // (`enrol` timeout = 1ms). Either the immediate post-timeout device-key probe confirms
-    // enrolment or retrying the same invite once the node finishes commits recovers cleanly.
+    // Scenario A: Client gives up waiting for confirmation while the node is still blocked before
+    // committing (`config.lock` held). Once `enrol` times out after sending the request (verified
+    // via an explicit server-side hand-over marker), releasing `config.lock` lets the node finish
+    // committing, and retrying the same invite recovers cleanly via the device-key probe.
     let invite_a_res = run_legion(
         &legion_bin,
         &legion_home,
@@ -528,12 +537,17 @@ async fn real_sshd_late_enrolment_confirmation_and_retry_recover_cleanly() {
             &user_arg,
         ],
     );
-    let invite_a_text = invite_a_res["invite"].as_str().unwrap();
+    let invite_a_text = invite_a_res["invite"].as_str().unwrap().to_owned();
+    let invite_a_id = invite_a_res["id"].as_str().unwrap();
+    let late_handover =
+        EnrolHandover::install(root.path(), &auth_keys, &legion_bin, invite_a_id, "late-a");
+    let config_lock = legion_home.join("state").join("sync").join("config.lock");
+    let config_holder = HeldLock::acquire(&config_lock);
 
     let key_a = DeviceKey::generate().unwrap();
     let short_opts = legion_link::LinkOptions {
         ssh_timeouts: SshTimeouts {
-            enrol: Duration::from_millis(1),
+            enrol: Duration::from_secs(1),
             ..SshTimeouts::default()
         },
         ..legion_link::LinkOptions::default()
@@ -546,50 +560,53 @@ async fn real_sshd_late_enrolment_confirmation_and_retry_recover_cleanly() {
         short_opts,
     );
 
-    let first_attempt = link_a.pair(invite_a_text, "late-phone").await;
-    let enrolled_a = match first_attempt {
-        Ok(enrolled) => enrolled,
-        Err(err) => {
-            assert_eq!(
-                err.code,
-                ErrorCode::Timeout,
-                "unexpected first error: {err}"
-            );
-            assert!(
-                link_a.config().node("tower").is_none(),
-                "timed-out pair must not save half-paired node locally"
-            );
-            // Wait deterministically for the node's in-flight enrolment to finish committing
-            // authorized_keys (simulating the node finishing a couple seconds after client timeout).
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while Instant::now() < deadline {
-                if fs::read_to_string(&auth_keys)
-                    .unwrap_or_default()
-                    .contains("--device late-phone")
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            assert!(
-                fs::read_to_string(&auth_keys)
-                    .unwrap_or_default()
-                    .contains("--device late-phone"),
-                "node did not finish committing late-phone enrolment"
-            );
-            // Retry with the exact same invite: temp key is already gone, so recovery probes
-            // `device_key` + `meta.whoami` and completes pairing cleanly.
-            link_a
-                .pair(invite_a_text, "late-phone")
-                .await
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "retry after late enrolment failed: {e}\n--- sshd log ---\n{}",
-                        sshd.log()
-                    )
-                })
-        }
+    let first_task = {
+        let link = link_a.clone();
+        let inv = invite_a_text.clone();
+        tokio::spawn(async move { link.pair(&inv, "late-phone").await })
     };
+    late_handover
+        .wait_received(
+            1,
+            "late-enrolment test: server received client enrolment request while config.lock held",
+            &sshd,
+            Some(&first_task),
+        )
+        .await;
+
+    let first_attempt = first_task.await.unwrap();
+    let err = first_attempt.expect_err("pair while config.lock is held must hit enrol timeout");
+    assert_eq!(
+        err.code,
+        ErrorCode::Timeout,
+        "unexpected first error: {err}"
+    );
+    assert!(
+        link_a.config().node("tower").is_none(),
+        "timed-out pair must not save half-paired node locally"
+    );
+
+    // Release `config.lock` so the in-flight server enrolment finishes committing authorized_keys.
+    drop(config_holder);
+    wait_file_contains(
+        &auth_keys,
+        "--device late-phone",
+        "late-enrolment test: node committing late-phone to authorized_keys after config.lock release",
+        &sshd,
+    )
+    .await;
+
+    // Retry with the exact same invite: temp key is already gone, so recovery probes
+    // `device_key` + `meta.whoami` and completes pairing cleanly.
+    let enrolled_a = link_a
+        .pair(&invite_a_text, "late-phone")
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "retry after late enrolment failed: {e}\n--- sshd log ---\n{}",
+                sshd.log()
+            )
+        });
     assert_eq!(enrolled_a.node, "tower");
     assert_eq!(enrolled_a.principal, "device:late-phone");
     assert_eq!(enrolled_a.role, "operator");
@@ -925,35 +942,53 @@ async fn real_sshd_cancel_before_and_after_send_behaves_honestly() {
             .contains("--device cancel-phone")
     );
 
-    // 2. Cancel RIGHT AFTER the machine commits `authorized_keys` (reproducing the race where
-    //    cancel fires after the request left): pairing MUST succeed and save `tower` instead of
+    // 2. Cancel RIGHT AFTER the machine commits `authorized_keys` and BEFORE it writes the reply:
+    //    pause `push_devices_to_fleet` on an explicit marker hand-over so cancel deterministically
+    //    fires after commit and before reply. Pairing MUST succeed and save `tower` instead of
     //    leaving the device half-paired.
-    let post_cancel = CancellationToken::new();
-    let cancel_trigger = post_cancel.clone();
-    let ak_path = auth_keys.clone();
-    let watcher = tokio::spawn(async move {
-        let before = fs::read_to_string(&ak_path).unwrap_or_default();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            let now = fs::read_to_string(&ak_path).unwrap_or_default();
-            if now != before && now.contains("--device cancel-phone") {
-                cancel_trigger.cancel();
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    });
+    let entered = root.path().join("post-cancel-entered");
+    let release = root.path().join("post-cancel-release");
+    let fleet_path = config_dir.join("fleet.toml");
+    fs::write(
+        &fleet_path,
+        format!(
+            "[machines.slowpeer]\ncommand = [\"/bin/sh\", \"-c\", \"touch '{}'; i=0; while [ ! -f '{}' ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done; exit 1\"]\n",
+            entered.display(),
+            release.display(),
+        ),
+    )
+    .unwrap();
 
-    let enrolled = link
-        .pair_cancellable(inv_text, "cancel-phone", post_cancel)
-        .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "cancel after send must save completed pairing instead of failing: {e}\n--- sshd log ---\n{}",
-                sshd.log()
-            )
-        });
-    let _ = watcher.await;
+    let post_cancel = CancellationToken::new();
+    let pair_task = {
+        let link = link.clone();
+        let inv = inv_text.to_owned();
+        let cancel = post_cancel.clone();
+        tokio::spawn(async move { link.pair_cancellable(&inv, "cancel-phone", cancel).await })
+    };
+    wait_path_exists(
+        &entered,
+        "cancel-after-send test: server reached fleet push after committing authorized_keys",
+        &sshd,
+        Some(&pair_task),
+    )
+    .await;
+    assert!(
+        fs::read_to_string(&auth_keys)
+            .unwrap_or_default()
+            .contains("--device cancel-phone"),
+        "expected authorized_keys to contain cancel-phone before post-commit cancel"
+    );
+    post_cancel.cancel();
+    let _ = fs::write(&release, b"go\n");
+
+    let enrolled = pair_task.await.unwrap().unwrap_or_else(|e| {
+        panic!(
+            "cancel after send must save completed pairing instead of failing: {e}\n--- sshd log ---\n{}",
+            sshd.log()
+        )
+    });
+    let _ = fs::remove_file(&fleet_path);
     assert_eq!(enrolled.node, "tower");
     assert_eq!(enrolled.principal, "device:cancel-phone");
     assert!(
@@ -1022,7 +1057,7 @@ async fn real_sshd_unconfirmed_lifecycle_confirmed_conflict_restore_and_compat()
         let entered = root.path().join(format!("entered-{tag}"));
         let release = root.path().join(format!("release-{tag}"));
         let fleet_toml = format!(
-            "[machines.slowpeer]\ncommand = [\"/bin/sh\", \"-c\", \"touch '{}'; i=0; while [ ! -f '{}' ] && [ $i -lt 250 ]; do sleep 0.02; i=$((i+1)); done; exit 1\"]\n",
+            "[machines.slowpeer]\ncommand = [\"/bin/sh\", \"-c\", \"touch '{}'; i=0; while [ ! -f '{}' ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done; exit 1\"]\n",
             entered.display(),
             release.display(),
         );
@@ -1038,6 +1073,7 @@ async fn real_sshd_unconfirmed_lifecycle_confirmed_conflict_restore_and_compat()
         let device_name = device_name.to_owned();
         let audit_path = audit_path.clone();
         let fleet_path = fleet_path.clone();
+        let sshd_ref = &sshd;
         async move {
             let temp_key = DeviceKey::from_seed(*invite.key_seed().unwrap());
             let pipe = open_exec_raw(
@@ -1064,24 +1100,30 @@ async fn real_sshd_unconfirmed_lifecycle_confirmed_conflict_restore_and_compat()
             writer.shutdown().await.unwrap();
 
             // Wait deterministically until commit finished and `push_devices_to_fleet` began.
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while !entered.exists() {
-                assert!(
-                    Instant::now() < deadline,
-                    "timed out waiting for enrol to reach fleet push"
-                );
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            wait_path_exists(
+                &entered,
+                "vanish_after_send: enrol reached fleet push after commit",
+                sshd_ref,
+                None::<&tokio::task::JoinHandle<()>>,
+            )
+            .await;
 
             // Client vanishes while machine is still finishing before writing its stdout reply.
+            let disconnects_before = sshd_ref.log().matches("Received disconnect from").count();
             drop(writer);
             drop(reader);
             Box::new(handle).close(Duration::from_millis(500)).await;
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            wait_sshd_log_count(
+                sshd_ref,
+                "Received disconnect from",
+                disconnects_before + 1,
+                "vanish_after_send: sshd observed client disconnect before releasing fleet push",
+            )
+            .await;
             let _ = fs::write(&release, b"go\n");
 
             // Wait for `legion gate --enrol` to finish and append its own `tool: "device.enrol"` audit entry.
-            let audit_deadline = Instant::now() + Duration::from_secs(10);
+            let audit_deadline = Instant::now() + HANG_GUARD;
             loop {
                 let enrol_count = fs::read_to_string(&audit_path)
                     .unwrap_or_default()
@@ -1093,7 +1135,9 @@ async fn real_sshd_unconfirmed_lifecycle_confirmed_conflict_restore_and_compat()
                 }
                 assert!(
                     Instant::now() < audit_deadline,
-                    "timed out waiting for device.enrol audit entry"
+                    "timed out after {}s at step [vanish_after_send: waiting for device.enrol audit entry]\n--- sshd log ---\n{}",
+                    HANG_GUARD.as_secs(),
+                    sshd_ref.log()
                 );
                 tokio::time::sleep(Duration::from_millis(15)).await;
             }
@@ -1330,67 +1374,293 @@ async fn real_sshd_unconfirmed_lifecycle_confirmed_conflict_restore_and_compat()
     assert!(older_machine_reply.details.is_none());
 }
 
-#[cfg(unix)]
-fn hold_flock(lock_path: &Path) -> Option<Child> {
-    find_tool("flock")?;
-    if let Some(parent) = lock_path.parent() {
-        fs::create_dir_all(parent).unwrap();
-    }
-    let mut child = Command::new("flock")
-        .args(["-o", "-x"])
-        .arg(lock_path)
-        .args(["sleep", "60"])
-        .stdin(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        let busy = !Command::new("flock")
-            .args(["-n", "-x"])
-            .arg(lock_path)
-            .arg("true")
-            .status()
-            .unwrap()
-            .success();
-        if busy {
-            return Some(child);
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    panic!("could not acquire lock {}", lock_path.display());
+/// Holds an exclusive kernel lock (`flock` on Unix, `LockFileEx` on Windows) on `lock_path` until
+/// dropped.
+///
+/// Acquires the lock directly via `File::lock()` (the same kernel primitive `legion_os::FileLock`
+/// uses), so ownership is guaranteed before returning with no child process, no external `flock`
+/// tool, no polling, and automatic release on drop or panic.
+struct HeldLock {
+    _file: File,
 }
 
-#[cfg(unix)]
-fn wait_lock_busy(lock_path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        let busy = !Command::new("flock")
-            .args(["-n", "-x"])
-            .arg(lock_path)
-            .arg("true")
-            .status()
-            .unwrap()
-            .success();
-        if busy {
-            return;
+impl HeldLock {
+    fn acquire(lock_path: &Path) -> Self {
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+            #[cfg(unix)]
+            {
+                let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+            }
         }
-        std::thread::sleep(Duration::from_millis(20));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .unwrap_or_else(|err| {
+                panic!("failed to open lock file {}: {err}", lock_path.display())
+            });
+        #[cfg(unix)]
+        {
+            let _ = fs::set_permissions(lock_path, fs::Permissions::from_mode(0o600));
+        }
+        file.lock()
+            .unwrap_or_else(|err| panic!("failed to acquire lock {}: {err}", lock_path.display()));
+        Self { _file: file }
     }
-    panic!("lock {} never became held", lock_path.display());
 }
 
-#[cfg(unix)]
-async fn wait_sshd_accepted(sshd: &ThrowawaySshd, target_count: usize) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while sshd.log().matches("Accepted publickey").count() < target_count {
+fn quote_posix_token(token: &str) -> String {
+    let plain_safe = token.bytes().all(|b| {
+        b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'-' | b'_' | b'+' | b':' | b'@')
+    });
+    if plain_safe {
+        token.to_owned()
+    } else {
+        format!("'{}'", token.replace('\'', "'\\''"))
+    }
+}
+
+fn sh_single_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// Wraps a single invite's forced command executable in `authorized_keys` with a tiny `0o700`
+/// helper script that reads the client's JSON enrolment line, atomically creates a marker file
+/// under `marker_dir`, and `exec`s the real `legion` binary with stdin redirected from that file.
+///
+/// Because `authorized_keys` retains the exact forced-command grammar (only the executable path
+/// changes), `legion` still parses and consumes the invite line as `LineKind::Invite`, while tests
+/// get an explicit hand-over proving the client sent its request and the server started enrolling.
+struct EnrolHandover {
+    marker_dir: PathBuf,
+}
+
+impl EnrolHandover {
+    fn install(
+        root: &Path,
+        auth_keys: &Path,
+        legion_bin: &Path,
+        invite_id: &str,
+        tag: &str,
+    ) -> Self {
+        let marker_dir = root.join(format!("enrol-handover-{tag}"));
+        fs::create_dir_all(&marker_dir).unwrap();
+        #[cfg(unix)]
+        {
+            let _ = fs::set_permissions(&marker_dir, fs::Permissions::from_mode(0o700));
+        }
+        // Basename must be `legion` so `authkeys` continues to parse the wrapped line as `LineKind::Invite`.
+        let wrapper_path = marker_dir.join("legion");
+        let script = format!(
+            "#!/bin/sh\n\
+             set -eu\n\
+             IFS= read -r line\n\
+             tmp={dir}/req-\"$$\".tmp\n\
+             ready={dir}/req-\"$$\".ready\n\
+             printf '%s\\n' \"$line\" > \"$tmp\"\n\
+             mv \"$tmp\" \"$ready\"\n\
+             exec {bin} \"$@\" < \"$ready\"\n",
+            dir = sh_single_quote(&marker_dir.to_string_lossy()),
+            bin = sh_single_quote(&legion_bin.to_string_lossy()),
+        );
+        fs::write(&wrapper_path, script).unwrap();
+        #[cfg(unix)]
+        {
+            let _ = fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o700));
+        }
+
+        let old_prefix = format!(
+            "command=\"{} gate --enrol ",
+            quote_posix_token(&legion_bin.to_string_lossy())
+        );
+        let new_prefix = format!(
+            "command=\"{} gate --enrol ",
+            quote_posix_token(&wrapper_path.to_string_lossy())
+        );
+        let invite_tag = format!("legion-invite:{invite_id}");
+        let raw = fs::read_to_string(auth_keys).unwrap();
+        let mut replaced = false;
+        let updated: Vec<String> = raw
+            .lines()
+            .map(|line| {
+                if line.contains(&invite_tag) && line.contains(&old_prefix) {
+                    replaced = true;
+                    line.replacen(&old_prefix, &new_prefix, 1)
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect();
+        assert!(
+            replaced,
+            "could not wrap forced command for {invite_tag} (expected {old_prefix:?}) in:\n{raw}"
+        );
+        fs::write(auth_keys, format!("{}\n", updated.join("\n"))).unwrap();
+        #[cfg(unix)]
+        {
+            let _ = fs::set_permissions(auth_keys, fs::Permissions::from_mode(0o600));
+        }
+        Self { marker_dir }
+    }
+
+    fn ready_count(&self) -> usize {
+        fs::read_dir(&self.marker_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("ready"))
+            .count()
+    }
+
+    async fn wait_received<T>(
+        &self,
+        expected: usize,
+        step: &str,
+        sshd: &ThrowawaySshd,
+        in_flight: Option<&tokio::task::JoinHandle<T>>,
+    ) {
+        let deadline = Instant::now() + HANG_GUARD;
+        loop {
+            let count = self.ready_count();
+            if count >= expected {
+                return;
+            }
+            if let Some(handle) = in_flight {
+                assert!(
+                    !handle.is_finished(),
+                    "in-flight task exited before step [{step}] (received {count}/{expected} markers)\n--- sshd log ---\n{}",
+                    sshd.log()
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out after {}s at step [{step}] (received {count}/{expected} markers in {})\n--- sshd log ---\n{}",
+                HANG_GUARD.as_secs(),
+                self.marker_dir.display(),
+                sshd.log()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
+async fn wait_path_exists<T>(
+    path: &Path,
+    step: &str,
+    sshd: &ThrowawaySshd,
+    in_flight: Option<&tokio::task::JoinHandle<T>>,
+) {
+    let deadline = Instant::now() + HANG_GUARD;
+    while !path.exists() {
+        if let Some(handle) = in_flight {
+            assert!(
+                !handle.is_finished(),
+                "in-flight task exited before step [{step}] (missing {})\n--- sshd log ---\n{}",
+                path.display(),
+                sshd.log()
+            );
+        }
         assert!(
             Instant::now() < deadline,
-            "sshd never accepted connection #{target_count}:\n{}",
+            "timed out after {}s at step [{step}] (missing {})\n--- sshd log ---\n{}",
+            HANG_GUARD.as_secs(),
+            path.display(),
             sshd.log()
         );
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_file_contains(path: &Path, needle: &str, step: &str, sshd: &ThrowawaySshd) {
+    let deadline = Instant::now() + HANG_GUARD;
+    loop {
+        if fs::read_to_string(path)
+            .unwrap_or_default()
+            .contains(needle)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out after {}s at step [{step}] ({} never contained {needle:?})\n--- sshd log ---\n{}",
+            HANG_GUARD.as_secs(),
+            path.display(),
+            sshd.log()
+        );
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+}
+
+async fn wait_sshd_log_count(sshd: &ThrowawaySshd, needle: &str, target_count: usize, step: &str) {
+    let deadline = Instant::now() + HANG_GUARD;
+    loop {
+        let log = sshd.log();
+        let count = log.matches(needle).count();
+        if count >= target_count {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out after {}s at step [{step}] (sshd log had {count}/{target_count} occurrences of {needle:?})\n--- sshd log ---\n{log}",
+            HANG_GUARD.as_secs(),
+        );
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+}
+
+/// Yields to the Tokio runtime while waiting for another process (such as `legion gate --enrol`)
+/// to hold the exclusive kernel lock on `lock_path`.
+///
+/// Must stay `async` so spawned client tasks on `#[tokio::test]`'s single-threaded runtime continue
+/// running while waiting for the server process to reach the lock.
+#[cfg(unix)]
+async fn wait_lock_held<T>(
+    lock_path: &Path,
+    step: &str,
+    sshd: &ThrowawaySshd,
+    holder_task: &tokio::task::JoinHandle<T>,
+) {
+    let deadline = Instant::now() + HANG_GUARD;
+    loop {
+        match OpenOptions::new().read(true).write(true).open(lock_path) {
+            Ok(file) => match file.try_lock() {
+                Err(std::fs::TryLockError::WouldBlock) => return,
+                Ok(()) => drop(file),
+                Err(std::fs::TryLockError::Error(err)) => {
+                    panic!(
+                        "step [{step}]: probing lock {} failed: {err}\n--- sshd log ---\n{}",
+                        lock_path.display(),
+                        sshd.log()
+                    );
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                panic!(
+                    "step [{step}]: opening lock {} failed: {err}\n--- sshd log ---\n{}",
+                    lock_path.display(),
+                    sshd.log()
+                );
+            }
+        }
+        assert!(
+            !holder_task.is_finished(),
+            "in-flight task exited before step [{step}] (lock {} was never held)\n--- sshd log ---\n{}",
+            lock_path.display(),
+            sshd.log()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "timed out after {}s at step [{step}] (lock {} never became held)\n--- sshd log ---\n{}",
+            HANG_GUARD.as_secs(),
+            lock_path.display(),
+            sshd.log()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -1402,13 +1672,6 @@ async fn real_sshd_shared_principal_post_send_not_found_does_not_recover() {
     ) else {
         return;
     };
-    if find_tool("flock").is_none() {
-        assert!(
-            !common::require_real_binary(),
-            "pairing::real_sshd_shared_principal_post_send_not_found_does_not_recover: flock unavailable"
-        );
-        return;
-    }
 
     let root = strict_tempdir();
     let user_home = root.path().join("home");
@@ -1481,12 +1744,14 @@ async fn real_sshd_shared_principal_post_send_not_found_does_not_recover() {
         .unwrap();
     confirm_y.close().await;
 
-    // Two holders of a fresh shared-principal invite race deterministically:
+    // Two holders of a fresh shared-principal invite race deterministically via explicit hand-over:
     // 1. Hold `.authorized_keys.legion.lock` so intruder X acquires `config.lock` first and blocks
     //    before editing `authorized_keys` (leaving the invite key accepted by sshd).
-    // 2. Start victim Y (`link_y.pair`): sshd accepts the invite key, Y sends its enrolment line,
-    //    and blocks on `config.lock` behind X.
-    // 3. Release `.authorized_keys.legion.lock`: X is guaranteed to finish enrolling first and
+    // 2. Wait explicitly for X's request marker AND for X's `legion gate --enrol` to hold
+    //    `config.lock` (yielding to Tokio so X's task makes progress).
+    // 3. Start victim Y (`link_y.pair`) and wait explicitly for Y's server-side request marker,
+    //    proving sshd accepted Y and Y already sent its enrolment line before releasing the lock.
+    // 4. Release `.authorized_keys.legion.lock`: X is guaranteed to finish enrolling first and
     //    consume the invite, so Y reliably receives post-send `ErrorCode::NotFound` and MUST NOT
     //    probe/recover (which would hide that X consumed the invite).
     let inv2_res = run_legion(
@@ -1502,15 +1767,15 @@ async fn real_sshd_shared_principal_post_send_not_found_does_not_recover() {
         ],
     );
     let inv2_text = inv2_res["invite"].as_str().unwrap().to_owned();
+    let inv2_id = inv2_res["id"].as_str().unwrap();
     let inv2 = Invite::parse(&inv2_text).unwrap();
+    let handover =
+        EnrolHandover::install(root.path(), &auth_keys, &legion_bin, inv2_id, "shared-race");
     let auth_lock = ssh_dir.join(".authorized_keys.legion.lock");
     let config_lock = legion_home.join("state").join("sync").join("config.lock");
-    let Some(mut auth_holder) = hold_flock(&auth_lock) else {
-        return;
-    };
+    let auth_holder = HeldLock::acquire(&auth_lock);
 
     let key_x = DeviceKey::generate().unwrap();
-    let accepted_before = sshd.log().matches("Accepted publickey").count();
     let inv_x = inv2.clone();
     let tx = tokio::spawn(async move {
         enrol(
@@ -1522,8 +1787,21 @@ async fn real_sshd_shared_principal_post_send_not_found_does_not_recover() {
         )
         .await
     });
-    wait_sshd_accepted(&sshd, accepted_before + 1).await;
-    wait_lock_busy(&config_lock);
+    handover
+        .wait_received(
+            1,
+            "shared-principal race: server received intruder X enrolment request",
+            &sshd,
+            Some(&tx),
+        )
+        .await;
+    wait_lock_held(
+        &config_lock,
+        "shared-principal race: intruder X acquired config.lock before blocking on auth_lock",
+        &sshd,
+        &tx,
+    )
+    .await;
 
     let link_y = Link::new(LinkConfig {
         device_key: Some(key_y.to_openssh().unwrap()),
@@ -1532,11 +1810,17 @@ async fn real_sshd_shared_principal_post_send_not_found_does_not_recover() {
     let ly = link_y.clone();
     let inv_y = inv2_text.clone();
     let ty = tokio::spawn(async move { ly.pair(&inv_y, "phone").await });
-    wait_sshd_accepted(&sshd, accepted_before + 2).await;
-    tokio::time::sleep(Duration::from_millis(350)).await;
+    handover
+        .wait_received(
+            2,
+            "shared-principal race: server received victim Y enrolment request",
+            &sshd,
+            Some(&ty),
+        )
+        .await;
+    tokio::task::yield_now().await;
 
-    let _ = auth_holder.kill();
-    let _ = auth_holder.wait();
+    drop(auth_holder);
 
     let rx = tx.await.unwrap();
     let ry = ty.await.unwrap();
@@ -1560,13 +1844,6 @@ async fn real_sshd_cancel_before_machine_commits_stays_honest_and_retry_picks_up
     ) else {
         return;
     };
-    if find_tool("flock").is_none() {
-        assert!(
-            !common::require_real_binary(),
-            "pairing::real_sshd_cancel_before_machine_commits_stays_honest_and_retry_picks_up_pairing: flock unavailable"
-        );
-        return;
-    }
 
     let root = strict_tempdir();
     let user_home = root.path().join("home");
@@ -1613,12 +1890,18 @@ async fn real_sshd_cancel_before_machine_commits_stays_honest_and_retry_picks_up
         ],
     );
     let inv_text = inv_res["invite"].as_str().unwrap().to_owned();
+    let inv_id = inv_res["id"].as_str().unwrap();
+    let handover = EnrolHandover::install(
+        root.path(),
+        &auth_keys,
+        &legion_bin,
+        inv_id,
+        "cancel-before-commit",
+    );
 
     // Hold `config.lock` so the machine receives the enrolment request and waits before committing.
     let config_lock = legion_home.join("state").join("sync").join("config.lock");
-    let Some(mut holder) = hold_flock(&config_lock) else {
-        return;
-    };
+    let holder = HeldLock::acquire(&config_lock);
 
     let key = DeviceKey::generate().unwrap();
     let link = Link::new(LinkConfig {
@@ -1626,15 +1909,22 @@ async fn real_sshd_cancel_before_machine_commits_stays_honest_and_retry_picks_up
         ..LinkConfig::default()
     });
     let cancel = CancellationToken::new();
-    let accepted_before = sshd.log().matches("Accepted publickey").count();
     let task = {
         let link = link.clone();
         let inv = inv_text.clone();
         let cancel = cancel.clone();
         tokio::spawn(async move { link.pair_cancellable(&inv, "phone", cancel).await })
     };
-    wait_sshd_accepted(&sshd, accepted_before + 1).await;
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    handover
+        .wait_received(
+            1,
+            "cancel-before-commit test: server received client enrolment request while config.lock held",
+            &sshd,
+            Some(&task),
+        )
+        .await;
+    // Yield once so the client task finishes its post-write `sent = true` store before cancel fires.
+    tokio::task::yield_now().await;
     cancel.cancel();
 
     let err = task
@@ -1665,8 +1955,7 @@ async fn real_sshd_cancel_before_machine_commits_stays_honest_and_retry_picks_up
     );
 
     // Release `config.lock`: the machine now finishes the in-flight enrolment cleanly.
-    let _ = holder.kill();
-    let _ = holder.wait();
+    drop(holder);
     let key_b64 = key
         .public_key_line("phone")
         .unwrap()
@@ -1674,20 +1963,13 @@ async fn real_sshd_cancel_before_machine_commits_stays_honest_and_retry_picks_up
         .nth(1)
         .unwrap()
         .to_owned();
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while !fs::read_to_string(&auth_keys)
-        .unwrap_or_default()
-        .contains(&key_b64)
-        && Instant::now() < deadline
-    {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(
-        fs::read_to_string(&auth_keys)
-            .unwrap_or_default()
-            .contains(&key_b64),
-        "machine finished enrolling the in-flight request after lock release"
-    );
+    wait_file_contains(
+        &auth_keys,
+        &key_b64,
+        "cancel-before-commit test: machine committing in-flight enrolment after config.lock release",
+        &sshd,
+    )
+    .await;
 
     // Pairing again with the SAME kept invite picks up the finished pairing automatically.
     let picked_up = link.pair(&inv_text, "phone").await.unwrap_or_else(|e| {
@@ -2370,13 +2652,6 @@ async fn real_sshd_concurrent_pair_same_machine_refuses_second_and_keeps_consist
     ) else {
         return;
     };
-    if find_tool("flock").is_none() {
-        assert!(
-            !common::require_real_binary(),
-            "pairing::real_sshd_concurrent_pair_same_machine_refuses_second_and_keeps_consistent_state: flock unavailable"
-        );
-        return;
-    }
 
     let root = strict_tempdir();
     let user_home = root.path().join("home");
@@ -2440,26 +2715,38 @@ async fn real_sshd_concurrent_pair_same_machine_refuses_second_and_keeps_consist
         ],
     );
     let inv1_text = inv1["invite"].as_str().unwrap().to_owned();
+    let inv1_id = inv1["id"].as_str().unwrap();
     let inv2_text = inv2["invite"].as_str().unwrap().to_owned();
     let inv2_id = inv2["id"].as_str().unwrap().to_owned();
+    let handover = EnrolHandover::install(
+        root.path(),
+        &auth_keys,
+        &legion_bin,
+        inv1_id,
+        "concurrent-pair",
+    );
 
     let config_lock = legion_home.join("state").join("sync").join("config.lock");
-    let Some(mut holder) = hold_flock(&config_lock) else {
-        return;
-    };
+    let holder = HeldLock::acquire(&config_lock);
 
     let key = DeviceKey::generate().unwrap();
     let link = Link::new(LinkConfig {
         device_key: Some(key.to_openssh().unwrap()),
         ..LinkConfig::default()
     });
-    let accepted_before = sshd.log().matches("Accepted publickey").count();
     let first_task = {
         let link = link.clone();
         let inv = inv1_text.clone();
         tokio::spawn(async move { link.pair(&inv, "phone1").await })
     };
-    wait_sshd_accepted(&sshd, accepted_before + 1).await;
+    handover
+        .wait_received(
+            1,
+            "concurrent-pair test: server received first pairing request while config.lock held",
+            &sshd,
+            Some(&first_task),
+        )
+        .await;
 
     // While first pairing is in flight for `tower`, a second concurrent `pair` for `tower` MUST
     // fail immediately with Busy without sending anything or spending `inv2`.
@@ -2480,8 +2767,7 @@ async fn real_sshd_concurrent_pair_same_machine_refuses_second_and_keeps_consist
     );
 
     // Release `config.lock`: first pairing finishes and `Link` matches `meta.whoami`.
-    let _ = holder.kill();
-    let _ = holder.wait();
+    drop(holder);
     let first_ok = first_task
         .await
         .unwrap()
