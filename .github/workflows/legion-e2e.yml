@@ -406,6 +406,22 @@ jobs:
           }
           & node @argsList
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($env:E2E_SANDBOX_ONLY -eq 'true') {
+            $probePath = Join-Path $env:E2E_DIR 'winsta-probe.ps1'
+            if (Test-Path -LiteralPath $probePath) {
+              Write-Output '--- SAME-SESSION SSHD VERIFICATION (ACE REVOKED ON WORKER EXIT) ---'
+              $sameSessionCmd = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ""& '$probePath'; & '$env:E2E_FAR_BIN' meta.doctor --json | Out-Null; if (`$LASTEXITCODE -ne 0) { exit `$LASTEXITCODE }; Write-Output '--- AFTER DOCTOR ---'; & '$probePath'"""
+              $post = (& ssh -T -o BatchMode=yes legion-e2e-far $sameSessionCmd | Out-String)
+              Write-Output $post
+              if ($LASTEXITCODE -ne 0) {
+                throw "Same-session sshd meta.doctor check failed with exit $LASTEXITCODE"
+              }
+              $afterPart = ($post -split '--- AFTER DOCTOR ---', 2)[1]
+              if (-not $afterPart -or $afterPart -match 'S-1-15-2-') {
+                throw "Leftover AppContainer ACE remained on sshd Window Station/Desktop after worker exit:`n$post"
+              }
+            }
+          }
 
       # What there is to read when it fails: both audit logs, the doctor's answers, every call the
       # driver made, and sshd's log. None of it is key material, and the check below makes sure.

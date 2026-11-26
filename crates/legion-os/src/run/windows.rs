@@ -274,6 +274,7 @@ pub(super) async fn run_sandboxed(
         pid,
         process,
         job,
+        winsta_grant,
         stdin_writer,
         stdout_reader,
         stderr_reader,
@@ -294,6 +295,7 @@ pub(super) async fn run_sandboxed(
     struct Handles {
         process: sandbox::windows::OwnedWinHandle,
         job: sandbox::windows::OwnedWinHandle,
+        _winsta_grant: Option<sandbox::windows::WindowStationGrant>,
     }
     impl Handles {
         fn terminate_job(&self) {
@@ -303,7 +305,11 @@ pub(super) async fn run_sandboxed(
                 unsafe { windows::Win32::System::JobObjects::TerminateJobObject(self.job.0, 1) };
         }
     }
-    let handles = Arc::new(Handles { process, job });
+    let handles = Arc::new(Handles {
+        process,
+        job,
+        _winsta_grant: winsta_grant,
+    });
 
     // Ensure the sandbox Job Object is terminated even if this future is dropped early.
     struct JobDropGuard(Arc<Handles>);

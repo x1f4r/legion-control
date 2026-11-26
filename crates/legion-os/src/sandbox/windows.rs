@@ -29,18 +29,21 @@ use windows::Win32::Foundation::{
     HANDLE, HLOCAL, LocalFree,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, SE_FILE_OBJECT,
-    SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW,
+    GetSecurityInfo, REVOKE_ACCESS, SE_FILE_OBJECT, SE_WINDOW_OBJECT, SetEntriesInAclW,
+    SetNamedSecurityInfoW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows::Win32::Security::{
-    ACL, CreateRestrictedToken, DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE, FreeSid,
-    GetLengthSid, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, LUA_TOKEN,
-    NO_INHERITANCE, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES,
-    SID_AND_ATTRIBUTES, SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY,
-    TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenIntegrityLevel, TokenIsAppContainer,
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+    CreateRestrictedToken, DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE, EqualSid, FreeSid,
+    GetAce, GetAclInformation, GetLengthSid, GetSidSubAuthority, GetSidSubAuthorityCount,
+    GetTokenInformation, LUA_TOKEN, NO_INHERITANCE, PSECURITY_DESCRIPTOR, PSID,
+    SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES, SetTokenInformation,
+    TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL,
+    TOKEN_QUERY, TokenIntegrityLevel, TokenIsAppContainer,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_SHARE_READ,
@@ -54,14 +57,18 @@ use windows::Win32::System::JobObjects::{
     JobObjectExtendedLimitInformation, SetInformationJobObject,
 };
 use windows::Win32::System::Pipes::CreatePipe;
+use windows::Win32::System::StationsAndDesktops::{
+    CloseDesktop, CloseWindowStation, DESKTOP_CONTROL_FLAGS, GetProcessWindowStation,
+    GetThreadDesktop, GetUserObjectInformationW, OpenDesktopW, OpenWindowStationW, UOI_NAME,
+};
 use windows::Win32::System::SystemServices::{JOB_OBJECT_UILIMIT_ALL, SE_GROUP_INTEGRITY};
 use windows::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
     CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
-    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-    PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
-    UpdateProcThreadAttribute,
+    GetCurrentThreadId, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, ResumeThread,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
 };
 use windows::core::{BOOL, PCWSTR, PWSTR};
 
@@ -73,8 +80,36 @@ const APPCONTAINER_NAME: &str = "Legion.DecodeWorker";
 const APPCONTAINER_DISPLAY_NAME: &str = "Legion Decode Worker";
 const APPCONTAINER_DESCRIPTION: &str = "Sandboxed media decode worker for Legion";
 const LOW_INTEGRITY_SID_STR: &str = "S-1-16-4096";
+const ALL_APP_PACKAGES_SID_STR: &str = "S-1-15-2-1";
 const SECURITY_MANDATORY_LOW_RID: u32 = 0x1000;
 const AC_FALLBACK_REASON_ENV: &str = "LEGION_WIN_AC_FALLBACK_REASON";
+
+// Standard Win32 access bits for Window Station and Desktop DACL management in non-interactive
+// sessions (e.g. Windows OpenSSH `sshd`, where `Service-0x0-<LUID>$\Default` omits
+// `ALL APPLICATION PACKAGES` and `user32.dll` fails initialization with `0xC0000142` unless our
+// specific AppContainer SID has read/connect access).
+const WIN_READ_CONTROL: u32 = 0x0002_0000;
+const WIN_WRITE_DAC: u32 = 0x0004_0000;
+const WINSTA_ENUMDESKTOPS: u32 = 0x0001;
+const WINSTA_READATTRIBUTES: u32 = 0x0002;
+const WINSTA_ACCESSGLOBALATOMS: u32 = 0x0020;
+const WINSTA_ENUMERATE: u32 = 0x0100;
+/// Minimal Window Station rights needed for `user32.dll` initialization inside AppContainer
+/// (omits clipboard, read-screen, desktop creation, write-attributes, and exit-windows; Job Object
+/// `JOB_OBJECT_UILIMIT_ALL` additionally blocks all UI interaction before the child thread resumes).
+const WINSTA_MIN_ACCESS: u32 = WIN_READ_CONTROL
+    | WINSTA_ENUMDESKTOPS
+    | WINSTA_READATTRIBUTES
+    | WINSTA_ACCESSGLOBALATOMS
+    | WINSTA_ENUMERATE;
+const DESKTOP_READOBJECTS: u32 = 0x0001;
+const DESKTOP_ENUMERATE: u32 = 0x0040;
+/// Minimal Desktop rights needed for `user32.dll` initialization inside AppContainer (read-only
+/// connect; omits create-window, create-menu, hooks, journal, write-objects, and switch-desktop).
+const DESKTOP_MIN_ACCESS: u32 = WIN_READ_CONTROL | DESKTOP_READOBJECTS | DESKTOP_ENUMERATE;
+const WIN_GENERIC_ALL: u32 = 0x1000_0000;
+const ACE_FLAG_INHERIT_ONLY: u8 = 0x08;
+const ACE_TYPE_ACCESS_ALLOWED: u8 = 0;
 
 /// Serializes inheritable stdio handle duplication across sandboxed `CreateProcess*` calls.
 static SANDBOX_SPAWN_LOCK: Mutex<()> = Mutex::new(());
@@ -84,6 +119,412 @@ static APPCONTAINER_SID_CACHE: OnceLock<std::result::Result<Vec<u8>, String>> = 
 
 /// Paths whose DACL has already been granted RX for our AppContainer SID in this process.
 static APPCONTAINER_ACL_CACHE: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+/// Refcounted process-wide guard tracking temporary Window Station / Desktop ACEs added for
+/// non-interactive sessions (such as `sshd` Session 0 `Service-0x0-<LUID>$\Default`).
+struct WinstaGrantState {
+    refcount: usize,
+    sid_bytes: Vec<u8>,
+    granted_winsta: Option<Vec<u16>>,
+    granted_desk: Option<Vec<u16>>,
+}
+
+static WINSTA_GRANT_STATE: Mutex<WinstaGrantState> = Mutex::new(WinstaGrantState {
+    refcount: 0,
+    sid_bytes: Vec::new(),
+    granted_winsta: None,
+    granted_desk: None,
+});
+
+/// RAII token holding a temporary Window Station / Desktop ACE grant for our specific AppContainer
+/// SID while one or more AppContainer child processes are alive in a non-interactive session.
+///
+/// On interactive desktops (`WinSta0\Default`), Windows already grants `ALL APPLICATION PACKAGES`
+/// (`S-1-15-2-1`) access, so no DACL is modified and [`WindowStationGrant::acquire`] returns
+/// `None`. When the last live grant drops, our SID's ACE is revoked via `REVOKE_ACCESS`.
+pub(crate) struct WindowStationGrant;
+
+impl WindowStationGrant {
+    fn acquire(sid_bytes: &[u8]) -> Option<Self> {
+        let mut state = WINSTA_GRANT_STATE.lock().unwrap_or_else(|p| p.into_inner());
+        if state.refcount > 0 {
+            state.refcount += 1;
+            return Some(Self);
+        }
+
+        // SAFETY: `GetProcessWindowStation` and `GetThreadDesktop` return OS-owned handles for the
+        // current process/thread that must not be closed.
+        let Ok(cur_ws) = (unsafe { GetProcessWindowStation() }) else {
+            return None;
+        };
+        if cur_ws.is_invalid() {
+            return None;
+        }
+        // SAFETY: `GetCurrentThreadId` and `GetThreadDesktop` take plain integer arguments.
+        let Ok(cur_dk) = (unsafe { GetThreadDesktop(GetCurrentThreadId()) }) else {
+            return None;
+        };
+        if cur_dk.is_invalid() {
+            return None;
+        }
+
+        let ws_name = query_user_object_name(HANDLE(cur_ws.0));
+        let dk_name = query_user_object_name(HANDLE(cur_dk.0));
+
+        let ws_modified = grant_winsta_if_needed(ws_name.as_deref(), HANDLE(cur_ws.0), sid_bytes);
+        let dk_modified = grant_desktop_if_needed(dk_name.as_deref(), HANDLE(cur_dk.0), sid_bytes);
+
+        if !ws_modified && !dk_modified {
+            return None;
+        }
+
+        state.sid_bytes = sid_bytes.to_vec();
+        state.granted_winsta = if ws_modified { ws_name } else { None };
+        state.granted_desk = if dk_modified { dk_name } else { None };
+        state.refcount = 1;
+        Some(Self)
+    }
+}
+
+impl Drop for WindowStationGrant {
+    fn drop(&mut self) {
+        let mut state = WINSTA_GRANT_STATE.lock().unwrap_or_else(|p| p.into_inner());
+        if state.refcount == 0 {
+            return;
+        }
+        state.refcount -= 1;
+        if state.refcount > 0 {
+            return;
+        }
+        let sid_bytes = std::mem::take(&mut state.sid_bytes);
+        let ws_name = state.granted_winsta.take();
+        let dk_name = state.granted_desk.take();
+
+        // Keep `WINSTA_GRANT_STATE` locked across revocation so a concurrent `acquire()` cannot
+        // observe the soon-to-be-revoked ACE and skip granting for its own child.
+        if !sid_bytes.is_empty() {
+            if let Some(name) = ws_name {
+                revoke_winsta(&name, &sid_bytes);
+            }
+            if let Some(name) = dk_name {
+                revoke_desktop(&name, &sid_bytes);
+            }
+        }
+    }
+}
+
+fn query_user_object_name(handle: HANDLE) -> Option<Vec<u16>> {
+    let mut needed = 0u32;
+    // SAFETY: size query with `None` output buffer.
+    let _ = unsafe { GetUserObjectInformationW(handle, UOI_NAME, None, 0, Some(&mut needed)) };
+    if needed < 2 {
+        return None;
+    }
+    let mut wide = vec![0u16; (needed as usize).div_ceil(2) + 1];
+    // SAFETY: `wide` holds at least `needed` writable bytes.
+    unsafe {
+        GetUserObjectInformationW(
+            handle,
+            UOI_NAME,
+            Some(wide.as_mut_ptr().cast::<c_void>()),
+            needed,
+            Some(&mut needed),
+        )
+    }
+    .ok()?;
+    if let Some(pos) = wide.iter().position(|&c| c == 0) {
+        wide.truncate(pos + 1);
+    } else {
+        wide.push(0);
+    }
+    (wide.len() > 1).then_some(wide)
+}
+
+fn dacl_already_allows(dacl: *const ACL, sid_bytes: &[u8], required_mask: u32) -> bool {
+    if dacl.is_null() {
+        // A NULL DACL grants unrestricted access to everyone; do not replace it.
+        return true;
+    }
+    let all_ac_w = str_to_wide_null(ALL_APP_PACKAGES_SID_STR);
+    let mut all_ac_sid = PSID::default();
+    // SAFETY: `all_ac_w` is NUL-terminated; freed with `LocalFree` before return.
+    let has_all_ac =
+        unsafe { ConvertStringSidToSidW(PCWSTR::from_raw(all_ac_w.as_ptr()), &mut all_ac_sid) }
+            .is_ok()
+            && !all_ac_sid.0.is_null();
+
+    let our_psid = PSID(sid_bytes.as_ptr().cast_mut().cast::<c_void>());
+    let mut size_info = ACL_SIZE_INFORMATION::default();
+    let mut granted_mask = 0u32;
+
+    // SAFETY: `dacl` is a valid Win32 ACL pointer returned by `GetSecurityInfo`.
+    let got_info = unsafe {
+        GetAclInformation(
+            dacl,
+            (&raw mut size_info).cast::<c_void>(),
+            size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    }
+    .is_ok();
+
+    if got_info {
+        for idx in 0..size_info.AceCount {
+            let mut ace_ptr: *mut c_void = std::ptr::null_mut();
+            // SAFETY: `idx < size_info.AceCount` for `dacl`.
+            if unsafe { GetAce(dacl, idx, &mut ace_ptr) }.is_err() || ace_ptr.is_null() {
+                continue;
+            }
+            // SAFETY: every ACE begins with `ACE_HEADER`.
+            let header = unsafe { &*ace_ptr.cast::<ACE_HEADER>() };
+            if header.AceType != ACE_TYPE_ACCESS_ALLOWED
+                || (header.AceFlags & ACE_FLAG_INHERIT_ONLY) != 0
+            {
+                continue;
+            }
+            // SAFETY: `AceType == ACCESS_ALLOWED_ACE_TYPE` confirms `ACCESS_ALLOWED_ACE` layout.
+            let allowed = unsafe { &*ace_ptr.cast::<ACCESS_ALLOWED_ACE>() };
+            let ace_sid = PSID((&raw const allowed.SidStart).cast_mut().cast::<c_void>());
+            // SAFETY: `ace_sid`, `our_psid`, and `all_ac_sid` are valid Win32 SIDs.
+            let matches_sid = unsafe { EqualSid(ace_sid, our_psid) }.is_ok()
+                || (has_all_ac && unsafe { EqualSid(ace_sid, all_ac_sid) }.is_ok());
+            if matches_sid {
+                granted_mask |= allowed.Mask;
+            }
+        }
+    }
+
+    if has_all_ac {
+        // SAFETY: `all_ac_sid` was allocated by `ConvertStringSidToSidW` and freed via `LocalFree`.
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(all_ac_sid.0)));
+        }
+    }
+
+    (granted_mask & required_mask) == required_mask || (granted_mask & WIN_GENERIC_ALL) != 0
+}
+
+fn grant_window_object_ace_if_needed(handle: HANDLE, sid_bytes: &[u8], access_mask: u32) -> bool {
+    let mut old_dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+
+    // SAFETY: `handle` is a valid Window Station or Desktop handle; `sd` is freed below.
+    let get_err = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_WINDOW_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut old_dacl),
+            None,
+            Some(&mut sd),
+        )
+    };
+    if get_err.0 != 0 {
+        return false;
+    }
+
+    let mut modified = false;
+    if !dacl_already_allows(old_dacl, sid_bytes, access_mask) {
+        let ea = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: access_mask,
+            grfAccessMode: GRANT_ACCESS,
+            grfInheritance: NO_INHERITANCE,
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: std::ptr::null_mut(),
+                MultipleTrusteeOperation: Default::default(),
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_UNKNOWN,
+                ptstrName: PWSTR::from_raw(sid_bytes.as_ptr().cast_mut().cast::<u16>()),
+            },
+        };
+        let mut new_dacl: *mut ACL = std::ptr::null_mut();
+        // SAFETY: `ea` references live `sid_bytes` and `old_dacl` stays live until `sd` is freed.
+        let merge_err = unsafe { SetEntriesInAclW(Some(&[ea]), Some(old_dacl), &mut new_dacl) };
+        if merge_err.0 == 0 && !new_dacl.is_null() {
+            // SAFETY: `handle` has `WRITE_DAC` and `new_dacl` was built by `SetEntriesInAclW`.
+            let set_err = unsafe {
+                SetSecurityInfo(
+                    handle,
+                    SE_WINDOW_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    None,
+                    None,
+                    Some(new_dacl),
+                    None,
+                )
+            };
+            modified = set_err.0 == 0;
+            // SAFETY: `new_dacl` was allocated by `SetEntriesInAclW`.
+            unsafe {
+                let _ = LocalFree(Some(HLOCAL(new_dacl.cast::<c_void>())));
+            }
+        }
+    }
+
+    if !sd.0.is_null() {
+        // SAFETY: `sd` was allocated by `GetSecurityInfo`.
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(sd.0)));
+        }
+    }
+    modified
+}
+
+fn revoke_window_object_ace(handle: HANDLE, sid_bytes: &[u8]) {
+    let mut old_dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+
+    // SAFETY: `handle` is a valid Window Station or Desktop handle; `sd` is freed below.
+    let get_err = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_WINDOW_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut old_dacl),
+            None,
+            Some(&mut sd),
+        )
+    };
+    if get_err.0 == 0 && !old_dacl.is_null() {
+        let ea = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: 0,
+            grfAccessMode: REVOKE_ACCESS,
+            grfInheritance: NO_INHERITANCE,
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: std::ptr::null_mut(),
+                MultipleTrusteeOperation: Default::default(),
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_UNKNOWN,
+                ptstrName: PWSTR::from_raw(sid_bytes.as_ptr().cast_mut().cast::<u16>()),
+            },
+        };
+        let mut new_dacl: *mut ACL = std::ptr::null_mut();
+        // SAFETY: `ea` references live `sid_bytes` and `old_dacl` stays live until `sd` is freed.
+        let merge_err = unsafe { SetEntriesInAclW(Some(&[ea]), Some(old_dacl), &mut new_dacl) };
+        if merge_err.0 == 0 && !new_dacl.is_null() {
+            // SAFETY: `handle` has `WRITE_DAC` and `new_dacl` was built by `SetEntriesInAclW`.
+            let _ = unsafe {
+                SetSecurityInfo(
+                    handle,
+                    SE_WINDOW_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    None,
+                    None,
+                    Some(new_dacl),
+                    None,
+                )
+            };
+            // SAFETY: `new_dacl` was allocated by `SetEntriesInAclW`.
+            unsafe {
+                let _ = LocalFree(Some(HLOCAL(new_dacl.cast::<c_void>())));
+            }
+        }
+    }
+    if !sd.0.is_null() {
+        // SAFETY: `sd` was allocated by `GetSecurityInfo`.
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(sd.0)));
+        }
+    }
+}
+
+fn grant_winsta_if_needed(name: Option<&[u16]>, fallback: HANDLE, sid_bytes: &[u8]) -> bool {
+    if let Some(wide) = name
+        // SAFETY: `wide` is NUL-terminated UTF-16; returned handle is closed below.
+        && let Ok(opened) = unsafe {
+            OpenWindowStationW(PCWSTR::from_raw(wide.as_ptr()), false, WIN_READ_CONTROL | WIN_WRITE_DAC)
+        }
+        && !opened.is_invalid()
+    {
+        let modified =
+            grant_window_object_ace_if_needed(HANDLE(opened.0), sid_bytes, WINSTA_MIN_ACCESS);
+        // SAFETY: `opened` was returned by `OpenWindowStationW`.
+        unsafe {
+            let _ = CloseWindowStation(opened);
+        }
+        return modified;
+    }
+    grant_window_object_ace_if_needed(fallback, sid_bytes, WINSTA_MIN_ACCESS)
+}
+
+fn grant_desktop_if_needed(name: Option<&[u16]>, fallback: HANDLE, sid_bytes: &[u8]) -> bool {
+    if let Some(wide) = name
+        // SAFETY: `wide` is NUL-terminated UTF-16; returned handle is closed below.
+        && let Ok(opened) = unsafe {
+            OpenDesktopW(
+                PCWSTR::from_raw(wide.as_ptr()),
+                DESKTOP_CONTROL_FLAGS(0),
+                false,
+                WIN_READ_CONTROL | WIN_WRITE_DAC,
+            )
+        }
+        && !opened.is_invalid()
+    {
+        let modified =
+            grant_window_object_ace_if_needed(HANDLE(opened.0), sid_bytes, DESKTOP_MIN_ACCESS);
+        // SAFETY: `opened` was returned by `OpenDesktopW`.
+        unsafe {
+            let _ = CloseDesktop(opened);
+        }
+        return modified;
+    }
+    grant_window_object_ace_if_needed(fallback, sid_bytes, DESKTOP_MIN_ACCESS)
+}
+
+fn revoke_winsta(name: &[u16], sid_bytes: &[u8]) {
+    // SAFETY: `name` is NUL-terminated UTF-16; returned handle is closed below.
+    if let Ok(opened) = unsafe {
+        OpenWindowStationW(
+            PCWSTR::from_raw(name.as_ptr()),
+            false,
+            WIN_READ_CONTROL | WIN_WRITE_DAC,
+        )
+    } && !opened.is_invalid()
+    {
+        revoke_window_object_ace(HANDLE(opened.0), sid_bytes);
+        // SAFETY: `opened` was returned by `OpenWindowStationW`.
+        unsafe {
+            let _ = CloseWindowStation(opened);
+        }
+        return;
+    }
+    // SAFETY: fallback to OS-owned process window station handle (must not be closed).
+    if let Ok(cur) = unsafe { GetProcessWindowStation() }
+        && !cur.is_invalid()
+    {
+        revoke_window_object_ace(HANDLE(cur.0), sid_bytes);
+    }
+}
+
+fn revoke_desktop(name: &[u16], sid_bytes: &[u8]) {
+    // SAFETY: `name` is NUL-terminated UTF-16; returned handle is closed below.
+    if let Ok(opened) = unsafe {
+        OpenDesktopW(
+            PCWSTR::from_raw(name.as_ptr()),
+            DESKTOP_CONTROL_FLAGS(0),
+            false,
+            WIN_READ_CONTROL | WIN_WRITE_DAC,
+        )
+    } && !opened.is_invalid()
+    {
+        revoke_window_object_ace(HANDLE(opened.0), sid_bytes);
+        // SAFETY: `opened` was returned by `OpenDesktopW`.
+        unsafe {
+            let _ = CloseDesktop(opened);
+        }
+        return;
+    }
+    // SAFETY: fallback to OS-owned thread desktop handle (must not be closed).
+    if let Ok(cur) = unsafe { GetThreadDesktop(GetCurrentThreadId()) }
+        && !cur.is_invalid()
+    {
+        revoke_window_object_ace(HANDLE(cur.0), sid_bytes);
+    }
+}
 
 /// RAII wrapper for an owned Win32 `HANDLE`.
 pub(crate) struct OwnedWinHandle(pub(crate) HANDLE);
@@ -619,6 +1060,7 @@ pub(crate) struct SandboxedProcess {
     pub(crate) pid: u32,
     pub(crate) process: OwnedWinHandle,
     pub(crate) job: OwnedWinHandle,
+    pub(crate) winsta_grant: Option<WindowStationGrant>,
     pub(crate) stdin_writer: Option<File>,
     pub(crate) stdout_reader: File,
     pub(crate) stderr_reader: File,
@@ -706,6 +1148,7 @@ pub(crate) fn spawn_sandboxed(
                     }
                 }
                 let ac_cwd = system_root_dir();
+                let winsta_grant = WindowStationGrant::acquire(sid_bytes);
                 match launch_with_appcontainer(
                     sid_bytes,
                     app_wide.as_deref(),
@@ -723,12 +1166,14 @@ pub(crate) fn spawn_sandboxed(
                             pid,
                             process,
                             job,
+                            winsta_grant,
                             stdin_writer: stdin_parent,
                             stdout_reader,
                             stderr_reader,
                         });
                     }
                     Err(err) => {
+                        drop(winsta_grant);
                         ac_error = Some(err.to_string());
                     }
                 }
@@ -763,6 +1208,7 @@ pub(crate) fn spawn_sandboxed(
             pid,
             process,
             job,
+            winsta_grant: None,
             stdin_writer: stdin_parent,
             stdout_reader,
             stderr_reader,
