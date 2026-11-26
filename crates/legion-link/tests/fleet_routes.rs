@@ -15,111 +15,27 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::env;
+mod common;
+
 use std::fs;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use common::{
+    current_user, find_sshd, find_tool, real_legion_bin_with_sshd, strict_tempdir, toml_literal,
+};
 use legion_link::proto::ErrorCode;
 use legion_link::{
     CAP_IF_EXISTS, Link, LinkConfig, LinkOptions, MachineRouteStatus, NodeOrigin, PutIfExists,
     PutRequest, REASON_DEVICE_REMOVED_OR_UNKNOWN, Route,
 };
 use serde_json::{Value, json};
-use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-
-fn find_tool(name: &str) -> Option<PathBuf> {
-    let path_var = env::var_os("PATH")?;
-    for dir in env::split_paths(&path_var) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-fn find_sshd() -> Option<PathBuf> {
-    if let Some(p) = find_tool("sshd") {
-        return Some(p);
-    }
-    for fallback in ["/usr/sbin/sshd", "/sbin/sshd", "/usr/local/sbin/sshd"] {
-        let p = PathBuf::from(fallback);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    None
-}
-
-fn find_legion_bin() -> Option<PathBuf> {
-    if let Some(explicit) = env::var_os("LEGION_BIN") {
-        let p = PathBuf::from(explicit);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    let exe_name = format!("legion{}", env::consts::EXE_SUFFIX);
-    let mut target_dirs = Vec::new();
-    if let Some(tmpdir) = option_env!("CARGO_TARGET_TMPDIR")
-        && let Some(parent) = Path::new(tmpdir).parent()
-    {
-        target_dirs.push(parent.to_path_buf());
-    }
-    if let Some(repo_root) = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-    {
-        target_dirs.push(repo_root.join("target"));
-    }
-    for target_dir in target_dirs {
-        for profile in ["debug", "release"] {
-            let candidate = target_dir.join(profile).join(&exe_name);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
-}
-
-fn current_user() -> Option<String> {
-    let output = Command::new("id")
-        .arg("-un")
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let name = String::from_utf8(output.stdout).ok()?.trim().to_owned();
-    (!name.is_empty()).then_some(name)
-}
-
-fn strict_tempdir() -> TempDir {
-    let dir = if let Some(base) = option_env!("CARGO_TARGET_TMPDIR") {
-        let base_path = PathBuf::from(base);
-        fs::create_dir_all(&base_path).unwrap();
-        tempfile::tempdir_in(&base_path).unwrap()
-    } else {
-        tempfile::tempdir().unwrap()
-    };
-    #[cfg(unix)]
-    {
-        let _ = fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700));
-    }
-    dir
-}
-
-fn toml_literal(path: &Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', "''"))
-}
 
 struct ManagedSshd {
     sshd_bin: PathBuf,
@@ -334,14 +250,10 @@ fn write_rpc_wrapper(
 
 #[tokio::test]
 async fn real_two_sshd_fleet_learn_direct_routing_failover_and_revocation() {
-    if !cfg!(unix) || find_sshd().is_none() || find_tool("ssh-keygen").is_none() {
-        eprintln!("skipping two-sshd fleet test: sshd/ssh-keygen unavailable");
+    let Some(legion_bin) = real_legion_bin_with_sshd(
+        "fleet_routes::real_two_sshd_fleet_learn_direct_routing_failover_and_revocation",
+    ) else {
         return;
-    }
-    let Some(legion_bin) = find_legion_bin() else {
-        panic!(
-            "built `legion` binary not found; run `cargo build -p legion-cli` (or set LEGION_BIN) before running fleet_routes"
-        );
     };
 
     let root = strict_tempdir();
@@ -637,14 +549,10 @@ async fn real_two_sshd_fleet_learn_direct_routing_failover_and_revocation() {
 
 #[tokio::test]
 async fn real_node_endpoint_superset_host_keys_does_not_flag_identity_changed() {
-    if !cfg!(unix) || find_sshd().is_none() || find_tool("ssh-keygen").is_none() {
-        eprintln!("skipping real-node host-key subset test: sshd/ssh-keygen unavailable");
+    let Some(legion_bin) = real_legion_bin_with_sshd(
+        "fleet_routes::real_node_endpoint_superset_host_keys_does_not_flag_identity_changed",
+    ) else {
         return;
-    }
-    let Some(legion_bin) = find_legion_bin() else {
-        panic!(
-            "built `legion` binary not found; run `cargo build -p legion-cli` (or set LEGION_BIN) before running fleet_routes"
-        );
     };
     let ssh_keygen_bin = find_tool("ssh-keygen").unwrap();
 
@@ -825,14 +733,10 @@ fn blake3_via_legion_stream(
 
 #[tokio::test]
 async fn real_two_sshd_relayed_streams_then_learn_switches_to_direct() {
-    if !cfg!(unix) || find_sshd().is_none() || find_tool("ssh-keygen").is_none() {
-        eprintln!("skipping two-sshd relayed stream test: sshd/ssh-keygen unavailable");
+    let Some(legion_bin) = real_legion_bin_with_sshd(
+        "fleet_routes::real_two_sshd_relayed_streams_then_learn_switches_to_direct",
+    ) else {
         return;
-    }
-    let Some(legion_bin) = find_legion_bin() else {
-        panic!(
-            "built `legion` binary not found; run `cargo build -p legion-cli` (or set LEGION_BIN) before running fleet_routes"
-        );
     };
 
     let root = strict_tempdir();
@@ -1095,14 +999,10 @@ async fn real_two_sshd_relayed_streams_then_learn_switches_to_direct() {
 
 #[tokio::test]
 async fn real_two_sshd_direct_and_relayed_put_if_exists_fail_refuses_raced_file_atomically() {
-    if !cfg!(unix) || find_sshd().is_none() || find_tool("ssh-keygen").is_none() {
-        eprintln!("skipping two-sshd if_exists race test: sshd/ssh-keygen unavailable");
+    let Some(legion_bin) = real_legion_bin_with_sshd(
+        "fleet_routes::real_two_sshd_direct_and_relayed_put_if_exists_fail_refuses_raced_file_atomically",
+    ) else {
         return;
-    }
-    let Some(legion_bin) = find_legion_bin() else {
-        panic!(
-            "built `legion` binary not found; run `cargo build -p legion-cli` (or set LEGION_BIN) before running fleet_routes"
-        );
     };
 
     let root = strict_tempdir();
@@ -1427,14 +1327,10 @@ async fn real_two_sshd_direct_and_relayed_put_if_exists_fail_refuses_raced_file_
 
 #[tokio::test]
 async fn real_two_sshd_learn_surfaces_name_mismatch_rejection_from_node() {
-    if !cfg!(unix) || find_sshd().is_none() || find_tool("ssh-keygen").is_none() {
-        eprintln!("skipping two-sshd name_mismatch learn test: sshd/ssh-keygen unavailable");
+    let Some(legion_bin) = real_legion_bin_with_sshd(
+        "fleet_routes::real_two_sshd_learn_surfaces_name_mismatch_rejection_from_node",
+    ) else {
         return;
-    }
-    let Some(legion_bin) = find_legion_bin() else {
-        panic!(
-            "built `legion` binary not found; run `cargo build -p legion-cli` (or set LEGION_BIN) before running fleet_routes"
-        );
     };
 
     let root = strict_tempdir();

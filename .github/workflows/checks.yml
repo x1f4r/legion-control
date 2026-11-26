@@ -71,10 +71,23 @@ jobs:
             target/
           key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-
+      - name: Ensure sshd is installed (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          if [ ! -x /usr/sbin/sshd ] && ! command -v sshd >/dev/null 2>&1; then
+            printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
+            sudo chmod 755 /usr/sbin/policy-rc.d
+            sudo apt-get update -q
+            sudo apt-get install -y -q --no-install-recommends openssh-server
+            sudo rm -f /usr/sbin/policy-rc.d
+          fi
       # Formatting, clippy with warnings as errors, and the tests, as scripts/check.sh runs them. The
       # tests run the built binary under a LEGION_HOME of their own, so Windows is the one place its
       # paths, its locks and its line endings are exercised.
       - run: bash scripts/check.sh rust
+        env:
+          LEGION_REQUIRE_REAL_BINARY: ${{ runner.os == 'Linux' && '1' || '' }}
       # Report 1,000-file real-disk apply throughput and write-through rename cost on Linux and Windows.
       - name: Measure 1,000-file apply throughput
         if: runner.os == 'Linux' || runner.os == 'Windows'
@@ -126,7 +139,8 @@ jobs:
         run: |
           set -euo pipefail
           cargo clippy -p legion-link --all-targets --all-features --locked -- -D warnings
-          cargo test -p legion-link --all-features --locked
+          LEGION_BIN="$PWD/target/debug/legion" LEGION_REQUIRE_REAL_BINARY=1 \
+            cargo test -p legion-link --all-features --locked
           # Search the captured tree: with pipefail, `grep -q` leaving the pipe at its first
           # match can kill `cargo tree` and make the test read as "not found".
           CLI_TREE="$(cargo tree -p legion-cli --locked)"
