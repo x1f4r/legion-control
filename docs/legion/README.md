@@ -231,4 +231,9 @@ accounts.
 | [Guides](guides.md) | Task walk-throughs: file transfer, long jobs, projects, services, power and wake, device pairing, the HTTP door, extension tools, configuration sync, and updates. |
 | [Tool reference](tools.md) | Generated reference of every built-in tool, its effect, and its input schema. |
 | [Design](design.md) | Architecture, workspace crates, wire and stream protocols, platform rules, and milestones. |
+| [Platforms](platforms.md) | Nodes, controllers, the three pipes (in-app ssh, local child, HTTP door), and packaging across platforms. |
+| [Machines](machines.md) | Machine status, hardware telemetry (`sys.info`, `sys.procs`, `sys.kill`), and wake-on-demand. |
+| [Files](files.md) | Browsing, opening, moving, searching, favourites, thumbnails, content streaming, and folder sync. |
+| [Watching and listening](player.md) | The custom video and audio player controls, folder queue, and platform full-screen behaviour. |
+| [Updates](updates.md) | Signed update sets, trust roots, sequence floors, and self-updates for the node, app, and web interface. |
 | [`examples/legion/`](../../examples/legion/) | Validated, commented example files for `node.toml`, `policy.toml`, `fleet.toml`, `projects.toml`, `tokens.toml`, and `tools.d/`. |

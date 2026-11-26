@@ -44,6 +44,8 @@ This page is the design the Rust workspace is built to.
       legion-proto/            wire types only: requests, replies, errors, tool specs (serde)
       legion-link/             client side of the wire: sessions over any pipe, shared ssh commands,
                                invites, device keys, and optional in-process ssh / local pipes
+      legion-content/          ticket-authenticated, single-range HTTP file streaming with safe
+                               headers, shared by the HTTP door and the app
       legion-os/               the one place platforms differ: shells, process trees, detaching,
                                process identity, atomic files, locks
       legion-xfer/             the transfer engine: hashes, tree listings, plans, tar streams,
@@ -56,8 +58,10 @@ This page is the design the Rust workspace is built to.
       legion-doors/            MCP (stdio and HTTP) and the JSON HTTP API
       legion-cli/              the `legion` binary: argument parsing and wiring
 
-Dependencies point one way: `proto ← link`, `proto ← update`, `proto, os, xfer ← core ← tools`, and `link, tools, update ← net ← doors ← cli`. `legion-os`,
-`legion-xfer` and `legion-update` know nothing about tools or policy, and `legion-tools` never knows a call came
+Dependencies point one way: `proto ← link`, `proto ← content`, `proto ← update`,
+`proto, os, xfer ← core ← tools`, `link, tools, update ← net`, and `content, core ← doors` with
+`legion-cli` wiring them together. `legion-os`, `legion-xfer`, `legion-content` and
+`legion-update` know nothing about tools or policy, and `legion-tools` never knows a call came
 from another machine; `legion-net` wraps a local registry and adds the tools that only make sense
 across machines.
 
@@ -150,15 +154,17 @@ are RFC 3339 UTC, durations are seconds.
 | `sys` | `sys.info`, `sys.procs`, `sys.kill` | OS, CPU, memory, disks, GPU, uptime, process control |
 | `exec` | `exec.run` | bounded command: timeout, captured output, kills the whole tree |
 | `job` | `job.start`, `job.list`, `job.status`, `job.logs`, `job.cancel`, `job.wait` | outlives the session |
-| `fs` | `fs.list`, `fs.stat`, `fs.read`, `fs.write`, `fs.edit`, `fs.mkdir`, `fs.move`, `fs.copy`, `fs.remove`, `fs.find`, `fs.grep`, `fs.hash`, `fs.manifest`, `fs.thumb` | one machine |
+| `fs` | `fs.list`, `fs.stat`, `fs.read`, `fs.write`, `fs.edit`, `fs.mkdir`, `fs.move`, `fs.copy`, `fs.remove`, `fs.find`, `fs.grep`, `fs.hash`, `fs.manifest`, `fs.tags`, `fs.thumb` | one machine |
 | `fs` (fleet) | `fs.transfer` | between any two machines, or to and from this one |
+| `fav` | `fav.list`, `fav.add`, `fav.remove`, `fav.set` | starred and pinned files and folders stored on the node |
 | `proj` | `proj.list`, `proj.add`, `proj.remove`, `proj.status`, `proj.clone`, `proj.pull`, `proj.run`, `proj.discover` | named projects and where they live |
 | `svc` | `svc.list`, `svc.status`, `svc.start`, `svc.stop`, `svc.restart`, `svc.logs` | systemd, launchd, Windows services |
 | `power` | `power.status`, `power.sleep`, `power.restart`, `power.shutdown`, `power.cancel` | busy-gated; `restart` can name the system to land in; `cancel` calls a pending one off |
 | `power` (fleet) | `power.wol`, `power.wake`, `power.switch` | wake a machine through a helper; restart one and confirm which system came back |
 | `fleet` | `fleet.list`, `fleet.ping`, `fleet.add`, `fleet.remove`, `fleet.discover`, `fleet.install`, `fleet.sync` | the machines, reachability, remote install, config sync |
 | `update` (fleet) | `update.list`, `update.read`, `update.publish` | signed update sets stored in `state/updates/` and propagated across the fleet |
-| `config` (fleet) | `config.list`, `config.read`, `config.write` | shared configuration documents (`fleet.toml`, `policy.toml`, `projects.toml`, `tools.d/*.toml`) |
+| `config` (fleet) | `config.list`, `config.read`, `config.write`, `config.set_name` | shared configuration documents (`fleet.toml`, `policy.toml`, `projects.toml`, `tools.d/*.toml`) and machine name |
+| `device` | `device.list`, `device.invite`, `device.set`, `device.remove`, `device.roles`, `device.endpoint` | paired controller devices, invite links, roles, and ssh endpoint |
 | `token` | `token.add`, `token.list`, `token.remove` | bearer tokens for `legion serve` (hashes in `tokens.toml`) |
 | `agent` | `agent.list`, `agent.add`, `agent.remove` | register Legion with AI coding agents through their own CLIs |
 | `ext` | `ext.list`, `ext.show`, `ext.define`, `ext.remove` | tools you add yourself |
