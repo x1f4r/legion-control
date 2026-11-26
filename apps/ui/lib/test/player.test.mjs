@@ -10,18 +10,22 @@ import { createAppLink, detectAppImmersiveCapability } from '../../link/app.js';
 import {
   applyPinchResistance,
   buildMediaQueue,
+  buildShuffledOrder,
   clampVolume,
   classifyPlayerKey,
   computeResumePosition,
   computeVideoZoomMetrics,
   createFullscreenController,
+  createPausedDismissTimer,
   createPictureGestureRecognizer,
   createResumeStore,
   createSpaceHoldController,
   createTurnWatcher,
   createVideoController,
+  cycleRepeatMode,
   DOUBLE_TAP_WINDOW_MS,
   extractTagsMap,
+  formatMiniPlayerDisplay,
   formatMusicDisplay,
   formatPlayerTime,
   formatPositionValueText,
@@ -33,11 +37,18 @@ import {
   GESTURE_MOVE_SLOP_PX,
   isNearEnd,
   isResumeEligible,
+  MUSIC_MODES_STORAGE_KEY,
+  MUSIC_PAUSED_DISMISS_MS,
+  normalizeRepeatMode,
   OVERLAY_HIDE_DELAY_MS,
   PLAYBACK_SPEEDS,
   preferredVideoOrientation,
   queueNeighbors,
+  readMusicModePreferences,
   readZoomPreference,
+  resolveMusicEndedAction,
+  resolveMusicPrevAction,
+  resolveMusicQueueState,
   resolvePinchZoomTarget,
   RESUME_CHIP_DURATION_MS,
   RESUME_MAX_ENTRIES,
@@ -51,6 +62,7 @@ import {
   tapZoneForPosition,
   TURN_LEAVE_GUARD_MS,
   TURN_SETTLE_MS,
+  writeMusicModePreferences,
   writeZoomPreference,
 } from '../player.js';
 
@@ -1540,4 +1552,169 @@ test('desktop Space hold engages 2x at 350 ms without toggling play/pause and sh
   space.onKeyUp();
   assert.deepEqual(log, [{ type: 'toggle', playing: false }]);
   space.dispose();
+});
+
+test('formatMiniPlayerDisplay shows title over artist and never invents Unknown artist', () => {
+  assert.deepEqual(
+    formatMiniPlayerDisplay({ title: 'Nocturne', artist: 'Clara', album: 'Evening' }, '01-nocturne.flac'),
+    { title: 'Nocturne', artist: 'Clara' },
+  );
+  assert.deepEqual(
+    formatMiniPlayerDisplay({ album: 'Evening Only' }, '02-untitled.mp3'),
+    { title: '02-untitled', artist: '' },
+  );
+  assert.deepEqual(formatMiniPlayerDisplay(null, 'track.opus'), { title: 'track', artist: '' });
+});
+
+test('shuffle and repeat mode preferences cycle cleanly and persist across restarts', () => {
+  assert.equal(cycleRepeatMode('off'), 'folder');
+  assert.equal(cycleRepeatMode('folder'), 'one');
+  assert.equal(cycleRepeatMode('one'), 'off');
+  assert.equal(normalizeRepeatMode('bogus'), 'off');
+
+  const store = new Map();
+  const storage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, String(v)),
+  };
+
+  assert.deepEqual(readMusicModePreferences(storage), { shuffle: false, repeat: 'off' });
+  writeMusicModePreferences(storage, { shuffle: true, repeat: 'folder' });
+  assert.deepEqual(readMusicModePreferences(storage), { shuffle: true, repeat: 'folder' });
+  assert.ok(store.has(MUSIC_MODES_STORAGE_KEY));
+
+  writeMusicModePreferences(storage, { shuffle: false, repeat: 'one' });
+  assert.deepEqual(readMusicModePreferences(storage), { shuffle: false, repeat: 'one' });
+});
+
+test('shuffle keeps current song first, preserves order while on, and Prev/Next follow shuffled order', () => {
+  const songs = [
+    { path: '/music/1.mp3', name: '1.mp3', kind: 'file' },
+    { path: '/music/2.mp3', name: '2.mp3', kind: 'file' },
+    { path: '/music/3.mp3', name: '3.mp3', kind: 'file' },
+    { path: '/music/4.mp3', name: '4.mp3', kind: 'file' },
+  ];
+
+  // Deterministic RNG picks index 0 on every Fisher-Yates swap -> rotates rest predictably.
+  const fixedRng = () => 0;
+  const order = buildShuffledOrder(songs, '/music/2.mp3', fixedRng);
+  assert.equal(order[0].path, '/music/2.mp3');
+  assert.deepEqual(
+    order.map((s) => s.path),
+    ['/music/2.mp3', '/music/3.mp3', '/music/4.mp3', '/music/1.mp3'],
+  );
+
+  // Starting shuffle on track 2 keeps it at index 0 and persists shuffledPaths.
+  const first = resolveMusicQueueState(songs, '/music/2.mp3', {
+    shuffle: true,
+    shuffledPaths: null,
+    repeat: 'off',
+    rng: fixedRng,
+  });
+  assert.equal(first.index, 0);
+  assert.equal(first.prev, null);
+  assert.equal(first.next?.path, '/music/3.mp3');
+  assert.deepEqual(first.shuffledPaths, ['/music/2.mp3', '/music/3.mp3', '/music/4.mp3', '/music/1.mp3']);
+
+  // Advancing to track 3 preserves the SAME shuffled order; Prev goes back to track 2, Next goes to track 4.
+  const second = resolveMusicQueueState(songs, '/music/3.mp3', {
+    shuffle: true,
+    shuffledPaths: first.shuffledPaths,
+    repeat: 'off',
+    rng: () => 0.99,
+  });
+  assert.equal(second.index, 1);
+  assert.equal(second.prev?.path, '/music/2.mp3');
+  assert.equal(second.next?.path, '/music/4.mp3');
+  assert.deepEqual(second.shuffledPaths, first.shuffledPaths);
+
+  // Turning shuffle off restores folder order around the currently playing track.
+  const unshuffled = resolveMusicQueueState(songs, '/music/3.mp3', {
+    shuffle: false,
+    shuffledPaths: first.shuffledPaths,
+    repeat: 'off',
+  });
+  assert.equal(unshuffled.index, 2);
+  assert.equal(unshuffled.prev?.path, '/music/2.mp3');
+  assert.equal(unshuffled.next?.path, '/music/4.mp3');
+  assert.equal(unshuffled.shuffledPaths, null);
+});
+
+test('repeat-folder wraps Next/Prev and track end; repeat-one repeats current song on end', () => {
+  const songs = [
+    { path: '/music/a.mp3', name: 'a.mp3', kind: 'file' },
+    { path: '/music/b.mp3', name: 'b.mp3', kind: 'file' },
+    { path: '/music/c.mp3', name: 'c.mp3', kind: 'file' },
+  ];
+
+  // Repeat off at end: no next, stops on end.
+  const endOff = resolveMusicQueueState(songs, '/music/c.mp3', { repeat: 'off' });
+  assert.equal(endOff.next, null);
+  assert.deepEqual(resolveMusicEndedAction(endOff, 'off'), { action: 'stop', entry: null });
+
+  // Repeat folder at end: wraps to first song on next and on track end.
+  const endFolder = resolveMusicQueueState(songs, '/music/c.mp3', { repeat: 'folder' });
+  assert.equal(endFolder.next?.path, '/music/a.mp3');
+  assert.deepEqual(resolveMusicEndedAction(endFolder, 'folder'), {
+    action: 'advance',
+    entry: songs[0],
+  });
+
+  // Repeat folder at start: Prev wraps to last song (when <= 3s in), restarts when > 3s in.
+  const startFolder = resolveMusicQueueState(songs, '/music/a.mp3', { repeat: 'folder' });
+  assert.equal(startFolder.prev?.path, '/music/c.mp3');
+  assert.deepEqual(resolveMusicPrevAction(startFolder, 1.0), { action: 'previous', entry: songs[2] });
+  assert.deepEqual(resolveMusicPrevAction(startFolder, 5.0), { action: 'restart', entry: null });
+
+  // Repeat one: natural end repeats the same song; explicit Next still steps when another exists.
+  const midOne = resolveMusicQueueState(songs, '/music/b.mp3', { repeat: 'one' });
+  assert.equal(midOne.next?.path, '/music/c.mp3');
+  assert.deepEqual(resolveMusicEndedAction(midOne, 'one'), { action: 'repeat_current', entry: null });
+
+  // Single-song folder: Next is absent, repeat-folder and repeat-one both repeat the sole song on end.
+  const solo = [songs[0]];
+  const soloFolder = resolveMusicQueueState(solo, '/music/a.mp3', { repeat: 'folder' });
+  assert.equal(soloFolder.next, null);
+  assert.equal(soloFolder.prev, null);
+  assert.deepEqual(resolveMusicEndedAction(soloFolder, 'folder'), { action: 'repeat_current', entry: null });
+  assert.deepEqual(resolveMusicEndedAction(soloFolder, 'off'), { action: 'stop', entry: null });
+});
+
+test('createPausedDismissTimer dismisses after 10 continuous paused minutes and cancels on resume', () => {
+  const clock = createFakeClock();
+  let dismissed = 0;
+  const timer = createPausedDismissTimer({
+    clock,
+    onDismiss: () => {
+      dismissed += 1;
+    },
+  });
+
+  assert.equal(MUSIC_PAUSED_DISMISS_MS, 600_000);
+
+  // Loaded & playing: no dismissal timer.
+  timer.sync({ loaded: true, playing: true });
+  assert.equal(timer.isPending(), false);
+  clock.advance(MUSIC_PAUSED_DISMISS_MS * 2);
+  assert.equal(dismissed, 0);
+
+  // Paused for 9m59s, then resumed -> timer cancels, never dismisses.
+  timer.sync({ loaded: true, playing: false });
+  assert.equal(timer.isPending(), true);
+  clock.advance(MUSIC_PAUSED_DISMISS_MS - 1000);
+  assert.equal(dismissed, 0);
+  timer.sync({ loaded: true, playing: true });
+  assert.equal(timer.isPending(), false);
+  clock.advance(5000);
+  assert.equal(dismissed, 0);
+
+  // Paused again for full 10 minutes -> dismisses exactly once at 600,000 ms.
+  timer.sync({ loaded: true, playing: false });
+  clock.advance(MUSIC_PAUSED_DISMISS_MS - 1);
+  assert.equal(dismissed, 0);
+  clock.advance(1);
+  assert.equal(dismissed, 1);
+  assert.equal(timer.isPending(), false);
+
+  timer.dispose();
 });

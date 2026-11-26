@@ -14,12 +14,20 @@ export const RESUME_CHIP_DURATION_MS = 5000;
 export const RESUME_SAVE_INTERVAL_MS = 10_000;
 export const RESUME_MAX_ENTRIES = 200;
 export const MUSIC_RESTART_THRESHOLD_S = 3;
+export const MUSIC_PAUSED_DISMISS_MS = 10 * 60 * 1000; // 10 minutes
+export const MINI_PLAYER_HEIGHT_PX = 56;
+export const MINI_PLAYER_COVER_PX = 40;
+export const MINI_PLAYER_COVER_RADIUS_PX = 8;
+export const MINI_PLAYER_TRANSITION_MS = 220;
+export const MINI_PLAYER_SWIPE_DISMISS_PX = 28;
 export const SEEK_STEP_S = 10;
 export const VOLUME_STEP = 0.1;
 export const SEEK_FLASH_MS = 600;
 export const PLAYBACK_SPEEDS = Object.freeze([0.5, 0.75, 1, 1.25, 1.5, 1.75, 2]);
+export const REPEAT_MODES = Object.freeze(['off', 'folder', 'one']);
 
 export const RESUME_STORAGE_KEY = 'legion.player.resume.v1';
+export const MUSIC_MODES_STORAGE_KEY = 'legion.player.musicModes.v1';
 
 // ── Time & spoken value formatting ───────────────────────────────────────────────────────────
 
@@ -90,6 +98,17 @@ export function formatMusicDisplay(tags, fileName) {
   return { title, subtitle };
 }
 
+/**
+ * Resolves the title and single-line artist for the small player bar.
+ * Without an artist tag, `artist` is empty; never produces placeholder text.
+ */
+export function formatMiniPlayerDisplay(tags, fileName) {
+  const cleanTitle = typeof tags?.title === 'string' ? tags.title.trim() : '';
+  const cleanArtist = typeof tags?.artist === 'string' ? tags.artist.trim() : '';
+  const title = cleanTitle || stripFileExtension(fileName) || String(fileName || '');
+  return { title, artist: cleanArtist };
+}
+
 // ── Wire extractor for fs.tags ───────────────────────────────────────────────────────────────
 
 /**
@@ -130,6 +149,240 @@ export function queueNeighbors(siblings, currentPath, category) {
 
 export function shouldMusicPrevRestart(currentTime) {
   return Number.isFinite(currentTime) && currentTime > MUSIC_RESTART_THRESHOLD_S;
+}
+
+// ── Music shuffle, repeat, and paused auto-dismiss ───────────────────────────────────────────
+
+export function normalizeRepeatMode(mode) {
+  return mode === 'folder' || mode === 'one' ? mode : 'off';
+}
+
+export function cycleRepeatMode(mode) {
+  const cur = normalizeRepeatMode(mode);
+  if (cur === 'off') return 'folder';
+  if (cur === 'folder') return 'one';
+  return 'off';
+}
+
+export function readMusicModePreferences(storage, key = MUSIC_MODES_STORAGE_KEY) {
+  if (!storage || typeof storage.getItem !== 'function') {
+    return { shuffle: false, repeat: 'off' };
+  }
+  try {
+    const raw = storage.getItem(key);
+    if (!raw) return { shuffle: false, repeat: 'off' };
+    const parsed = JSON.parse(raw);
+    return {
+      shuffle: Boolean(parsed?.shuffle),
+      repeat: normalizeRepeatMode(parsed?.repeat),
+    };
+  } catch {
+    return { shuffle: false, repeat: 'off' };
+  }
+}
+
+export function writeMusicModePreferences(storage, prefs, key = MUSIC_MODES_STORAGE_KEY) {
+  if (!storage || typeof storage.setItem !== 'function') return;
+  try {
+    storage.setItem(
+      key,
+      JSON.stringify({
+        shuffle: Boolean(prefs?.shuffle),
+        repeat: normalizeRepeatMode(prefs?.repeat),
+      }),
+    );
+  } catch {
+    // Ignore storage quota / private-mode write failures.
+  }
+}
+
+/**
+ * Builds a random order of `items` starting with `currentPath` (when present) and shuffling the
+ * remaining items with Fisher-Yates.
+ */
+export function buildShuffledOrder(items, currentPath, rng = Math.random) {
+  if (!Array.isArray(items) || items.length === 0) return [];
+  const random = typeof rng === 'function' ? rng : Math.random;
+  let current = null;
+  const rest = [];
+  for (const item of items) {
+    if (!item || typeof item.path !== 'string') continue;
+    if (!current && currentPath && item.path === currentPath) {
+      current = item;
+    } else {
+      rest.push(item);
+    }
+  }
+  for (let i = rest.length - 1; i > 0; i -= 1) {
+    const r = random();
+    const clamped = Number.isFinite(r) ? Math.max(0, Math.min(0.999999999999, r)) : 0;
+    const j = Math.floor(clamped * (i + 1));
+    const tmp = rest[i];
+    rest[i] = rest[j];
+    rest[j] = tmp;
+  }
+  return current ? [current, ...rest] : rest;
+}
+
+/**
+ * Resolves the active ordered queue, current index, and previous/next songs under the active
+ * shuffle and repeat settings. When shuffle is on, an existing `shuffledPaths` order is preserved
+ * as long as items remain in the folder; any newly appearing songs are appended at the end.
+ */
+export function resolveMusicQueueState(
+  baseItems,
+  currentPath,
+  { shuffle = false, shuffledPaths = null, repeat = 'off', rng = Math.random } = {},
+) {
+  const validBase = Array.isArray(baseItems)
+    ? baseItems.filter((item) => item && item.kind !== 'dir' && typeof item.path === 'string')
+    : [];
+  const repeatMode = normalizeRepeatMode(repeat);
+  let items = validBase;
+  let nextShuffledPaths = null;
+
+  if (shuffle && validBase.length > 0) {
+    const byPath = new Map();
+    for (const item of validBase) {
+      if (!byPath.has(item.path)) byPath.set(item.path, item);
+    }
+    const preserved = [];
+    const seen = new Set();
+    if (Array.isArray(shuffledPaths) && shuffledPaths.length > 0) {
+      for (const p of shuffledPaths) {
+        if (typeof p === 'string' && !seen.has(p) && byPath.has(p)) {
+          preserved.push(byPath.get(p));
+          seen.add(p);
+        }
+      }
+      if (preserved.length > 0) {
+        for (const item of validBase) {
+          if (!seen.has(item.path)) {
+            preserved.push(item);
+            seen.add(item.path);
+          }
+        }
+        items = preserved;
+      } else {
+        items = buildShuffledOrder(validBase, currentPath, rng);
+      }
+    } else {
+      items = buildShuffledOrder(validBase, currentPath, rng);
+    }
+    nextShuffledPaths = items.map((item) => item.path);
+  }
+
+  const index = currentPath ? items.findIndex((item) => item.path === currentPath) : -1;
+  const hasOther = items.length > 1;
+  let prev = null;
+  let next = null;
+  if (index >= 0 && hasOther) {
+    if (index > 0) {
+      prev = items[index - 1];
+    } else if (repeatMode === 'folder') {
+      prev = items[items.length - 1];
+    }
+    if (index + 1 < items.length) {
+      next = items[index + 1];
+    } else if (repeatMode === 'folder') {
+      next = items[0];
+    }
+  }
+
+  return {
+    items,
+    index,
+    prev,
+    next,
+    hasOther,
+    shuffledPaths: nextShuffledPaths,
+  };
+}
+
+export function resolveMusicEndedAction(queueState, repeat = 'off') {
+  const mode = normalizeRepeatMode(repeat);
+  if (mode === 'one') {
+    return { action: 'repeat_current', entry: null };
+  }
+  if (mode === 'folder' && queueState?.items?.length === 1) {
+    return { action: 'repeat_current', entry: null };
+  }
+  if (queueState?.next) {
+    return { action: 'advance', entry: queueState.next };
+  }
+  return { action: 'stop', entry: null };
+}
+
+export function resolveMusicPrevAction(queueState, currentTime) {
+  if (!queueState?.prev || shouldMusicPrevRestart(currentTime)) {
+    return { action: 'restart', entry: null };
+  }
+  return { action: 'previous', entry: queueState.prev };
+}
+
+/**
+ * Controlled-clock timer that dismisses a loaded song after it stays paused continuously for
+ * `delayMs` (10 minutes by default). Resuming or unloading cancels the pending dismissal.
+ */
+export function createPausedDismissTimer({
+  clock = {
+    setTimeout: (fn, ms) => globalThis.setTimeout(fn, ms),
+    clearTimeout: (id) => globalThis.clearTimeout(id),
+  },
+  delayMs = MUSIC_PAUSED_DISMISS_MS,
+  onDismiss = () => {},
+} = {}) {
+  let timerId = null;
+  let disposed = false;
+
+  function cancel() {
+    if (timerId != null) {
+      clock.clearTimeout(timerId);
+      timerId = null;
+    }
+  }
+
+  function start() {
+    if (disposed || timerId != null) return;
+    timerId = clock.setTimeout(() => {
+      timerId = null;
+      if (!disposed) onDismiss();
+    }, delayMs);
+  }
+
+  function sync({ loaded = false, playing = false } = {}) {
+    if (disposed) return;
+    if (loaded && !playing) {
+      start();
+    } else {
+      cancel();
+    }
+  }
+
+  function reset() {
+    if (disposed) return;
+    if (timerId != null) {
+      cancel();
+      start();
+    }
+  }
+
+  function isPending() {
+    return timerId != null;
+  }
+
+  function dispose() {
+    disposed = true;
+    cancel();
+  }
+
+  return {
+    sync,
+    reset,
+    cancel,
+    isPending,
+    dispose,
+  };
 }
 
 export function preferredVideoOrientation(videoWidth, videoHeight) {
