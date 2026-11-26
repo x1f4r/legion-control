@@ -523,4 +523,50 @@ mod tests {
         assert_eq!(fs::read(&archived)?, original);
         Ok(())
     }
+
+    #[test]
+    fn sealed_ratchet_round_trips_and_legacy_json_defaults_false()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = AppStore::in_dir(dir.path());
+        let legacy = serde_json::json!({
+            "version": 2,
+            "link": {
+                "nodes": [
+                    {
+                        "node": "studio",
+                        "target": {
+                            "hosts": ["studio.example"],
+                            "port": 22,
+                            "user": "me",
+                            "host_keys": ["ssh-ed25519 AAAA"]
+                        },
+                        "principal": "phone"
+                    }
+                ]
+            },
+            "current_node": "studio"
+        })
+        .to_string();
+        fs::write(store.path(), legacy)?;
+
+        let mut loaded = store.load()?;
+        assert!(!loaded.link.node("studio").ok_or("missing studio")?.sealed);
+
+        // Saving with sealed=false omits the field from JSON.
+        store.save(&loaded)?;
+        let raw_false: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(store.path())?)?;
+        assert!(raw_false["link"]["nodes"][0].get("sealed").is_none());
+
+        // Setting sealed=true persists cleanly across save/load.
+        loaded.link.nodes[0].sealed = true;
+        store.save(&loaded)?;
+        let raw_true: serde_json::Value = serde_json::from_str(&fs::read_to_string(store.path())?)?;
+        assert_eq!(raw_true["link"]["nodes"][0]["sealed"], true);
+
+        let reloaded = store.load()?;
+        assert!(reloaded.link.node("studio").ok_or("missing studio")?.sealed);
+        Ok(())
+    }
 }

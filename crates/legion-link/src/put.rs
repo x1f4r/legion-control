@@ -129,6 +129,10 @@ pub struct PutStream {
     offset: u64,
     remaining: u64,
     stream_capabilities: Vec<String>,
+    /// `true` when the stream greeting came directly from the target node (direct SSH/local or a
+    /// sealed relayed session), `false` for legacy unsealed `op: "relay"` where the greeting came
+    /// from the relay.
+    greeting_from_target: bool,
     route: Route,
     timeout: Duration,
     cancel: CancellationToken,
@@ -153,12 +157,13 @@ impl PutStream {
         self.remaining
     }
 
-    /// Returns `true` when this direct upload channel advertised [`CAP_IF_EXISTS`].
+    /// Returns `true` when the target's stream greeting advertised [`CAP_IF_EXISTS`].
     ///
-    /// Relayed channels return `false` because the stream greeting came from the relay rather than
-    /// the final target.
+    /// Legacy unsealed relayed channels return `false` because the stream greeting came from the
+    /// relay rather than the final target; direct and sealed relayed channels receive the target's
+    /// own greeting directly.
     pub fn if_exists_supported(&self) -> bool {
-        self.route == Route::Direct && self.stream_capabilities.iter().any(|c| c == CAP_IF_EXISTS)
+        self.greeting_from_target && self.stream_capabilities.iter().any(|c| c == CAP_IF_EXISTS)
     }
 
     /// Stream capabilities advertised by the remote machine on this stream channel.
@@ -403,11 +408,14 @@ struct PutDoneReply {
     hash: String,
 }
 
-/// Runs the `legion stream` `put` handshake on a direct `stream` and returns a positioned
-/// [`PutStream`].
-pub(crate) async fn handshake_put(
+/// Runs the `legion stream` `put` handshake on a direct-framed `stream` and returns a positioned
+/// [`PutStream`] recording `reported_route` (`Route::Direct` or `Route::Relay { via }` inside a
+/// sealed relayed SSH session).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handshake_put_with_route(
     stream: RawStream,
     machine: &str,
+    reported_route: Route,
     request: &PutRequest,
     as_principal: Option<&str>,
     timeout: Duration,
@@ -418,6 +426,7 @@ pub(crate) async fn handshake_put(
         PutStreamStart::Raw(stream),
         machine,
         None,
+        reported_route,
         request,
         as_principal,
         timeout,
@@ -443,6 +452,9 @@ pub(crate) async fn handshake_put_relayed(
         PutStreamStart::Greeted(stream),
         machine,
         Some(relay_via),
+        Route::Relay {
+            via: relay_via.to_owned(),
+        },
         request,
         as_principal,
         timeout,
@@ -462,6 +474,7 @@ async fn handshake_put_from_source(
     stream: PutStreamStart,
     machine: &str,
     relay_via: Option<&str>,
+    route: Route,
     request: &PutRequest,
     as_principal: Option<&str>,
     timeout: Duration,
@@ -599,12 +612,7 @@ async fn handshake_put_from_source(
         .with_machine(machine));
     }
 
-    let route = match relay_via {
-        Some(via) => Route::Relay {
-            via: via.to_owned(),
-        },
-        None => Route::Direct,
-    };
+    let greeting_from_target = relay_via.is_none();
 
     let stream_cancel = cancel.child_token();
     let active_cancel = channel_cancel.clone();
@@ -627,6 +635,7 @@ async fn handshake_put_from_source(
         offset: ready.offset,
         remaining: request.size - ready.offset,
         stream_capabilities,
+        greeting_from_target,
         route,
         timeout,
         cancel: stream_cancel,

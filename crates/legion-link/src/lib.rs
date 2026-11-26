@@ -126,9 +126,16 @@ pub const REASON_UNREACHABLE: &str = "unreachable";
 /// Structured `details.reason` when the remote side emits too much non-protocol output before
 /// answering `hello` (`code: "unreachable"`).
 pub const REASON_NON_PROTOCOL_OUTPUT: &str = "non_protocol_output";
-/// Structured `details.reason` when a relay node does not advertise `stream.relay` and needs an
-/// update before it can pass files along from another machine (`code: "unsupported"`).
+/// Structured `details.reason` when a relay node does not advertise `stream.relay` (or
+/// `stream.relay.tunnel` for sealed sessions) and needs an update (`code: "unsupported"`).
 pub const REASON_RELAY_TOO_OLD: &str = "relay_too_old";
+/// Structured `details.reason` when a target node does not advertise `stream.tunnel` and needs an
+/// update before it can accept sealed relayed sessions (`code: "unsupported"`).
+pub const REASON_TARGET_TOO_OLD: &str = "target_too_old";
+/// Structured `details.reason` when a node previously completed a sealed session and no reachable
+/// relay can open a sealed tunnel, so the client refuses to fall back to the legacy unsealed
+/// `relay` path (`code: "unsupported"`).
+pub const REASON_SEAL_REQUIRED: &str = "seal_required";
 /// Structured `details.reason` when neither this device nor its relay knows a machine by that name
 /// (`code: "not_found"`).
 pub const REASON_UNKNOWN_MACHINE: &str = "unknown_machine";
@@ -218,8 +225,8 @@ pub(crate) fn decode_remote_error(
 
 pub use command::{RemoteOs, Subcommand, remote_command, validate_program};
 pub use content::{
-    CAP_STREAM_RELAY, ContentStream, ContentTime, DEFAULT_MAX_PARKED_STREAMS, RawStream,
-    StreamOpenError, StreamOpener,
+    CAP_STREAM_RELAY, CAP_STREAM_RELAY_TUNNEL, CAP_STREAM_TUNNEL, ContentStream, ContentTime,
+    DEFAULT_MAX_PARKED_STREAMS, RawStream, StreamOpenError, StreamOpener,
 };
 pub use invite::{
     DEFAULT_ENROL_TIMEOUT, Enrolled, FleetPushOutcome, INVITE_PREFIX, INVITE_VERSION, Invite,
@@ -230,12 +237,13 @@ pub use invite::{enrol, restore_pairing};
 #[cfg(feature = "ssh")]
 pub use key::DeviceKey;
 pub use link::{
-    ConflictingIdentityReport, ContentRoutePolicy, DEFAULT_CHANNEL_REFUSED_RECONNECT_COOLDOWN,
-    DEFAULT_IDLE_TIMEOUT, DEFAULT_UNSYNCED_BACKOFF, DisagreementReport, LearnDisagreement,
-    LearnRejection, LearnReport, Link, LinkConfig, LinkOptions, MAX_CONFIGURED_NODES,
-    MAX_ENDPOINT_FIELD_LEN, MAX_ENDPOINT_HOST_KEY_LEN, MAX_ENDPOINT_HOST_KEYS, MAX_ENDPOINT_HOSTS,
-    MachineRouteStatus, NodeLink, NodeOrigin, PendingIdentityChange, Route, RoutedValue,
-    SessionOpener, parse_optional_target, public_key_fingerprint,
+    ConfigChangeHook, ConflictingIdentityReport, ContentRoutePolicy,
+    DEFAULT_CHANNEL_REFUSED_RECONNECT_COOLDOWN, DEFAULT_IDLE_TIMEOUT, DEFAULT_UNSYNCED_BACKOFF,
+    DisagreementReport, LearnDisagreement, LearnRejection, LearnReport, Link, LinkConfig,
+    LinkOptions, MAX_CONFIGURED_NODES, MAX_ENDPOINT_FIELD_LEN, MAX_ENDPOINT_HOST_KEY_LEN,
+    MAX_ENDPOINT_HOST_KEYS, MAX_ENDPOINT_HOSTS, MachineRouteStatus, NodeLink, NodeOrigin,
+    PendingIdentityChange, Route, RoutedValue, SessionOpener, parse_optional_target,
+    public_key_fingerprint,
 };
 pub use put::{CAP_IF_EXISTS, PutIfExists, PutRequest, PutResult, PutStream};
 pub use session::{

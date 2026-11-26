@@ -37,6 +37,11 @@ use crate::stderr::StderrTail;
 const STREAM_PROTOCOL: u32 = 1;
 /// Stream capability advertised in a node's opening greeting when it supports `op: "relay"`.
 pub const CAP_STREAM_RELAY: &str = "stream.relay";
+/// Stream capability advertised in a node's opening greeting when it supports `op: "tunnel"`.
+pub const CAP_STREAM_TUNNEL: &str = "stream.tunnel";
+/// Stream capability advertised in a node's opening greeting when it supports relaying
+/// `op: "tunnel"` for end-to-end encrypted sessions.
+pub const CAP_STREAM_RELAY_TUNNEL: &str = "stream.relay.tunnel";
 /// Maximum reply line length accepted during the `get` handshake.
 const MAX_REPLY_LINE: usize = 1024 * 1024;
 /// Maximum `{"done": true}` trailer line length on a `keep_open` frame.
@@ -329,6 +334,19 @@ pub trait StreamOpener: Send + Sync + 'static {
         &self,
         cancel: CancellationToken,
     ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>>;
+
+    /// Opens one fresh `legion stream` channel suitable for a raw bidirectional `tunnel` byte
+    /// pipe.
+    ///
+    /// Defaults to [`Self::open_stream`]; transports whose ordinary content streams enforce a
+    /// pull-window abort cap (such as `russh`) override this with bounded backpressure so
+    /// concurrent inner streams never trip the content-stream buffer cap.
+    fn open_tunnel_stream(
+        &self,
+        cancel: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<RawStream, StreamOpenError>> + Send + '_>> {
+        self.open_stream(cancel)
+    }
 }
 
 /// A raw `legion stream` channel whose opening `{"protocol": 1, "capabilities": [...]}` greeting
@@ -2104,17 +2122,20 @@ fn is_done_frame(line: &[u8]) -> bool {
     map.len() == 1 && map.get("done") == Some(&Value::Bool(true))
 }
 
-/// Runs the `legion stream` `get` handshake on `stream` and returns a positioned [`ContentStream`].
+/// Runs the `legion stream` `get` handshake on `stream` and returns a positioned [`ContentStream`]
+/// recording `reported_route` (`Route::Direct` for direct sessions or `Route::Relay { via }` for
+/// direct-framed `get` running inside a sealed relayed SSH session).
 ///
 /// When `opener` advertises a [`WindowPolicy`], the initial request asks for `keep_open: true`
 /// capped at `initial_bytes`. If the remote speaks `keep_open`, subsequent adaptive pull-based
 /// windows run over the same channel with one window of read-ahead; otherwise, older remotes fall
 /// back to per-window channels with exponential backoff on channel refusals.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn handshake_get(
+pub(crate) async fn handshake_get_with_route(
     stream: RawStream,
     opener: Option<Arc<dyn StreamOpener>>,
     machine: &str,
+    reported_route: Route,
     path: &str,
     offset: u64,
     length: Option<u64>,
@@ -2124,10 +2145,12 @@ pub(crate) async fn handshake_get(
     options: ContentStreamOptions,
     on_greeting_capabilities: Option<&(dyn Fn(Vec<String>) + Send + Sync)>,
 ) -> Result<ContentStream, ErrorBody> {
-    handshake_get_inner(
-        stream,
+    handshake_get_from_source(
+        StreamStart::Raw(stream),
         opener,
         machine,
+        None,
+        reported_route,
         path,
         offset,
         length,
@@ -2154,10 +2177,11 @@ pub(crate) async fn handshake_get_with_options(
     cancel: CancellationToken,
     options: ContentStreamOptions,
 ) -> Result<ContentStream, ErrorBody> {
-    handshake_get_inner(
+    handshake_get_with_route(
         stream,
         opener,
         machine,
+        Route::Direct,
         path,
         offset,
         length,
@@ -2191,6 +2215,9 @@ pub(crate) async fn handshake_get_relayed(
         opener,
         machine,
         Some(relay_via),
+        Route::Relay {
+            via: relay_via.to_owned(),
+        },
         path,
         offset,
         length,
@@ -2209,42 +2236,12 @@ enum StreamStart {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handshake_get_inner(
-    stream: RawStream,
-    opener: Option<Arc<dyn StreamOpener>>,
-    machine: &str,
-    path: &str,
-    offset: u64,
-    length: Option<u64>,
-    as_principal: Option<&str>,
-    timeout: Duration,
-    cancel: CancellationToken,
-    options: ContentStreamOptions,
-    on_greeting_capabilities: Option<&(dyn Fn(Vec<String>) + Send + Sync)>,
-) -> Result<ContentStream, ErrorBody> {
-    handshake_get_from_source(
-        StreamStart::Raw(stream),
-        opener,
-        machine,
-        None,
-        path,
-        offset,
-        length,
-        as_principal,
-        timeout,
-        cancel,
-        options,
-        on_greeting_capabilities,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
 async fn handshake_get_from_source(
     stream: StreamStart,
     opener: Option<Arc<dyn StreamOpener>>,
     machine: &str,
     relay_via: Option<&str>,
+    route: Route,
     path: &str,
     offset: u64,
     length: Option<u64>,
@@ -2294,13 +2291,6 @@ async fn handshake_get_from_source(
             () = active_cancel.cancelled() => {}
         }
     });
-
-    let route = match relay_via {
-        Some(via) => Route::Relay {
-            via: via.to_owned(),
-        },
-        None => Route::Direct,
-    };
 
     let mode = if let Some(policy) = policy
         && validated.keep_open
@@ -2818,7 +2808,7 @@ async fn read_get_ready<R: AsyncRead + Unpin>(
     }
 }
 
-async fn read_bounded_line<R: AsyncRead + Unpin>(
+pub(crate) async fn read_bounded_line<R: AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
     out: &mut Vec<u8>,
     limit: usize,

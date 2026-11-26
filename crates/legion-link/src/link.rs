@@ -23,14 +23,16 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "ssh")]
+use crate::content::{BoxStreamRead, BoxStreamWrite, CAP_STREAM_RELAY_TUNNEL, read_bounded_line};
 use crate::content::{
     CAP_STREAM_RELAY, CONTENT_STREAM_BUF_BYTES, ContentStream, ContentStreamOptions,
-    DEFAULT_MAX_PARKED_STREAMS, ParkedStreamPool, StreamOpenError, greet_raw_stream, handshake_get,
-    handshake_get_relayed,
+    DEFAULT_MAX_PARKED_STREAMS, ParkedStreamPool, StreamOpenError, greet_raw_stream,
+    handshake_get_relayed, handshake_get_with_route,
 };
 use crate::invite::{Enrolled, SshTarget, SshTimeouts};
 use crate::put::{
-    PUT_STREAM_BUF_BYTES, PutRequest, PutStream, handshake_put, handshake_put_relayed,
+    PUT_STREAM_BUF_BYTES, PutRequest, PutStream, handshake_put_relayed, handshake_put_with_route,
     validate_blake3_hash,
 };
 use crate::session::{CallError, Session};
@@ -144,11 +146,14 @@ impl fmt::Debug for LinkConfig {
 impl LinkConfig {
     /// Adds or replaces a node entry by name. Adding a directly paired node clears any prior
     /// forgotten marker for that machine.
-    pub fn upsert_node(&mut self, entry: NodeLink) {
+    pub fn upsert_node(&mut self, mut entry: NodeLink) {
         if entry.origin == NodeOrigin::Paired {
             self.clear_forgotten(&entry.node);
         }
         if let Some(existing) = self.nodes.iter_mut().find(|n| n.node == entry.node) {
+            if entry.target.is_some() {
+                entry.sealed |= existing.sealed;
+            }
             *existing = entry;
         } else {
             self.nodes.push(entry);
@@ -477,6 +482,11 @@ pub struct NodeLink {
     /// already known machine. Old pins stay in `target` until accepted explicitly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_changed: Option<PendingIdentityChange>,
+    /// `true` once this controller has completed at least one end-to-end encrypted ("sealed")
+    /// relayed session to this node. Once set, the controller refuses to fall back to the legacy
+    /// unsealed `relay` path for this node.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sealed: bool,
 }
 
 impl NodeLink {
@@ -490,6 +500,7 @@ impl NodeLink {
             origin: NodeOrigin::Paired,
             learned_from: None,
             identity_changed: None,
+            sealed: false,
         }
     }
 
@@ -508,6 +519,7 @@ impl NodeLink {
             origin: NodeOrigin::Learned,
             learned_from: Some(learned_from.into()),
             identity_changed: None,
+            sealed: false,
         }
     }
 
@@ -521,6 +533,7 @@ impl NodeLink {
             origin: NodeOrigin::Paired,
             learned_from: None,
             identity_changed: None,
+            sealed: false,
         }
     }
 
@@ -586,6 +599,10 @@ pub type SessionOpener = Arc<
         + Sync,
 >;
 
+/// Optional callback fired whenever [`Link`] updates persisted config state on its own (such as
+/// engaging a node's sealed-session ratchet after its first completed sealed session).
+pub type ConfigChangeHook = Arc<dyn Fn(LinkConfig) + Send + Sync>;
+
 /// High-level controller handle that manages lazy, reused, idle-reaped sessions to paired nodes.
 ///
 /// Cloning is cheap and shares the same session pool and active-call table.
@@ -598,6 +615,7 @@ struct LinkInner {
     config: Mutex<LinkConfig>,
     options: LinkOptions,
     opener: SessionOpener,
+    on_config_change: Mutex<Option<ConfigChangeHook>>,
     /// Serializes `pair`, `forget`, and `learn` mutations so device key generation, forgetting,
     /// and endpoint learning never race.
     mutation_lock: tokio::sync::Mutex<()>,
@@ -633,12 +651,40 @@ struct NodeSlot {
 struct LiveSession {
     session: Arc<Session>,
     config_snapshot: NodeLink,
+    /// `None` for a direct session; `Some(relay)` for a sealed session running inside a relayed
+    /// `op: "tunnel"` through `relay`.
+    via: Option<String>,
     last_used: Arc<Mutex<Instant>>,
     in_flight: Arc<AtomicUsize>,
     stream_capabilities: Arc<Mutex<Option<Vec<String>>>>,
 }
 
 impl LiveSession {
+    fn route(&self) -> Route {
+        match &self.via {
+            None => Route::Direct,
+            Some(via) => Route::Relay { via: via.clone() },
+        }
+    }
+
+    fn route_status(&self) -> MachineRouteStatus {
+        match &self.via {
+            None => MachineRouteStatus::Direct,
+            Some(via) => MachineRouteStatus::Relay { via: via.clone() },
+        }
+    }
+
+    fn matches_content_policy(&self, policy: &ContentRoutePolicy) -> bool {
+        match policy {
+            ContentRoutePolicy::Any => true,
+            ContentRoutePolicy::DirectOnly => self.via.is_none(),
+            ContentRoutePolicy::RelayOnly(relay) => self.via.as_deref() == Some(relay.as_str()),
+            ContentRoutePolicy::DirectOrRelay(relay) => {
+                self.via.is_none() || self.via.as_deref() == Some(relay.as_str())
+            }
+        }
+    }
+
     fn touch(&self) {
         *self
             .last_used
@@ -806,6 +852,7 @@ impl Link {
                 config: Mutex::new(config),
                 options,
                 opener,
+                on_config_change: Mutex::new(None),
                 mutation_lock: tokio::sync::Mutex::new(()),
                 #[cfg(feature = "ssh")]
                 pairing_nodes: Mutex::new(HashSet::new()),
@@ -828,6 +875,44 @@ impl Link {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Registers a hook called whenever [`Link`] updates persisted per-node state internally
+    /// (for example setting [`NodeLink::sealed`] after a node's first sealed relayed session).
+    pub fn set_on_config_change(&self, hook: ConfigChangeHook) {
+        *self
+            .inner
+            .on_config_change
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+    }
+
+    #[cfg(feature = "ssh")]
+    fn mark_node_sealed(&self, machine: &str) {
+        let updated = {
+            let mut cfg = self
+                .inner
+                .config
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(entry) = cfg.nodes.iter_mut().find(|n| n.node == machine) else {
+                return;
+            };
+            if entry.sealed {
+                return;
+            }
+            entry.sealed = true;
+            cfg.clone()
+        };
+        let hook = self
+            .inner
+            .on_config_change
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook(updated);
+        }
     }
 
     /// Parses `invite_text`, ensures this [`Link`] has a device key (generating one on first use
@@ -1900,13 +1985,14 @@ impl Link {
     /// [`Link::call_machine`]).
     pub async fn tools_machine(&self, machine: &str) -> Result<RoutedValue, ErrorBody> {
         self.ensure_reaper();
-        let entry = self
-            .inner
-            .config
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .node(machine)
-            .cloned();
+        let (entry, has_device_key) = {
+            let cfg = self
+                .inner
+                .config
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (cfg.node(machine).cloned(), cfg.device_key.is_some())
+        };
 
         if let Some(ref e) = entry
             && e.local_program.is_some()
@@ -1920,11 +2006,35 @@ impl Link {
             });
         }
 
+        let cancel = CancellationToken::new();
+        if let Some(ref e) = entry
+            && let Some(live) = self.cached_sealed_session(machine, e, None)
+        {
+            match self.tools_on_live(&live, machine, cancel.clone()).await {
+                Ok(value) => {
+                    self.clear_unsynced(machine);
+                    self.record_route(machine, live.route_status());
+                    return Ok(RoutedValue {
+                        value,
+                        route: live.route(),
+                    });
+                }
+                Err(CallError::NotWritten(_)) => {
+                    self.invalidate_if_same(machine, &live.session);
+                }
+                Err(err) => {
+                    return Err(self.handle_call_error(machine, &live.session, err));
+                }
+            }
+        }
+
         let entry_is_learned = entry
             .as_ref()
             .is_some_and(|e| e.origin == NodeOrigin::Learned);
+        let entry_sealed = entry.as_ref().is_some_and(|e| e.sealed);
         let entry_learned_from = entry.as_ref().and_then(|e| e.learned_from.clone());
-        let in_unsynced_backoff = entry_is_learned && self.is_in_unsynced_backoff(machine);
+        let in_unsynced_backoff =
+            entry_is_learned && !entry_sealed && self.is_in_unsynced_backoff(machine);
 
         let mut direct_err: Option<ErrorBody> = None;
         let mut learned_auth_err: Option<ErrorBody> = None;
@@ -1944,7 +2054,7 @@ impl Link {
                         return Err(err);
                     }
                     if is_device_removed_or_unknown(&err) {
-                        if entry_is_learned {
+                        if entry_is_learned && !entry_sealed {
                             self.mark_unsynced(machine);
                             learned_auth_err = Some(err);
                         } else {
@@ -1962,9 +2072,87 @@ impl Link {
         let relays = self.relay_candidates(machine, entry_learned_from.as_deref());
         let mut last_relay_err: Option<ErrorBody> = None;
         let mut relay_auth_err: Option<ErrorBody> = None;
+        let mut seal_unsupported_err: Option<ErrorBody> = None;
         let mut unknown_machine_err: Option<ErrorBody> = None;
+        let mut seal_eligible = cfg!(feature = "ssh")
+            && entry.as_ref().is_some_and(|e| e.target.is_some())
+            && has_device_key
+            && (entry_sealed || (!in_unsynced_backoff && learned_auth_err.is_none()));
 
         for relay in relays {
+            if seal_eligible && let Some(ref e) = entry {
+                match self
+                    .get_or_open_sealed(&relay, machine, e, cancel.clone())
+                    .await
+                {
+                    Ok(live) => match self.tools_on_live(&live, machine, cancel.clone()).await {
+                        Ok(value) => {
+                            self.clear_unsynced(machine);
+                            self.record_route(machine, live.route_status());
+                            return Ok(RoutedValue {
+                                value,
+                                route: live.route(),
+                            });
+                        }
+                        Err(CallError::NotWritten(err)) => {
+                            self.invalidate_if_same(machine, &live.session);
+                            last_relay_err = Some(mark_not_sent(err));
+                            continue;
+                        }
+                        Err(err) => {
+                            return Err(self.handle_call_error(machine, &live.session, err));
+                        }
+                    },
+                    Err(
+                        SealOpenError::UnsupportedRelay(err)
+                        | SealOpenError::UnsupportedTarget(err),
+                    ) => {
+                        if entry_sealed {
+                            if seal_unsupported_err.is_none() {
+                                seal_unsupported_err = Some(err);
+                            }
+                            continue;
+                        }
+                        // Older relay or target on a node that has not yet completed a sealed
+                        // session: fall through to the legacy `relay` path on this relay.
+                    }
+                    Err(SealOpenError::TargetAuthUnsynced(err)) => {
+                        self.mark_unsynced(machine);
+                        learned_auth_err = Some(err);
+                        seal_eligible = false;
+                        // Fall through to legacy `relay` path on this relay.
+                    }
+                    Err(
+                        SealOpenError::TargetIdentityFailed(err)
+                        | SealOpenError::Fatal(err)
+                        | SealOpenError::Denied(err),
+                    ) => {
+                        return Err(err);
+                    }
+                    Err(SealOpenError::UnknownMachine(err)) => {
+                        unknown_machine_err = Some(err);
+                        continue;
+                    }
+                    Err(SealOpenError::RelayAuthFailed(err)) => {
+                        let relay_is_learned = self.is_learned(&relay);
+                        if relay_is_learned {
+                            self.mark_unsynced(&relay);
+                        }
+                        if relay_auth_err.is_none() || !relay_is_learned {
+                            relay_auth_err = Some(err);
+                        }
+                        continue;
+                    }
+                    Err(SealOpenError::Unreachable(err)) => {
+                        last_relay_err = Some(err);
+                        continue;
+                    }
+                    Err(SealOpenError::NotApplicable) => {}
+                }
+            }
+            if entry_sealed {
+                continue;
+            }
             match self
                 .tools(&relay, Some(Value::String(machine.to_owned())))
                 .await
@@ -2044,7 +2232,13 @@ impl Link {
             self.clear_unsynced(machine);
             return Err(auth_err);
         }
-
+        if entry_sealed && let Some(unsupported_err) = seal_unsupported_err {
+            return Err(seal_required_error(
+                machine,
+                unsupported_err,
+                direct_err.as_ref(),
+            ));
+        }
         if let Some(err) = direct_err.or(last_relay_err) {
             return Err(err);
         }
@@ -2297,13 +2491,14 @@ impl Link {
         let args = validate_call_args(arguments, machine)?;
         let (cancel, _active_guard) = self.register_call_id(call_id)?;
 
-        let entry = self
-            .inner
-            .config
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .node(machine)
-            .cloned();
+        let (entry, has_device_key) = {
+            let cfg = self
+                .inner
+                .config
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (cfg.node(machine).cloned(), cfg.device_key.is_some())
+        };
 
         // A local-only desktop pipe (e.g. `local`) cannot be relayed through remote SSH peers.
         if let Some(ref e) = entry
@@ -2320,11 +2515,37 @@ impl Link {
             });
         }
 
+        if let Some(ref e) = entry
+            && let Some(live) = self.cached_sealed_session(machine, e, None)
+        {
+            match self
+                .call_on_live(&live, tool, args.clone(), cancel.clone(), &mut events)
+                .await
+            {
+                Ok(value) => {
+                    self.clear_unsynced(machine);
+                    self.record_route(machine, live.route_status());
+                    return Ok(RoutedValue {
+                        value,
+                        route: live.route(),
+                    });
+                }
+                Err(CallError::NotWritten(_)) => {
+                    self.invalidate_if_same(machine, &live.session);
+                }
+                Err(err) => {
+                    return Err(self.handle_call_error(machine, &live.session, err));
+                }
+            }
+        }
+
         let entry_is_learned = entry
             .as_ref()
             .is_some_and(|e| e.origin == NodeOrigin::Learned);
+        let entry_sealed = entry.as_ref().is_some_and(|e| e.sealed);
         let entry_learned_from = entry.as_ref().and_then(|e| e.learned_from.clone());
-        let in_unsynced_backoff = entry_is_learned && self.is_in_unsynced_backoff(machine);
+        let in_unsynced_backoff =
+            entry_is_learned && !entry_sealed && self.is_in_unsynced_backoff(machine);
 
         let mut direct_err: Option<ErrorBody> = None;
         let mut learned_auth_err: Option<ErrorBody> = None;
@@ -2354,7 +2575,7 @@ impl Link {
                         return Err(err);
                     }
                     if is_device_removed_or_unknown(&err) {
-                        if entry_is_learned {
+                        if entry_is_learned && !entry_sealed {
                             self.mark_unsynced(machine);
                             learned_auth_err = Some(err);
                         } else {
@@ -2372,9 +2593,87 @@ impl Link {
         let relays = self.relay_candidates(machine, entry_learned_from.as_deref());
         let mut last_relay_err: Option<ErrorBody> = None;
         let mut relay_auth_err: Option<ErrorBody> = None;
+        let mut seal_unsupported_err: Option<ErrorBody> = None;
         let mut unknown_machine_err: Option<ErrorBody> = None;
+        let mut seal_eligible = cfg!(feature = "ssh")
+            && entry.as_ref().is_some_and(|e| e.target.is_some())
+            && has_device_key
+            && (entry_sealed || (!in_unsynced_backoff && learned_auth_err.is_none()));
 
         for relay in relays {
+            if seal_eligible && let Some(ref e) = entry {
+                match self
+                    .get_or_open_sealed(&relay, machine, e, cancel.clone())
+                    .await
+                {
+                    Ok(live) => match self
+                        .call_on_live(&live, tool, args.clone(), cancel.clone(), &mut events)
+                        .await
+                    {
+                        Ok(value) => {
+                            self.clear_unsynced(machine);
+                            self.record_route(machine, live.route_status());
+                            return Ok(RoutedValue {
+                                value,
+                                route: live.route(),
+                            });
+                        }
+                        Err(CallError::NotWritten(err)) => {
+                            self.invalidate_if_same(machine, &live.session);
+                            last_relay_err = Some(mark_not_sent(err));
+                            continue;
+                        }
+                        Err(err) => {
+                            return Err(self.handle_call_error(machine, &live.session, err));
+                        }
+                    },
+                    Err(
+                        SealOpenError::UnsupportedRelay(err)
+                        | SealOpenError::UnsupportedTarget(err),
+                    ) => {
+                        if entry_sealed {
+                            if seal_unsupported_err.is_none() {
+                                seal_unsupported_err = Some(err);
+                            }
+                            continue;
+                        }
+                    }
+                    Err(SealOpenError::TargetAuthUnsynced(err)) => {
+                        self.mark_unsynced(machine);
+                        learned_auth_err = Some(err);
+                        seal_eligible = false;
+                    }
+                    Err(
+                        SealOpenError::TargetIdentityFailed(err)
+                        | SealOpenError::Fatal(err)
+                        | SealOpenError::Denied(err),
+                    ) => {
+                        return Err(err);
+                    }
+                    Err(SealOpenError::UnknownMachine(err)) => {
+                        unknown_machine_err = Some(err);
+                        continue;
+                    }
+                    Err(SealOpenError::RelayAuthFailed(err)) => {
+                        let relay_is_learned = self.is_learned(&relay);
+                        if relay_is_learned {
+                            self.mark_unsynced(&relay);
+                        }
+                        if relay_auth_err.is_none() || !relay_is_learned {
+                            relay_auth_err = Some(err);
+                        }
+                        continue;
+                    }
+                    Err(SealOpenError::Unreachable(err)) => {
+                        last_relay_err = Some(err);
+                        continue;
+                    }
+                    Err(SealOpenError::NotApplicable) => {}
+                }
+            }
+            if entry_sealed {
+                continue;
+            }
             match self
                 .call_with_cancel(
                     &relay,
@@ -2466,6 +2765,13 @@ impl Link {
         if let Some(auth_err) = relay_auth_err.or(learned_auth_err) {
             self.clear_unsynced(machine);
             return Err(auth_err);
+        }
+        if entry_sealed && let Some(unsupported_err) = seal_unsupported_err {
+            return Err(seal_required_error(
+                machine,
+                unsupported_err,
+                direct_err.as_ref(),
+            ));
         }
 
         if let Some(err) = direct_err.or(last_relay_err) {
@@ -2689,13 +2995,14 @@ impl Link {
             );
         }
 
-        let entry = self
-            .inner
-            .config
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .node(machine)
-            .cloned();
+        let (entry, has_device_key) = {
+            let cfg = self
+                .inner
+                .config
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (cfg.node(machine).cloned(), cfg.device_key.is_some())
+        };
 
         let allow_direct = !matches!(route_policy, ContentRoutePolicy::RelayOnly(_));
         let allow_relay = !matches!(route_policy, ContentRoutePolicy::DirectOnly);
@@ -2713,17 +3020,55 @@ impl Link {
             && e.target.is_none()
         {
             let stream = self
-                .open_content_direct(machine, path, offset, length, cancel, park_pool)
+                .open_content_direct(
+                    machine,
+                    path,
+                    offset,
+                    length,
+                    route_policy,
+                    cancel,
+                    park_pool,
+                )
                 .await?;
             self.record_route(machine, MachineRouteStatus::Direct);
             return Ok(stream);
         }
 
+        if let Some(ref e) = entry
+            && let Some(live) = self.cached_sealed_session(machine, e, Some(&route_policy))
+        {
+            match self
+                .open_content_on_live(
+                    &live,
+                    machine,
+                    path,
+                    offset,
+                    length,
+                    route_policy.clone(),
+                    cancel.clone(),
+                    park_pool.clone(),
+                )
+                .await
+            {
+                Ok(stream) => {
+                    self.clear_unsynced(machine);
+                    self.record_route(machine, live.route_status());
+                    return Ok(stream);
+                }
+                Err(StreamOpenOrHandshakeError::DeadSession) => {
+                    self.invalidate_if_same(machine, &live.session);
+                }
+                Err(StreamOpenOrHandshakeError::Error(err)) => return Err(err),
+            }
+        }
+
         let entry_is_learned = entry
             .as_ref()
             .is_some_and(|e| e.origin == NodeOrigin::Learned);
+        let entry_sealed = entry.as_ref().is_some_and(|e| e.sealed);
         let entry_learned_from = entry.as_ref().and_then(|e| e.learned_from.clone());
-        let in_unsynced_backoff = entry_is_learned && self.is_in_unsynced_backoff(machine);
+        let in_unsynced_backoff =
+            entry_is_learned && !entry_sealed && self.is_in_unsynced_backoff(machine);
 
         let mut direct_err: Option<ErrorBody> = None;
         let mut learned_auth_err: Option<ErrorBody> = None;
@@ -2735,6 +3080,7 @@ impl Link {
                     path,
                     offset,
                     length,
+                    route_policy.clone(),
                     cancel.clone(),
                     park_pool.clone(),
                 )
@@ -2753,7 +3099,7 @@ impl Link {
                         return Err(err);
                     }
                     if is_device_removed_or_unknown(&err) {
-                        if entry_is_learned {
+                        if entry_is_learned && !entry_sealed {
                             self.mark_unsynced(machine);
                             learned_auth_err = Some(err);
                         } else {
@@ -2778,7 +3124,15 @@ impl Link {
             }
             if in_unsynced_backoff {
                 match self
-                    .open_content_direct(machine, path, offset, length, cancel, park_pool)
+                    .open_content_direct(
+                        machine,
+                        path,
+                        offset,
+                        length,
+                        route_policy,
+                        cancel,
+                        park_pool,
+                    )
                     .await
                 {
                     Ok(stream) => {
@@ -2811,9 +3165,97 @@ impl Link {
         let mut last_relay_err: Option<ErrorBody> = None;
         let mut relay_auth_err: Option<ErrorBody> = None;
         let mut old_relay_err: Option<ErrorBody> = None;
+        let mut seal_unsupported_err: Option<ErrorBody> = None;
         let mut unknown_machine_err: Option<ErrorBody> = None;
+        let mut seal_eligible = cfg!(feature = "ssh")
+            && entry.as_ref().is_some_and(|e| e.target.is_some())
+            && has_device_key
+            && (entry_sealed || (!in_unsynced_backoff && learned_auth_err.is_none()));
 
         for relay in relays {
+            if seal_eligible && let Some(ref e) = entry {
+                match self
+                    .get_or_open_sealed(&relay, machine, e, cancel.clone())
+                    .await
+                {
+                    Ok(live) => match self
+                        .open_content_on_live(
+                            &live,
+                            machine,
+                            path,
+                            offset,
+                            length,
+                            route_policy.clone(),
+                            cancel.clone(),
+                            park_pool.clone(),
+                        )
+                        .await
+                    {
+                        Ok(stream) => {
+                            self.clear_unsynced(machine);
+                            self.record_route(machine, live.route_status());
+                            return Ok(stream);
+                        }
+                        Err(StreamOpenOrHandshakeError::DeadSession) => {
+                            self.invalidate_if_same(machine, &live.session);
+                            last_relay_err = Some(mark_not_sent(
+                                ErrorBody::new(
+                                    ErrorCode::Unreachable,
+                                    format!("The sealed session to {machine} via {relay} closed before opening the stream."),
+                                )
+                                .with_machine(machine),
+                            ));
+                            continue;
+                        }
+                        Err(StreamOpenOrHandshakeError::Error(err)) => return Err(err),
+                    },
+                    Err(
+                        SealOpenError::UnsupportedRelay(err)
+                        | SealOpenError::UnsupportedTarget(err),
+                    ) => {
+                        if entry_sealed {
+                            if seal_unsupported_err.is_none() {
+                                seal_unsupported_err = Some(err);
+                            }
+                            continue;
+                        }
+                    }
+                    Err(SealOpenError::TargetAuthUnsynced(err)) => {
+                        self.mark_unsynced(machine);
+                        learned_auth_err = Some(err);
+                        seal_eligible = false;
+                    }
+                    Err(
+                        SealOpenError::TargetIdentityFailed(err)
+                        | SealOpenError::Fatal(err)
+                        | SealOpenError::Denied(err),
+                    ) => {
+                        return Err(err);
+                    }
+                    Err(SealOpenError::UnknownMachine(err)) => {
+                        unknown_machine_err = Some(err);
+                        continue;
+                    }
+                    Err(SealOpenError::RelayAuthFailed(err)) => {
+                        let relay_is_learned = self.is_learned(&relay);
+                        if relay_is_learned {
+                            self.mark_unsynced(&relay);
+                        }
+                        if relay_auth_err.is_none() || !relay_is_learned {
+                            relay_auth_err = Some(err);
+                        }
+                        continue;
+                    }
+                    Err(SealOpenError::Unreachable(err)) => {
+                        last_relay_err = Some(err);
+                        continue;
+                    }
+                    Err(SealOpenError::NotApplicable) => {}
+                }
+            }
+            if entry_sealed {
+                continue;
+            }
             match self
                 .open_content_via_relay(
                     &relay,
@@ -2880,7 +3322,15 @@ impl Link {
 
         if allow_direct && in_unsynced_backoff {
             match self
-                .open_content_direct(machine, path, offset, length, cancel, park_pool)
+                .open_content_direct(
+                    machine,
+                    path,
+                    offset,
+                    length,
+                    route_policy.clone(),
+                    cancel,
+                    park_pool,
+                )
                 .await
             {
                 Ok(stream) => {
@@ -2896,6 +3346,17 @@ impl Link {
                     }
                 }
             }
+        }
+
+        if entry_sealed
+            && relay_auth_err.is_none()
+            && let Some(unsupported_err) = seal_unsupported_err
+        {
+            return Err(seal_required_error(
+                machine,
+                unsupported_err,
+                direct_err.as_ref(),
+            ));
         }
 
         if let Some(relay) = pinned_relay
@@ -2979,12 +3440,14 @@ impl Link {
         unknown_machine_error(machine)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn open_content_direct(
         &self,
         machine: &str,
         path: &str,
         offset: u64,
         length: Option<u64>,
+        route_policy: ContentRoutePolicy,
         cancel: CancellationToken,
         park_pool: Option<Arc<ParkedStreamPool>>,
     ) -> Result<ContentStream, ErrorBody> {
@@ -2997,9 +3460,19 @@ impl Link {
         let prev_guard = raw.guard.take();
         raw.guard = Some(Box::new((prev_guard, flight)));
 
+        let reopen_mode = if live.config_snapshot.local_program.is_some()
+            && live.config_snapshot.target.is_none()
+        {
+            StreamReopenMode::DirectPeer(machine.to_owned())
+        } else {
+            StreamReopenMode::RoutedMachine {
+                machine: machine.to_owned(),
+                route_policy,
+            }
+        };
         let reopener: Arc<dyn crate::content::StreamOpener> = Arc::new(LinkStreamOpener {
             link: self.clone(),
-            peer: machine.to_owned(),
+            mode: reopen_mode,
             window_policy: opener.window_policy(),
         });
 
@@ -3008,10 +3481,11 @@ impl Link {
             cap_session.record_stream_capabilities(caps);
         };
 
-        handshake_get(
+        handshake_get_with_route(
             raw,
             Some(reopener),
             machine,
+            Route::Direct,
             path,
             offset,
             length,
@@ -3025,6 +3499,86 @@ impl Link {
             Some(&record_caps),
         )
         .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn open_content_on_live(
+        &self,
+        live: &LiveSession,
+        machine: &str,
+        path: &str,
+        offset: u64,
+        length: Option<u64>,
+        route_policy: ContentRoutePolicy,
+        cancel: CancellationToken,
+        park_pool: Option<Arc<ParkedStreamPool>>,
+    ) -> Result<ContentStream, StreamOpenOrHandshakeError> {
+        let flight = live.acquire_flight();
+        let (mut raw, opener) = match self.open_stream_on(live, machine, cancel.clone()).await {
+            Ok(pair) => pair,
+            Err(StreamOpenError::DeadSession(_)) => {
+                drop(flight);
+                return Err(StreamOpenOrHandshakeError::DeadSession);
+            }
+            Err(StreamOpenError::ChannelRefused(body)) => {
+                drop(flight);
+                return Err(StreamOpenOrHandshakeError::Error(mark_not_sent(
+                    body.with_machine(machine),
+                )));
+            }
+            Err(StreamOpenError::Failed(body)) => {
+                drop(flight);
+                let body = body.with_machine(machine);
+                let body = if matches!(body.code, ErrorCode::Unreachable | ErrorCode::Timeout) {
+                    mark_not_sent(body)
+                } else {
+                    body
+                };
+                return Err(StreamOpenOrHandshakeError::Error(body));
+            }
+        };
+        let prev_guard = raw.guard.take();
+        raw.guard = Some(Box::new((prev_guard, flight)));
+
+        let reopener: Arc<dyn crate::content::StreamOpener> = Arc::new(LinkStreamOpener {
+            link: self.clone(),
+            mode: StreamReopenMode::RoutedMachine {
+                machine: machine.to_owned(),
+                route_policy,
+            },
+            window_policy: opener.window_policy(),
+        });
+
+        let cap_session = live.clone();
+        let record_caps = move |caps: Vec<String>| {
+            cap_session.record_stream_capabilities(caps);
+        };
+
+        let as_principal = if live.via.is_some() {
+            None
+        } else {
+            live.config_snapshot.principal.as_deref()
+        };
+
+        handshake_get_with_route(
+            raw,
+            Some(reopener),
+            machine,
+            live.route(),
+            path,
+            offset,
+            length,
+            as_principal,
+            self.inner.options.ssh_timeouts.handshake,
+            cancel,
+            ContentStreamOptions {
+                park_pool,
+                ..ContentStreamOptions::default()
+            },
+            Some(&record_caps),
+        )
+        .await
+        .map_err(StreamOpenOrHandshakeError::Error)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3062,7 +3616,7 @@ impl Link {
 
         let reopener: Arc<dyn crate::content::StreamOpener> = Arc::new(LinkStreamOpener {
             link: self.clone(),
-            peer: relay.to_owned(),
+            mode: StreamReopenMode::DirectPeer(relay.to_owned()),
             window_policy: opener.window_policy(),
         });
 
@@ -3145,13 +3699,14 @@ impl Link {
         }
         validate_blake3_hash(&request.hash, machine)?;
 
-        let entry = self
-            .inner
-            .config
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .node(machine)
-            .cloned();
+        let (entry, has_device_key) = {
+            let cfg = self
+                .inner
+                .config
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (cfg.node(machine).cloned(), cfg.device_key.is_some())
+        };
 
         // A local-only desktop pipe (e.g. `local`) cannot be relayed through remote SSH peers.
         if let Some(ref e) = entry
@@ -3163,11 +3718,32 @@ impl Link {
             return Ok(stream);
         }
 
+        if let Some(ref e) = entry
+            && let Some(live) = self.cached_sealed_session(machine, e, None)
+        {
+            match self
+                .open_put_on_live(&live, machine, &request, cancel.clone())
+                .await
+            {
+                Ok(stream) => {
+                    self.clear_unsynced(machine);
+                    self.record_route(machine, live.route_status());
+                    return Ok(stream);
+                }
+                Err(StreamOpenOrHandshakeError::DeadSession) => {
+                    self.invalidate_if_same(machine, &live.session);
+                }
+                Err(StreamOpenOrHandshakeError::Error(err)) => return Err(err),
+            }
+        }
+
         let entry_is_learned = entry
             .as_ref()
             .is_some_and(|e| e.origin == NodeOrigin::Learned);
+        let entry_sealed = entry.as_ref().is_some_and(|e| e.sealed);
         let entry_learned_from = entry.as_ref().and_then(|e| e.learned_from.clone());
-        let in_unsynced_backoff = entry_is_learned && self.is_in_unsynced_backoff(machine);
+        let in_unsynced_backoff =
+            entry_is_learned && !entry_sealed && self.is_in_unsynced_backoff(machine);
 
         let mut direct_err: Option<ErrorBody> = None;
         let mut learned_auth_err: Option<ErrorBody> = None;
@@ -3187,7 +3763,7 @@ impl Link {
                         return Err(err);
                     }
                     if is_device_removed_or_unknown(&err) {
-                        if entry_is_learned {
+                        if entry_is_learned && !entry_sealed {
                             self.mark_unsynced(machine);
                             learned_auth_err = Some(err);
                         } else {
@@ -3206,9 +3782,88 @@ impl Link {
         let mut last_relay_err: Option<ErrorBody> = None;
         let mut relay_auth_err: Option<ErrorBody> = None;
         let mut old_relay_err: Option<ErrorBody> = None;
+        let mut seal_unsupported_err: Option<ErrorBody> = None;
         let mut unknown_machine_err: Option<ErrorBody> = None;
+        let mut seal_eligible = cfg!(feature = "ssh")
+            && entry.as_ref().is_some_and(|e| e.target.is_some())
+            && has_device_key
+            && (entry_sealed || (!in_unsynced_backoff && learned_auth_err.is_none()));
 
         for relay in relays {
+            if seal_eligible && let Some(ref e) = entry {
+                match self
+                    .get_or_open_sealed(&relay, machine, e, cancel.clone())
+                    .await
+                {
+                    Ok(live) => match self
+                        .open_put_on_live(&live, machine, &request, cancel.clone())
+                        .await
+                    {
+                        Ok(stream) => {
+                            self.clear_unsynced(machine);
+                            self.record_route(machine, live.route_status());
+                            return Ok(stream);
+                        }
+                        Err(StreamOpenOrHandshakeError::DeadSession) => {
+                            self.invalidate_if_same(machine, &live.session);
+                            last_relay_err = Some(mark_not_sent(
+                                ErrorBody::new(
+                                    ErrorCode::Unreachable,
+                                    format!("The sealed session to {machine} via {relay} closed before opening the upload."),
+                                )
+                                .with_machine(machine),
+                            ));
+                            continue;
+                        }
+                        Err(StreamOpenOrHandshakeError::Error(err)) => return Err(err),
+                    },
+                    Err(
+                        SealOpenError::UnsupportedRelay(err)
+                        | SealOpenError::UnsupportedTarget(err),
+                    ) => {
+                        if entry_sealed {
+                            if seal_unsupported_err.is_none() {
+                                seal_unsupported_err = Some(err);
+                            }
+                            continue;
+                        }
+                    }
+                    Err(SealOpenError::TargetAuthUnsynced(err)) => {
+                        self.mark_unsynced(machine);
+                        learned_auth_err = Some(err);
+                        seal_eligible = false;
+                    }
+                    Err(
+                        SealOpenError::TargetIdentityFailed(err)
+                        | SealOpenError::Fatal(err)
+                        | SealOpenError::Denied(err),
+                    ) => {
+                        return Err(err);
+                    }
+                    Err(SealOpenError::UnknownMachine(err)) => {
+                        unknown_machine_err = Some(err);
+                        continue;
+                    }
+                    Err(SealOpenError::RelayAuthFailed(err)) => {
+                        let relay_is_learned = self.is_learned(&relay);
+                        if relay_is_learned {
+                            self.mark_unsynced(&relay);
+                        }
+                        if relay_auth_err.is_none() || !relay_is_learned {
+                            relay_auth_err = Some(err);
+                        }
+                        continue;
+                    }
+                    Err(SealOpenError::Unreachable(err)) => {
+                        last_relay_err = Some(err);
+                        continue;
+                    }
+                    Err(SealOpenError::NotApplicable) => {}
+                }
+            }
+            if entry_sealed {
+                continue;
+            }
             match self
                 .open_put_via_relay(&relay, machine, &request, cancel.clone())
                 .await
@@ -3282,6 +3937,17 @@ impl Link {
             }
         }
 
+        if entry_sealed
+            && relay_auth_err.is_none()
+            && let Some(unsupported_err) = seal_unsupported_err
+        {
+            return Err(seal_required_error(
+                machine,
+                unsupported_err,
+                direct_err.as_ref(),
+            ));
+        }
+
         Err(self.resolve_stream_fallback_error(
             machine,
             entry_learned_from,
@@ -3309,9 +3975,10 @@ impl Link {
             cap_session.record_stream_capabilities(caps);
         };
 
-        let mut stream = handshake_put(
+        let mut stream = handshake_put_with_route(
             raw,
             machine,
+            Route::Direct,
             request,
             live.config_snapshot.principal.as_deref(),
             self.inner.options.ssh_timeouts.handshake,
@@ -3319,6 +3986,65 @@ impl Link {
             Some(&record_caps),
         )
         .await?;
+        stream.attach_flight(Box::new(flight));
+        Ok(stream)
+    }
+
+    async fn open_put_on_live(
+        &self,
+        live: &LiveSession,
+        machine: &str,
+        request: &PutRequest,
+        cancel: CancellationToken,
+    ) -> Result<PutStream, StreamOpenOrHandshakeError> {
+        let flight = live.acquire_flight();
+        let (raw, _opener) = match self.open_stream_on(live, machine, cancel.clone()).await {
+            Ok(pair) => pair,
+            Err(StreamOpenError::DeadSession(_)) => {
+                drop(flight);
+                return Err(StreamOpenOrHandshakeError::DeadSession);
+            }
+            Err(StreamOpenError::ChannelRefused(body)) => {
+                drop(flight);
+                return Err(StreamOpenOrHandshakeError::Error(mark_not_sent(
+                    body.with_machine(machine),
+                )));
+            }
+            Err(StreamOpenError::Failed(body)) => {
+                drop(flight);
+                let body = body.with_machine(machine);
+                let body = if matches!(body.code, ErrorCode::Unreachable | ErrorCode::Timeout) {
+                    mark_not_sent(body)
+                } else {
+                    body
+                };
+                return Err(StreamOpenOrHandshakeError::Error(body));
+            }
+        };
+
+        let cap_session = live.clone();
+        let record_caps = move |caps: Vec<String>| {
+            cap_session.record_stream_capabilities(caps);
+        };
+
+        let as_principal = if live.via.is_some() {
+            None
+        } else {
+            live.config_snapshot.principal.as_deref()
+        };
+
+        let mut stream = handshake_put_with_route(
+            raw,
+            machine,
+            live.route(),
+            request,
+            as_principal,
+            self.inner.options.ssh_timeouts.handshake,
+            cancel,
+            Some(&record_caps),
+        )
+        .await
+        .map_err(StreamOpenOrHandshakeError::Error)?;
         stream.attach_flight(Box::new(flight));
         Ok(stream)
     }
@@ -3514,6 +4240,257 @@ impl Link {
         let raw = opener.open_stream(cancel).await?;
         Ok((raw, opener))
     }
+
+    #[cfg(feature = "ssh")]
+    async fn open_tunnel_stream_on(
+        &self,
+        live: &LiveSession,
+        machine: &str,
+        cancel: CancellationToken,
+    ) -> Result<
+        (
+            crate::content::RawStream,
+            Arc<dyn crate::content::StreamOpener>,
+        ),
+        StreamOpenError,
+    > {
+        let Some(opener) = live.session.stream_opener() else {
+            return Err(StreamOpenError::Failed(
+                ErrorBody::new(
+                    ErrorCode::Unsupported,
+                    format!("The session to {machine} does not support opening tunnel streams."),
+                )
+                .with_hint("Use an SSH or local node transport.")
+                .with_machine(machine),
+            ));
+        };
+        let raw = opener.open_tunnel_stream(cancel).await?;
+        Ok((raw, opener))
+    }
+
+    #[cfg(feature = "ssh")]
+    async fn open_tunnel_stream_on_peer(
+        &self,
+        peer: &str,
+        cancel: CancellationToken,
+    ) -> Result<(crate::content::RawStream, LiveSession, InFlightGuard), ErrorBody> {
+        let live = self.get_or_open(peer, cancel.clone()).await?;
+        let flight = live.acquire_flight();
+        match self
+            .open_tunnel_stream_on(&live, peer, cancel.clone())
+            .await
+        {
+            Ok((raw, _)) => Ok((raw, live, flight)),
+            Err(StreamOpenError::DeadSession(_)) => {
+                drop(flight);
+                self.invalidate_if_same(peer, &live.session);
+                let fresh = self.get_or_open(peer, cancel.clone()).await?;
+                let flight2 = fresh.acquire_flight();
+                let (raw, _) = self
+                    .open_tunnel_stream_on(&fresh, peer, cancel)
+                    .await
+                    .map_err(|err| match err {
+                        StreamOpenError::DeadSession(body) | StreamOpenError::Failed(body) => {
+                            self.invalidate_if_same(peer, &fresh.session);
+                            mark_not_sent(body.with_machine(peer))
+                        }
+                        StreamOpenError::ChannelRefused(body) => {
+                            mark_not_sent(body.with_machine(peer))
+                        }
+                    })?;
+                Ok((raw, fresh, flight2))
+            }
+            Err(StreamOpenError::ChannelRefused(body))
+                if is_channel_refused_with_free_permits(&body)
+                    && self.try_claim_channel_refused_reconnect(peer) =>
+            {
+                drop(flight);
+                self.invalidate_if_same(peer, &live.session);
+                let fresh = self.get_or_open(peer, cancel.clone()).await?;
+                let flight2 = fresh.acquire_flight();
+                let (raw, _) = self
+                    .open_tunnel_stream_on(&fresh, peer, cancel)
+                    .await
+                    .map_err(|err| match err {
+                        StreamOpenError::DeadSession(body) | StreamOpenError::Failed(body) => {
+                            self.invalidate_if_same(peer, &fresh.session);
+                            mark_not_sent(body.with_machine(peer))
+                        }
+                        StreamOpenError::ChannelRefused(body) => {
+                            mark_not_sent(body.with_machine(peer))
+                        }
+                    })?;
+                Ok((raw, fresh, flight2))
+            }
+            Err(StreamOpenError::ChannelRefused(body)) => {
+                Err(mark_not_sent(body.with_machine(peer)))
+            }
+            Err(StreamOpenError::Failed(body)) => Err(mark_not_sent(body.with_machine(peer))),
+        }
+    }
+
+    async fn open_stream_for_routed_machine(
+        &self,
+        machine: &str,
+        route_policy: &ContentRoutePolicy,
+        cancel: CancellationToken,
+    ) -> Result<(crate::content::RawStream, InFlightGuard), StreamOpenError> {
+        let (entry, has_device_key) = {
+            let cfg = self
+                .inner
+                .config
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (cfg.node(machine).cloned(), cfg.device_key.is_some())
+        };
+        let Some(entry) = entry else {
+            return Err(StreamOpenError::Failed(unknown_machine_error(machine)));
+        };
+
+        if let Some(live) = self.cached_sealed_session(machine, &entry, Some(route_policy)) {
+            let flight = live.acquire_flight();
+            match self.open_stream_on(&live, machine, cancel.clone()).await {
+                Ok((raw, _)) => return Ok((raw, flight)),
+                Err(StreamOpenError::DeadSession(_)) => {
+                    drop(flight);
+                    self.invalidate_if_same(machine, &live.session);
+                }
+                Err(StreamOpenError::ChannelRefused(body))
+                    if is_channel_refused_with_free_permits(&body)
+                        && self.try_claim_channel_refused_reconnect(machine) =>
+                {
+                    drop(flight);
+                    self.invalidate_if_same(machine, &live.session);
+                }
+                Err(other) => return Err(other),
+            }
+        }
+
+        let allow_direct = !matches!(route_policy, ContentRoutePolicy::RelayOnly(_));
+        let allow_relay = !matches!(route_policy, ContentRoutePolicy::DirectOnly);
+        let pinned_relay: Option<&str> = match route_policy {
+            ContentRoutePolicy::RelayOnly(relay) | ContentRoutePolicy::DirectOrRelay(relay) => {
+                Some(relay.as_str())
+            }
+            ContentRoutePolicy::Any | ContentRoutePolicy::DirectOnly => None,
+        };
+
+        let mut last_err: Option<ErrorBody> = None;
+        if allow_direct {
+            match self.get_or_open(machine, cancel.clone()).await {
+                Ok(live) => {
+                    let flight = live.acquire_flight();
+                    let (raw, _) = self.open_stream_on(&live, machine, cancel.clone()).await?;
+                    self.record_route(machine, MachineRouteStatus::Direct);
+                    return Ok((raw, flight));
+                }
+                Err(err) => {
+                    if !allow_relay
+                        || !is_unsent(&err)
+                        || !matches!(err.code, ErrorCode::Unreachable | ErrorCode::Timeout)
+                    {
+                        return Err(StreamOpenError::Failed(err));
+                    }
+                    last_err = Some(err);
+                }
+            }
+        }
+
+        if allow_relay && cfg!(feature = "ssh") && entry.target.is_some() && has_device_key {
+            let relays: Vec<String> = match pinned_relay {
+                Some(relay) => {
+                    let configured = self
+                        .inner
+                        .config
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .node(relay)
+                        .is_some();
+                    if configured && relay != machine {
+                        vec![relay.to_owned()]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                None => self.relay_candidates(machine, entry.learned_from.as_deref()),
+            };
+            let mut seal_unsupported_err: Option<ErrorBody> = None;
+            for relay in relays {
+                match self
+                    .get_or_open_sealed(&relay, machine, &entry, cancel.clone())
+                    .await
+                {
+                    Ok(live) => {
+                        let flight = live.acquire_flight();
+                        match self.open_stream_on(&live, machine, cancel.clone()).await {
+                            Ok((raw, _)) => {
+                                self.record_route(machine, live.route_status());
+                                return Ok((raw, flight));
+                            }
+                            Err(StreamOpenError::DeadSession(body)) => {
+                                drop(flight);
+                                self.invalidate_if_same(machine, &live.session);
+                                last_err = Some(body);
+                            }
+                            Err(other) => return Err(other),
+                        }
+                    }
+                    Err(
+                        SealOpenError::UnsupportedRelay(err)
+                        | SealOpenError::UnsupportedTarget(err),
+                    ) => {
+                        if seal_unsupported_err.is_none() {
+                            seal_unsupported_err = Some(err);
+                        }
+                    }
+                    Err(
+                        SealOpenError::TargetIdentityFailed(err)
+                        | SealOpenError::Fatal(err)
+                        | SealOpenError::Denied(err),
+                    ) => return Err(StreamOpenError::Failed(err)),
+                    Err(
+                        SealOpenError::Unreachable(err)
+                        | SealOpenError::UnknownMachine(err)
+                        | SealOpenError::RelayAuthFailed(err)
+                        | SealOpenError::TargetAuthUnsynced(err),
+                    ) => {
+                        last_err = Some(err);
+                    }
+                    Err(SealOpenError::NotApplicable) => {}
+                }
+            }
+            if entry.sealed
+                && let Some(unsupported_err) = seal_unsupported_err
+            {
+                return Err(StreamOpenError::Failed(seal_required_error(
+                    machine,
+                    unsupported_err,
+                    last_err.as_ref(),
+                )));
+            }
+        }
+
+        Err(StreamOpenError::Failed(last_err.unwrap_or_else(|| {
+            ErrorBody::new(
+                ErrorCode::Unreachable,
+                format!("Could not reopen content stream to {machine}."),
+            )
+            .with_machine(machine)
+        })))
+    }
+}
+
+enum StreamOpenOrHandshakeError {
+    DeadSession,
+    Error(ErrorBody),
+}
+
+enum StreamReopenMode {
+    DirectPeer(String),
+    RoutedMachine {
+        machine: String,
+        route_policy: ContentRoutePolicy,
+    },
 }
 
 fn is_channel_refused_with_free_permits(body: &ErrorBody) -> bool {
@@ -3526,10 +4503,10 @@ fn is_channel_refused_with_free_permits(body: &ErrorBody) -> bool {
 
 /// Session-backed [`crate::content::StreamOpener`] used by [`ContentStream`] when reopening a
 /// parked or idle-closed channel, transparently acquiring the current (or freshly reconnected)
-/// session for `peer` (either the direct target machine or the relay carrying it).
+/// session for `peer` (either the direct/sealed target machine or the legacy relay carrying it).
 struct LinkStreamOpener {
     link: Link,
-    peer: String,
+    mode: StreamReopenMode,
     window_policy: Option<crate::content::WindowPolicy>,
 }
 
@@ -3544,10 +4521,21 @@ impl crate::content::StreamOpener for LinkStreamOpener {
     ) -> Pin<Box<dyn Future<Output = Result<crate::content::RawStream, StreamOpenError>> + Send + '_>>
     {
         Box::pin(async move {
-            let (mut raw, _, _, flight) = self
-                .link
-                .open_stream_with_recovery(&self.peer, cancel)
-                .await?;
+            let (mut raw, flight) = match &self.mode {
+                StreamReopenMode::DirectPeer(peer) => {
+                    let (raw, _, _, flight) =
+                        self.link.open_stream_with_recovery(peer, cancel).await?;
+                    (raw, flight)
+                }
+                StreamReopenMode::RoutedMachine {
+                    machine,
+                    route_policy,
+                } => {
+                    self.link
+                        .open_stream_for_routed_machine(machine, route_policy, cancel)
+                        .await?
+                }
+            };
             let prev_guard = raw.guard.take();
             raw.guard = Some(Box::new((prev_guard, flight)));
             Ok(raw)
@@ -3714,7 +4702,10 @@ impl Link {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             std::mem::take(&mut *list)
         };
-        let mut closing = JoinSet::new();
+        // Close sealed sessions before direct/relay sessions so inner SSH sessions can send a
+        // clean disconnect over their live tunnel before the underlying relay session tears down.
+        let mut sealed_closing = JoinSet::new();
+        let mut direct_sessions = Vec::new();
         for slot in slots {
             let live = slot
                 .current
@@ -3722,59 +4713,105 @@ impl Link {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take();
             if let Some(live) = live {
-                closing.spawn(async move {
-                    live.session.close().await;
-                });
+                if live.via.is_some() {
+                    sealed_closing.spawn(async move {
+                        live.session.close().await;
+                    });
+                } else {
+                    direct_sessions.push(live.session);
+                }
             }
         }
         for live in retired {
-            closing.spawn(async move {
-                live.session.close().await;
+            if live.via.is_some() {
+                sealed_closing.spawn(async move {
+                    live.session.close().await;
+                });
+            } else {
+                direct_sessions.push(live.session);
+            }
+        }
+        while sealed_closing.join_next().await.is_some() {}
+
+        let mut direct_closing = JoinSet::new();
+        for session in direct_sessions {
+            direct_closing.spawn(async move {
+                session.close().await;
             });
         }
-        while closing.join_next().await.is_some() {}
+        while direct_closing.join_next().await.is_some() {}
     }
 
     fn retire_node(&self, node: &str) {
-        let slot = self
+        let slots: Vec<(String, Arc<NodeSlot>)> = self
             .inner
             .slots
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(node)
-            .cloned();
-        if let Some(slot) = slot {
-            let old = slot
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            .collect();
+        let mut to_retire = Vec::new();
+        for (slot_name, slot) in slots {
+            let mut guard = slot
                 .current
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
-            if let Some(old) = old {
-                self.inner
-                    .retired
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .push(old);
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let should_retire = slot_name == node
+                || guard
+                    .as_ref()
+                    .is_some_and(|live| live.via.as_deref() == Some(node));
+            if should_retire && let Some(old) = guard.take() {
+                to_retire.push(old);
             }
+        }
+        if !to_retire.is_empty() {
+            self.inner
+                .retired
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend(to_retire);
         }
     }
 
     async fn evict(&self, node: &str) {
-        let slot = self
-            .inner
-            .slots
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(node);
-        let mut to_close = Vec::new();
-        if let Some(slot) = slot {
+        let (own_slot, other_slots) = {
+            let mut map = self
+                .inner
+                .slots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let own = map.remove(node);
+            let others: Vec<Arc<NodeSlot>> = map.values().cloned().collect();
+            (own, others)
+        };
+        let mut sealed_to_close = Vec::new();
+        let mut direct_to_close = Vec::new();
+        if let Some(slot) = own_slot {
             let live = slot
                 .current
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take();
             if let Some(live) = live {
-                to_close.push(live.session);
+                if live.via.is_some() {
+                    sealed_to_close.push(live.session);
+                } else {
+                    direct_to_close.push(live.session);
+                }
+            }
+        }
+        for slot in other_slots {
+            let mut guard = slot
+                .current
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if guard
+                .as_ref()
+                .is_some_and(|live| live.via.as_deref() == Some(node))
+                && let Some(live) = guard.take()
+            {
+                sealed_to_close.push(live.session);
             }
         }
         {
@@ -3785,21 +4822,32 @@ impl Link {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut keep = Vec::new();
             for live in retired.drain(..) {
-                if live.config_snapshot.node == node {
-                    to_close.push(live.session);
+                if live.config_snapshot.node == node || live.via.as_deref() == Some(node) {
+                    if live.via.is_some() {
+                        sealed_to_close.push(live.session);
+                    } else {
+                        direct_to_close.push(live.session);
+                    }
                 } else {
                     keep.push(live);
                 }
             }
             *retired = keep;
         }
-        let mut closing = JoinSet::new();
-        for session in to_close {
-            closing.spawn(async move {
+        let mut closing_sealed = JoinSet::new();
+        for session in sealed_to_close {
+            closing_sealed.spawn(async move {
                 session.close().await;
             });
         }
-        while closing.join_next().await.is_some() {}
+        while closing_sealed.join_next().await.is_some() {}
+        let mut closing_direct = JoinSet::new();
+        for session in direct_to_close {
+            closing_direct.spawn(async move {
+                session.close().await;
+            });
+        }
+        while closing_direct.join_next().await.is_some() {}
     }
 
     fn invalidate_if_same(&self, node: &str, dead: &Arc<Session>) {
@@ -3838,6 +4886,82 @@ impl Link {
         }
     }
 
+    fn cached_sealed_session(
+        &self,
+        node: &str,
+        entry: &NodeLink,
+        policy: Option<&ContentRoutePolicy>,
+    ) -> Option<LiveSession> {
+        let slot = self
+            .inner
+            .slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(node)
+            .cloned()?;
+        let guard = slot
+            .current
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let live = guard.as_ref()?;
+        if live.via.is_none()
+            || !live.session.is_alive()
+            || !live.config_snapshot.same_transport(entry)
+        {
+            return None;
+        }
+        if let Some(p) = policy
+            && !live.matches_content_policy(p)
+        {
+            return None;
+        }
+        live.touch();
+        Some(live.clone())
+    }
+
+    async fn tools_on_live(
+        &self,
+        live: &LiveSession,
+        machine: &str,
+        cancel: CancellationToken,
+    ) -> Result<Value, CallError> {
+        let _flight = live.acquire_flight();
+        let result = live.session.tools(None, cancel).await?;
+        serde_json::to_value(&result).map_err(|err| {
+            CallError::Remote(
+                ErrorBody::new(
+                    ErrorCode::Internal,
+                    format!("Could not serialize tools result: {err}."),
+                )
+                .with_machine(machine),
+            )
+        })
+    }
+
+    async fn call_on_live(
+        &self,
+        live: &LiveSession,
+        tool: &str,
+        args: Value,
+        cancel: CancellationToken,
+        events: &mut impl FnMut(Value),
+    ) -> Result<Value, CallError> {
+        let _flight = live.acquire_flight();
+        let params = CallParams {
+            tool: tool.to_owned(),
+            args,
+            as_principal: if live.via.is_some() {
+                None
+            } else {
+                live.config_snapshot.principal.clone()
+            },
+            on: None,
+            hops: 0,
+        };
+        self.run_call_with_events(&live.session, params, cancel, events)
+            .await
+    }
+
     async fn get_or_open(
         &self,
         node: &str,
@@ -3866,6 +4990,7 @@ impl Link {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(live) = guard.as_ref()
+                && live.via.is_none()
                 && live.session.is_alive()
                 && live.config_snapshot.same_transport(&entry)
             {
@@ -3892,13 +5017,22 @@ impl Link {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(live) = guard.as_ref()
+                && live.via.is_none()
                 && live.session.is_alive()
                 && live.config_snapshot.same_transport(&entry)
             {
                 live.touch();
                 return Ok(live.clone());
             }
-            guard.take()
+            // Only discard an existing slot before dialing if it is dead or mismatched; preserve a
+            // live sealed session if a direct dial attempt fails.
+            if guard.as_ref().is_some_and(|live| {
+                !live.session.is_alive() || !live.config_snapshot.same_transport(&entry)
+            }) {
+                guard.take()
+            } else {
+                None
+            }
         };
         if let Some(old) = stale {
             // Do not close the displaced session while callers may still hold an `Arc<Session>`
@@ -3940,15 +5074,438 @@ impl Link {
         let live = LiveSession {
             session: Arc::new(session),
             config_snapshot: entry,
+            via: None,
             last_used: Arc::new(Mutex::new(Instant::now())),
             in_flight: Arc::new(AtomicUsize::new(0)),
             stream_capabilities: Arc::new(Mutex::new(None)),
         };
-        *slot
+        let displaced = slot
             .current
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(live.clone());
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(live.clone());
+        if let Some(old) = displaced {
+            self.inner
+                .retired
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(old);
+        }
         Ok(live)
+    }
+
+    #[cfg(not(feature = "ssh"))]
+    async fn get_or_open_sealed(
+        &self,
+        _relay: &str,
+        _machine: &str,
+        _entry: &NodeLink,
+        _cancel: CancellationToken,
+    ) -> Result<LiveSession, SealOpenError> {
+        Err(SealOpenError::NotApplicable)
+    }
+
+    #[cfg(feature = "ssh")]
+    async fn get_or_open_sealed(
+        &self,
+        relay: &str,
+        machine: &str,
+        entry: &NodeLink,
+        cancel: CancellationToken,
+    ) -> Result<LiveSession, SealOpenError> {
+        let Some(target) = entry.target.as_ref() else {
+            return Err(SealOpenError::NotApplicable);
+        };
+        let key_pem = {
+            let cfg = self
+                .inner
+                .config
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cfg.device_key.clone()
+        };
+        let Some(key_pem) = key_pem else {
+            return Err(SealOpenError::NotApplicable);
+        };
+
+        let slot = self.slot(machine);
+        let _open_guard = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                return Err(SealOpenError::Fatal(
+                    ErrorBody::new(
+                        ErrorCode::Cancelled,
+                        format!("Connecting to {machine} via {relay} was cancelled."),
+                    )
+                    .with_machine(machine),
+                ));
+            }
+            guard = slot.open_lock.lock() => guard,
+        };
+
+        // Another concurrent caller may have already established a live sealed session via this
+        // relay while we waited for `slot.open_lock`; reuse it so only one tunnel is opened.
+        {
+            let guard = slot
+                .current
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(live) = guard.as_ref()
+                && live.session.is_alive()
+                && live.config_snapshot.same_transport(entry)
+                && live.via.as_deref() == Some(relay)
+            {
+                live.touch();
+                return Ok(live.clone());
+            }
+        }
+
+        let (tunnel_io, tunnel_guard) = self.open_tunnel_io(relay, machine, cancel.clone()).await?;
+        let device_key = crate::key::DeviceKey::from_openssh(&key_pem)
+            .map_err(|err| SealOpenError::Fatal(mark_not_sent(err.with_machine(machine))))?;
+
+        let retry_link = self.clone();
+        let retry_relay = relay.to_owned();
+        let retry_machine = machine.to_owned();
+        let retry_open = move |retry_cancel: CancellationToken| async move {
+            retry_link
+                .open_tunnel_io(&retry_relay, &retry_machine, retry_cancel)
+                .await
+                .map_err(SealOpenError::into_error)
+        };
+
+        let session = match crate::ssh::open_over_stream(
+            machine,
+            target,
+            &device_key,
+            crate::command::Subcommand::Rpc,
+            self.inner.options.ssh_timeouts,
+            tunnel_io,
+            tunnel_guard,
+            retry_open,
+            cancel,
+        )
+        .await
+        {
+            Ok(session) => session,
+            Err(err) => {
+                let err = mark_not_sent(classify_open_error(machine, err));
+                if is_host_key_mismatch(&err) {
+                    return Err(SealOpenError::TargetIdentityFailed(err));
+                }
+                if is_device_removed_or_unknown(&err) {
+                    if entry.origin == NodeOrigin::Learned && !entry.sealed {
+                        return Err(SealOpenError::TargetAuthUnsynced(err));
+                    }
+                    return Err(SealOpenError::TargetIdentityFailed(err));
+                }
+                if err.code == ErrorCode::Cancelled {
+                    return Err(SealOpenError::Fatal(err));
+                }
+                if matches!(err.code, ErrorCode::Unreachable | ErrorCode::Timeout) {
+                    return Err(SealOpenError::Unreachable(err));
+                }
+                return Err(SealOpenError::Fatal(err));
+            }
+        };
+
+        let actual = session.info().hello.node.clone();
+        if actual != entry.node {
+            session.close().await;
+            return Err(SealOpenError::TargetIdentityFailed(mark_not_sent(
+                ErrorBody::new(
+                    ErrorCode::Denied,
+                    format!(
+                        "Connected to {actual:?} when expecting {:?}.",
+                        entry.node
+                    ),
+                )
+                .with_hint(
+                    "Check that the endpoint points to the intended machine and has not been redirected.",
+                )
+                .with_machine(&entry.node)
+                .with_details(json!({
+                    "reason": crate::REASON_NODE_MISMATCH,
+                    "expected": entry.node,
+                    "actual": actual,
+                })),
+            )));
+        }
+
+        self.mark_node_sealed(machine);
+        let mut sealed_snapshot = entry.clone();
+        sealed_snapshot.sealed = true;
+        let live = LiveSession {
+            session: Arc::new(session),
+            config_snapshot: sealed_snapshot,
+            via: Some(relay.to_owned()),
+            last_used: Arc::new(Mutex::new(Instant::now())),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            stream_capabilities: Arc::new(Mutex::new(None)),
+        };
+        let displaced = slot
+            .current
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(live.clone());
+        if let Some(old) = displaced {
+            self.inner
+                .retired
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(old);
+        }
+        Ok(live)
+    }
+
+    #[cfg(feature = "ssh")]
+    async fn open_tunnel_io(
+        &self,
+        relay: &str,
+        machine: &str,
+        cancel: CancellationToken,
+    ) -> Result<(TunnelIo, Box<dyn Send + Sync>), SealOpenError> {
+        use tokio::io::AsyncWriteExt;
+
+        const TUNNEL_HANDSHAKE_BUF_BYTES: usize = 64 * 1024;
+        const MAX_TUNNEL_READY_LINE: usize = 1024 * 1024;
+        const MAX_TUNNEL_BUSY_LINES: usize = 32;
+
+        if self.stream_supports(relay, CAP_STREAM_RELAY_TUNNEL) == Some(false) {
+            return Err(SealOpenError::UnsupportedRelay(relay_tunnel_too_old_error(
+                relay, machine,
+            )));
+        }
+
+        let (mut raw, relay_live, relay_flight) =
+            match self.open_tunnel_stream_on_peer(relay, cancel.clone()).await {
+                Ok(opened) => opened,
+                Err(err) => {
+                    if err.code == ErrorCode::Unsupported {
+                        return Err(SealOpenError::UnsupportedRelay(err));
+                    }
+                    if is_device_removed_or_unknown(&err) {
+                        return Err(SealOpenError::RelayAuthFailed(err));
+                    }
+                    if matches!(err.code, ErrorCode::Unreachable | ErrorCode::Timeout) {
+                        return Err(SealOpenError::Unreachable(err));
+                    }
+                    return Err(SealOpenError::Fatal(err));
+                }
+            };
+        let prev_guard = raw.guard.take();
+        raw.guard = Some(Box::new((prev_guard, relay_flight)));
+
+        let timeout = self.inner.options.ssh_timeouts.handshake;
+        let mut greeted = match greet_raw_stream(
+            raw,
+            relay,
+            TUNNEL_HANDSHAKE_BUF_BYTES,
+            timeout,
+            &cancel,
+        )
+        .await
+        {
+            Ok(greeted) => greeted,
+            Err(err) => {
+                if err.code == ErrorCode::Unsupported {
+                    return Err(SealOpenError::UnsupportedRelay(err));
+                }
+                if matches!(err.code, ErrorCode::Unreachable | ErrorCode::Timeout) {
+                    return Err(SealOpenError::Unreachable(err));
+                }
+                return Err(SealOpenError::Fatal(err));
+            }
+        };
+        relay_live.record_stream_capabilities(greeted.capabilities.clone());
+        if !greeted
+            .capabilities
+            .iter()
+            .any(|c| c == CAP_STREAM_RELAY_TUNNEL)
+        {
+            greeted.cancel.cancel();
+            return Err(SealOpenError::UnsupportedRelay(relay_tunnel_too_old_error(
+                relay, machine,
+            )));
+        }
+
+        let mut envelope = json!({
+            "protocol": 1u32,
+            "op": "relay",
+            "on": machine,
+            "request": {
+                "protocol": 1u32,
+                "op": "tunnel",
+            },
+        });
+        if let Some(principal) = relay_live.config_snapshot.principal.as_deref() {
+            envelope["as"] = json!(principal);
+        }
+        let mut header_bytes = envelope.to_string().into_bytes();
+        header_bytes.push(b'\n');
+
+        let ready_fut = async {
+            greeted
+                .writer
+                .write_all(&header_bytes)
+                .await
+                .map_err(|err| {
+                    SealOpenError::Unreachable(mark_not_sent(
+                        ErrorBody::new(
+                            ErrorCode::Unreachable,
+                            format!("Could not send tunnel request to {relay}: {err}."),
+                        )
+                        .with_machine(relay),
+                    ))
+                })?;
+            greeted.writer.flush().await.map_err(|err| {
+                SealOpenError::Unreachable(mark_not_sent(
+                    ErrorBody::new(
+                        ErrorCode::Unreachable,
+                        format!("Could not flush tunnel request to {relay}: {err}."),
+                    )
+                    .with_machine(relay),
+                ))
+            })?;
+
+            let mut line = Vec::new();
+            let mut busy_count = 0usize;
+            loop {
+                line.clear();
+                let n = read_bounded_line(&mut greeted.reader, &mut line, MAX_TUNNEL_READY_LINE)
+                    .await
+                    .map_err(|err| {
+                        SealOpenError::Unreachable(mark_not_sent(
+                            ErrorBody::new(
+                                ErrorCode::Unreachable,
+                                format!("Reading tunnel reply from {relay} failed: {err}."),
+                            )
+                            .with_machine(relay),
+                        ))
+                    })?;
+                if n == 0 {
+                    let mut err = ErrorBody::new(
+                        ErrorCode::Unreachable,
+                        format!("The tunnel stream to {machine} via {relay} closed before ready."),
+                    )
+                    .with_machine(machine);
+                    if let Some(tail) = &greeted.stderr {
+                        let text = tail.text();
+                        if !text.is_empty() {
+                            err = err.with_hint(format!("Remote stderr: {text}"));
+                        }
+                    }
+                    return Err(SealOpenError::Unreachable(mark_not_sent(err)));
+                }
+                let Value::Object(fields) =
+                    serde_json::from_slice::<Value>(&line).map_err(|_| {
+                        SealOpenError::Unreachable(mark_not_sent(
+                            ErrorBody::new(
+                                ErrorCode::Failed,
+                                format!("{relay} answered tunnel request with non-JSON output."),
+                            )
+                            .with_machine(relay),
+                        ))
+                    })?
+                else {
+                    return Err(SealOpenError::Unreachable(mark_not_sent(
+                        ErrorBody::new(
+                            ErrorCode::Failed,
+                            format!("{relay} answered tunnel request with a non-object JSON line."),
+                        )
+                        .with_machine(relay),
+                    )));
+                };
+                if fields.len() == 1 && fields.get("busy") == Some(&Value::Bool(true)) {
+                    busy_count += 1;
+                    if busy_count > MAX_TUNNEL_BUSY_LINES {
+                        return Err(SealOpenError::Unreachable(mark_not_sent(
+                            ErrorBody::new(
+                                ErrorCode::Timeout,
+                                format!(
+                                    "{relay} stayed busy while opening a sealed tunnel to {machine}."
+                                ),
+                            )
+                            .with_machine(relay),
+                        )));
+                    }
+                    continue;
+                }
+                if let Some(err_val) = fields.get("error") {
+                    let body = mark_not_sent(crate::decode_remote_error(err_val, machine));
+                    if body.code == ErrorCode::Unsupported {
+                        let reason = body
+                            .details
+                            .as_ref()
+                            .and_then(|d| d.get("reason"))
+                            .and_then(Value::as_str);
+                        if reason == Some(crate::REASON_RELAY_TOO_OLD) {
+                            return Err(SealOpenError::UnsupportedRelay(body));
+                        }
+                        return Err(SealOpenError::UnsupportedTarget(
+                            ensure_target_too_old_reason(body, machine),
+                        ));
+                    }
+                    if is_unknown_machine(&body) {
+                        return Err(SealOpenError::UnknownMachine(body));
+                    }
+                    if matches!(body.code, ErrorCode::Unreachable | ErrorCode::Timeout) {
+                        return Err(SealOpenError::Unreachable(body));
+                    }
+                    if body.code == ErrorCode::Denied {
+                        return Err(SealOpenError::Denied(body));
+                    }
+                    return Err(SealOpenError::Fatal(body));
+                }
+                if fields.get("tunnel") == Some(&Value::Bool(true)) {
+                    return Ok(());
+                }
+                return Err(SealOpenError::Unreachable(mark_not_sent(
+                    ErrorBody::new(
+                        ErrorCode::Failed,
+                        format!("{relay} answered tunnel request with an unexpected reply."),
+                    )
+                    .with_machine(relay),
+                )));
+            }
+        };
+
+        let ready_res = tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(SealOpenError::Fatal(
+                ErrorBody::new(
+                    ErrorCode::Cancelled,
+                    format!("Opening sealed tunnel to {machine} via {relay} was cancelled."),
+                )
+                .with_machine(machine),
+            )),
+            res = tokio::time::timeout(timeout, ready_fut) => match res {
+                Ok(inner) => inner,
+                Err(_) => Err(SealOpenError::Unreachable(mark_not_sent(
+                    ErrorBody::new(
+                        ErrorCode::Timeout,
+                        format!(
+                            "Timed out waiting for {relay} to open a sealed tunnel to {machine} after {}s.",
+                            timeout.as_secs_f64()
+                        ),
+                    )
+                    .with_machine(relay),
+                ))),
+            },
+        };
+
+        if let Err(err) = ready_res {
+            greeted.cancel.cancel();
+            return Err(err);
+        }
+
+        let tunnel_io = TunnelIo {
+            reader: greeted.reader,
+            writer: greeted.writer,
+        };
+        let tunnel_guard: Box<dyn Send + Sync> =
+            Box::new((greeted.guard, TunnelCancelGuard(greeted.cancel)));
+        Ok((tunnel_io, tunnel_guard))
     }
 
     fn slot(&self, node: &str) -> Arc<NodeSlot> {
@@ -4211,6 +5768,208 @@ fn attach_direct_error(mut err: ErrorBody, direct: Option<&ErrorBody>) -> ErrorB
         err.details = Some(details);
     }
     err
+}
+
+#[cfg_attr(not(feature = "ssh"), allow(dead_code))]
+enum SealOpenError {
+    NotApplicable,
+    UnsupportedRelay(ErrorBody),
+    UnsupportedTarget(ErrorBody),
+    TargetAuthUnsynced(ErrorBody),
+    TargetIdentityFailed(ErrorBody),
+    RelayAuthFailed(ErrorBody),
+    UnknownMachine(ErrorBody),
+    Denied(ErrorBody),
+    Unreachable(ErrorBody),
+    Fatal(ErrorBody),
+}
+
+#[cfg(feature = "ssh")]
+impl SealOpenError {
+    fn into_error(self) -> ErrorBody {
+        match self {
+            SealOpenError::NotApplicable => ErrorBody::new(
+                ErrorCode::Unsupported,
+                "Sealed sessions require an SSH target and device key.",
+            ),
+            SealOpenError::UnsupportedRelay(err)
+            | SealOpenError::UnsupportedTarget(err)
+            | SealOpenError::TargetAuthUnsynced(err)
+            | SealOpenError::TargetIdentityFailed(err)
+            | SealOpenError::RelayAuthFailed(err)
+            | SealOpenError::UnknownMachine(err)
+            | SealOpenError::Denied(err)
+            | SealOpenError::Unreachable(err)
+            | SealOpenError::Fatal(err) => err,
+        }
+    }
+}
+
+#[cfg(feature = "ssh")]
+struct TunnelCancelGuard(CancellationToken);
+
+#[cfg(feature = "ssh")]
+impl Drop for TunnelCancelGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// Bidirectional async byte stream adapter over an already-greeted `legion stream` tunnel,
+/// keeping the `BufReader` intact so any SSH banner bytes buffered right after `{"tunnel":true}\n`
+/// are handed to `russh` without loss.
+#[cfg(feature = "ssh")]
+struct TunnelIo {
+    reader: tokio::io::BufReader<BoxStreamRead>,
+    writer: BoxStreamWrite,
+}
+
+#[cfg(feature = "ssh")]
+impl tokio::io::AsyncRead for TunnelIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.reader).poll_read(cx, buf)
+    }
+}
+
+#[cfg(feature = "ssh")]
+impl tokio::io::AsyncWrite for TunnelIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.writer).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.writer).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.writer).poll_shutdown(cx)
+    }
+}
+
+#[cfg(feature = "ssh")]
+fn is_host_key_mismatch(err: &ErrorBody) -> bool {
+    err.code == ErrorCode::Denied
+        && err
+            .details
+            .as_ref()
+            .and_then(|d| d.get("reason"))
+            .and_then(Value::as_str)
+            == Some(crate::REASON_HOST_KEY_MISMATCH)
+}
+
+#[cfg(feature = "ssh")]
+fn ensure_target_too_old_reason(mut err: ErrorBody, target: &str) -> ErrorBody {
+    let mut details = err.details.take().unwrap_or_else(|| json!({}));
+    if let Some(obj) = details.as_object_mut() {
+        obj.entry("reason".to_owned())
+            .or_insert_with(|| json!(crate::REASON_TARGET_TOO_OLD));
+        obj.entry("target".to_owned())
+            .or_insert_with(|| json!(target));
+    } else {
+        details = json!({
+            "reason": crate::REASON_TARGET_TOO_OLD,
+            "target": target,
+            "detail": details,
+        });
+    }
+    err.details = Some(details);
+    err
+}
+
+#[cfg(feature = "ssh")]
+fn relay_tunnel_too_old_error(relay: &str, target: &str) -> ErrorBody {
+    mark_not_sent(
+        ErrorBody::new(
+            ErrorCode::Unsupported,
+            format!("{relay} needs an update before it can relay sealed sessions to {target}."),
+        )
+        .with_hint(format!(
+            "Update legion on {relay} so it advertises `{CAP_STREAM_RELAY_TUNNEL}`."
+        ))
+        .with_machine(relay)
+        .with_details(json!({
+            "reason": crate::REASON_RELAY_TOO_OLD,
+            "relay": relay,
+            "target": target,
+        })),
+    )
+}
+
+fn seal_required_error(
+    target: &str,
+    cause: ErrorBody,
+    direct_err: Option<&ErrorBody>,
+) -> ErrorBody {
+    let cause_reason = cause
+        .details
+        .as_ref()
+        .and_then(|d| d.get("reason"))
+        .and_then(Value::as_str)
+        .unwrap_or("unsupported")
+        .to_owned();
+    let relay_name = cause
+        .details
+        .as_ref()
+        .and_then(|d| d.get("relay"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+
+    let (message, hint) = match (cause_reason.as_str(), relay_name.as_deref()) {
+        (crate::REASON_RELAY_TOO_OLD, Some(relay)) => (
+            format!(
+                "Refused to connect to {target} through unsealed relay {relay}: {target} has already completed a sealed session, and {relay} is too old to seal."
+            ),
+            format!(
+                "Update legion on {relay} so it supports sealed tunnels, or reach {target} directly or through a newer relay."
+            ),
+        ),
+        (crate::REASON_TARGET_TOO_OLD, _) => (
+            format!(
+                "Refused to fall back to an unsealed relay for {target}: {target} has already completed a sealed session, but no relay could open a sealed tunnel to it."
+            ),
+            format!(
+                "Check that {target} is running a current legion build with `stream.tunnel` enabled, or connect directly."
+            ),
+        ),
+        _ => (
+            format!(
+                "Refused to fall back to an unsealed relay for {target}: {target} has already completed a sealed session, and no reachable relay can open a sealed tunnel."
+            ),
+            format!(
+                "Update legion on your relay machines (and {target}), or connect to {target} directly."
+            ),
+        ),
+    };
+
+    let mut details = json!({
+        "reason": crate::REASON_SEAL_REQUIRED,
+        "cause": cause_reason,
+        "target": target,
+    });
+    if let Some(relay) = relay_name
+        && let Some(obj) = details.as_object_mut()
+    {
+        obj.insert("relay".to_owned(), json!(relay));
+    }
+    let err = ErrorBody::new(ErrorCode::Unsupported, message)
+        .with_hint(hint)
+        .with_machine(cause.machine.as_deref().unwrap_or(target))
+        .with_details(details);
+    attach_direct_error(err, direct_err)
 }
 
 fn relay_too_old_error(relay: &str, target: &str) -> ErrorBody {

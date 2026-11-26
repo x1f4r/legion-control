@@ -53,5 +53,10 @@ name = "fleet_routes"
 path = "tests/fleet_routes.rs"
 required-features = ["ssh"]
 
+[[test]]
+name = "sealed_sessions"
+path = "tests/sealed_sessions.rs"
+required-features = ["ssh"]
+
 [lints]
 workspace = true

@@ -538,7 +538,7 @@ impl Drop for NodePairingGuard {
 /// Production backend implementation over [`legion_link::Link`].
 pub struct LinkBackend {
     store: AppStore,
-    state: Mutex<BackendState>,
+    state: Arc<Mutex<BackendState>>,
     /// Serializes pairing/unpairing/learning/identity-change mutations so device key generation
     /// and store writes never race.
     mutate_lock: AsyncMutex<()>,
@@ -746,6 +746,7 @@ impl LinkBackend {
             None => Link::with_options(link_cfg, link_options),
         };
 
+        let link_hook_handle = link.clone();
         let mut state = BackendState {
             data,
             store_error,
@@ -767,9 +768,42 @@ impl LinkBackend {
             state.sync_pairing_epochs();
         }
 
+        let state_arc = Arc::new(Mutex::new(state));
+        let weak_state = Arc::downgrade(&state_arc);
+        let persist = store.clone();
+        link_hook_handle.set_on_config_change(Arc::new(move |live_cfg| {
+            let Some(state_arc) = weak_state.upgrade() else {
+                return;
+            };
+            let mut guard = state_arc
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if guard.store_error.is_some() {
+                return;
+            }
+            let mut updated = guard.data.clone();
+            let mut changed = false;
+            for node in &mut updated.link.nodes {
+                if !node.sealed
+                    && live_cfg
+                        .node(&node.node)
+                        .is_some_and(|live_node| live_node.sealed)
+                {
+                    node.sealed = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return;
+            }
+            if persist.save(&updated).is_ok() {
+                guard.data = updated;
+            }
+        }));
+
         Self {
             store,
-            state: Mutex::new(state),
+            state: state_arc,
             mutate_lock: AsyncMutex::new(()),
             next_call_seq: AtomicU64::new(1),
             active_pairs: Arc::new(Mutex::new(Vec::new())),
@@ -5018,6 +5052,40 @@ mod tests {
         let on_disk = store.load()?;
         assert!(on_disk.link.node("tower").is_some());
         assert!(on_disk.link.node("pi").is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sealed_ratchet_persists_across_mutations_and_clears_on_unpair()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = AppStore::in_dir(dir.path());
+        let mut initial = AppStoreData::default();
+        initial.link.upsert_node(sample_ssh_node("tower"));
+        let mut studio = sample_ssh_node("studio");
+        studio.sealed = true;
+        initial.link.upsert_node(studio);
+        initial.current_node = Some("tower".to_owned());
+        store.save(&initial)?;
+
+        let backend = LinkBackend::with_local_program(store.clone(), None);
+        // Selecting another node must keep `studio.sealed == true` on disk and in live Link config.
+        backend.select_node("studio".to_owned()).await?;
+        assert!(
+            store.load()?.link.node("studio").is_some_and(|n| n.sealed),
+            "select_node must preserve sealed ratchet on disk"
+        );
+        {
+            let guard = backend.state.lock().unwrap_or_else(|p| p.into_inner());
+            assert!(
+                guard.link.config().node("studio").is_some_and(|n| n.sealed),
+                "live Link config must retain sealed ratchet"
+            );
+        }
+
+        // Unpairing `studio` removes the entry cleanly so re-adding starts unsealed.
+        backend.unpair("studio".to_owned()).await?;
+        assert!(store.load()?.link.node("studio").is_none());
         Ok(())
     }
 }
