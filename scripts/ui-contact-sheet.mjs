@@ -488,7 +488,13 @@ function buildButtonsPageHtml(symbols, theme) {
     .cs-spec-label { font: 600 12.5px/1.3 var(--mono); color: var(--text); }
     .cs-spec-note { font: 11.5px/1.35 var(--sans); color: var(--dim); margin-top: 2px; }
     .cs-cell { text-align: center; background: var(--bg); }
-    .cs-cell-dark { background: #0d0e10; color: #eceef0; }
+    .cs-cell-dark {
+      background: #0d0e10;
+      color: #eceef0;
+      --accent: #b6f24a;
+      --accent-ink: #11160a;
+      --press-surface: rgb(255 255 255 / 0.16);
+    }
     .cs-pair { display: inline-flex; gap: 8px; align-items: center; }
     .cs-seg { width: 150px; margin: 0 auto; }
     .cs-tabs { margin: 0; justify-content: center; }
