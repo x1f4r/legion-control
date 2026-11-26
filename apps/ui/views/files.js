@@ -2,11 +2,20 @@
 // thumbnails, 5 000-entry paging, swipe actions, long-press selection), Search, Favourites, Recent,
 // and Kept-in-sync folder detail.
 
-import { html, useCallback, useEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
+import {
+  html,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from '../vendor/preact-htm.js';
 import { Icon } from '../icons.js';
 import {
   baseFileName,
   changedPresetCutoff,
+  computeVirtualWindow,
   createThumbQueue,
   detectFileCapabilities,
   entryCategory,
@@ -61,8 +70,157 @@ import { FilesViewer } from './files-viewer.js';
 import { SplitView } from './split-view.js';
 
 const PAGE_SIZE = 200;
+const NEXT_PAGE_SIZE = 500;
 const RENDER_STEP = 120;
 const LONG_PRESS_MS = 450;
+const VIRTUAL_MIN_ITEMS = 60;
+const DEFAULT_ROW_HEIGHT_PX = 56;
+const VIRTUAL_OVERSCAN = 20;
+
+function findScrollParent(el) {
+  let node = el?.parentElement || null;
+  while (node && node !== document.body && node !== document.documentElement) {
+    const oy = window.getComputedStyle ? window.getComputedStyle(node).overflowY : '';
+    if (oy === 'auto' || oy === 'scroll') return node;
+    node = node.parentElement;
+  }
+  return document.scrollingElement || document.documentElement;
+}
+
+function VirtualFileList({ items, renderRow, resetKey }) {
+  const listRef = useRef(null);
+  const topSpacerRef = useRef(null);
+  const bottomSpacerRef = useRef(null);
+  const rowHeightRef = useRef(DEFAULT_ROW_HEIGHT_PX);
+  const rafRef = useRef(0);
+  const total = items.length;
+  const virtualized = total > VIRTUAL_MIN_ITEMS;
+
+  const [win, setWin] = useState(() =>
+    computeVirtualWindow({
+      total,
+      rowHeight: DEFAULT_ROW_HEIGHT_PX,
+      scrollOffset: 0,
+      viewportHeight: typeof window !== 'undefined' ? window.innerHeight || 720 : 720,
+      overscan: VIRTUAL_OVERSCAN,
+    }),
+  );
+
+  const computeFromDom = useCallback(() => {
+    const listEl = listRef.current;
+    if (!listEl || total <= VIRTUAL_MIN_ITEMS) return;
+    const scroller = findScrollParent(listEl);
+    const isDoc =
+      !scroller || scroller === document.documentElement || scroller === document.body;
+    const listRect = listEl.getBoundingClientRect();
+    const scrollOffset = isDoc
+      ? Math.max(0, -listRect.top)
+      : Math.max(0, scroller.getBoundingClientRect().top - listRect.top);
+    const viewportHeight = isDoc
+      ? window.innerHeight || 720
+      : scroller.clientHeight || window.innerHeight || 720;
+    const next = computeVirtualWindow({
+      total,
+      rowHeight: rowHeightRef.current,
+      scrollOffset,
+      viewportHeight,
+      overscan: VIRTUAL_OVERSCAN,
+    });
+    setWin((prev) =>
+      prev.start === next.start &&
+      prev.end === next.end &&
+      prev.topPad === next.topPad &&
+      prev.bottomPad === next.bottomPad
+        ? prev
+        : next,
+    );
+  }, [total]);
+
+  const start = Math.min(win.start, total);
+  const end = Math.min(Math.max(win.end, start), total);
+  const topPad = Math.round(start * rowHeightRef.current);
+  const bottomPad = Math.max(0, Math.round((total - end) * rowHeightRef.current));
+
+  useLayoutEffect(() => {
+    if (!virtualized) return;
+    const listEl = listRef.current;
+    const topEl = topSpacerRef.current;
+    const bottomEl = bottomSpacerRef.current;
+    if (topEl) topEl.style.height = `${topPad}px`;
+    if (bottomEl) bottomEl.style.height = `${bottomPad}px`;
+    if (listEl) {
+      const firstRow = topEl?.nextElementSibling;
+      if (firstRow && firstRow !== bottomEl) {
+        const measured = firstRow.getBoundingClientRect().height;
+        if (measured >= 24 && Math.abs(measured - rowHeightRef.current) > 0.5) {
+          rowHeightRef.current = measured;
+          computeFromDom();
+        }
+      }
+    }
+  }, [virtualized, topPad, bottomPad, start, end, computeFromDom]);
+
+  useEffect(() => {
+    if (!virtualized) return undefined;
+    const listEl = listRef.current;
+    if (!listEl) return undefined;
+    const scroller = findScrollParent(listEl);
+    const isDoc =
+      !scroller || scroller === document.documentElement || scroller === document.body;
+    const scrollTarget = isDoc ? window : scroller;
+
+    computeFromDom();
+
+    const scheduleUpdate = () => {
+      if (rafRef.current) return;
+      rafRef.current = window.requestAnimationFrame(() => {
+        rafRef.current = 0;
+        computeFromDom();
+      });
+    };
+
+    scrollTarget.addEventListener('scroll', scheduleUpdate, { passive: true });
+    let ro = null;
+    if (typeof ResizeObserver !== 'undefined' && scroller) {
+      ro = new ResizeObserver(scheduleUpdate);
+      ro.observe(scroller);
+    }
+    return () => {
+      scrollTarget.removeEventListener('scroll', scheduleUpdate);
+      if (ro) ro.disconnect();
+      if (rafRef.current) {
+        window.cancelAnimationFrame(rafRef.current);
+        rafRef.current = 0;
+      }
+    };
+  }, [virtualized, total, resetKey, computeFromDom]);
+
+  if (!virtualized) {
+    return html`<div class="list">${items.map(renderRow)}</div>`;
+  }
+
+  const slice = items.slice(start, end);
+
+  return html`
+    <div class="list" ref=${listRef}>
+      <div
+        key="__vlist_top"
+        ref=${topSpacerRef}
+        class="vlist-spacer"
+        data-empty=${topPad === 0 ? 'true' : 'false'}
+        aria-hidden="true"
+      />
+      ${slice.map(renderRow)}
+      <div
+        key="__vlist_bottom"
+        ref=${bottomSpacerRef}
+        class="vlist-spacer"
+        data-empty=${bottomPad === 0 ? 'true' : 'false'}
+        aria-hidden="true"
+      />
+    </div>
+  `;
+}
 
 const KIND_FILTER_LABELS = {
   image: 'Pictures',
@@ -224,7 +382,7 @@ function useBatchedThumbs({
   useEffect(() => {
     const map = new Map();
     for (const e of entries || []) {
-      if (e?.path) map.set(e.path, e);
+      if (e?.path && isThumbEligible(e, { allowAudio: true })) map.set(e.path, e);
     }
     entryMapRef.current = map;
   }, [entries]);
@@ -268,7 +426,9 @@ function useBatchedThumbs({
   useEffect(() => {
     if (!enabled || !machine || !Array.isArray(entries)) return;
     let count = 0;
-    for (const e of entries) {
+    const scanLimit = Math.min(entries.length, 60);
+    for (let i = 0; i < scanLimit; i += 1) {
+      const e = entries[i];
       if (count >= 24) break;
       if (isThumbEligible(e, { allowAudio })) {
         requestPath(e);
@@ -311,7 +471,16 @@ function useBatchedThumbs({
 
   const observeEl = useCallback((el) => {
     if (!el) return;
-    observedElsRef.current.add(el);
+    const observed = observedElsRef.current;
+    if (observed.size > 120) {
+      for (const prev of observed) {
+        if (!prev.isConnected) {
+          observerRef.current?.unobserve(prev);
+          observed.delete(prev);
+        }
+      }
+    }
+    observed.add(el);
     if (observerRef.current) {
       observerRef.current.observe(el);
     }
@@ -400,8 +569,14 @@ function EntryThumb({ entry, thumbUrl, observeEl }) {
       </span>
     `;
   }
+  const canThumb = isThumbEligible(entry, { allowAudio: true });
   return html`
-    <span class="thumb" ref=${observeEl} data-thumb-path=${entry.path} aria-hidden="true">
+    <span
+      class="thumb"
+      ref=${canThumb ? observeEl : null}
+      data-thumb-path=${canThumb ? entry.path : undefined}
+      aria-hidden="true"
+    >
       ${thumbUrl
         ? html`<img src=${thumbUrl} alt="" loading="lazy" decoding="async" />`
         : html`<${Icon} name=${entryIconName(entry)} />`}
@@ -1135,7 +1310,7 @@ export function FolderBrowser({
       path: resolvedPath,
       depth: 1,
       hidden: showHidden,
-      limit: PAGE_SIZE,
+      limit: NEXT_PAGE_SIZE,
       offset: offsetRef.current,
     };
     if (caps?.hasListSort) {
@@ -1157,17 +1332,19 @@ export function FolderBrowser({
     nextPromise
       .then((res) => {
         const more = Array.isArray(res?.entries) ? res.entries : [];
+        let mergedLen = 0;
         setRawEntries((prev) => {
           const seen = new Set(prev.map((e) => e.path));
           const merged = [...prev];
           for (const e of more) {
             if (!seen.has(e.path)) merged.push(e);
           }
+          mergedLen = merged.length;
           return merged;
         });
         offsetRef.current += more.length;
         setHasMorePages(Boolean(res?.truncated && more.length > 0));
-        setRenderLimit((n) => n + RENDER_STEP);
+        setRenderLimit((n) => Math.max(n + RENDER_STEP, mergedLen, offsetRef.current));
         setLoadingMore(false);
       })
       .catch(() => {
@@ -1667,7 +1844,13 @@ export function FolderBrowser({
               `
             : effectiveMode === 'grid'
               ? renderGrid()
-              : html`<div class="list">${visibleEntries.map(renderListRow)}</div>`}
+              : html`
+                  <${VirtualFileList}
+                    items=${visibleEntries}
+                    renderRow=${renderListRow}
+                    resetKey=${`${machine}\0${resolvedPath}\0${sortPref.sort}\0${sortPref.order}\0${kindFilter || ''}`}
+                  />
+                `}
 
       ${oldTruncated
         ? html`

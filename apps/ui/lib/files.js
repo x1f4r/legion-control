@@ -1103,3 +1103,35 @@ export function buildTransferDestination(destDir, sourcePath) {
   const name = baseFileName(sourcePath);
   return joinFilePath(destDir || '~', name);
 }
+
+/**
+ * Computes the visible `[start, end)` row slice and top/bottom spacer heights in pixels
+ * for a fixed-row-height virtualized list.
+ */
+export function computeVirtualWindow({
+  total,
+  rowHeight = 56,
+  scrollOffset = 0,
+  viewportHeight = 720,
+  overscan = 20,
+}) {
+  if (!Number.isFinite(total) || total <= 0) {
+    return { start: 0, end: 0, topPad: 0, bottomPad: 0 };
+  }
+  const count = Math.floor(total);
+  const h = Number.isFinite(rowHeight) && rowHeight > 0 ? rowHeight : 56;
+  const vp = Number.isFinite(viewportHeight) && viewportHeight > 0 ? viewportHeight : 720;
+  const off = Number.isFinite(scrollOffset) && scrollOffset > 0 ? scrollOffset : 0;
+  const pad = Number.isFinite(overscan) && overscan > 0 ? Math.floor(overscan) : 0;
+
+  const firstVisible = Math.floor(off / h);
+  const visibleCount = Math.ceil(vp / h) + 1;
+  const start = Math.max(0, Math.min(count, firstVisible - pad));
+  const end = Math.max(start, Math.min(count, firstVisible + visibleCount + pad));
+  return {
+    start,
+    end,
+    topPad: Math.round(start * h),
+    bottomPad: Math.round((count - end) * h),
+  };
+}

@@ -6,6 +6,7 @@ import {
   canOpenExternally,
   categoryFromName,
   changedPresetCutoff,
+  computeVirtualWindow,
   createThumbQueue,
   detectFileCapabilities,
   entryCategory,
@@ -906,4 +907,58 @@ test('createThumbQueue batches at most 32 paths and retries busy errors with exp
     'data:image/jpeg;base64,UEhPVE8=',
   );
   qOldAudio.dispose();
+});
+
+test('computeVirtualWindow bounds rendered rows and preserves total scroll height', () => {
+  assert.deepEqual(
+    computeVirtualWindow({ total: 0, rowHeight: 56, scrollOffset: 0, viewportHeight: 720 }),
+    { start: 0, end: 0, topPad: 0, bottomPad: 0 },
+  );
+
+  // Top of a 5,000-entry list: starts at 0 with topPad 0 and full remaining bottomPad.
+  const top = computeVirtualWindow({
+    total: 5000,
+    rowHeight: 56,
+    scrollOffset: 0,
+    viewportHeight: 720,
+    overscan: 20,
+  });
+  assert.equal(top.start, 0);
+  assert.equal(top.topPad, 0);
+  assert.ok(top.end > 20 && top.end < 80, `expected bounded top window, got ${top.end}`);
+  assert.equal(top.topPad + (top.end - top.start) * 56 + top.bottomPad, 5000 * 56);
+
+  // Mid-scroll through 5,000 rows: symmetric overscan and exact height preservation.
+  const mid = computeVirtualWindow({
+    total: 5000,
+    rowHeight: 56,
+    scrollOffset: 140_000, // row 2500
+    viewportHeight: 720,
+    overscan: 20,
+  });
+  assert.equal(mid.start, 2480);
+  assert.equal(mid.end, 2500 + Math.ceil(720 / 56) + 1 + 20);
+  assert.equal(mid.topPad + (mid.end - mid.start) * 56 + mid.bottomPad, 5000 * 56);
+
+  // Bottom of list: reaches exact final item with bottomPad 0.
+  const bottom = computeVirtualWindow({
+    total: 5000,
+    rowHeight: 56,
+    scrollOffset: 5000 * 56,
+    viewportHeight: 720,
+    overscan: 20,
+  });
+  assert.equal(bottom.end, 5000);
+  assert.equal(bottom.bottomPad, 0);
+  assert.equal(bottom.topPad + (bottom.end - bottom.start) * 56 + bottom.bottomPad, 5000 * 56);
+
+  // Small list shorter than viewport + overscan renders all items with zero spacers.
+  const small = computeVirtualWindow({
+    total: 12,
+    rowHeight: 56,
+    scrollOffset: -50,
+    viewportHeight: 720,
+    overscan: 20,
+  });
+  assert.deepEqual(small, { start: 0, end: 12, topPad: 0, bottomPad: 0 });
 });

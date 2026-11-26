@@ -1154,6 +1154,15 @@ button.row:active {
   border-top: 0;
 }
 
+.vlist-spacer {
+  pointer-events: none;
+}
+
+.list > .vlist-spacer[data-empty="true"] + .swipe-row,
+.list > .vlist-spacer[data-empty="true"] + .row {
+  border-top: 0;
+}
+
 .swipe-row > .row {
   flex: 1;
   min-width: 0;
