@@ -801,7 +801,7 @@ pub fn serve_with_options<R: Read + Send + 'static, W: Write>(
     output: W,
 ) -> Result<(), ErrorBody> {
     let started = Instant::now();
-    let mut reader = BufReader::new(input);
+    let mut reader = BufReader::with_capacity(OUTPUT_BUFFER, input);
     let mut output = BufWriter::with_capacity(OUTPUT_BUFFER, output);
     // Said before anything else, refusals included, so a reader can tell this node's replies
     // and advertised capabilities from those of an older node.

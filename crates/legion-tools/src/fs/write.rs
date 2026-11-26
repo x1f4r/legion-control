@@ -298,6 +298,7 @@ async fn write(ctx: &Ctx, args: WriteArgs) -> Result<WriteResult, ToolError> {
             mode: unix_mode,
             force_mode: false,
             no_replace: mode == WriteMode::Create,
+            no_sync: false,
         };
         write_atomic_cancellable(&path, &payload, options, &cancel, "fs.write")?;
         // `legion-os` preserves the existing file's mode on overwrite; honor an explicit

@@ -287,6 +287,7 @@ fn authorise_relay(
 struct RelayAuthCheck {
     host_name: String,
     paths: Paths,
+    config: Arc<ConfigStore>,
     pinned: Option<String>,
     pairing_id: Option<String>,
     as_principal: Arc<Mutex<Option<String>>>,
@@ -303,6 +304,7 @@ struct RelayAuthCheck {
 impl RelayAuthCheck {
     fn new(
         host: &Host,
+        config: Arc<ConfigStore>,
         pinned: Option<&str>,
         as_principal: Option<&str>,
         options: &StreamServeOptions,
@@ -312,6 +314,7 @@ impl RelayAuthCheck {
         Self {
             host_name: host.name().to_owned(),
             paths: host.paths().clone(),
+            config,
             pinned: pinned.map(str::to_owned),
             pairing_id: options.pairing_id.clone(),
             as_principal: Arc::new(Mutex::new(as_principal.map(str::to_owned))),
@@ -354,12 +357,12 @@ impl RelayAuthCheck {
     }
 
     fn verify_once(&self) -> Result<(), ErrorBody> {
-        let config = ConfigStore::new(self.paths.config_dir());
         if let Some(ref pid) = self.pairing_id {
-            check_pairing_not_revoked(&config, pid)
+            check_pairing_not_revoked(&self.config, pid)
                 .map_err(|err| machine_or(err, &self.host_name))?;
         }
-        let policy = config
+        let policy = self
+            .config
             .get::<Policy>()
             .map_err(|err| machine_or(err, &self.host_name))?;
         let as_principal = self.as_principal.lock().ok().and_then(|slot| slot.clone());
@@ -708,7 +711,7 @@ pub(crate) fn serve_relay_remote_spawned<R: Read + Send + 'static, W: Write>(
     mut input: BufReader<R>,
     mut output: BufWriter<W>,
 ) -> Result<(), ErrorBody> {
-    let config = ConfigStore::new(host.paths().config_dir());
+    let config = Arc::new(ConfigStore::new(host.paths().config_dir()));
     let (inner_op, inner_map) = match validate_relay_header(host, &on, &request) {
         Ok(parsed) => parsed,
         Err(error) => {
@@ -805,6 +808,7 @@ pub(crate) fn serve_relay_remote_spawned<R: Read + Send + 'static, W: Write>(
     let (tool_name, tool_effect) = inner_op.authorised_as();
     let auth_check = RelayAuthCheck::new(
         host,
+        Arc::clone(&config),
         pinned,
         as_principal.as_deref(),
         options,
@@ -2970,5 +2974,51 @@ pub(crate) fn unwrap_local_relay_next(host: &Host, next: NextHeader) -> NextHead
             ),
         },
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_auth_check_reuses_config_store_and_detects_live_revocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path().join("legion"));
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        let policy_path = paths.config_file("policy.toml");
+        std::fs::write(
+            &policy_path,
+            "[roles.reader]\nallow = [\"fs.read\"]\n\n[principals.alice]\nrole = \"reader\"\n",
+        )
+        .unwrap();
+
+        let host = Host::new(paths.clone(), "relay");
+        let config = Arc::new(ConfigStore::new(paths.config_dir()));
+        let check = RelayAuthCheck::new(
+            &host,
+            Arc::clone(&config),
+            Some("alice"),
+            None,
+            &StreamServeOptions::default(),
+            "fs.read",
+            Effect::Read,
+        );
+
+        // Warm cached config passes repeatedly.
+        check.verify_once().expect("initial check must pass");
+        check.verify_once().expect("cached recheck must pass");
+
+        // Rewriting policy.toml (with a different size and mtime) must invalidate the cached
+        // ConfigStore entry and immediately fail verify_once.
+        std::fs::write(
+            &policy_path,
+            "[roles.reader]\nallow = []\n\n[principals.alice]\nrole = \"reader\"\n# revoked\n",
+        )
+        .unwrap();
+        let err = check
+            .verify_once()
+            .expect_err("revoked role must be denied immediately");
+        assert_eq!(err.code, ErrorCode::Denied);
     }
 }

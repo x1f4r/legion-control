@@ -15,10 +15,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::future::Future;
+use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -36,15 +38,15 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use legion_content::{
-    CONTENT_SANDBOX_CSP, ContentBody, ContentLimiter, ContentSource, ContentTime, CorpPolicy,
-    GuardRejection, HostOriginGuard, MAX_PATH_BYTES, OpenRangeError, OpenedRange, ServeOptions,
-    StreamHooks, Ticket, TicketConfig, TicketRequest, TicketTable, encode_path_segment,
-    extract_file_name, handle_request,
+    CHUNK_SIZE, CONTENT_SANDBOX_CSP, ContentBody, ContentLimiter, ContentSource, ContentTime,
+    CorpPolicy, GuardRejection, HostOriginGuard, MAX_PATH_BYTES, OpenRangeError, OpenedRange,
+    ServeOptions, StreamHooks, Ticket, TicketConfig, TicketRequest, TicketTable,
+    encode_path_segment, extract_file_name, handle_request,
 };
 use legion_link::proto::{ErrorBody as ProtoErrorBody, ErrorCode as ProtoErrorCode};
 use legion_link::{ContentRoutePolicy, Route};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -68,7 +70,7 @@ pub const CUSTOM_SCHEME_MAX_FULL_BYTES: u64 = 16 * 1024 * 1024;
 pub const CUSTOM_SCHEME_TOTAL_MEMORY_BUDGET_BYTES: usize = 24 * 1024 * 1024;
 
 /// Accounting unit for the custom-scheme memory budget semaphore (64 KiB).
-const CUSTOM_SCHEME_BUDGET_UNIT_BYTES: usize = 64 * 1024;
+const CUSTOM_SCHEME_BUDGET_UNIT_BYTES: usize = CHUNK_SIZE;
 
 /// Maximum simultaneous TCP connections accepted by the loopback content listener.
 pub const MAX_LOOPBACK_CONNECTIONS: usize = 32;
@@ -77,6 +79,11 @@ pub const MAX_LOOPBACK_CONNECTIONS: usize = 32;
 /// `legion-doors` so paused players and revoked or torn-down streams backpressure promptly rather
 /// than pulling megabytes into kernel loopback buffers.
 const LOOPBACK_SOCKET_SNDBUF: u32 = 128 * 1024;
+
+/// Maximum bytes handed to the OS loopback TCP socket in one write call (64 KiB, matching
+/// [`legion_content::CHUNK_SIZE`]), ensuring revocation is checked before each slice and
+/// preventing buffered write queues from overshooting [`LOOPBACK_SOCKET_SNDBUF`] in one send call.
+const LOOPBACK_WRITE_SLICE: usize = CHUNK_SIZE;
 
 /// Maximum time an authenticated loopback client may take to send HTTP request headers (5 seconds).
 pub const LOOPBACK_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -329,6 +336,7 @@ impl LoopbackConnTable {
 struct LoopbackRequestCtx<'a> {
     conn_authenticated: &'a AtomicBool,
     probe_secret: &'a [u8; 32],
+    active_cancel: &'a Arc<Mutex<Option<CancellationToken>>>,
 }
 
 struct LoopbackConnGuard {
@@ -349,10 +357,14 @@ struct ActiveStreamGuard {
     active_streams: Arc<AtomicUsize>,
     active_streams_notify: Arc<Notify>,
     activity: Arc<Mutex<ActivityState>>,
+    conn_cancel: Option<Arc<Mutex<Option<CancellationToken>>>>,
 }
 
 impl Drop for ActiveStreamGuard {
     fn drop(&mut self) {
+        if let Some(ref slot) = self.conn_cancel {
+            *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
         if self.active_streams.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.active_streams_notify.notify_waiters();
         }
@@ -360,6 +372,121 @@ impl Drop for ActiveStreamGuard {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .last_activity = Instant::now();
+    }
+}
+
+/// Wraps a loopback [`TcpStream`] to cap every OS write call at [`LOOPBACK_WRITE_SLICE`] (64 KiB)
+/// and check listener shutdown / active ticket revocation before each slice, dropping remaining
+/// buffered bytes rather than flushing them once cancelled.
+struct SlicedLoopbackStream {
+    inner: TcpStream,
+    shutdown: CancellationToken,
+    active_cancel: Arc<Mutex<Option<CancellationToken>>>,
+}
+
+impl SlicedLoopbackStream {
+    fn is_cancelled(&self) -> bool {
+        if self.shutdown.is_cancelled() {
+            return true;
+        }
+        self.active_cancel
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+    }
+}
+
+fn poll_write_vectored_capped(
+    inner: &mut TcpStream,
+    cx: &mut Context<'_>,
+    bufs: &[io::IoSlice<'_>],
+    max_bytes: usize,
+) -> Poll<io::Result<usize>> {
+    const STACK_IOVS: usize = 16;
+    let mut capped = [io::IoSlice::new(&[]); STACK_IOVS];
+    let mut count = 0usize;
+    let mut remaining = max_bytes;
+
+    for slice in bufs {
+        let bytes: &[u8] = slice;
+        if bytes.is_empty() {
+            continue;
+        }
+        if count == STACK_IOVS || remaining == 0 {
+            break;
+        }
+        let take = bytes.len().min(remaining);
+        capped[count] = io::IoSlice::new(&bytes[..take]);
+        count += 1;
+        remaining -= take;
+    }
+
+    if count == 0 {
+        return Pin::new(inner).poll_write(cx, &[]);
+    }
+    if count == 1 {
+        return Pin::new(inner).poll_write(cx, &capped[0]);
+    }
+    Pin::new(inner).poll_write_vectored(cx, &capped[..count])
+}
+
+impl AsyncRead for SlicedLoopbackStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for SlicedLoopbackStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.is_cancelled() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "content stream was revoked",
+            )));
+        }
+        let slice = &buf[..buf.len().min(LOOPBACK_WRITE_SLICE)];
+        Pin::new(&mut self.inner).poll_write(cx, slice)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        if self.is_cancelled() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "content stream was revoked",
+            )));
+        }
+        poll_write_vectored_capped(&mut self.inner, cx, bufs, LOOPBACK_WRITE_SLICE)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.is_cancelled() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "content stream was revoked",
+            )));
+        }
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -1505,12 +1632,20 @@ impl AppContentServer {
             let unauth_timeout = header_read_timeout.min(LOOPBACK_UNAUTH_HEADER_READ_TIMEOUT);
             tokio::spawn(async move {
                 let _slot_guard = conn_guard_slot;
-                let io = TokioIo::new(stream);
+                let active_cancel: Arc<Mutex<Option<CancellationToken>>> =
+                    Arc::new(Mutex::new(None));
+                let io = TokioIo::new(SlicedLoopbackStream {
+                    inner: stream,
+                    shutdown: conn_shutdown.clone(),
+                    active_cancel: Arc::clone(&active_cancel),
+                });
                 let service_auth = Arc::clone(&conn_authenticated);
+                let service_cancel = Arc::clone(&active_cancel);
                 let service = service_fn(move |req: Request<Incoming>| {
                     let server = Arc::clone(&server);
                     let guard = Arc::clone(&conn_guard);
                     let auth_flag = Arc::clone(&service_auth);
+                    let active_cancel = Arc::clone(&service_cancel);
                     async move {
                         let method = req.method().clone();
                         let uri = req.uri().clone();
@@ -1525,6 +1660,7 @@ impl AppContentServer {
                                 Some(LoopbackRequestCtx {
                                     conn_authenticated: &auth_flag,
                                     probe_secret: &probe_secret,
+                                    active_cancel: &active_cancel,
                                 }),
                             )
                             .await;
@@ -1535,6 +1671,7 @@ impl AppContentServer {
                     .keep_alive(true)
                     .timer(TokioTimer::new())
                     .header_read_timeout(header_read_timeout)
+                    .max_buf_size(LOOPBACK_WRITE_SLICE)
                     .serve_connection(io, service);
                 tokio::pin!(conn);
                 let unauth_deadline = tokio::time::sleep(unauth_timeout);
@@ -1660,12 +1797,24 @@ impl AppContentServer {
         }
         let key_hash = valid_ticket.as_ref().map(|t| t.key_hash);
         let stream_failed = key_hash.map(|h| self.ensure_ticket_stream_flag(h));
+        let conn_cancel = loopback.as_ref().map(|ctx| Arc::clone(ctx.active_cancel));
+        if let (Some(slot), Some(h)) = (&conn_cancel, key_hash) {
+            let token = self
+                .ticket_cancels
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(h)
+                .or_default()
+                .child_token();
+            *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(token);
+        }
 
         self.active_streams.fetch_add(1, Ordering::AcqRel);
         let active_guard = ActiveStreamGuard {
             active_streams: Arc::clone(&self.active_streams),
             active_streams_notify: Arc::clone(&self.active_streams_notify),
             activity: Arc::clone(&self.activity),
+            conn_cancel,
         };
         let hooks = StreamHooks {
             limiter: Some(self.limiter.clone()),
@@ -7990,6 +8139,7 @@ mod tests {
         );
         let uri: Uri = LOOPBACK_PROBE_PATH.parse().unwrap();
         let conn_auth = AtomicBool::new(false);
+        let active_cancel = Arc::new(Mutex::new(None));
         let resp = server
             .handle_checked_request(
                 &guard,
@@ -8003,6 +8153,7 @@ mod tests {
                 Some(LoopbackRequestCtx {
                     conn_authenticated: &conn_auth,
                     probe_secret: &secret,
+                    active_cancel: &active_cancel,
                 }),
             )
             .await;

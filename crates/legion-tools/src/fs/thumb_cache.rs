@@ -411,7 +411,15 @@ impl ThumbCache {
             return;
         }
         let entry_path = self.entry_path(key);
-        if write_atomic(&entry_path, encoded, WriteOptions::with_mode(0o600)).is_err() {
+        // Thumbnail and tag cache entries can be regenerated from source files; keep sibling temp
+        // + atomic rename so readers never see partial bytes, without paying per-entry fsync.
+        if write_atomic(
+            &entry_path,
+            encoded,
+            WriteOptions::with_mode(0o600).no_sync(true),
+        )
+        .is_err()
+        {
             return;
         }
         let _ = self.touch_recency(&entry_path);

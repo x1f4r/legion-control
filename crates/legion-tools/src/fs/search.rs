@@ -330,11 +330,38 @@ impl PartialOrd for SortedCandidate {
     }
 }
 
-/// Checks whether every whitespace-separated word in `words` appears in `name` (case-insensitive,
-/// Unicode-aware).
-fn name_matches_words(name: &str, lower_words: &[String]) -> bool {
+/// Allocation-free ASCII case-insensitive substring check (`lower_needle` must already be ASCII
+/// lowercase).
+fn contains_ascii_case_insensitive(haystack: &[u8], lower_needle: &[u8]) -> bool {
+    if lower_needle.is_empty() {
+        return true;
+    }
+    if lower_needle.len() > haystack.len() {
+        return false;
+    }
+    let first = lower_needle[0];
+    let limit = haystack.len() - lower_needle.len();
+    for i in 0..=limit {
+        if haystack[i].to_ascii_lowercase() == first
+            && haystack[i..i + lower_needle.len()].eq_ignore_ascii_case(lower_needle)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Checks whether every whitespace-separated word in `lower_words` appears in `name`
+/// (case-insensitive, Unicode-aware, with a zero-allocation ASCII fast path).
+fn name_matches_words(name: &str, lower_words: &[String], all_words_ascii: bool) -> bool {
     if lower_words.is_empty() {
         return true;
+    }
+    if all_words_ascii && name.is_ascii() {
+        let haystack = name.as_bytes();
+        return lower_words
+            .iter()
+            .all(|word| contains_ascii_case_insensitive(haystack, word.as_bytes()));
     }
     let lowered = name.to_lowercase();
     lower_words
@@ -409,6 +436,7 @@ async fn find(ctx: &Ctx, args: FindArgs) -> Result<FindResult, ToolError> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let all_words_ascii = name_words.iter().all(|w| w.is_ascii());
     let sort_spec: Option<(SortField, SortOrder)> = match (args.sort, args.order) {
         (Some(field), order) => Some((field, order.unwrap_or_default())),
         (None, Some(order)) => Some((SortField::Name, order)),
@@ -516,6 +544,18 @@ async fn find(ctx: &Ctx, args: FindArgs) -> Result<FindResult, ToolError> {
                 continue;
             }
             let entry_path = entry.path();
+            let file_name = entry.file_name().to_string_lossy();
+            if !name_words.is_empty()
+                && !name_matches_words(&file_name, &name_words, all_words_ascii)
+            {
+                continue;
+            }
+            if glob
+                .as_ref()
+                .is_some_and(|filter| !filter.matches(&root, entry_path))
+            {
+                continue;
+            }
             let (mut category, mut mime) = if kind == EntryKind::File {
                 let info = classify_path(entry_path);
                 (Some(info.category), Some(info.mime))
@@ -537,16 +577,6 @@ async fn find(ctx: &Ctx, args: FindArgs) -> Result<FindResult, ToolError> {
             }
             if let Some(wanted) = categories.as_deref()
                 && !category.is_some_and(|cat| wanted.contains(&cat))
-            {
-                continue;
-            }
-            let file_name = entry.file_name().to_string_lossy();
-            if !name_words.is_empty() && !name_matches_words(&file_name, &name_words) {
-                continue;
-            }
-            if glob
-                .as_ref()
-                .is_some_and(|filter| !filter.matches(&root, entry_path))
             {
                 continue;
             }
@@ -1112,5 +1142,34 @@ mod tests {
     fn binary_probe_detects_nul_bytes() {
         assert!(!is_binary_probe(b"hello world\n"));
         assert!(is_binary_probe(b"ELF\x00binary"));
+    }
+
+    #[test]
+    fn name_matches_words_ascii_fast_path_matches_unicode_fallback() {
+        let cases = [
+            ("Invoice_2026_FINAL.pdf", "invoice final", true),
+            ("Invoice_2026_FINAL.pdf", "invoice draft", false),
+            ("abc", "abcd", false),
+            ("aaab", "aab", true),
+            ("Straße_ÜBER.txt", "straße über", true),
+            ("Straße_ÜBER.txt", "uber", false),
+            ("Café_Report.txt", "report", true),
+            ("anything.txt", "", true),
+        ];
+        for (name, query, expected) in cases {
+            let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+            let all_ascii = words.iter().all(|w| w.is_ascii());
+            assert_eq!(
+                name_matches_words(name, &words, all_ascii),
+                expected,
+                "name={name:?} query={query:?}"
+            );
+            // Force Unicode path (`all_words_ascii = false`) and assert identical result.
+            assert_eq!(
+                name_matches_words(name, &words, false),
+                expected,
+                "unicode fallback mismatch for name={name:?} query={query:?}"
+            );
+        }
     }
 }
