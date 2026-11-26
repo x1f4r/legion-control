@@ -214,7 +214,8 @@ async function collectAllScrolledRows(page, scrollSelector, rowSelector, slotSel
           if (r.height === 0 || r.bottom <= bounds.top + 1 || r.top >= bounds.bottom - 1) continue;
           if (slot.getAttribute('data-fn-ready') !== '1') continue;
           const lines = [...slot.querySelectorAll('.fn-line')];
-          const drawn = lines.map((l) => l.textContent || '').join('');
+          const lineTexts = lines.map((l) => l.textContent || '');
+          const drawn = lineTexts.join('');
           const dimTexts = [...slot.querySelectorAll('.fn-dim')].map((d) => d.textContent || '');
           const lineOverflows = lines.some((l) => l.scrollWidth > slot.clientWidth + 2);
           out.push({
@@ -222,6 +223,7 @@ async function collectAllScrolledRows(page, scrollSelector, rowSelector, slotSel
             ariaLabel: row.getAttribute('aria-label') || '',
             titleAttr: row.getAttribute('title') || '',
             drawn,
+            lineTexts,
             lineCount: lines.length,
             dimText: dimTexts.join(''),
             lineOverflows,
@@ -260,11 +262,13 @@ async function collectAllScrolledRows(page, scrollSelector, rowSelector, slotSel
             if (r.height === 0 || r.bottom <= bounds.top + 1 || r.top >= bounds.bottom - 1) continue;
             if (slot.getAttribute('data-fn-ready') !== '1') continue;
             const lines = [...slot.querySelectorAll('.fn-line')];
+            const lineTexts = lines.map((l) => l.textContent || '');
             out.push({
               href: row.getAttribute('href') || '',
               ariaLabel: row.getAttribute('aria-label') || '',
               titleAttr: row.getAttribute('title') || '',
-              drawn: lines.map((l) => l.textContent || '').join(''),
+              drawn: lineTexts.join(''),
+              lineTexts,
               lineCount: lines.length,
               dimText: [...slot.querySelectorAll('.fn-dim')].map((d) => d.textContent || '').join(''),
               lineOverflows: lines.some((l) => l.scrollWidth > slot.clientWidth + 2),
@@ -385,6 +389,9 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
     assert.equal(pinnedSnap.length, 2, 'Expected 2 pinned long-name tiles');
     assert.notEqual(pinnedSnap[0].drawn, pinnedSnap[1].drawn, 'Pinned tiles must draw distinct names');
     assert.ok(pinnedSnap.every((p) => p.lineCount <= 2), 'Pinned tiles must wrap up to 2 lines');
+    for (const p of pinnedSnap) {
+      assert.ok(!p.drawn.includes('…11-25') && !p.drawn.includes('2026-11-…'), `Pinned tile broke date digit run: "${p.drawn}"`);
+    }
     assert.deepEqual(
       pinnedSnap.map((p) => p.ariaLabel).sort(),
       ['Screen Recording 2026-11-25 at 14.01.12.mov', 'Screen Recording 2026-11-25 at 14.02.04.mov'],
@@ -412,15 +419,35 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
     await phone.goto(capturesHref, { waitUntil: 'domcontentloaded' });
     await phone.locator('.grid a.cell, .list a.row').first().waitFor({ timeout: 10_000 });
 
-    // Switch to List view first and check dark + light.
+    // Switch to List view first and check dark + light + capture list primary/dim colour tokens.
     const showListBtn = phone.locator('.dock button[aria-label="Show as list"]');
     if (await showListBtn.count()) {
       await showListBtn.click();
     }
     await waitForVisibleFitted(phone, '.list a.row .fn-slot');
+
+    const readNameColors = async (page, slotSelector) =>
+      page.evaluate((sel) => {
+        const slot = [...document.querySelectorAll(sel)].find((el) => el.querySelector('.fn-dim'));
+        if (!slot) return null;
+        const dim = slot.querySelector('.fn-dim');
+        return {
+          primary: getComputedStyle(slot).color,
+          dim: getComputedStyle(dim).color,
+          primaryWeight: getComputedStyle(slot).fontWeight,
+          dimWeight: getComputedStyle(dim).fontWeight,
+        };
+      }, slotSelector);
+
     await setTheme(phone, 'dark');
+    const phoneListColorsDark = await readNameColors(phone, '.list a.row .title.fn-title');
+    assert.ok(phoneListColorsDark, 'Expected dimmed list row in dark theme');
+    assert.notEqual(phoneListColorsDark.primary, phoneListColorsDark.dim);
     await maybeShot(phone, 'after-phone-list-top-dark');
     await setTheme(phone, 'light');
+    const phoneListColorsLight = await readNameColors(phone, '.list a.row .title.fn-title');
+    assert.ok(phoneListColorsLight, 'Expected dimmed list row in light theme');
+    assert.notEqual(phoneListColorsLight.primary, phoneListColorsLight.dim);
     await maybeShot(phone, 'after-phone-list-top-light');
     await setTheme(phone, 'dark');
 
@@ -454,11 +481,49 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
       assert.equal(r.lineOverflows, false, `Horizontal text overflow in row "${r.drawn}"`);
     }
 
-    // Verify shared-lead dimming on IMG_ rows (`IMG_20261125_` steps back, `140311.jpg` stands out).
+    // Verify shared-lead dimming & break placement on IMG_, Screen Recording, Quarterly report, and checklist rows.
     const imgRow = phoneListRows.find((r) => r.ariaLabel === 'IMG_20261125_140311.jpg');
     assert.ok(imgRow, 'IMG_20261125_140311.jpg row missing');
     assert.equal(imgRow.dimText, 'IMG_20261125_', `Expected IMG_ shared lead dim, got "${imgRow.dimText}"`);
     assert.equal(imgRow.lineCount, 1, '1-line IMG_ name must stay on 1 line');
+
+    const rec03Row = phoneListRows.find((r) => r.ariaLabel === 'Screen Recording 2026-11-25 at 14.03.19.mov');
+    assert.ok(rec03Row, 'Screen Recording 2026-11-25 at 14.03.19.mov row missing');
+    assert.equal(
+      rec03Row.dimText,
+      'Screen Recording 2026-11-25 at ',
+      `Expected whole time strong on Screen Recording, got dim="${rec03Row.dimText}"`,
+    );
+    assert.deepEqual(
+      rec03Row.lineTexts,
+      ['Screen Recording 2026-11-25 at ', '14.03.19.mov'],
+      `Expected Screen Recording to break before whole time, got ${JSON.stringify(rec03Row.lineTexts)}`,
+    );
+
+    const repQ1Row = phoneListRows.find(
+      (r) => r.ariaLabel === 'Quarterly_Architecture_Review_Q1_2026_Final_Approved.pdf',
+    );
+    assert.ok(repQ1Row, 'Quarterly_Architecture_Review_Q1_2026_Final_Approved.pdf row missing');
+    assert.equal(
+      repQ1Row.dimText,
+      'Quarterly_Architecture_Review_',
+      `Expected Q1 kept strong on report, got dim="${repQ1Row.dimText}"`,
+    );
+    assert.deepEqual(
+      repQ1Row.lineTexts,
+      ['Quarterly_Architecture_Review_', 'Q1_2026_Final_Approved.pdf'],
+      `Expected report second line to start with Q1, got ${JSON.stringify(repQ1Row.lineTexts)}`,
+    );
+
+    const depRev1Row = phoneListRows.find(
+      (r) => r.ariaLabel === 'deployment-checklist-europe-west-primary-cluster-rollout-plan-rev1',
+    );
+    assert.ok(depRev1Row, 'deployment-checklist rev1 row missing');
+    assert.equal(
+      depRev1Row.dimText,
+      'deployment-checklist-europe-west-primary-cluster-rollout-plan-',
+      `Expected whole rev1 strong on checklist, got dim="${depRev1Row.dimText}"`,
+    );
 
     // Verify zero page-level horizontal overflow on phone.
     const phoneOverflow = await phone.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
@@ -541,8 +606,32 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
     });
     await waitForVisibleFitted(phone, '.grid a.cell .fn-slot');
     await setTheme(phone, 'dark');
+    const phoneGridColorsDark = await readNameColors(phone, '.grid a.cell .cell-name');
+    assert.ok(phoneGridColorsDark, 'Expected dimmed grid cell in dark theme');
+    assert.equal(
+      phoneGridColorsDark.primary,
+      phoneListColorsDark.primary,
+      'Grid cell primary text must match list primary token (--text) in dark theme',
+    );
+    assert.equal(
+      phoneGridColorsDark.dim,
+      phoneListColorsDark.dim,
+      'Grid cell dimmed text must match list secondary token (--dim) in dark theme',
+    );
     await maybeShot(phone, 'after-phone-grid-dark');
     await setTheme(phone, 'light');
+    const phoneGridColorsLight = await readNameColors(phone, '.grid a.cell .cell-name');
+    assert.ok(phoneGridColorsLight, 'Expected dimmed grid cell in light theme');
+    assert.equal(
+      phoneGridColorsLight.primary,
+      phoneListColorsLight.primary,
+      'Grid cell primary text must match list primary token (--text) in light theme',
+    );
+    assert.equal(
+      phoneGridColorsLight.dim,
+      phoneListColorsLight.dim,
+      'Grid cell dimmed text must match list secondary token (--dim) in light theme',
+    );
     await maybeShot(phone, 'after-phone-grid-light');
     await setTheme(phone, 'dark');
 
@@ -643,8 +732,12 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
     // Desktop Grid view screenshots & checks (dark + light).
     await waitForVisibleFitted(desk, '.split-right .grid a.cell .fn-slot');
     await setTheme(desk, 'dark');
+    const deskGridColorsDark = await readNameColors(desk, '.split-right .grid a.cell .cell-name');
+    assert.ok(deskGridColorsDark, 'Expected dimmed desktop grid cell in dark theme');
     await maybeShot(desk, 'after-desktop-grid-dark');
     await setTheme(desk, 'light');
+    const deskGridColorsLight = await readNameColors(desk, '.split-right .grid a.cell .cell-name');
+    assert.ok(deskGridColorsLight, 'Expected dimmed desktop grid cell in light theme');
     await maybeShot(desk, 'after-desktop-grid-light');
     await setTheme(desk, 'dark');
 
@@ -666,8 +759,16 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
     await desk.locator('.split-right .list a.row[aria-label="Screen Recording 2026-11-25 at 14.01.12.mov"]').scrollIntoViewIfNeeded();
     await waitForVisibleFitted(desk, '.split-right .list a.row .fn-slot');
     await setTheme(desk, 'dark');
+    const deskListColorsDark = await readNameColors(desk, '.split-right .list a.row .title.fn-title');
+    assert.ok(deskListColorsDark, 'Expected dimmed desktop list row in dark theme');
+    assert.equal(deskGridColorsDark.primary, deskListColorsDark.primary);
+    assert.equal(deskGridColorsDark.dim, deskListColorsDark.dim);
     await maybeShot(desk, 'after-desktop-list-dark');
     await setTheme(desk, 'light');
+    const deskListColorsLight = await readNameColors(desk, '.split-right .list a.row .title.fn-title');
+    assert.ok(deskListColorsLight, 'Expected dimmed desktop list row in light theme');
+    assert.equal(deskGridColorsLight.primary, deskListColorsLight.primary);
+    assert.equal(deskGridColorsLight.dim, deskListColorsLight.dim);
     await maybeShot(desk, 'after-desktop-list-light');
     await setTheme(desk, 'dark');
 
@@ -687,6 +788,16 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
       assert.equal(r.titleAttr, r.ariaLabel, 'Desktop list row hover title must equal full name');
       assert.equal(r.lineOverflows, false, `Desktop row overflow: "${r.drawn}"`);
     }
+    const deskRec03 = deskListRows.find((r) => r.ariaLabel === 'Screen Recording 2026-11-25 at 14.03.19.mov');
+    assert.ok(deskRec03);
+    assert.equal(deskRec03.lineCount, 1);
+    assert.equal(deskRec03.dimText, 'Screen Recording 2026-11-25 at ');
+    const deskRepQ1 = deskListRows.find(
+      (r) => r.ariaLabel === 'Quarterly_Architecture_Review_Q1_2026_Final_Approved.pdf',
+    );
+    assert.ok(deskRepQ1);
+    assert.equal(deskRepQ1.lineCount, 1);
+    assert.equal(deskRepQ1.dimText, 'Quarterly_Architecture_Review_');
 
     // Verify zero CSS text-overflow:ellipsis or -webkit-line-clamp on any file name slot.
     const cssLeak = await desk.evaluate(() => {
