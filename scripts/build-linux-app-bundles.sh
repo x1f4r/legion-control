@@ -152,8 +152,8 @@ cleanup_ownership() {
 }
 trap cleanup_ownership EXIT
 
-apt-get update -qq
-apt-get install -y -qq --no-install-recommends \
+sh /workspace/legion-control/scripts/retry-fetch.sh -- apt-get update -qq
+sh /workspace/legion-control/scripts/retry-fetch.sh --quiet -- apt-get install -y -qq --no-install-recommends \
   build-essential \
   ca-certificates \
   curl \
@@ -168,7 +168,7 @@ apt-get install -y -qq --no-install-recommends \
   patchelf \
   pkg-config \
   squashfs-tools \
-  xdg-utils >/dev/null
+  xdg-utils
 
 export HOME=/home/me
 export CARGO_HOME=/u22-cache/cargo-home
@@ -186,7 +186,8 @@ fi
 export PATH="/u22-cache/tauri-cli/bin:/opt/rust/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 if [[ "$(/u22-cache/tauri-cli/bin/cargo-tauri --version 2>/dev/null || true)" != "tauri-cli 2.12.6" ]]; then
-  CARGO_HOME=/u22-cache/tauri-install-cargo cargo install tauri-cli --version =2.12.6 --locked --force --root /u22-cache/tauri-cli
+  CARGO_HOME=/u22-cache/tauri-install-cargo sh /workspace/legion-control/scripts/retry-fetch.sh -- \
+    cargo install tauri-cli --version =2.12.6 --locked --force --root /u22-cache/tauri-cli
 fi
 
 cd /workspace/legion-control/apps/legion-app

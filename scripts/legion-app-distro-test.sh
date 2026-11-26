@@ -54,9 +54,15 @@ if ! docker info >/dev/null 2>&1; then
   fi
 fi
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+[[ -f "${SCRIPT_DIR}/retry-fetch.sh" ]] || die "Missing helper script: ${SCRIPT_DIR}/retry-fetch.sh"
+
 PKG_DIR="$(cd -- "$(dirname -- "$PKG_PATH")" && pwd -P)"
 PKG_BASE="$(basename -- "$PKG_PATH")"
-DOCKER_MOUNTS=(-v "${PKG_DIR}/${PKG_BASE}:/art/${PKG_BASE}:ro")
+DOCKER_MOUNTS=(
+  -v "${SCRIPT_DIR}/retry-fetch.sh:/opt/retry-fetch.sh:ro"
+  -v "${PKG_DIR}/${PKG_BASE}:/art/${PKG_BASE}:ro"
+)
 DOCKER_ENV=(
   -e "LEGION_APP_IMAGE=${IMAGE}"
   -e "LEGION_APP_DISTRO_KIND=${DISTRO_KIND}"
@@ -90,13 +96,13 @@ if [[ "$LEGION_APP_DISTRO_KIND" == "deb" ]]; then
   chmod 0755 /usr/sbin/policy-rc.d
 
   step "Installing legion-app .deb with apt-get (resolving dependencies cleanly)"
-  apt-get update -qq
-  apt-get install -y -qq "$LEGION_APP_PKG" >/dev/null
+  sh /opt/retry-fetch.sh -- apt-get update -qq
+  sh /opt/retry-fetch.sh --quiet -- apt-get install -y -qq "$LEGION_APP_PKG"
   rm -f /usr/sbin/policy-rc.d
 else
   step "Installing legion-app package with pacman -U"
-  pacman -Syu --noconfirm >/dev/null
-  pacman -U --noconfirm "$LEGION_APP_PKG" >/dev/null
+  sh /opt/retry-fetch.sh --quiet -- pacman -Syu --noconfirm
+  sh /opt/retry-fetch.sh --quiet -- pacman -U --noconfirm "$LEGION_APP_PKG"
 fi
 
 test -x /usr/bin/legion-app || fail "/usr/bin/legion-app not installed"

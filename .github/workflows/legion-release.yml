@@ -139,8 +139,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install
-          rustup target add "${{ matrix.target }}"
+          sh scripts/retry-fetch.sh -- rustup toolchain install
+          sh scripts/retry-fetch.sh -- rustup target add "${{ matrix.target }}"
       # blake3 compiles C sources; musl-tools supplies musl-gcc so the native x86_64 musl build
       # links cleanly against musl rather than picking up host glibc fortify symbols.
       - name: Install musl-tools
@@ -148,8 +148,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends musl-tools
+          sh scripts/retry-fetch.sh -- sudo apt-get update -q
+          sh scripts/retry-fetch.sh -- sudo apt-get install -y -q --no-install-recommends musl-tools
       # aarch64-unknown-linux-musl cross-compiles C code in blake3 through zig and cargo-zigbuild
       # so it produces a fully static binary on an x86_64 runner.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -163,7 +163,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo install --locked cargo-zigbuild --version 0.24.1
+          sh scripts/retry-fetch.sh -- cargo install --locked cargo-zigbuild --version 0.24.1
       - name: Build release binary (zigbuild)
         if: matrix.use_zigbuild
         shell: bash

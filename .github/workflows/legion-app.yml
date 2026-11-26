@@ -66,12 +66,12 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust
-        run: rustup toolchain install
+        run: sh scripts/retry-fetch.sh -- rustup toolchain install
       - name: Install Linux WebKitGTK and GTK build dependencies
         run: |
           set -euo pipefail
-          sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends \
+          sh scripts/retry-fetch.sh -- sudo apt-get update -q
+          sh scripts/retry-fetch.sh -- sudo apt-get install -y -q --no-install-recommends \
             libwebkit2gtk-4.1-dev \
             libgtk-3-dev \
             libayatana-appindicator3-dev \
@@ -84,7 +84,7 @@ jobs:
             # Keep the system sshd service stopped; tests spawn throwaway loopback instances.
             printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
             sudo chmod 755 /usr/sbin/policy-rc.d
-            sudo apt-get install -y -q --no-install-recommends openssh-server
+            sh scripts/retry-fetch.sh -- sudo apt-get install -y -q --no-install-recommends openssh-server
             sudo rm -f /usr/sbin/policy-rc.d
           fi
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -158,7 +158,7 @@ jobs:
         run: |
           set -euo pipefail
           yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager \
+          sh scripts/retry-fetch.sh -- sdkmanager \
             "platform-tools" \
             "platforms;android-37.0" \
             "build-tools;37.0.0" \
@@ -167,8 +167,8 @@ jobs:
           echo "NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> "$GITHUB_ENV"
       - name: Install Rust and Android targets
         run: |
-          rustup toolchain install
-          rustup target add \
+          sh scripts/retry-fetch.sh -- rustup toolchain install
+          sh scripts/retry-fetch.sh -- rustup target add \
             aarch64-linux-android \
             x86_64-linux-android \
             armv7-linux-androideabi \
@@ -191,7 +191,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$(cargo tauri --version 2>/dev/null || true)" != "tauri-cli 2.12.6" ]; then
-            cargo install tauri-cli --version =2.12.6 --locked
+            sh scripts/retry-fetch.sh -- cargo install tauri-cli --version =2.12.6 --locked
           fi
       - id: build
         name: Build Android debug APK (arm64 + x86_64)
@@ -377,12 +377,12 @@ jobs:
             --sequence "$LEGION_PREVIEW_SEQUENCE"
       - name: Install Rust
         run: |
-          rustup toolchain install
-          rustup target add x86_64-unknown-linux-musl
+          sh scripts/retry-fetch.sh -- rustup toolchain install
+          sh scripts/retry-fetch.sh -- rustup target add x86_64-unknown-linux-musl
       - name: Install Linux Tauri bundle and headless display dependencies
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends \
+          sh scripts/retry-fetch.sh -- sudo apt-get update -q
+          sh scripts/retry-fetch.sh -- sudo apt-get install -y -q --no-install-recommends \
             libwebkit2gtk-4.1-dev \
             libgtk-3-dev \
             libayatana-appindicator3-dev \
@@ -418,7 +418,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$(cargo tauri --version 2>/dev/null || true)" != "tauri-cli 2.12.6" ]; then
-            cargo install tauri-cli --version =2.12.6 --locked
+            sh scripts/retry-fetch.sh -- cargo install tauri-cli --version =2.12.6 --locked
           fi
       - id: build
         name: Build deb and AppImage bundles (ubuntu:22.04 glibc baseline)
@@ -1007,8 +1007,8 @@ jobs:
           persist-credentials: false
       - name: Install Rust and iOS targets
         run: |
-          rustup toolchain install
-          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+          sh scripts/retry-fetch.sh -- rustup toolchain install
+          sh scripts/retry-fetch.sh -- rustup target add aarch64-apple-ios aarch64-apple-ios-sim
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/bin/cargo-tauri
@@ -1027,7 +1027,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$(cargo tauri --version 2>/dev/null || true)" != "tauri-cli 2.12.6" ]; then
-            cargo install tauri-cli --version =2.12.6 --locked
+            sh scripts/retry-fetch.sh -- cargo install tauri-cli --version =2.12.6 --locked
           fi
       - name: Build iOS debug simulator app
         working-directory: apps/legion-app
@@ -1180,7 +1180,7 @@ jobs:
             --os macos \
             --sequence "$LEGION_PREVIEW_SEQUENCE"
       - name: Install Rust
-        run: rustup toolchain install
+        run: sh scripts/retry-fetch.sh -- rustup toolchain install
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/bin/cargo-tauri
@@ -1199,7 +1199,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$(cargo tauri --version 2>/dev/null || true)" != "tauri-cli 2.12.6" ]; then
-            cargo install tauri-cli --version =2.12.6 --locked
+            sh scripts/retry-fetch.sh -- cargo install tauri-cli --version =2.12.6 --locked
           fi
       - name: Run unit tests on macOS (including Apple backup exclusion)
         run: cargo test --manifest-path apps/legion-app/src-tauri/Cargo.toml --locked
@@ -1704,7 +1704,8 @@ jobs:
             --sequence "$env:LEGION_PREVIEW_SEQUENCE"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Install Rust
-        run: rustup toolchain install
+        shell: pwsh
+        run: ./scripts/retry-fetch.ps1 -- rustup toolchain install
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/bin/cargo-tauri.exe
@@ -1725,7 +1726,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $ver = (& cargo tauri --version 2>$null)
           if ($ver -ne 'tauri-cli 2.12.6') {
-            cargo install tauri-cli --version =2.12.6 --locked
+            ./scripts/retry-fetch.ps1 -- cargo install tauri-cli --version =2.12.6 --locked
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
       - name: Run unit tests on Windows (including rollback file-lock protection)

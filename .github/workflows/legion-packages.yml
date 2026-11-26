@@ -48,8 +48,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install
-          rustup target add x86_64-unknown-linux-musl
+          sh scripts/retry-fetch.sh -- rustup toolchain install
+          sh scripts/retry-fetch.sh -- rustup target add x86_64-unknown-linux-musl
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -63,8 +63,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends musl-tools
+          sh scripts/retry-fetch.sh -- sudo apt-get update -q
+          sh scripts/retry-fetch.sh -- sudo apt-get install -y -q --no-install-recommends musl-tools
       - name: Build static legion binary (x86_64-unknown-linux-musl)
         shell: bash
         env:
@@ -159,8 +159,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install
-          rustup target add aarch64-unknown-linux-musl
+          sh scripts/retry-fetch.sh -- rustup toolchain install
+          sh scripts/retry-fetch.sh -- rustup target add aarch64-unknown-linux-musl
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -174,8 +174,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends musl-tools
+          sh scripts/retry-fetch.sh -- sudo apt-get update -q
+          sh scripts/retry-fetch.sh -- sudo apt-get install -y -q --no-install-recommends musl-tools
       - name: Build static arm64 binary and .deb
         shell: bash
         env:

@@ -60,7 +60,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust
-        run: rustup toolchain install
+        run: sh scripts/retry-fetch.sh -- rustup toolchain install
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -101,7 +101,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust
-        run: rustup toolchain install
+        run: sh scripts/retry-fetch.sh -- rustup toolchain install
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -149,7 +149,8 @@ jobs:
       # action that would be one more thing to pin. rust-toolchain.toml names the release and its
       # components, so CI builds with the compiler a local checkout does.
       - name: Install Rust
-        run: rustup toolchain install
+        shell: bash
+        run: sh scripts/retry-fetch.sh -- rustup toolchain install
       # Downloaded crates and what was built from them, for the compiler and the lock file they
       # were built with. A newer key starts from the nearest older one, and the workspace's own
       # crates are rebuilt on every run anyway.
@@ -169,8 +170,8 @@ jobs:
           if [ ! -x /usr/sbin/sshd ] && ! command -v sshd >/dev/null 2>&1; then
             printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
             sudo chmod 755 /usr/sbin/policy-rc.d
-            sudo apt-get update -q
-            sudo apt-get install -y -q --no-install-recommends openssh-server
+            sh scripts/retry-fetch.sh -- sudo apt-get update -q
+            sh scripts/retry-fetch.sh -- sudo apt-get install -y -q --no-install-recommends openssh-server
             sudo rm -f /usr/sbin/policy-rc.d
           fi
       # Formatting, clippy with warnings as errors, and the tests, as scripts/check.sh runs them. The
@@ -246,7 +247,7 @@ jobs:
             exit 1
           fi
           toolchain="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          rustup target add aarch64-linux-android x86_64-linux-android
+          sh scripts/retry-fetch.sh -- rustup target add aarch64-linux-android x86_64-linux-android
           CC_aarch64_linux_android="$toolchain/aarch64-linux-android24-clang" \
           AR_aarch64_linux_android="$toolchain/llvm-ar" \
           CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$toolchain/aarch64-linux-android24-clang" \
@@ -264,7 +265,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
-          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+          sh scripts/retry-fetch.sh -- rustup target add aarch64-apple-ios aarch64-apple-ios-sim
           IPHONEOS_DEPLOYMENT_TARGET=15.0 \
             cargo build --lib -p legion-link --features ssh --locked --target aarch64-apple-ios
           IPHONEOS_DEPLOYMENT_TARGET=15.0 \
@@ -345,7 +346,7 @@ jobs:
       # arrive in a change of their own rather than fail an unrelated one.
       - name: Install PSScriptAnalyzer
         shell: pwsh
-        run: Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force
+        run: ./scripts/retry-fetch.ps1 -ScriptBlock { Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force }
       - shell: pwsh
         run: |
           Import-Module -Name PSScriptAnalyzer -RequiredVersion 1.25.0
@@ -364,7 +365,7 @@ jobs:
         with:
           node-version: 24
       - name: Install Rust
-        run: rustup toolchain install
+        run: sh scripts/retry-fetch.sh -- rustup toolchain install
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -377,7 +378,7 @@ jobs:
       - name: Build release legion binary
         run: cargo build --release --locked --bin legion
       - name: Install browser test driver
-        run: npm --prefix apps/ui/test ci
+        run: sh scripts/retry-fetch.sh -- npm --prefix apps/ui/test ci
       - name: Run headless browser end-to-end test
         run: node --test apps/ui/test/browser.test.mjs
 
@@ -391,7 +392,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust
-        run: rustup toolchain install
+        run: sh scripts/retry-fetch.sh -- rustup toolchain install
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -420,7 +421,7 @@ jobs:
         with:
           node-version: 24
       - name: Install Rust
-        run: rustup toolchain install
+        run: sh scripts/retry-fetch.sh -- rustup toolchain install
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -431,10 +432,10 @@ jobs:
         run: |
           set -euo pipefail
           if [ ! -x "$HOME/.cargo/bin/cargo-audit" ]; then
-            cargo install --locked cargo-audit --version 0.22.2
+            sh scripts/retry-fetch.sh -- cargo install --locked cargo-audit --version 0.22.2
           fi
           if [ ! -x "$HOME/.cargo/bin/cargo-deny" ]; then
-            cargo install --locked cargo-deny --version 0.20.2
+            sh scripts/retry-fetch.sh -- cargo install --locked cargo-deny --version 0.20.2
           fi
       - name: Audit Rust dependencies (cargo-audit)
         run: |

@@ -56,7 +56,8 @@ case "$IMAGE" in
     ;;
 esac
 
-DOCKER_MOUNTS=()
+[[ -f "${SCRIPT_DIR}/retry-fetch.sh" ]] || die "Missing helper script: ${SCRIPT_DIR}/retry-fetch.sh"
+DOCKER_MOUNTS=(-v "${SCRIPT_DIR}/retry-fetch.sh:/opt/retry-fetch.sh:ro")
 DOCKER_ENV=()
 
 if [[ "$TARGET" == "pkgbuild" ]]; then
@@ -147,9 +148,9 @@ if [[ "$LEGION_DISTRO_KIND" == "deb" ]]; then
   chmod 0755 /usr/sbin/policy-rc.d
 
   step "Installing test prerequisites (openssh-server, openssh-client, systemd, jq, curl, python3)"
-  apt-get update -qq
-  apt-get install -y -qq --no-install-recommends \
-    ca-certificates curl jq openssh-client openssh-server python3 systemd >/dev/null
+  sh /opt/retry-fetch.sh -- apt-get update -qq
+  sh /opt/retry-fetch.sh --quiet -- apt-get install -y -qq --no-install-recommends \
+    ca-certificates curl jq openssh-client openssh-server python3 systemd
 
   step "Installing .deb with apt-get install"
   # List the archive once and search the text: `grep -q` leaving a pipe early kills the writer
@@ -159,7 +160,7 @@ if [[ "$LEGION_DISTRO_KIND" == "deb" ]]; then
   grep -q 'usr/share/doc/legion/copyright$' <<<"$PKG_CONTENTS" || fail "package archive missing copyright"
   grep -q 'usr/share/doc/legion/changelog\.Debian\.gz$' <<<"$PKG_CONTENTS" || fail "package archive missing changelog"
 
-  apt-get install -y -qq "$LEGION_PKG_FILE" >/dev/null
+  sh /opt/retry-fetch.sh --quiet -- apt-get install -y -qq "$LEGION_PKG_FILE"
   REINSTALL_PKG="$LEGION_PKG_FILE"
 
   test -x /usr/bin/legion || fail "/usr/bin/legion not installed"
@@ -182,11 +183,11 @@ elif [[ "$LEGION_DISTRO_KIND" == "arch" ]]; then
   EXPECTED_HINT_NEEDLE="pacman"
 
   step "Installing Arch prerequisites (base-devel, namcap, openssh, openssl, systemd, jq, curl, python)"
-  pacman -Syu --noconfirm --needed base-devel curl jq namcap openssh openssl python systemd >/dev/null
+  sh /opt/retry-fetch.sh --quiet -- pacman -Syu --noconfirm --needed base-devel curl jq namcap openssh openssl python systemd
 
   if [[ "$LEGION_TEST_MODE" == "pkgbuild" ]]; then
     step "Installing rustup for PKGBUILD source build"
-    pacman -S --noconfirm --needed rustup >/dev/null
+    sh /opt/retry-fetch.sh --quiet -- pacman -S --noconfirm --needed rustup
 
     useradd -m -s /bin/bash builder
     mkdir -p /work/repo /work/out
@@ -223,7 +224,7 @@ elif [[ "$LEGION_DISTRO_KIND" == "arch" ]]; then
         export CARGO_HOME=/work/cargo
       fi
       cd /work/repo
-      rustup toolchain install
+      sh /opt/retry-fetch.sh -- rustup toolchain install
       bash packaging/arch/build-local.sh source /work/out
     ' 2>&1 | tee /work/makepkg-source.log
 
@@ -264,7 +265,7 @@ elif [[ "$LEGION_DISTRO_KIND" == "arch" ]]; then
     fi
 
     step "Installing built package with pacman -U"
-    pacman -U --noconfirm "$BUILT_PKG" >/dev/null
+    sh /opt/retry-fetch.sh --quiet -- pacman -U --noconfirm "$BUILT_PKG"
     REINSTALL_PKG="$BUILT_PKG"
 
     step "Verifying built Arch binary contains no build directory or cargo home paths"
@@ -276,7 +277,7 @@ elif [[ "$LEGION_DISTRO_KIND" == "arch" ]]; then
     done
   else
     step "Installing package with pacman -U"
-    pacman -U --noconfirm "$LEGION_PKG_FILE" >/dev/null
+    sh /opt/retry-fetch.sh --quiet -- pacman -U --noconfirm "$LEGION_PKG_FILE"
     REINSTALL_PKG="$LEGION_PKG_FILE"
   fi
 

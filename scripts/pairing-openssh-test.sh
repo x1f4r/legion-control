@@ -101,8 +101,8 @@ echo "    link:   $LINK_BIN"
 CONTAINER_SCRIPT="$(cat <<'CONTAINER_EOF'
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq --no-install-recommends openssh-server openssh-client openssl python3 >/dev/null
+sh /opt/retry-fetch.sh -- apt-get update -qq
+sh /opt/retry-fetch.sh --quiet -- apt-get install -y -qq --no-install-recommends openssh-server openssh-client openssl python3
 
 echo "==> OpenSSH version:"
 sshd -V 2>&1 || true
@@ -867,6 +867,7 @@ CONTAINER_EOF
 )"
 
 "${DOCKER_CMD[@]}" run --rm \
+  -v "$ROOT/scripts/retry-fetch.sh:/opt/retry-fetch.sh:ro" \
   -v "$BIN:/usr/local/bin/legion:ro" \
   -v "$LINK_BIN:/usr/local/bin/legion-link-cli:ro" \
   "$IMAGE" \

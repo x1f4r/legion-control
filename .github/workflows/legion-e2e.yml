@@ -53,7 +53,8 @@ jobs:
         with:
           node-version: 24
       - name: Install Rust
-        run: rustup toolchain install
+        shell: bash
+        run: sh scripts/retry-fetch.sh -- rustup toolchain install
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -89,8 +90,8 @@ jobs:
             # The package would start its own sshd on every interface; policy-rc.d keeps it down.
             printf '#!/bin/sh\nexit 101\n' | sudo tee /usr/sbin/policy-rc.d >/dev/null
             sudo chmod 755 /usr/sbin/policy-rc.d
-            sudo apt-get update -q
-            sudo apt-get install -y -q --no-install-recommends openssh-server
+            sh scripts/retry-fetch.sh -- sudo apt-get update -q
+            sh scripts/retry-fetch.sh -- sudo apt-get install -y -q --no-install-recommends openssh-server
             sudo rm -f /usr/sbin/policy-rc.d
           fi
           for key in host far gate; do
@@ -172,7 +173,8 @@ jobs:
           $farBin = Join-Path $env:LOCALAPPDATA 'legion\legion.exe'
           New-Item -ItemType Directory -Force -Path $e2e, $farHome | Out-Null
           if (-not (Get-Service -Name sshd -ErrorAction SilentlyContinue)) {
-            Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
+            ./scripts/retry-fetch.ps1 -ScriptBlock { Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null }
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
           $programData = Join-Path $env:ProgramData 'ssh'
           New-Item -ItemType Directory -Force -Path $programData | Out-Null
