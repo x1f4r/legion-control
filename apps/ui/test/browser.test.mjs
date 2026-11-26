@@ -28,6 +28,7 @@ import './long-names-browser.mjs';
 import './machine-browser.mjs';
 import './player-background-browser.mjs';
 import './player-browser.mjs';
+import './player-pip-browser.mjs';
 import './split-view-browser.mjs';
 import './ui-craft-browser.mjs';
 

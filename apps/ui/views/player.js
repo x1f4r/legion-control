@@ -647,7 +647,7 @@ export function VideoPlayer({
     };
   }, [link, viewerRef, mediaUrl]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     onPipActiveChangeRef.current?.(pipActive);
   }, [pipActive]);
 
