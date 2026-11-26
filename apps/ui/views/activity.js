@@ -3,6 +3,7 @@
 
 import { html, useEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
 import { Notice, ProgressBar, SwipeRow } from './common.js';
+import { FileName, FileNameList } from './file-name.js';
 import { SplitView } from './split-view.js';
 import {
   formatActivityDuration,
@@ -232,6 +233,8 @@ export function ActivityRow({
   includeMachine = true,
   technical = false,
   canCancel = false,
+  beforeTitle = null,
+  afterTitle = null,
   onStop,
 }) {
   const active = job.state === 'running' || job.state === 'starting';
@@ -253,9 +256,26 @@ export function ActivityRow({
   const rowCls = ['row', selected ? 'selected' : ''].filter(Boolean).join(' ');
 
   const rowEl = html`
-    <a class=${rowCls} href=${href} aria-current=${selected ? 'true' : undefined}>
+    <a
+      class=${rowCls}
+      href=${href}
+      aria-current=${selected ? 'true' : undefined}
+      aria-label=${isTransfer ? title : undefined}
+      title=${isTransfer ? title : undefined}
+    >
       <span class="body">
-        <span class=${technical ? 'title mono' : 'title'}>${title}</span>
+        ${isTransfer
+          ? html`
+              <${FileName}
+                className=${technical ? 'title mono fn-title' : 'title fn-title'}
+                name=${title}
+                before=${beforeTitle}
+                after=${afterTitle}
+                lines=${2}
+                titleOnHover=${false}
+              />
+            `
+          : html`<span class=${technical ? 'title mono' : 'title'}>${title}</span>`}
         ${subtitle || (active && pct != null)
           ? html`
               <span class=${wrapSub ? 'sub wrap' : 'sub'}>
@@ -284,6 +304,8 @@ export function DeviceTransferRow({
   deviceNoun = 'phone',
   technical = false,
   canControl = false,
+  beforeTitle = null,
+  afterTitle = null,
   onControl,
   onOpen,
 }) {
@@ -299,9 +321,16 @@ export function DeviceTransferRow({
 
   if (isDone && transfer.canOpen && onOpen) {
     return html`
-      <button type="button" class="row" onClick=${() => onOpen(transfer)}>
+      <button type="button" class="row" aria-label=${title} title=${title} onClick=${() => onOpen(transfer)}>
         <span class="body">
-          <span class=${technical ? 'title mono' : 'title'}>${title}</span>
+          <${FileName}
+            className=${technical ? 'title mono fn-title' : 'title fn-title'}
+            name=${title}
+            before=${beforeTitle}
+            after=${afterTitle}
+            lines=${2}
+            titleOnHover=${false}
+          />
           <span class="sub">${sub}</span>
         </span>
         <span class=${`state ${stateInfo.cls}`}>${stateInfo.label}</span>
@@ -310,9 +339,16 @@ export function DeviceTransferRow({
   }
 
   return html`
-    <div class="row">
+    <div class="row" role="group" aria-label=${title} title=${title}>
       <div class="body">
-        <span class=${technical ? 'title mono' : 'title'}>${title}</span>
+        <${FileName}
+          className=${technical ? 'title mono fn-title' : 'title fn-title'}
+          name=${title}
+          before=${beforeTitle}
+          after=${afterTitle}
+          lines=${2}
+          titleOnHover=${false}
+        />
         <span class="sub wrap">
           ${sub}
           ${(isActive || isPaused) && pct != null ? html`<${ProgressBar} value=${pct} />` : null}
@@ -416,8 +452,18 @@ export function ActivityGroups({
         (group, idx) => html`
           <div key=${group.key}>
             ${!(hideFirstLabel && idx === 0) ? html`<p class="label">${group.label}</p>` : null}
-            <div class="list">
-              ${group.items.map((item) => {
+            <${FileNameList} className="list" lines=${2}>
+              ${group.items.map((item, itemIdx) => {
+                const titleFor = (entry) => {
+                  if (!entry) return null;
+                  if (entry._kind === 'transfer') return formatDeviceTransferTitle(entry._transfer, technical);
+                  if (entry.kind === 'transfer') {
+                    return technical ? entry.command || entry.name || entry.id : friendlyJobName(entry);
+                  }
+                  return null;
+                };
+                const prevTitle = itemIdx > 0 ? titleFor(group.items[itemIdx - 1]) : null;
+                const nextTitle = itemIdx + 1 < group.items.length ? titleFor(group.items[itemIdx + 1]) : null;
                 if (item._kind === 'transfer') {
                   return html`
                     <${DeviceTransferRow}
@@ -426,6 +472,8 @@ export function ActivityGroups({
                       deviceNoun=${deviceNoun}
                       technical=${technical}
                       canControl=${canControlTransfers}
+                      beforeTitle=${prevTitle}
+                      afterTitle=${nextTitle}
                       onControl=${onControlTransfer}
                       onOpen=${onOpenTransfer}
                     />
@@ -441,11 +489,13 @@ export function ActivityGroups({
                     includeMachine=${includeMachine}
                     technical=${technical}
                     canCancel=${canCancel}
+                    beforeTitle=${prevTitle}
+                    afterTitle=${nextTitle}
                     onStop=${onStopJob}
                   />
                 `;
               })}
-            </div>
+            <//>
           </div>
         `,
       )}

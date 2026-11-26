@@ -3,81 +3,15 @@
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import http from 'node:http';
 import path from 'node:path';
-import test from 'node:test';
-import { fileURLToPath } from 'node:url';
-import { chromium } from 'playwright-core';
+import {
+  browserTest,
+  launchBrowser,
+  setTheme,
+  startStaticUiServer,
+} from './browser-helpers.mjs';
 
-const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
-const UI_ROOT = path.resolve(TEST_DIR, '..');
 const SHOTS_DIR = process.env.LEGION_MACHINE_SHOTS_DIR || '';
-
-const STRICT_CSP =
-  "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self' blob: data:; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
-
-const MIME_BY_EXT = {
-  '.html': 'text/html; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.svg': 'image/svg+xml',
-  '.png': 'image/png',
-  '.webmanifest': 'application/manifest+json; charset=utf-8',
-};
-
-function findBrowser() {
-  if (process.env.LEGION_CHROME && fs.existsSync(process.env.LEGION_CHROME)) {
-    return process.env.LEGION_CHROME;
-  }
-  const candidates = [
-    '/usr/bin/chromium',
-    '/usr/bin/chromium-browser',
-    '/usr/bin/google-chrome',
-    '/usr/bin/google-chrome-stable',
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-  ];
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) return candidate;
-  }
-  throw new Error('No Chromium or Chrome binary found; set LEGION_CHROME.');
-}
-
-async function startStaticUiServer() {
-  const server = http.createServer((req, res) => {
-    const urlPath = (req.url || '/').split('?')[0];
-    const rel = urlPath === '/' ? 'index.html' : urlPath.replace(/^\/+/, '');
-    const full = path.resolve(UI_ROOT, rel);
-    if (!full.startsWith(UI_ROOT) || !fs.existsSync(full) || fs.statSync(full).isDirectory()) {
-      res.writeHead(404);
-      res.end('Not found');
-      return;
-    }
-    const ext = path.extname(full).toLowerCase();
-    res.writeHead(200, {
-      'Content-Type': MIME_BY_EXT[ext] || 'application/octet-stream',
-      'Content-Security-Policy': STRICT_CSP,
-      'Cache-Control': 'no-store',
-    });
-    fs.createReadStream(full).pipe(res);
-  });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const { port } = server.address();
-  return {
-    url: `http://127.0.0.1:${port}`,
-    stop: () => new Promise((resolve) => server.close(resolve)),
-  };
-}
-
-async function setTheme(page, theme) {
-  await page.evaluate((t) => {
-    const raw = localStorage.getItem('legion.settings.v1');
-    const obj = raw ? JSON.parse(raw) : {};
-    obj.theme = t;
-    localStorage.setItem('legion.settings.v1', JSON.stringify(obj));
-    document.documentElement.dataset.theme = t;
-  }, theme);
-  await page.waitForTimeout(80);
-}
 
 async function captureShot(page, name) {
   if (!SHOTS_DIR) return;
@@ -91,26 +25,27 @@ async function captureShot(page, name) {
 
 const PLAIN_JARGON_RE = /\b(?:PID|PIDs|SIGTERM|SIGKILL|process|processes)\b/i;
 
-test('Machine Overview: no empty meters on minimal machine, Stop then Force stop, amber warnings, and Wake it and continue', async () => {
-  const server = await startStaticUiServer();
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu'],
-  });
-  const consoleErrors = [];
-  const pageErrors = [];
+browserTest(
+  'Machine Overview: no empty meters on minimal machine, Stop then Force stop, amber warnings, and Wake it and continue',
+  { timeout: 120_000 },
+  async (_t, tracker) => {
+    const server = await startStaticUiServer();
+    const browser = await launchBrowser();
+    const consoleErrors = [];
+    const pageErrors = [];
 
-  try {
-    // ── 1. Minimal machine reports no optional values -> no empty meters ──────────────────────
-    {
-      const ctx = await browser.newContext({
-        viewport: { width: 412, height: 915 },
-        colorScheme: 'dark',
-      });
-      const page = await ctx.newPage();
-      page.on('console', (m) => { if (m.type() === 'error') consoleErrors.push(m.text()); });
-      page.on('pageerror', (e) => pageErrors.push(String(e)));
+    try {
+      // ── 1. Minimal machine reports no optional values -> no empty meters ──────────────────────
+      {
+        tracker.setStep('minimal machine overview');
+        const ctx = await browser.newContext({
+          viewport: { width: 412, height: 915 },
+          colorScheme: 'dark',
+        });
+        const page = tracker.attach(await ctx.newPage(), {
+          collectConsole: consoleErrors,
+          collectPage: pageErrors,
+        });
 
       await page.goto(`${server.url}/?mock=minimal#/machines/pi`, { waitUntil: 'domcontentloaded' });
       await page.getByText('Nothing much is running.').waitFor({ timeout: 10_000 });
@@ -125,13 +60,15 @@ test('Machine Overview: no empty meters on minimal machine, Stop then Force stop
 
     // ── 2. Overview busy, Stop -> still_running -> Force stop, plain language, and idle laptop ─
     {
+      tracker.setStep('busy overview, stop and force stop');
       const ctx = await browser.newContext({
         viewport: { width: 412, height: 915 },
         colorScheme: 'dark',
       });
-      const page = await ctx.newPage();
-      page.on('console', (m) => { if (m.type() === 'error') consoleErrors.push(m.text()); });
-      page.on('pageerror', (e) => pageErrors.push(String(e)));
+      const page = tracker.attach(await ctx.newPage(), {
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
 
       await page.goto(`${server.url}/?mock#/machines/tower`, { waitUntil: 'domcontentloaded' });
       await page.getByText('Using it now').waitFor({ timeout: 10_000 });
@@ -188,16 +125,18 @@ test('Machine Overview: no empty meters on minimal machine, Stop then Force stop
 
     // ── 3. Amber words on Machines list and amber meters (phone & desktop) ───────────────────
     {
+      tracker.setStep('amber warnings phone and desktop');
       const ctx = await browser.newContext({
         viewport: { width: 412, height: 915 },
         colorScheme: 'dark',
       });
-      const page = await ctx.newPage();
-      page.on('console', (m) => { if (m.type() === 'error') consoleErrors.push(m.text()); });
-      page.on('pageerror', (e) => pageErrors.push(String(e)));
+      const page = tracker.attach(await ctx.newPage(), {
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
 
       await page.goto(`${server.url}/?mock=amber#/machines`, { waitUntil: 'domcontentloaded' });
-      await page.getByText('Running hot').waitFor({ timeout: 10_000 });
+      await tracker.waitForLocator(page.getByText('Running hot'), 'Running hot warning');
       await page.getByText('Battery low').waitFor();
       await page.getByText('Storage almost full').waitFor();
       await page.locator('a.machine', { hasText: 'tower' }).getByText('Storage').waitFor();
@@ -209,9 +148,10 @@ test('Machine Overview: no empty meters on minimal machine, Stop then Force stop
         viewport: { width: 1280, height: 800 },
         colorScheme: 'dark',
       });
-      const deskPage = await deskCtx.newPage();
-      deskPage.on('console', (m) => { if (m.type() === 'error') consoleErrors.push(m.text()); });
-      deskPage.on('pageerror', (e) => pageErrors.push(String(e)));
+      const deskPage = tracker.attach(await deskCtx.newPage(), {
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
 
       await deskPage.goto(`${server.url}/?mock=amber#/machines/tower`, { waitUntil: 'domcontentloaded' });
       await deskPage.getByText('Running hot').waitFor({ timeout: 10_000 });
@@ -257,13 +197,15 @@ test('Machine Overview: no empty meters on minimal machine, Stop then Force stop
 
     // ── 4. Wake it and continue: success, timeout (fake clock), and leaving the screen ───────
     {
+      tracker.setStep('wake it and continue flows');
       const ctx = await browser.newContext({
         viewport: { width: 412, height: 915 },
         colorScheme: 'dark',
       });
-      const page = await ctx.newPage();
-      page.on('console', (m) => { if (m.type() === 'error') consoleErrors.push(m.text()); });
-      page.on('pageerror', (e) => pageErrors.push(String(e)));
+      const page = tracker.attach(await ctx.newPage(), {
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
 
       // Inject a deterministic controllable clock for the wake controller before the page loads.
       await page.addInitScript(() => {
@@ -274,7 +216,8 @@ test('Machine Overview: no empty meters on minimal machine, Stop then Force stop
           now: () => nowMs,
           setInterval(fn, ms) {
             const id = nextId++;
-            intervals.set(id, { fn, ms, nextAt: nowMs + ms });
+            const stepMs = Math.max(1, Number(ms) || 1);
+            intervals.set(id, { fn, ms: stepMs, nextAt: nowMs + stepMs });
             return id;
           },
           clearInterval(id) {
@@ -282,7 +225,11 @@ test('Machine Overview: no empty meters on minimal machine, Stop then Force stop
           },
           async advance(ms) {
             const target = nowMs + ms;
+            let iterations = 0;
             while (true) {
+              if (++iterations > 1000) {
+                throw new Error(`Fake wake clock exceeded 1000 ticks advancing ${ms}ms`);
+              }
               let soonest = null;
               for (const item of intervals.values()) {
                 if (item.nextAt <= target && (!soonest || item.nextAt < soonest.nextAt)) {
@@ -377,4 +324,5 @@ test('Machine Overview: no empty meters on minimal machine, Stop then Force stop
     await browser.close();
     await server.stop();
   }
-});
+},
+);

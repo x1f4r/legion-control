@@ -22,11 +22,30 @@ import { readTextWrapPreference, writeTextWrapPreference } from '../lib/files-st
 import { formatBytePair, formatBytes, formatRelativeTime } from '../lib/format.js';
 import { createFullscreenController, formatSpeed, PLAYBACK_SPEEDS, queueNeighbors } from '../lib/player.js';
 import { CopyButton, Notice, Sheet } from './common.js';
+import { FileNameSingle } from './file-name.js';
 import { MusicPlayer, VideoPlayer } from './player.js';
 
 const TEXT_CHUNK_BYTES = 131072; // 128 KiB
 const MEDIA_RECOVERY_WINDOW_MS = 10_000;
+const HTTP_RESTART_RETRY_DELAYS_MS = [250, 500, 1000];
 const PREVIEW_THUMB_SIZE = 512;
+
+function waitAbortable(ms, signal) {
+  if (signal?.aborted) {
+    return Promise.reject({ code: 'cancelled', message: 'The request was cancelled.' });
+  }
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      if (signal) signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    function onAbort() {
+      window.clearTimeout(timer);
+      reject({ code: 'cancelled', message: 'The request was cancelled.' });
+    }
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
 
 function isLocalMediaUrl(url) {
   return typeof url === 'string' && (url.startsWith('data:') || url.startsWith('blob:'));
@@ -1603,6 +1622,9 @@ export function FilesViewer({
     if (!inspection || activeFileKeyRef.current !== expectedKey || activeMediaUrlRef.current !== expectedUrl) {
       return;
     }
+    if (recoveryRef.current.key === expectedKey && recoveryRef.current.inFlight) {
+      return;
+    }
 
     // On a first failure outside the 10-second loop guard, silently request ONE fresh content
     // address for non-fatal responses (never retry 413/403 or local blob:/data: URLs) so
@@ -1629,7 +1651,23 @@ export function FilesViewer({
 
       recoveryRef.current = { key: expectedKey, lastAttemptAt: now, inFlight: true };
       try {
-        const res = await link.contentUrl({ machine, path, signal });
+        let res = null;
+        for (let attempt = 0; ; attempt += 1) {
+          try {
+            res = await link.contentUrl({ machine, path, signal });
+            break;
+          } catch (mintErr) {
+            const isRestartingDoor =
+              link?.kind === 'http' &&
+              mintErr?.code === 'unreachable' &&
+              mintErr?.status == null &&
+              attempt < HTTP_RESTART_RETRY_DELAYS_MS.length;
+            if (!isRestartingDoor || signal?.aborted || activeFileKeyRef.current !== expectedKey) {
+              throw mintErr;
+            }
+            await waitAbortable(HTTP_RESTART_RETRY_DELAYS_MS[attempt], signal);
+          }
+        }
         if (signal?.aborted || activeFileKeyRef.current !== expectedKey) {
           if (res?.url) revokeContentUrlNow(res.url);
           return;
@@ -2541,8 +2579,8 @@ export function FilesViewer({
                 >
                   <${Icon} name=${fullscreenState.active && fullscreenState.source === 'button' ? 'back' : 'down'} />
                 </button>
-                <span class="name">
-                  ${name}
+                <span class="name" role="heading" aria-level="2" aria-label=${name} title=${name}>
+                  <${FileNameSingle} name=${name} lines=${1} titleOnHover=${false} />
                   ${topSub ? html`<small>${topSub}</small>` : null}
                 </span>
                 ${isViewerFullscreen
@@ -2623,6 +2661,10 @@ export function FilesViewer({
       ${moreOpen
         ? html`
             <${Sheet} title=${name} onClose=${() => setMoreOpen(false)}>
+              <div class="sheet-name-actions">
+                <${CopyButton} text=${name} label="Copy name" />
+                ${technical ? html`<${CopyButton} text=${`${machine}:${path}`} label="Copy path" />` : null}
+              </div>
               ${useMusicPlayer
                 ? html`
                     <p class="label">Playback speed</p>
@@ -2791,14 +2833,6 @@ export function FilesViewer({
                     `
                   : null}
               </div>
-
-              ${technical
-                ? html`
-                    <div class="sheet-cta">
-                      <${CopyButton} text=${`${machine}:${path}`} label="Copy path" />
-                    </div>
-                  `
-                : null}
             </${Sheet}>
           `
         : null}

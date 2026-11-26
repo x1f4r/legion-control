@@ -46,9 +46,9 @@ use std::fs::{self, FileTimes};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::guard::{Expected, Guarded, Watch};
@@ -1024,7 +1024,7 @@ fn serve_single_op<R: Read + Send + 'static, W: Write>(
     output: &mut BufWriter<W>,
 ) -> Result<(), ErrorBody> {
     let tool = format!("stream.{}", header.op.name());
-    let config = ConfigStore::new(host.paths.config_dir());
+    let config = Arc::new(ConfigStore::new(host.paths.config_dir()));
     let (principal, result) = match authorise(
         host,
         &config,
@@ -1142,7 +1142,8 @@ fn serve_keep_open_gets_with_source<W: Write>(
     mut output: BufWriter<W>,
     mut next_header: impl FnMut(&mut Option<GetAuditBucket>) -> NextHeader,
 ) -> Result<(), ErrorBody> {
-    let config = ConfigStore::new(host.paths.config_dir());
+    let config = Arc::new(ConfigStore::new(host.paths.config_dir()));
+    let watchdog = RevokeWatchdog::start_reusable(options.abort_on_revoke.clone());
     let mut bucket: Option<GetAuditBucket> = None;
     let mut current = Some((first_header, first_recorded));
 
@@ -1234,6 +1235,7 @@ fn serve_keep_open_gets_with_source<W: Write>(
             offset,
             length,
             true,
+            Some(&watchdog),
             &mut output,
         ) {
             Ok(served_bytes) => {
@@ -1557,6 +1559,7 @@ pub(crate) fn check_pairing_not_revoked(
 #[derive(Clone)]
 struct StreamAuthCheck {
     paths: Paths,
+    config: Arc<ConfigStore>,
     principal: String,
     pairing_id: Option<String>,
     tool: &'static str,
@@ -1569,6 +1572,7 @@ struct StreamAuthCheck {
 }
 
 impl StreamAuthCheck {
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn new(
         host: &Host,
@@ -1580,8 +1584,34 @@ impl StreamAuthCheck {
         access: Access,
         create_kind: Option<CreateKind>,
     ) -> Self {
+        Self::with_config(
+            host,
+            Arc::new(ConfigStore::new(host.paths.config_dir())),
+            grant,
+            pairing_id,
+            tool,
+            effect,
+            path,
+            access,
+            create_kind,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_config(
+        host: &Host,
+        config: Arc<ConfigStore>,
+        grant: &Grant,
+        pairing_id: Option<&str>,
+        tool: &'static str,
+        effect: Effect,
+        path: PathBuf,
+        access: Access,
+        create_kind: Option<CreateKind>,
+    ) -> Self {
         Self {
             paths: host.paths.clone(),
+            config,
             principal: grant.principal().to_owned(),
             pairing_id: pairing_id.map(str::to_owned),
             tool,
@@ -1595,11 +1625,10 @@ impl StreamAuthCheck {
     }
 
     fn verify_once(&self) -> Result<(), ErrorBody> {
-        let config = ConfigStore::new(self.paths.config_dir());
         if let Some(ref pid) = self.pairing_id {
-            check_pairing_not_revoked(&config, pid)?;
+            check_pairing_not_revoked(&self.config, pid)?;
         }
-        let policy = config.get::<Policy>()?;
+        let policy = self.config.get::<Policy>()?;
         let spec = ToolSpec {
             name: self.tool.to_owned(),
             description: String::new(),
@@ -1682,43 +1711,124 @@ impl StreamAuthCheck {
     }
 }
 
+struct WatchdogState {
+    stopped: bool,
+    parked: bool,
+    active: Option<StreamAuthCheck>,
+}
+
 /// Background watchdog for outbound (`get`/`pack`) streams so a completely stalled pipe (0 B/s)
 /// still stops within [`RECHECK_INTERVAL_TIME`] when permissions or device access are revoked.
+///
+/// Uses a [`Condvar`] so tearing down a completed stream wakes the watchdog immediately instead of
+/// blocking on a fixed sleep interval, and supports reusing one watchdog thread across every frame
+/// of a `keep_open` `get` session.
 struct RevokeWatchdog {
-    done: Arc<AtomicBool>,
+    state: Arc<(Mutex<WatchdogState>, Condvar)>,
     handle: Option<std::thread::JoinHandle<()>>,
+}
+
+struct WatchdogArmGuard<'a> {
+    watchdog: &'a RevokeWatchdog,
+}
+
+impl Drop for WatchdogArmGuard<'_> {
+    fn drop(&mut self) {
+        self.watchdog.disarm();
+    }
 }
 
 impl RevokeWatchdog {
     fn start(check: StreamAuthCheck, abort: Option<CancellationToken>) -> Self {
-        let done = Arc::new(AtomicBool::new(false));
+        Self::spawn(Some(check), abort)
+    }
+
+    fn start_reusable(abort: Option<CancellationToken>) -> Self {
+        Self::spawn(None, abort)
+    }
+
+    fn spawn(initial: Option<StreamAuthCheck>, abort: Option<CancellationToken>) -> Self {
+        let state = Arc::new((
+            Mutex::new(WatchdogState {
+                stopped: false,
+                parked: false,
+                active: initial,
+            }),
+            Condvar::new(),
+        ));
         let Some(token) = abort else {
-            return Self { done, handle: None };
+            return Self {
+                state,
+                handle: None,
+            };
         };
-        let done_bg = Arc::clone(&done);
+        let state_bg = Arc::clone(&state);
         let handle = std::thread::spawn(move || {
-            while !done_bg.load(Ordering::Acquire) {
-                std::thread::sleep(RECHECK_POLL_INTERVAL);
-                if done_bg.load(Ordering::Acquire) {
+            let (lock, cvar) = &*state_bg;
+            let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+            while !guard.stopped {
+                if guard.active.is_none() {
+                    guard.parked = true;
+                    guard = cvar.wait(guard).unwrap_or_else(|p| p.into_inner());
+                    guard.parked = false;
+                    continue;
+                }
+                let (next, _) = cvar
+                    .wait_timeout(guard, RECHECK_POLL_INTERVAL)
+                    .unwrap_or_else(|p| p.into_inner());
+                guard = next;
+                if guard.stopped {
                     break;
                 }
+                let Some(check) = guard.active.clone() else {
+                    continue;
+                };
+                drop(guard);
                 let mut zero = 0u64;
                 if check.maybe_recheck(&mut zero).is_err() {
                     token.cancel();
                     break;
                 }
+                guard = lock.lock().unwrap_or_else(|p| p.into_inner());
             }
         });
         Self {
-            done,
+            state,
             handle: Some(handle),
+        }
+    }
+
+    fn arm(&self, check: StreamAuthCheck) -> WatchdogArmGuard<'_> {
+        if self.handle.is_some() {
+            let (lock, cvar) = &*self.state;
+            let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+            guard.active = Some(check);
+            if guard.parked {
+                guard.parked = false;
+                cvar.notify_one();
+            }
+        }
+        WatchdogArmGuard { watchdog: self }
+    }
+
+    fn disarm(&self) {
+        if self.handle.is_some() {
+            let (lock, _) = &*self.state;
+            let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+            guard.active = None;
         }
     }
 }
 
 impl Drop for RevokeWatchdog {
     fn drop(&mut self) {
-        self.done.store(true, Ordering::Release);
+        let (lock, cvar) = &*self.state;
+        {
+            let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+            guard.stopped = true;
+            guard.active = None;
+            cvar.notify_all();
+        }
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -1866,7 +1976,7 @@ pub(crate) fn record_for_target(
 #[allow(clippy::too_many_arguments)]
 fn run<R: Read + Send + 'static, W: Write>(
     host: &Host,
-    config: &ConfigStore,
+    config: &Arc<ConfigStore>,
     pinned: Option<&str>,
     as_principal: Option<&str>,
     grant: &Grant,
@@ -1913,6 +2023,7 @@ fn run<R: Read + Send + 'static, W: Write>(
             offset,
             length,
             false,
+            None,
             output,
         )
         .map(|_| ()),
@@ -1924,10 +2035,12 @@ fn run<R: Read + Send + 'static, W: Write>(
             mtime,
             if_exists,
         } => put(
-            host, grant, pairing_id, &path, size, &hash, mode, mtime, if_exists, input, output,
+            host, config, grant, pairing_id, &path, size, &hash, mode, mtime, if_exists, input,
+            output,
         ),
         Op::Pack { root, names } => pack(
             host,
+            config,
             grant,
             pairing_id,
             abort_on_revoke,
@@ -1940,7 +2053,7 @@ fn run<R: Read + Send + 'static, W: Write>(
             entries,
             if_exists,
         } => unpack(
-            host, grant, pairing_id, &root, &entries, if_exists, input, output,
+            host, config, grant, pairing_id, &root, &entries, if_exists, input, output,
         ),
         Op::Delete {
             root,
@@ -2249,7 +2362,7 @@ fn stat<W: Write>(
 #[allow(clippy::too_many_arguments)]
 fn get_range_framed<W: Write>(
     host: &Host,
-    config: &ConfigStore,
+    config: &Arc<ConfigStore>,
     pinned: Option<&str>,
     as_principal: Option<&str>,
     grant: &Grant,
@@ -2258,6 +2371,7 @@ fn get_range_framed<W: Write>(
     offset: u64,
     length: Option<u64>,
     keep_open: bool,
+    shared_watchdog: Option<&RevokeWatchdog>,
     output: &mut BufWriter<W>,
 ) -> Result<u64, Failure> {
     let checked_path = grant.check_path(raw_path, Access::Read)?;
@@ -2274,8 +2388,9 @@ fn get_range_framed<W: Write>(
         },
     )?;
 
-    let check = StreamAuthCheck::new(
+    let check = StreamAuthCheck::with_config(
         host,
+        Arc::clone(config),
         grant,
         options.pairing_id.as_deref(),
         "fs.read",
@@ -2284,7 +2399,18 @@ fn get_range_framed<W: Write>(
         Access::Read,
         None,
     );
-    let _watchdog = RevokeWatchdog::start(check.clone(), options.abort_on_revoke.clone());
+    let _owned_watchdog;
+    let _armed_watchdog;
+    if let Some(wd) = shared_watchdog {
+        _armed_watchdog = Some(wd.arm(check.clone()));
+        _owned_watchdog = None;
+    } else {
+        _owned_watchdog = Some(RevokeWatchdog::start(
+            check.clone(),
+            options.abort_on_revoke.clone(),
+        ));
+        _armed_watchdog = None;
+    }
     // Write raw file bytes directly to the underlying writer (already flushed above) so slow links
     // never block inside a 64 KiB BufWriter drain before the 2-second re-auth timer fires.
     let mut guarded = RecheckingWriter::new(output.get_mut(), check.clone());
@@ -2364,6 +2490,7 @@ fn recheck_get_access(
 #[allow(clippy::too_many_arguments)]
 fn put<R: Read + Send + 'static, W: Write>(
     host: &Host,
+    config: &Arc<ConfigStore>,
     grant: &Grant,
     pairing_id: Option<&str>,
     path: &str,
@@ -2447,8 +2574,9 @@ fn put<R: Read + Send + 'static, W: Write>(
     let offset = session.offset();
     reply(output, &PutReady { offset })?;
     let grant_for_check = grant.clone();
-    let check = StreamAuthCheck::new(
+    let check = StreamAuthCheck::with_config(
         host,
+        Arc::clone(config),
         grant,
         pairing_id,
         "fs.write",
@@ -2533,8 +2661,10 @@ fn put<R: Read + Send + 'static, W: Write>(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pack<W: Write>(
     host: &Host,
+    config: &Arc<ConfigStore>,
     grant: &Grant,
     pairing_id: Option<&str>,
     abort_on_revoke: Option<CancellationToken>,
@@ -2576,8 +2706,9 @@ fn pack<W: Write>(
         }
     }
     reply(output, &ready)?;
-    let check = StreamAuthCheck::new(
+    let check = StreamAuthCheck::with_config(
         host,
+        Arc::clone(config),
         grant,
         pairing_id,
         "fs.read",
@@ -2600,6 +2731,7 @@ fn pack<W: Write>(
 #[allow(clippy::too_many_arguments)]
 fn unpack<R: Read + Send + 'static, W: Write>(
     host: &Host,
+    config: &Arc<ConfigStore>,
     grant: &Grant,
     pairing_id: Option<&str>,
     root: &str,
@@ -2655,8 +2787,9 @@ fn unpack<R: Read + Send + 'static, W: Write>(
         ));
     }
     reply(output, &UnpackReady { ready: true })?;
-    let check = StreamAuthCheck::new(
+    let check = StreamAuthCheck::with_config(
         host,
+        Arc::clone(config),
         grant,
         pairing_id,
         "fs.write",
@@ -5946,5 +6079,134 @@ mod tests {
         );
         assert!(!id_lock_path.exists());
         assert!(!target_lock_path.exists());
+    }
+
+    #[test]
+    fn revoke_watchdog_drops_promptly_and_still_aborts_on_revocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::from_explicit_home(dir.path()).unwrap();
+        fs::create_dir_all(paths.config_dir()).unwrap();
+        fs::create_dir_all(paths.state_dir()).unwrap();
+        let data_file = dir.path().join("sample.bin");
+        fs::write(&data_file, vec![0xABu8; 4096]).unwrap();
+
+        fs::write(
+            paths.config_file("policy.toml"),
+            format!(
+                "default = \"owner\"\n\n[principals.reader]\nrole = \"ro\"\n\n[roles.ro]\nallow = [\"effect:read\"]\npaths = [{:?}]\n",
+                dir.path().to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let host = Host::new(paths.clone(), "tower");
+        let config = ConfigStore::new(paths.config_dir());
+        let policy = config.get::<Policy>().unwrap();
+        let spec = ToolSpec {
+            name: "fs.read".to_owned(),
+            description: String::new(),
+            effect: Effect::Read,
+            input_schema: json!({"type": "object"}),
+        };
+        let grant = policy.authorize("reader", &spec, &paths).unwrap();
+
+        // 1. Dropping a live watchdog must wake via Condvar immediately rather than waiting out
+        //    the 250 ms polling sleep.
+        let check = StreamAuthCheck::new(
+            &host,
+            &grant,
+            None,
+            "fs.read",
+            Effect::Read,
+            data_file.clone(),
+            Access::Read,
+            None,
+        );
+        let abort = CancellationToken::new();
+        let wd = RevokeWatchdog::start(check.clone(), Some(abort.clone()));
+        // Give the background thread a moment to enter wait_timeout.
+        std::thread::sleep(Duration::from_millis(15));
+        let drop_started = Instant::now();
+        drop(wd);
+        assert!(
+            drop_started.elapsed() < Duration::from_millis(100),
+            "RevokeWatchdog::drop blocked for {:?} (expected < 100ms)",
+            drop_started.elapsed()
+        );
+        assert!(!abort.is_cancelled());
+
+        // 2. A keep_open session serving 30 sequential get frames with abort_on_revoke armed must
+        //    not incur 250 ms stalls per frame.
+        let mut reqs = String::new();
+        for _ in 0..30 {
+            reqs.push_str(
+                &json!({
+                    "protocol": STREAM_PROTOCOL,
+                    "op": "get",
+                    "path": data_file.to_string_lossy(),
+                    "offset": 0,
+                    "length": 1024,
+                    "keep_open": true,
+                })
+                .to_string(),
+            );
+            reqs.push('\n');
+        }
+        let keep_abort = CancellationToken::new();
+        let opts = StreamServeOptions {
+            abort_on_revoke: Some(keep_abort.clone()),
+            ..StreamServeOptions::default()
+        };
+        let mut out = Vec::new();
+        let batch_started = Instant::now();
+        serve_with_options(
+            &host,
+            Some("reader"),
+            Door::Stream,
+            None,
+            opts,
+            io::Cursor::new(reqs.into_bytes()),
+            &mut out,
+        )
+        .unwrap();
+        assert!(
+            batch_started.elapsed() < Duration::from_secs(1),
+            "30 keep_open gets with watchdog took {:?} (expected well under 1s)",
+            batch_started.elapsed()
+        );
+        assert!(!keep_abort.is_cancelled());
+
+        // 3. While armed with an expired check interval, revoking policy must still cancel
+        //    `abort_on_revoke` promptly even when no bytes are flowing.
+        let revoke_abort = CancellationToken::new();
+        let reusable = RevokeWatchdog::start_reusable(Some(revoke_abort.clone()));
+        let check_rev = StreamAuthCheck::new(
+            &host,
+            &grant,
+            None,
+            "fs.read",
+            Effect::Read,
+            data_file,
+            Access::Read,
+            None,
+        );
+        // Backdate last_check past RECHECK_INTERVAL_TIME so the next poll tick verifies right away.
+        *check_rev.last_check.lock().unwrap() = Instant::now()
+            .checked_sub(RECHECK_INTERVAL_TIME * 2)
+            .unwrap();
+        fs::write(
+            paths.config_file("policy.toml"),
+            "default = \"owner\"\n\n[principals.reader]\nrole = \"none\"\n\n[roles.none]\nallow = []\n",
+        )
+        .unwrap();
+        let _armed = reusable.arm(check_rev);
+        let wait_started = Instant::now();
+        while !revoke_abort.is_cancelled() && wait_started.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            revoke_abort.is_cancelled(),
+            "reusable RevokeWatchdog did not cancel abort_on_revoke after policy revocation"
+        );
     }
 }

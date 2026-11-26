@@ -5,28 +5,17 @@
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import http from 'node:http';
 import path from 'node:path';
-import test from 'node:test';
-import { fileURLToPath } from 'node:url';
-import { chromium } from 'playwright-core';
 import { routeHref } from '../lib/route.js';
+import {
+  browserTest,
+  launchBrowser,
+  setTheme,
+  startStaticUiServer,
+  waitForLayoutSettled,
+} from './browser-helpers.mjs';
 
-const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
-const UI_ROOT = path.resolve(TEST_DIR, '..');
 const SHOTS_DIR = process.env.LEGION_SPLIT_SHOTS_DIR || '';
-
-const MOCK_TEST_CSP =
-  "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self' blob: data:; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
-
-const MIME_BY_EXT = {
-  '.html': 'text/html; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.svg': 'image/svg+xml',
-  '.png': 'image/png',
-  '.webmanifest': 'application/manifest+json; charset=utf-8',
-};
 
 const VIEWPORTS = [
   { width: 1100, height: 720 },
@@ -37,60 +26,6 @@ const VIEWPORTS = [
 const LONG_MACHINE_NAME = 'studio-rendering-workstation-north-01';
 const LONG_FOLDER_NAME =
   '2026-annual-architecture-deliverables-and-reference-assets-quarterly-verified-archive-release';
-
-function findBrowser() {
-  if (process.env.LEGION_CHROME && fs.existsSync(process.env.LEGION_CHROME)) {
-    return process.env.LEGION_CHROME;
-  }
-  const candidates = [
-    '/usr/bin/chromium',
-    '/usr/bin/chromium-browser',
-    '/usr/bin/google-chrome',
-    '/usr/bin/google-chrome-stable',
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-  ];
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) return candidate;
-  }
-  throw new Error('No Chromium or Chrome binary found; set LEGION_CHROME.');
-}
-
-async function startStaticUiServer() {
-  const server = http.createServer((req, res) => {
-    const urlPath = (req.url || '/').split('?')[0];
-    const rel = urlPath === '/' ? 'index.html' : urlPath.replace(/^\/+/, '');
-    const full = path.resolve(UI_ROOT, rel);
-    if (!full.startsWith(UI_ROOT) || !fs.existsSync(full) || fs.statSync(full).isDirectory()) {
-      res.writeHead(404);
-      res.end('Not found');
-      return;
-    }
-    const ext = path.extname(full).toLowerCase();
-    res.writeHead(200, {
-      'Content-Type': MIME_BY_EXT[ext] || 'application/octet-stream',
-      'Content-Security-Policy': MOCK_TEST_CSP,
-      'Cache-Control': 'no-store',
-    });
-    fs.createReadStream(full).pipe(res);
-  });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const { port } = server.address();
-  return {
-    url: `http://127.0.0.1:${port}`,
-    stop: () => new Promise((resolve) => server.close(resolve)),
-  };
-}
-
-async function setTheme(page, theme) {
-  await page.evaluate((t) => {
-    const raw = localStorage.getItem('legion.settings.v1');
-    const obj = raw ? JSON.parse(raw) : {};
-    obj.theme = t;
-    localStorage.setItem('legion.settings.v1', JSON.stringify(obj));
-    document.documentElement.dataset.theme = t;
-  }, theme);
-  await page.waitForTimeout(80);
-}
 
 async function maybeShot(page, name) {
   if (!SHOTS_DIR) return;
@@ -403,18 +338,17 @@ function assertSplitAligned(m, label, { expectRightContent = true, expectMatchin
   }
 }
 
-test('split view aligns structurally across viewports, all five tabs, breakpoint edges, long names, empty right, and dual scrolling', async () => {
-  const server = await startStaticUiServer();
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu'],
-  });
+browserTest(
+  'split view aligns structurally across viewports, all five tabs, breakpoint edges, long names, empty right, and dual scrolling',
+  { timeout: 120_000 },
+  async (_t, tracker) => {
+    const server = await startStaticUiServer();
+    const browser = await launchBrowser();
 
-  const consoleErrors = [];
-  const pageErrors = [];
+    const consoleErrors = [];
+    const pageErrors = [];
 
-  try {
+    try {
     // ── 1. All five tabs across 1100x720, 1440x900, and 1920x1080 ──────────────────────────────
     const tabs = [
       {
@@ -495,16 +429,17 @@ test('split view aligns structurally across viewports, all five tabs, breakpoint
 
     for (const vp of VIEWPORTS) {
       const ctx = await browser.newContext({ viewport: vp, colorScheme: 'dark' });
-      const page = await ctx.newPage();
-      page.on('console', (msg) => {
-        if (msg.type() === 'error') consoleErrors.push(`[${vp.width}x${vp.height}] ${msg.text()}`);
+      const page = tracker.attach(await ctx.newPage(), {
+        label: `${vp.width}x${vp.height}`,
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
       });
-      page.on('pageerror', (err) => pageErrors.push(`[${vp.width}x${vp.height}] ${err}`));
 
       for (const tab of tabs) {
+        tracker.setStep(`split view ${tab.name} @ ${vp.width}x${vp.height}`);
         await page.goto(`${server.url}${tab.url}`, { waitUntil: 'domcontentloaded' });
         await tab.ready(page);
-        await page.waitForTimeout(80);
+        await waitForLayoutSettled(page, 2);
 
         const metrics = await measureSplitGeometry(page);
         assertSplitAligned(metrics, `${tab.name} @ ${vp.width}x${vp.height}`, {
@@ -514,11 +449,11 @@ test('split view aligns structurally across viewports, all five tabs, breakpoint
         });
 
         if (vp.width === 1440 && vp.height === 900 && SHOTS_DIR) {
-          await setTheme(page, 'dark');
+          await setTheme(page, 'dark', tracker);
           await maybeShot(page, `${tab.name}-dark`);
-          await setTheme(page, 'light');
+          await setTheme(page, 'light', tracker);
           await maybeShot(page, `${tab.name}-light`);
-          await setTheme(page, 'dark');
+          await setTheme(page, 'dark', tracker);
         }
       }
 
@@ -527,19 +462,21 @@ test('split view aligns structurally across viewports, all five tabs, breakpoint
 
     // ── 2. Breakpoint edges: 819px (phone) vs 820px (split) ────────────────────────────────────
     for (const routeHash of ['#/files', '#/machines']) {
+      tracker.setStep(`breakpoint 819px ${routeHash}`);
       const phoneCtx = await browser.newContext({ viewport: { width: 819, height: 720 }, colorScheme: 'dark' });
-      const phonePage = await phoneCtx.newPage();
+      const phonePage = tracker.attach(await phoneCtx.newPage(), { label: `819px ${routeHash}` });
       await phonePage.goto(`${server.url}/?mock${routeHash}`, { waitUntil: 'domcontentloaded' });
-      await phonePage.locator('header.top h1').waitFor();
+      await tracker.waitForLocator(phonePage.locator('header.top h1'), `819px ${routeHash} header`);
       assert.equal(await phonePage.locator('.split').count(), 0, `819px ${routeHash}: must stay in phone layout`);
       const navBoxPhone = await phonePage.locator('nav.nav').boundingBox();
       assert.ok(navBoxPhone && navBoxPhone.y > 600 && navBoxPhone.width > 700, `819px ${routeHash}: bottom nav expected`);
       await phoneCtx.close();
 
+      tracker.setStep(`breakpoint 820px ${routeHash}`);
       const splitCtx = await browser.newContext({ viewport: { width: 820, height: 720 }, colorScheme: 'dark' });
-      const splitPage = await splitCtx.newPage();
+      const splitPage = tracker.attach(await splitCtx.newPage(), { label: `820px ${routeHash}` });
       await splitPage.goto(`${server.url}/?mock${routeHash}`, { waitUntil: 'domcontentloaded' });
-      await splitPage.locator('.split').waitFor();
+      await tracker.waitForLocator(splitPage.locator('.split'), `820px ${routeHash} split container`);
       assert.equal(await splitPage.locator('header.top').count(), 0, `820px ${routeHash}: header.top must disappear in split layout`);
       const navBoxSplit = await splitPage.locator('nav.nav').boundingBox();
       assert.ok(navBoxSplit && navBoxSplit.width <= 90 && navBoxSplit.height >= 700, `820px ${routeHash}: left rail expected`);
@@ -548,13 +485,14 @@ test('split view aligns structurally across viewports, all five tabs, breakpoint
 
     // ── 3. Edge cases at 1440x900: long names, empty right pane, dual scrolling ────────────────
     const edgeCtx = await browser.newContext({ viewport: { width: 1440, height: 900 }, colorScheme: 'dark' });
-    const edgePage = await edgeCtx.newPage();
-    edgePage.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(`[edge] ${msg.text()}`);
+    const edgePage = tracker.attach(await edgeCtx.newPage(), {
+      label: 'edge',
+      collectConsole: consoleErrors,
+      collectPage: pageErrors,
     });
-    edgePage.on('pageerror', (err) => pageErrors.push(`[edge] ${err}`));
 
     // 3a. Files with a long folder name and a long machine name.
+    tracker.setStep('files long names @ 1440x900');
     const longHref = routeHref({
       section: 'files',
       view: 'folder',
@@ -564,10 +502,10 @@ test('split view aligns structurally across viewports, all five tabs, breakpoint
     await edgePage.goto(`${server.url}/?mock=longnames${longHref}`, {
       waitUntil: 'domcontentloaded',
     });
-    await edgePage.locator('.split-right .pane-title', { hasText: LONG_FOLDER_NAME }).waitFor();
-    await edgePage.locator('.split-right .split-fact', { hasText: '6 items' }).waitFor();
-    await edgePage.locator('.split-right .split-body .list .row').first().waitFor();
-    await edgePage.waitForTimeout(80);
+    await tracker.waitForLocator(edgePage.locator('.split-right .pane-title', { hasText: LONG_FOLDER_NAME }), 'long folder title');
+    await tracker.waitForLocator(edgePage.locator('.split-right .split-fact', { hasText: '6 items' }), 'long folder item count');
+    await tracker.waitForLocator(edgePage.locator('.split-right .split-body .list .row').first(), 'long folder first row');
+    await waitForLayoutSettled(edgePage, 2);
     const longMetrics = await measureSplitGeometry(edgePage);
     assertSplitAligned(longMetrics, 'files long names @ 1440x900', {
       expectRightContent: true,
@@ -596,9 +534,13 @@ test('split view aligns structurally across viewports, all five tabs, breakpoint
     await maybeShot(edgePage, 'files-long-names');
 
     // 3b. Files with an empty right pane.
+    tracker.setStep('files empty right @ 1440x900');
     await edgePage.goto(`${server.url}/?mock=emptyright#/files`, { waitUntil: 'domcontentloaded' });
-    await edgePage.locator('.split-right .split-empty', { hasText: 'Choose a place on the left.' }).waitFor();
-    await edgePage.waitForTimeout(80);
+    await tracker.waitForLocator(
+      edgePage.locator('.split-right .split-empty', { hasText: 'Choose a place on the left.' }),
+      'files empty right message',
+    );
+    await waitForLayoutSettled(edgePage, 2);
     const emptyMetrics = await measureSplitGeometry(edgePage);
     assertSplitAligned(emptyMetrics, 'files empty right @ 1440x900', {
       expectRightContent: false,
@@ -610,20 +552,25 @@ test('split view aligns structurally across viewports, all five tabs, breakpoint
     await maybeShot(edgePage, 'files-empty-right');
 
     // Also verify Activity empty right pane when no item is chosen.
+    tracker.setStep('activity empty right @ 1440x900');
     await edgePage.goto(`${server.url}/?mock#/activity`, { waitUntil: 'domcontentloaded' });
-    await edgePage.locator('.split-right .split-empty', { hasText: 'Choose an item on the left.' }).waitFor();
-    await edgePage.waitForTimeout(80);
+    await tracker.waitForLocator(
+      edgePage.locator('.split-right .split-empty', { hasText: 'Choose an item on the left.' }),
+      'activity empty right message',
+    );
+    await waitForLayoutSettled(edgePage, 2);
     const actEmptyMetrics = await measureSplitGeometry(edgePage);
     assertSplitAligned(actEmptyMetrics, 'activity empty right @ 1440x900', {
       expectRightContent: false,
     });
 
     // 3b-ii. Files when nothing is pinned or synced (?mock=old): MACHINES is first and carries "3 ON".
+    tracker.setStep('files machines-first @ 1440x900');
     await edgePage.goto(`${server.url}/?mock=old#/files`, { waitUntil: 'domcontentloaded' });
-    await edgePage.locator('.split-left .split-label-text', { hasText: /^MACHINES$/i }).waitFor();
-    await edgePage.locator('.split-left .split-label-fact', { hasText: /^3 ON$/i }).waitFor();
-    await edgePage.locator('.split-right .pane-title', { hasText: 'Home' }).waitFor();
-    await edgePage.waitForTimeout(80);
+    await tracker.waitForLocator(edgePage.locator('.split-left .split-label-text', { hasText: /^MACHINES$/i }), 'MACHINES label');
+    await tracker.waitForLocator(edgePage.locator('.split-left .split-label-fact', { hasText: /^3 ON$/i }), '3 ON label fact');
+    await tracker.waitForLocator(edgePage.locator('.split-right .pane-title', { hasText: 'Home' }), 'Home pane title');
+    await waitForLayoutSettled(edgePage, 2);
     const oldFilesMetrics = await measureSplitGeometry(edgePage);
     assertSplitAligned(oldFilesMetrics, 'files machines-first @ 1440x900', {
       expectRightContent: true,
@@ -632,11 +579,12 @@ test('split view aligns structurally across viewports, all five tabs, breakpoint
     });
 
     // 3c. Files with a list long enough to scroll in BOTH panes.
+    tracker.setStep('files dual scrolling @ 1440x900');
     await edgePage.goto(`${server.url}/?mock=longlist#/files`, { waitUntil: 'domcontentloaded' });
-    await edgePage.locator('.split-right .split-fact', { hasText: /items/ }).waitFor();
-    await edgePage.locator('.split-left .row', { hasText: 'node-12' }).waitFor();
-    await edgePage.locator('.split-right .split-body .list .row').nth(20).waitFor();
-    await edgePage.waitForTimeout(80);
+    await tracker.waitForLocator(edgePage.locator('.split-right .split-fact', { hasText: /items/ }), 'longlist item count');
+    await tracker.waitForLocator(edgePage.locator('.split-left .row', { hasText: 'node-12' }), 'node-12 left row');
+    await tracker.waitForLocator(edgePage.locator('.split-right .split-body .list .row').nth(20), '21st right row');
+    await waitForLayoutSettled(edgePage, 2);
 
     const scrollBefore = await measureSplitGeometry(edgePage);
     assert.ok(
@@ -659,7 +607,15 @@ test('split view aligns structurally across viewports, all five tabs, breakpoint
       document.querySelector('.split-left .split-body').scrollTop = 220;
       document.querySelector('.split-right .split-body').scrollTop = 340;
     });
-    await edgePage.waitForTimeout(60);
+    await tracker.waitForFn(
+      edgePage,
+      () =>
+        document.querySelector('.split-left .split-body')?.scrollTop >= 200 &&
+        document.querySelector('.split-right .split-body')?.scrollTop >= 300,
+      null,
+      'dual panes scrollTop update',
+    );
+    await waitForLayoutSettled(edgePage, 2);
     const scrollAfter = await measureSplitGeometry(edgePage);
     assertNear(scrollAfter.leftTitleRow.top, scrollBefore.leftTitleRow.top, 0.5, 'left title pinned while scrolling');
     assertNear(scrollAfter.rightTitleRow.top, scrollBefore.rightTitleRow.top, 0.5, 'right title pinned while scrolling');
@@ -681,4 +637,5 @@ test('split view aligns structurally across viewports, all five tabs, breakpoint
     await browser.close();
     await server.stop();
   }
-});
+},
+);
