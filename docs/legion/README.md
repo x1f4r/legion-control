@@ -230,6 +230,7 @@ accounts.
 | [AI agents](agents.md) | `legion mcp` (compact and full mode), `legion agents add`, operating rules for agents, the 13 error codes, and adding extension tools safely. |
 | [Guides](guides.md) | Task walk-throughs: file transfer, long jobs, projects, services, power and wake, device pairing, the HTTP door, extension tools, configuration sync, and updates. |
 | [Tool reference](tools.md) | Generated reference of every built-in tool, its effect, and its input schema. |
+| [Interface](interface.md) | How icons, press feedback, focus rings, and unavailable controls are drawn and checked. |
 | [Security](security.md) | Threat model by attacker class, standing security invariants, and known trust boundaries. |
 | [Design](design.md) | Architecture, workspace crates, wire and stream protocols, platform rules, and milestones. |
 | [`examples/legion/`](../../examples/legion/) | Validated, commented example files for `node.toml`, `policy.toml`, `fleet.toml`, `projects.toml`, `tokens.toml`, and `tools.d/`. |
