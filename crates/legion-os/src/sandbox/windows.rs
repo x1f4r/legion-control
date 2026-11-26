@@ -390,6 +390,57 @@ fn duplicate_inheritable(source: HANDLE) -> Result<OwnedWinHandle> {
     Ok(OwnedWinHandle(dup))
 }
 
+fn build_appcontainer_env_block(
+    env_clear: bool,
+    env_remove: &[OsString],
+    overrides: &BTreeMap<OsString, OsString>,
+) -> Vec<u16> {
+    // Windows `CreateProcessW` with `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` runs
+    // `BasepAppContainerEnvironmentExtension`, which fails with `ERROR_ENVVAR_NOT_FOUND` (203 /
+    // `0x800700CB`) when an explicit `lpEnvironment` block omits required profile/system variables
+    // (`LOCALAPPDATA`, `TEMP`, `TMP`, `USERPROFILE`, `SystemRoot`, `SystemDrive`, `WINDIR`).
+    // Windows itself rewrites `LOCALAPPDATA`/`TEMP`/`TMP` to the isolated AppContainer storage
+    // path inside the child, and zero-capability AppContainer tokens cannot access the host user's
+    // profile directory.
+    let mut ac_overrides = overrides.clone();
+    let has_ci = |map: &BTreeMap<OsString, OsString>, name: &str| {
+        map.keys()
+            .any(|k| k.to_string_lossy().eq_ignore_ascii_case(name))
+    };
+    let sys_root = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .unwrap_or_else(|| OsString::from(r"C:\Windows"));
+    let sys_drive = std::env::var_os("SystemDrive").unwrap_or_else(|| OsString::from("C:"));
+    let fallback_tmp = PathBuf::from(&sys_root).join("Temp").into_os_string();
+    for (name, fallback) in [
+        ("SystemRoot", sys_root.clone()),
+        ("WINDIR", sys_root.clone()),
+        ("SystemDrive", sys_drive),
+        (
+            "USERPROFILE",
+            std::env::var_os("USERPROFILE").unwrap_or_else(|| sys_root.clone()),
+        ),
+        (
+            "APPDATA",
+            std::env::var_os("APPDATA").unwrap_or_else(|| fallback_tmp.clone()),
+        ),
+        (
+            "LOCALAPPDATA",
+            std::env::var_os("LOCALAPPDATA").unwrap_or_else(|| fallback_tmp.clone()),
+        ),
+        (
+            "TEMP",
+            std::env::var_os("TEMP").unwrap_or_else(|| fallback_tmp.clone()),
+        ),
+        ("TMP", std::env::var_os("TMP").unwrap_or(fallback_tmp)),
+    ] {
+        if !has_ci(&ac_overrides, name) {
+            ac_overrides.insert(OsString::from(name), fallback);
+        }
+    }
+    build_unicode_env_block(env_clear, env_remove, &ac_overrides)
+}
+
 fn build_unicode_env_block(
     env_clear: bool,
     env_remove: &[OsString],
@@ -601,6 +652,7 @@ pub(crate) fn spawn_sandboxed(
     };
     let app_wide = resolved_exe.as_deref().map(|p| to_wide_null(p.as_os_str()));
     let cmdline_base = build_command_line(program, args);
+    let ac_env_block = build_appcontainer_env_block(env_clear, env_remove, env_overrides);
     let env_block = build_unicode_env_block(env_clear, env_remove, env_overrides);
 
     // Prepare stdio handles (parent ends stay non-inheritable; child ends are duplicated
@@ -659,7 +711,7 @@ pub(crate) fn spawn_sandboxed(
                     app_wide.as_deref(),
                     &cmdline_base,
                     &ac_cwd,
-                    &env_block,
+                    &ac_env_block,
                     stdin_child_base.0,
                     stdout_child_base.0,
                     stderr_child_base.0,

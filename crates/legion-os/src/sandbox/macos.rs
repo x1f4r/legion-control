@@ -23,8 +23,10 @@ const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
 /// Minimal deny-by-default Seatbelt profile for `__thumb-worker`.
 ///
 /// Denies every filesystem open, socket creation, and process fork/exec while allowing reads and
-/// writes on already-inherited stdio file descriptors, heap memory allocation, and `sysctl-read`.
-const WORKER_SBPL_PROFILE: &str = "(version 1)\n(deny default)\n(allow sysctl-read)\n";
+/// writes on already-inherited stdio file descriptors, heap memory allocation, `sysctl-read`, and
+/// self-signals (e.g. `SIGABRT`).
+const WORKER_SBPL_PROFILE: &str =
+    "(version 1)\n(deny default)\n(allow sysctl-read)\n(allow signal (target self))\n";
 
 unsafe extern "C" {
     fn sandbox_init(
@@ -130,21 +132,28 @@ fn build_ffmpeg_sbpl_profile(
          (allow file-read-metadata)\n\
          (allow file-read* (literal \"/dev/null\") (literal \"/dev/urandom\") (literal \"/dev/random\") (literal \"/dev/dtracehelper\"))\n\
          (allow file-write* (literal \"/dev/null\"))\n\
-         (allow file-read* (subpath \"/System/Library\") (subpath \"/usr/lib\") (subpath \"/Library/Frameworks\"))\n\
+         (allow file-read* (subpath \"/System/Library\") (subpath \"/System/Volumes/Preboot/Cryptexes\") (subpath \"/System/Cryptexes\") (subpath \"/private/var/db/dyld\") (subpath \"/usr/lib\") (subpath \"/Library/Frameworks\"))\n\
          (allow file-read* (subpath \"/opt/homebrew/lib\") (subpath \"/opt/homebrew/Cellar\") (subpath \"/opt/homebrew/opt\"))\n\
-         (allow file-read* (subpath \"/usr/local/lib\") (subpath \"/usr/local/Cellar\") (subpath \"/usr/local/opt\"))\n",
+         (allow file-read* (subpath \"/usr/local/lib\") (subpath \"/usr/local/Cellar\") (subpath \"/usr/local/opt\"))\n\
+         (allow file-map-executable (subpath \"/System/Library\") (subpath \"/System/Volumes/Preboot/Cryptexes\") (subpath \"/System/Cryptexes\") (subpath \"/usr/lib\") (subpath \"/Library/Frameworks\") (subpath \"/opt/homebrew\") (subpath \"/usr/local\"))\n",
     );
 
-    // Allow executing and reading ONLY the resolved `ffmpeg` binary (plus its prefix lib dir).
+    // Allow executing, reading, and mapping ONLY the resolved `ffmpeg` binary (plus its prefix lib dir).
     for bin in canonical_and_given(ffmpeg_bin) {
         let esc = escape_sbpl_string(&bin)?;
         profile.push_str(&format!("(allow process-exec (literal \"{esc}\"))\n"));
         profile.push_str(&format!("(allow file-read* (literal \"{esc}\"))\n"));
+        profile.push_str(&format!(
+            "(allow file-map-executable (literal \"{esc}\"))\n"
+        ));
         if let Some(prefix) = bin.parent().and_then(Path::parent) {
             let lib = prefix.join("lib");
             if lib.is_dir() {
                 let lib_esc = escape_sbpl_string(&lib)?;
                 profile.push_str(&format!("(allow file-read* (subpath \"{lib_esc}\"))\n"));
+                profile.push_str(&format!(
+                    "(allow file-map-executable (subpath \"{lib_esc}\"))\n"
+                ));
             }
         }
     }

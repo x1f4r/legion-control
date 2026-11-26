@@ -2704,24 +2704,33 @@ async fn test_in_budget_large_base64_picture_and_invalid_utf8_succeed_under_48mi
         const TIGHT_CAP_BYTES: u64 = 12 * 1024 * 1024;
         let exe = std::env::current_exe().expect("current exe");
         let stdin_file = fs::File::open(&opus_wrapped_pic).unwrap();
-        let direct = std::process::Command::new(&exe)
-            .args([
-                "__thumb-worker",
-                "--audio-tags",
-                "ogg",
-                &TIGHT_CAP_BYTES.to_string(),
-                "/wrapped_15_9mib_pic.opus",
-            ])
-            .stdin(Stdio::from(stdin_file))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .expect("spawn direct __thumb-worker --audio-tags");
+        let direct = legion_os::run::run(
+            legion_os::run::RunOptions::new(legion_os::shell::CommandSpec::Argv {
+                program: exe.into_os_string(),
+                args: vec![
+                    std::ffi::OsString::from("__thumb-worker"),
+                    std::ffi::OsString::from("--audio-tags"),
+                    std::ffi::OsString::from("ogg"),
+                    std::ffi::OsString::from(TIGHT_CAP_BYTES.to_string()),
+                    std::ffi::OsString::from("/wrapped_15_9mib_pic.opus"),
+                ],
+            })
+            .env_clear(true)
+            .envs(minimal_selftest_env())
+            .stdin_file(stdin_file)
+            .sandbox(legion_os::sandbox::SandboxPolicy::Worker)
+            .timeout(Duration::from_secs(15))
+            .kill_grace(Duration::ZERO),
+        )
+        .await
+        .expect("spawn direct __thumb-worker --audio-tags");
         assert_eq!(
-            direct.status.code(),
+            direct.exit_code,
             Some(legion_os::capped_alloc::CAP_EXCEEDED_EXIT_CODE),
-            "direct --audio-tags worker with 12 MiB cap on 15.9 MiB Opus must exit 107, got {:?}",
-            direct.status
+            "direct --audio-tags worker with 12 MiB cap on 15.9 MiB Opus must exit 107, got exit={:?} signal={:?} stderr={:?}",
+            direct.exit_code,
+            direct.signal,
+            direct.stderr.text,
         );
 
         struct TagsHeapCapGuard;
