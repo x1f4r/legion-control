@@ -101,6 +101,10 @@
  *
  * @property {(on: boolean) => Promise<boolean | void> | void} [keepScreenOn]
  *   Keep the display awake while a video plays and release the hold on pause, end, or close.
+ *
+ * @property {(kind: 'tick' | 'tap') => void} [haptic]
+ *   Trigger light native tactile feedback (`'tick'` for state transitions, `'tap'` reserved).
+ *   Present only on Android and iOS/iPadOS; absent on desktop and browser.
  */
 
 export const DEVICE_TRANSFER_STATES = Object.freeze([

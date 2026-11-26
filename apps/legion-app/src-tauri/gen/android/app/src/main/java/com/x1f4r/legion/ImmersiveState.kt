@@ -1,6 +1,7 @@
 package com.x1f4r.legion
 
 import android.content.pm.ActivityInfo
+import android.view.HapticFeedbackConstants
 import android.view.WindowManager
 
 /**
@@ -69,6 +70,8 @@ internal class ImmersiveState {
     const val ORIENTATION_NONE = "none"
     const val ORIENTATION_LANDSCAPE = "landscape"
     const val ORIENTATION_PORTRAIT = "portrait"
+    const val HAPTIC_TICK = "tick"
+    const val HAPTIC_TAP = "tap"
 
     fun normalizeOrientation(raw: String?): String = when (raw?.trim()?.lowercase()) {
       ORIENTATION_LANDSCAPE -> ORIENTATION_LANDSCAPE
@@ -80,6 +83,12 @@ internal class ImmersiveState {
       ORIENTATION_LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
       ORIENTATION_PORTRAIT -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
       else -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+    }
+
+    fun hapticFeedbackConstant(kind: String?): Int? = when (kind?.trim()?.lowercase()) {
+      HAPTIC_TICK -> HapticFeedbackConstants.CLOCK_TICK
+      HAPTIC_TAP -> HapticFeedbackConstants.KEYBOARD_TAP
+      else -> null
     }
   }
 }
