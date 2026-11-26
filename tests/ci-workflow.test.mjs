@@ -416,3 +416,43 @@ test('dependency audit runs cargo-audit, cargo-deny, and npm audit, and every al
     );
   }
 });
+
+test('legion-app.yml:android restores and saves slim Gradle wrapper/dependency caches and retries transient Gradle fetch errors', () => {
+  const appWorkflow = read('.github/workflows/legion-app.yml');
+  const androidBody = jobs(appWorkflow).get('android').join('\n');
+
+  // Must not rely on setup-java's exact-key-only `cache: gradle` (which misses on any gradle
+  // file edit, archives all of ~/.gradle/caches while the daemon runs, and loses caches on emulator flakes).
+  assert.doesNotMatch(androidBody, /^\s+cache:\s*gradle\b/m);
+
+  // Restores both wrapper and dependency caches with prefix restore-keys.
+  assert.match(androidBody, /uses: actions\/cache\/restore@[0-9a-f]{40} # v\d+\.\d+\.\d+/);
+  assert.match(androidBody, /key: legion-app-gradle-wrapper-v1-\$\{\{ runner\.os \}\}-/);
+  assert.match(androidBody, /restore-keys: legion-app-gradle-wrapper-v1-\$\{\{ runner\.os \}\}-/);
+  assert.match(androidBody, /~\/\.gradle\/wrapper\/dists/);
+  assert.match(androidBody, /key: legion-app-gradle-deps-v1-\$\{\{ runner\.os \}\}-/);
+  assert.match(androidBody, /restore-keys: legion-app-gradle-deps-v1-\$\{\{ runner\.os \}\}-/);
+  assert.match(androidBody, /~\/\.gradle\/caches\/modules-2\/files-2\.1/);
+
+  // Stops the Gradle daemon and saves both caches before booting the emulator.
+  const stopIdx = androidBody.indexOf('./gradlew --stop');
+  const saveIdx = androidBody.indexOf('uses: actions/cache/save@');
+  const emuIdx = androidBody.indexOf('reactivecircus/android-emulator-runner@');
+  assert.ok(stopIdx !== -1, 'android job must stop the Gradle daemon before caching');
+  assert.ok(saveIdx > stopIdx, 'android job must save Gradle caches after stopping the daemon');
+  assert.ok(emuIdx > saveIdx, 'android job must save Gradle caches before booting the emulator');
+  assert.match(
+    androidBody,
+    /steps\.android-kotlin-tests\.outcome == 'success' && steps\.gradle-deps-cache\.outputs\.cache-hit != 'true'/,
+    'dependency cache save must wait for Gradle steps to succeed so partial downloads never poison the primary key',
+  );
+
+  // Both Gradle-invoking steps go through scripts/retry-gradle.sh, and the workflow watches it.
+  assert.match(
+    androidBody,
+    /retry-gradle\.sh[\s\S]*--log "\$RUNNER_TEMP\/android-build\.log"[\s\S]*cargo tauri android build/,
+  );
+  assert.match(androidBody, /retry-gradle\.sh"? -- \.\/gradlew :app:testUniversalDebugUnitTest/);
+  const triggerMatches = appWorkflow.match(/'scripts\/retry-gradle\.sh'/g) ?? [];
+  assert.equal(triggerMatches.length, 2, 'legion-app.yml push and pull_request paths must both watch scripts/retry-gradle.sh');
+});

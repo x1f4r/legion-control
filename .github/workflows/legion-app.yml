@@ -11,6 +11,7 @@ on:
       - 'scripts/ios-sim-check.sh'
       - 'scripts/ios-sim-resume.sh'
       - 'scripts/legion-app-distro-test.sh'
+      - 'scripts/retry-gradle.sh'
       - 'rust-toolchain.toml'
   pull_request:
     paths:
@@ -22,6 +23,7 @@ on:
       - 'scripts/ios-sim-check.sh'
       - 'scripts/ios-sim-resume.sh'
       - 'scripts/legion-app-distro-test.sh'
+      - 'scripts/retry-gradle.sh'
       - 'rust-toolchain.toml'
   workflow_dispatch:
     inputs:
@@ -123,12 +125,32 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-          cache: gradle
-          cache-dependency-path: |
-            apps/legion-app/src-tauri/gen/android/*.gradle*
-            apps/legion-app/src-tauri/gen/android/app/*.gradle*
-            apps/legion-app/src-tauri/gen/android/buildSrc/**/*.gradle*
-            apps/legion-app/src-tauri/gen/android/gradle/wrapper/gradle-wrapper.properties
+      # Restore slim Gradle wrapper and dependency caches with prefix restore-keys instead of
+      # setup-java's exact-key-only full ~/.gradle/caches archive. Both are saved right after the
+      # Gradle steps (with the daemon stopped) so an emulator flake never discards them.
+      - id: gradle-wrapper-cache
+        name: Restore Gradle wrapper cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/wrapper/dists
+            !~/.gradle/wrapper/dists/**/*.lck
+            !~/.gradle/wrapper/dists/**/*.part
+          key: legion-app-gradle-wrapper-v1-${{ runner.os }}-${{ hashFiles('apps/legion-app/src-tauri/gen/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: legion-app-gradle-wrapper-v1-${{ runner.os }}-
+      - id: gradle-deps-cache
+        name: Restore Gradle dependency cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/caches/modules-2/files-2.1
+            ~/.gradle/caches/modules-2/metadata-*
+            ~/.gradle/caches/jars-*
+            ~/.gradle/caches/*/generated-gradle-jars
+            !~/.gradle/caches/**/*.lock
+            !~/.gradle/caches/**/gc.properties
+          key: legion-app-gradle-deps-v1-${{ runner.os }}-${{ hashFiles('apps/legion-app/src-tauri/gen/android/build.gradle.kts', 'apps/legion-app/src-tauri/gen/android/settings.gradle', 'apps/legion-app/src-tauri/gen/android/app/build.gradle.kts', 'apps/legion-app/src-tauri/gen/android/buildSrc/build.gradle.kts', 'apps/legion-app/src-tauri/gen/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: legion-app-gradle-deps-v1-${{ runner.os }}-
       - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
         with:
           packages: platform-tools
@@ -178,7 +200,9 @@ jobs:
           set -euo pipefail
           rm -rf src-tauri/gen/android/app/build/outputs/apk
           export LEGION_BUILD_SEQUENCE="$(date -u +%Y%m%d%H%M)"
-          cargo tauri android build --debug --apk --target aarch64 --target x86_64 2>&1 | tee "$RUNNER_TEMP/android-build.log"
+          bash "$GITHUB_WORKSPACE/scripts/retry-gradle.sh" \
+            --log "$RUNNER_TEMP/android-build.log" \
+            -- cargo tauri android build --debug --apk --target aarch64 --target x86_64
           APK_REL="apps/legion-app/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk"
           test -f "../../$APK_REL"
           node ../../scripts/make-update-set.mjs check-artifact \
@@ -188,9 +212,57 @@ jobs:
             --forbid-preview-key \
             --build-log "$RUNNER_TEMP/android-build.log"
           echo "apk_path=$APK_REL" >> "$GITHUB_OUTPUT"
-      - name: Run Android Kotlin unit tests
+      - id: android-kotlin-tests
+        name: Run Android Kotlin unit tests
         working-directory: apps/legion-app/src-tauri/gen/android
-        run: ./gradlew :app:testUniversalDebugUnitTest
+        run: bash "$GITHUB_WORKSPACE/scripts/retry-gradle.sh" -- ./gradlew :app:testUniversalDebugUnitTest
+      - id: gradle-cache-prep
+        name: Stop Gradle daemon and prune lock files before caching
+        if: always()
+        working-directory: apps/legion-app/src-tauri/gen/android
+        run: |
+          set -euo pipefail
+          has_wrapper=false
+          if [ -d "$HOME/.gradle/wrapper/dists" ]; then
+            wrapper_ok="$(find "$HOME/.gradle/wrapper/dists" -name '*.ok' -print -quit 2>/dev/null || true)"
+            if [ -n "$wrapper_ok" ]; then
+              has_wrapper=true
+              ./gradlew --stop || true
+            fi
+          fi
+          if [ -d "$HOME/.gradle" ]; then
+            find "$HOME/.gradle" \( -name '*.lock' -o -name '*.lck' -o -name '*.part' -o -name 'gc.properties' \) -delete 2>/dev/null || true
+          fi
+          has_deps=false
+          if [ -d "$HOME/.gradle/caches/modules-2/files-2.1" ]; then
+            deps_any="$(find "$HOME/.gradle/caches/modules-2/files-2.1" -mindepth 1 -print -quit 2>/dev/null || true)"
+            if [ -n "$deps_any" ]; then
+              has_deps=true
+            fi
+          fi
+          echo "has_wrapper=$has_wrapper" >> "$GITHUB_OUTPUT"
+          echo "has_deps=$has_deps" >> "$GITHUB_OUTPUT"
+      - name: Save Gradle wrapper cache
+        if: always() && steps.gradle-wrapper-cache.outputs.cache-hit != 'true' && steps.gradle-cache-prep.outputs.has_wrapper == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/wrapper/dists
+            !~/.gradle/wrapper/dists/**/*.lck
+            !~/.gradle/wrapper/dists/**/*.part
+          key: ${{ steps.gradle-wrapper-cache.outputs.cache-primary-key }}
+      - name: Save Gradle dependency cache
+        if: always() && steps.android-kotlin-tests.outcome == 'success' && steps.gradle-deps-cache.outputs.cache-hit != 'true' && steps.gradle-cache-prep.outputs.has_deps == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/caches/modules-2/files-2.1
+            ~/.gradle/caches/modules-2/metadata-*
+            ~/.gradle/caches/jars-*
+            ~/.gradle/caches/*/generated-gradle-jars
+            !~/.gradle/caches/**/*.lock
+            !~/.gradle/caches/**/gc.properties
+          key: ${{ steps.gradle-deps-cache.outputs.cache-primary-key }}
       - name: Build local legion node binary for emulator content-media check
         run: |
           CARGO_TARGET_DIR="$RUNNER_TEMP/android-node-target" cargo build --locked --bin legion
