@@ -113,10 +113,11 @@ JSON carries control, never bulk bytes. File content beyond what `fs.read` allow
 (1 MiB) moves over a second pipe, `legion stream`. Its first line on stdin is one JSON object
 carrying `protocol` (starting at 1), `op`, optional `as`, and the operation's fields; raw bytes
 follow in the direction the operation needs. The node's first line on stdout, before any reply or
-refusal, is `{"protocol": 1, "capabilities": ["if_exists", "rename", "stream.relay"]}` (older nodes
+refusal, is `{"protocol": 1, "capabilities": ["if_exists", "rename", "stream.relay", "stream.tunnel", "stream.relay.tunnel"]}` (older nodes
 emit `{"protocol": 1}` without `capabilities`) so both ends agree on the protocol version and
 optional stream capabilities before bulk bytes move (waiting up to 60 seconds for the handshake and
-first reply, and 120 seconds between messages or chunks). While an operation works on something long
+first reply, and 120 seconds between messages or chunks, except active `tunnel` pipes which have no
+idle timeout). While an operation works on something long
 it writes `{"busy": true}` every 10 seconds where a reply line is awaited:
 
 | `op` | Header | Then |
@@ -129,11 +130,20 @@ it writes `{"busy": true}` every 10 seconds where a reply line is awaited:
 | `unpack` | `{protocol, op, root, entries: [{path, kind, size?, hash?, target?}]}` | `{ready}` on stdout; a tar stream on stdin (only the planned `entries` are accepted, verified before replacing the destination); `{ok, files, …}` when done |
 | `delete` | `{protocol, op, root, names: […]}` | `{removed, skipped}` on stdout |
 | `relay` | `{protocol, op, on, request, as?, hops?}` | forwards the inner direct stream `request` to fleet machine `on` (serving locally when `on` names this node); the relay checks the caller's principal against its own policy without checking paths, then passes that principal on so the target enforces its own policy and path confinement; bounded buffers, hop cap, heartbeat pass-through, and audit logs on both nodes |
+| `tunnel` | `{protocol, op, as?}` | accepts no destination fields; connects strictly to this node's own `sshd` (`127.0.0.1` first, then the node's own advertised addresses), replies `{"tunnel": true}` on stdout, then copies raw bytes bidirectionally with bounded buffers, live revocation checks, and no idle timeout |
 
-They are the same permission-checked operations as the `fs.*` tools (`fs.read` for `manifest`,
-`stat`, `get` and `pack`; `fs.write` for `put` and `unpack`; `fs.remove` for `delete`), audited
-with door `stream`. Using a distinct `relay` operation ensures older nodes that do not advertise
-`stream.relay` reject it with `unsupported` rather than misreading a relayed header as local.
+The file operations are the same permission-checked operations as the `fs.*` tools (`fs.read` for
+`manifest`, `stat`, `get` and `pack`; `fs.write` for `put` and `unpack`; `fs.remove` for `delete`),
+audited with door `stream`. `tunnel` (both directly and via `relay`) requires any resolved
+principal whose role is not `nobody` and an unrevoked pairing: it grants no access on its own, as
+everything inside the pipe is authenticated by the target's `sshd` against the caller's own key and
+forced command. Using distinct `relay` and `tunnel` operations and greeting capabilities
+(`stream.relay`, `stream.tunnel`, `stream.relay.tunnel`) ensures older nodes fail cleanly with
+`unsupported` rather than misreading a header. When a controller app (`legion-link`) cannot reach a
+known node directly, it opens a relayed `tunnel` and runs its in-process SSH session end-to-end
+inside it against the target's pinned host keys, falling back to legacy `relay` only when an older
+relay or target answers `unsupported`; once a node completes one sealed session, the app persists
+that per-node ratchet in its own state and refuses to fall back to unsealed `relay` for it again.
 Hashes are BLAKE3, written `blake3:<hex>`.
 
 The remote command line is therefore always one of two fixed strings, `legion rpc` or
