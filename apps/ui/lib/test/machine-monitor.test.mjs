@@ -142,7 +142,7 @@ test('selectBusyPrograms filters by 5% whole CPU, 5% memory, or 256 MB GPU and c
   const sys = {
     cpu: { cores: 32 },
     memory: { total: 64e9 },
-    gpus: [{ name: 'RTX 5080', memory_total: 16e9 }],
+    gpus: [{ name: 'RTX 4070', memory_total: 16e9 }],
   };
   const rows = [
     { name: 'idle-daemon', user: 'me', count: 1, cpu_pct: 50, memory: 100e6, members: [] }, // 1.56% whole CPU -> excluded

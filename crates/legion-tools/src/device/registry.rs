@@ -4066,14 +4066,14 @@ mod tests {
 
     fn random_devices_file(rng: &mut Rng) -> DevicesFile {
         let ids: Vec<String> = (1_u8..=6).map(sample_id).collect();
-        let names = ["pixel", "ipad", "laptop", "phone", "watch"];
-        let principals = ["device:pixel", "device:ipad", "owner", "phone"];
+        let names = ["handset", "tablet", "laptop", "phone", "watch"];
+        let principals = ["device:handset", "device:tablet", "owner", "phone"];
         let roles: [Option<&str>; 4] = [Some("observer"), Some("editor"), Some("operator"), None];
         let nodes = ["tower", "pi", "mac"];
         // Small timestamp pools so tie-breaks trigger frequently across all remaining fields.
         let paired_times = ["2026-11-24T09:00:00Z", "2026-11-24T09:30:00Z"];
         let times = ["2026-11-24T10:00:00Z", "2026-11-24T10:00:00.5Z"];
-        let creator_principals = ["owner", "device:pixel"];
+        let creator_principals = ["owner", "device:handset"];
         let confirmed_opts: [Option<&str>; 2] = [None, Some("owner")];
 
         let mut file = DevicesFile::default();
@@ -4369,7 +4369,7 @@ mod tests {
             id.clone(),
             sample_device(
                 1,
-                "pixel",
+                "handset",
                 Some("observer"),
                 "2026-11-24T10:00:00Z",
                 "tower",
@@ -4378,24 +4378,24 @@ mod tests {
         let mut b = DevicesFile::default();
         let mut b_dev = sample_device(
             1,
-            "pixel-renamed",
+            "handset-renamed",
             Some("editor"),
             "2026-11-24T11:00:00Z",
             "pi",
         );
-        b_dev.principal = "device:pixel".to_owned();
+        b_dev.principal = "device:handset".to_owned();
         b.devices.insert(id.clone(), b_dev);
 
         let merged = merge_devices(&a, &b);
         assert!(!merged.devices[&id].conflict);
-        assert_eq!(merged.devices[&id].name, "pixel-renamed");
+        assert_eq!(merged.devices[&id].name, "handset-renamed");
         assert_eq!(merged.devices[&id].role.as_deref(), Some("editor"));
 
         // Even an older tombstone beats a newer live edit.
         let mut c = DevicesFile::default();
         c.removed.insert(
             id.clone(),
-            sample_tombstone("pixel", "2026-11-24T10:05:00Z", "mac"),
+            sample_tombstone("handset", "2026-11-24T10:05:00Z", "studio"),
         );
         let merged_tomb = merge_devices(&b, &c);
         assert!(merged_tomb.devices.is_empty());
@@ -4415,9 +4415,9 @@ mod tests {
 version = 1
 
 [devices.{id}]
-name = \"pixel\"
+name = \"handset\"
 public_key = \"{key1}\"
-principal = \"device:pixel\"
+principal = \"device:handset\"
 role = \"observer\"
 paired_at = \"2026-11-24T09:00:00Z\"
 paired_on = \"tower\"
@@ -4449,7 +4449,7 @@ updated_on = \"pi\"
         // 2. Independent per-field stamps merge `name` and `role` separately.
         let mut side_a = legacy.clone();
         let da = side_a.devices.get_mut(&id).unwrap();
-        da.name = "pixel-renamed".to_owned();
+        da.name = "handset-renamed".to_owned();
         da.name_updated_at = "2026-11-24T12:00:00Z".to_owned();
         da.name_updated_on = "tower".to_owned();
         da.updated_at = "2026-11-24T12:00:00Z".to_owned();
@@ -4471,7 +4471,7 @@ updated_on = \"pi\"
         assert_eq!(ab, ba);
         let merged = &ab.devices[&id];
         assert!(!merged.conflict);
-        assert_eq!(merged.name, "pixel-renamed");
+        assert_eq!(merged.name, "handset-renamed");
         assert_eq!(merged.role.as_deref(), Some("observer"));
 
         // 3. Immutable-field mismatch on ANY of public_key, principal, paired_at, paired_on,
@@ -4542,7 +4542,7 @@ updated_on = \"pi\"
         std::fs::write(
             paths.config_file("policy.toml"),
             format!(
-                "default = \"owner\"\n\n[roles.observer]\nallow = [\"effect:read\"]\n\n[principals.\"device:pixel\"]\nrole = \"observer\"\ndevice = \"{id}\"\n"
+                "default = \"owner\"\n\n[roles.observer]\nallow = [\"effect:read\"]\n\n[principals.\"device:handset\"]\nrole = \"observer\"\ndevice = \"{id}\"\n"
             ),
         )
         .unwrap();
@@ -4564,7 +4564,7 @@ updated_on = \"pi\"
             &std::fs::read(paths.config_file("policy.toml")).unwrap(),
         )
         .unwrap();
-        assert_eq!(pol.role_of("device:pixel").0, NOBODY);
+        assert_eq!(pol.role_of("device:handset").0, NOBODY);
 
         let rec =
             reconcile_devices_and_auth_keys_blocking(&paths, "tower", &node_file, false).unwrap();
@@ -4582,15 +4582,15 @@ updated_on = \"pi\"
         );
         assert_eq!(
             inspect_immutable_conflict_devices(&paths),
-            vec![("pixel".to_owned(), id.clone())]
+            vec![("handset".to_owned(), id.clone())]
         );
         let gate_err = verify_gate_device(
             &paths,
             "tower",
             &node_file,
-            "pixel",
+            "handset",
             &id,
-            "device:pixel",
+            "device:handset",
             None,
         )
         .unwrap_err();
@@ -4604,13 +4604,13 @@ updated_on = \"pi\"
         let newer_ts = "2026-11-24T10:05:00Z";
 
         let mut side_a = DevicesFile::default();
-        let mut da = sample_device(8, "pixel", Some("admin"), ts, "tower");
+        let mut da = sample_device(8, "handset", Some("admin"), ts, "tower");
         da.confirmed_by = Some("owner".to_owned());
         da.confirmed_at = Some(ts.to_owned());
         side_a.devices.insert(id.clone(), da);
 
         let mut side_b = DevicesFile::default();
-        let mut db = sample_device(8, "pixel", Some("observer"), ts, "tower");
+        let mut db = sample_device(8, "handset", Some("observer"), ts, "tower");
         db.confirmed_by = Some("owner".to_owned());
         db.confirmed_at = Some(ts.to_owned());
         side_b.devices.insert(id.clone(), db);
@@ -4668,7 +4668,7 @@ updated_on = \"pi\"
         std::fs::write(
             paths.config_file("policy.toml"),
             format!(
-                "default = \"owner\"\n\n[roles.observer]\nallow = [\"effect:read\"]\n\n[roles.admin]\nallow = [\"*\"]\n\n[principals.\"device:pixel\"]\nrole = \"observer\"\ndevice = \"{id}\"\n"
+                "default = \"owner\"\n\n[roles.observer]\nallow = [\"effect:read\"]\n\n[roles.admin]\nallow = [\"*\"]\n\n[principals.\"device:handset\"]\nrole = \"observer\"\ndevice = \"{id}\"\n"
             ),
         )
         .unwrap();
@@ -4688,7 +4688,7 @@ updated_on = \"pi\"
         )
         .unwrap();
         assert_eq!(
-            pol.role_of("device:pixel").0,
+            pol.role_of("device:handset").0,
             NOBODY,
             "role-conflicted device must be restricted to nobody"
         );
@@ -4711,9 +4711,9 @@ updated_on = \"pi\"
             &paths,
             "tower",
             &node_file,
-            "pixel",
+            "handset",
             &id,
-            "device:pixel",
+            "device:handset",
             None,
         )
         .unwrap_err();
@@ -4749,19 +4749,20 @@ updated_on = \"pi\"
             id.clone(),
             sample_device(
                 1,
-                "pixel",
+                "handset",
                 Some("observer"),
                 "2026-11-24T10:00:00Z",
                 "tower",
             ),
         );
-        overlap
-            .removed
-            .insert(id, sample_tombstone("pixel", "2026-11-24T11:00:00Z", "pi"));
+        overlap.removed.insert(
+            id,
+            sample_tombstone("handset", "2026-11-24T11:00:00Z", "pi"),
+        );
         assert!(overlap.validate().is_err());
 
         let bad_key = format!(
-            "version = 1\n[devices.{}]\nname = \"pixel\"\npublic_key = \"restrict {}\"\nprincipal = \"device:pixel\"\npaired_at = \"2026-11-24T10:00:00Z\"\npaired_on = \"tower\"\nupdated_at = \"2026-11-24T10:00:00Z\"\nupdated_on = \"tower\"\n",
+            "version = 1\n[devices.{}]\nname = \"handset\"\npublic_key = \"restrict {}\"\nprincipal = \"device:handset\"\npaired_at = \"2026-11-24T10:00:00Z\"\npaired_on = \"tower\"\nupdated_at = \"2026-11-24T10:00:00Z\"\nupdated_on = \"tower\"\n",
             sample_id(2),
             sample_key(2)
         );
@@ -4786,8 +4787,8 @@ allow = [\"effect:read\"]
 [roles.editor]
 allow = [\"effect:read\", \"effect:write\"]
 
-# Stale leftover owner entry owned by device:pixel's pairing id must be downgraded when syncing an observer device!
-[principals.\"device:pixel\"]
+# Stale leftover owner entry owned by device:handset's pairing id must be downgraded when syncing an observer device!
+[principals.\"device:handset\"]
 role = \"owner\"
 device = \"{pixel_id}\"
 
@@ -4800,12 +4801,12 @@ role = \"editor\"
         .unwrap();
 
         let mut devices = DevicesFile::default();
-        // 1. device:pixel recorded as observer -> must downgrade stale owner to observer.
+        // 1. device:handset recorded as observer -> must downgrade stale owner to observer.
         devices.devices.insert(
             sample_id(1),
             sample_device(
                 1,
-                "pixel",
+                "handset",
                 Some("observer"),
                 "2026-11-24T10:00:00Z",
                 "tower",
@@ -4855,7 +4856,7 @@ role = \"editor\"
             &std::fs::read(paths.config_file("policy.toml")).unwrap(),
         )
         .unwrap();
-        assert_eq!(policy.role_of("device:pixel").0, "observer");
+        assert_eq!(policy.role_of("device:handset").0, "observer");
         assert_eq!(policy.role_of("device:missingrole").0, NOBODY);
         assert_eq!(policy.role_of("device:collide").0, NOBODY);
         assert_eq!(policy.role_of("phone").0, "editor");
@@ -4996,21 +4997,21 @@ role = "editor"
         for (label, incoming) in [
             ("live updated_at far future", {
                 let mut f = DevicesFile::default();
-                let mut d = sample_device(1, "pixel", Some("observer"), &far_future, "pi");
+                let mut d = sample_device(1, "handset", Some("observer"), &far_future, "pi");
                 d.paired_at = now.to_string();
                 f.devices.insert(sample_id(1), d);
                 f
             }),
             ("live updated_at Timestamp::MAX", {
                 let mut f = DevicesFile::default();
-                let mut d = sample_device(2, "pixel", Some("observer"), &max_time, "pi");
+                let mut d = sample_device(2, "handset", Some("observer"), &max_time, "pi");
                 d.paired_at = now.to_string();
                 f.devices.insert(sample_id(2), d);
                 f
             }),
             ("live paired_at far future", {
                 let mut f = DevicesFile::default();
-                let mut d = sample_device(3, "pixel", Some("observer"), &now.to_string(), "pi");
+                let mut d = sample_device(3, "handset", Some("observer"), &now.to_string(), "pi");
                 d.paired_at = far_future.clone();
                 f.devices.insert(sample_id(3), d);
                 f
@@ -5018,18 +5019,18 @@ role = "editor"
             ("tombstone removed_at far future", {
                 let mut f = DevicesFile::default();
                 f.removed
-                    .insert(sample_id(4), sample_tombstone("pixel", &far_future, "pi"));
+                    .insert(sample_id(4), sample_tombstone("handset", &far_future, "pi"));
                 f
             }),
             ("tombstone removed_at Timestamp::MAX", {
                 let mut f = DevicesFile::default();
                 f.removed
-                    .insert(sample_id(5), sample_tombstone("pixel", &max_time, "pi"));
+                    .insert(sample_id(5), sample_tombstone("handset", &max_time, "pi"));
                 f
             }),
             ("tombstone paired_at far future", {
                 let mut f = DevicesFile::default();
-                let mut t = sample_tombstone("pixel", &now.to_string(), "pi");
+                let mut t = sample_tombstone("handset", &now.to_string(), "pi");
                 t.paired_at = Some(far_future.clone());
                 f.removed.insert(sample_id(6), t);
                 f
@@ -5053,7 +5054,7 @@ role = "editor"
         // Timestamps within the 10-minute skew allowance are accepted.
         let within_skew = (now + SignedDuration::from_mins(5)).to_string();
         let mut ok_file = DevicesFile::default();
-        let mut d = sample_device(7, "pixel", Some("observer"), &within_skew, "pi");
+        let mut d = sample_device(7, "handset", Some("observer"), &within_skew, "pi");
         d.paired_at = within_skew.clone();
         ok_file.devices.insert(sample_id(7), d);
         validate_incoming_timestamps(&ok_file, now).unwrap();
@@ -5141,9 +5142,9 @@ role = \"observer\"
         let pinned_home = PinnedHome::from_paths(&paths);
         let stale_line = format_device_line(
             &exe,
-            "device:pixel",
+            "device:handset",
             &k1,
-            "pixel",
+            "handset",
             &id_x,
             &pinned_home,
             None,
@@ -5154,7 +5155,13 @@ role = \"observer\"
 
         // Registry says K2 for the exact same pairing id X, name, and principal.
         let mut devices = DevicesFile::default();
-        let mut dev = sample_device(10, "pixel", Some("observer"), "2026-11-24T10:00:00Z", "pi");
+        let mut dev = sample_device(
+            10,
+            "handset",
+            Some("observer"),
+            "2026-11-24T10:00:00Z",
+            "pi",
+        );
         dev.public_key = k2.clone();
         devices.devices.insert(id_x.clone(), dev);
         std::fs::write(paths.config_file("devices.toml"), devices.to_toml_string()).unwrap();
@@ -5165,9 +5172,9 @@ role = \"observer\"
             &paths,
             "tower",
             &node_file,
-            "pixel",
+            "handset",
             &id_x,
-            "device:pixel",
+            "device:handset",
             None,
         )
         .unwrap_err();
@@ -5185,9 +5192,9 @@ role = \"observer\"
             &paths,
             "tower",
             &node_file,
-            "pixel",
+            "handset",
             &id_x,
-            "device:pixel",
+            "device:handset",
             None,
         )
         .unwrap();

@@ -6,18 +6,23 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createSigningKey } from '../scripts/release-integrity.mjs';
 import { checkBinaryPaths } from '../scripts/check-binary-paths.mjs';
 import { parseSha256Sums, signLegionRelease, signSha256SumsBytes } from '../scripts/sign-legion-release.mjs';
 
 const repoFile = (rel) => fileURLToPath(new URL(`../${rel}`, import.meta.url));
+
+function createTestSigningKey(privateFile, publicFile) {
+  const pair = crypto.generateKeyPairSync('ed25519');
+  fs.writeFileSync(privateFile, pair.privateKey.export({ type: 'pkcs8', format: 'pem' }), { mode: 0o600 });
+  fs.writeFileSync(publicFile, pair.publicKey.export({ type: 'spki', format: 'pem' }), { mode: 0o644 });
+}
 
 test('sign-legion-release signs draft SHA256SUMS, uploads SHA256SUMS.sig, and prints --latest=false publish command', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-sign-test-'));
   try {
     const privKey = path.join(dir, 'release-signing.key');
     const pubKey = path.join(dir, 'release-public-key.pem');
-    createSigningKey(privKey, pubKey);
+    createTestSigningKey(privKey, pubKey);
 
     const sumsBytes = Buffer.from(
       [
@@ -87,7 +92,7 @@ if (args[0] === 'release' && args[1] === 'view') {
     // Mismatched public key is refused before upload.
     const otherPriv = path.join(dir, 'other.key');
     const otherPub = path.join(dir, 'other.pem');
-    createSigningKey(otherPriv, otherPub);
+    createTestSigningKey(otherPriv, otherPub);
     assert.throws(
       () => signSha256SumsBytes(sumsBytes, privKey, otherPub),
       /does not match/,
@@ -309,4 +314,28 @@ test('install/legion.sh keeps ~/.local and ~/.local/bin non-group-writable under
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('Arch legion-bin PKGBUILD pins the exact contract release public key and verifies signatures', () => {
+  const contractPem = fs.readFileSync(repoFile('contract/release-public-key.pem'), 'utf8').trim();
+  const pkgbuild = fs.readFileSync(repoFile('packaging/arch/legion-bin/PKGBUILD'), 'utf8');
+  assert.ok(
+    pkgbuild.includes(contractPem),
+    'packaging/arch/legion-bin/PKGBUILD must pin contract/release-public-key.pem verbatim',
+  );
+  assert.match(
+    pkgbuild,
+    /prepare\(\)\s*\{/,
+    'packaging/arch/legion-bin/PKGBUILD must verify release signatures in prepare()',
+  );
+  assert.match(
+    pkgbuild,
+    /openssl pkeyutl -verify -pubin/,
+    'packaging/arch/legion-bin/PKGBUILD must verify SHA256SUMS.sig with OpenSSL Ed25519',
+  );
+  assert.match(
+    pkgbuild,
+    /SHA256SUMS\.sig/,
+    'packaging/arch/legion-bin/PKGBUILD must fetch SHA256SUMS.sig',
+  );
 });

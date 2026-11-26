@@ -93,8 +93,8 @@ test('applySettingsToRoot toggles data attributes cleanly without inline styles'
 
 test('detectDeviceNoun and summary descriptions read cleanly', () => {
   assert.equal(detectDeviceNoun('http', 'Mozilla/5.0', 390), 'browser');
-  assert.equal(detectDeviceNoun('app', 'Mozilla/5.0 (Linux; Android 15; Pixel 10 Mobile)', 390), 'phone');
-  assert.equal(detectDeviceNoun('app', 'Mozilla/5.0 (Linux; Android 15; Pixel Tablet)', 1100), 'tablet');
+  assert.equal(detectDeviceNoun('app', 'Mozilla/5.0 (Linux; Android 15; Phone Mobile)', 390), 'phone');
+  assert.equal(detectDeviceNoun('app', 'Mozilla/5.0 (Linux; Android 15; Android Tablet)', 1100), 'tablet');
   assert.equal(detectDeviceNoun('app', 'Mozilla/5.0 (Macintosh; Intel Mac OS X)', 1200), 'computer');
 
   assert.equal(
@@ -139,11 +139,11 @@ test('buildDeviceInviteArgs and buildDeviceRemoveArgs match fleet device tool sc
   // With role + name schema and a role chosen -> sends name + role (never principal + role).
   assert.deepEqual(
     buildDeviceInviteArgs(fleetInviteSpec, {
-      label: 'Pixel 10',
+      label: 'My phone',
       role: 'observer',
       validMinutes: 15,
     }),
-    { name: 'Pixel 10', role: 'observer', valid_minutes: 15 },
+    { name: 'My phone', role: 'observer', valid_minutes: 15 },
   );
 
   // With owner role + explicit allowOwner -> sends allow_owner: true.
@@ -179,10 +179,10 @@ test('buildDeviceInviteArgs and buildDeviceRemoveArgs match fleet device tool sc
   );
 
   // device.remove prefers unique pairing id when available, falling back to name.
-  assert.deepEqual(buildDeviceRemoveArgs({ id: '0123456789abcdef0123456789abcdef', name: 'pixel' }), {
+  assert.deepEqual(buildDeviceRemoveArgs({ id: '0123456789abcdef0123456789abcdef', name: 'my-phone' }), {
     id: '0123456789abcdef0123456789abcdef',
   });
-  assert.deepEqual(buildDeviceRemoveArgs({ name: 'Pixel 10' }), { name: 'Pixel 10' });
+  assert.deepEqual(buildDeviceRemoveArgs({ name: 'My phone' }), { name: 'My phone' });
 });
 
 test('isInviteOwnerStrength detects owner-strength roles and identities beyond the literal name owner', () => {
@@ -305,11 +305,11 @@ test('findIncomingDevice matches pairing-id routes strictly by id and never by a
 
   assert.equal(isPairingId(realId), true);
   assert.equal(isPairingId('0123456789ABCDEF0123456789ABCDEF'), false);
-  assert.equal(isPairingId('Pixel 10'), false);
+  assert.equal(isPairingId('My phone'), false);
 
   const spoofedByNameWithOtherId = { id: otherId, name: realId, principal: 'phone' };
   const spoofedByNameWithoutId = { name: realId, principal: 'phone' };
-  const realDevice = { id: realId, name: 'Pixel 10', principal: 'device:pixel' };
+  const realDevice = { id: realId, name: 'My phone', principal: 'device:my-phone' };
   const legacyDevice = { name: 'Legacy Phone', principal: 'phone' };
 
   // When route item is a pairing id, never match a device whose name happens to equal that id.
@@ -333,16 +333,16 @@ test('formatDeviceRemovedNotice never lists fleet machines for a local-only devi
   );
   assert.equal(
     formatDeviceRemovedNotice(
-      { name: 'Pixel 10', local_only: false },
+      { name: 'My phone', local_only: false },
       { removed: true, still_trusted_by: [] },
     ),
     null,
   );
   const notice = formatDeviceRemovedNotice(
-    { name: 'Pixel 10', local_only: false },
+    { name: 'My phone', local_only: false },
     { removed: true, still_trusted_by: ['pi'] },
   );
-  assert.ok(notice && notice.includes('pi') && notice.includes('Pixel 10'));
+  assert.ok(notice && notice.includes('pi') && notice.includes('My phone'));
 });
 
 test('formatPairSyncNotice describes synced and pending fleet machines without leaking tool names in plain mode', () => {
@@ -708,8 +708,8 @@ test('formatIncomingDeviceSubtitle highlights unconfirmed devices as Pairing not
     formatIncomingDeviceSubtitle(
       {
         id: '0123456789abcdef0123456789abcdef',
-        name: 'Pixel 10',
-        principal: 'device:pixel-10',
+        name: 'My phone',
+        principal: 'device:my-phone',
         role: 'operator',
         unconfirmed: true,
       },
@@ -721,21 +721,21 @@ test('formatIncomingDeviceSubtitle highlights unconfirmed devices as Pairing not
     formatIncomingDeviceSubtitle(
       {
         id: '0123456789abcdef0123456789abcdef',
-        name: 'Pixel 10',
-        principal: 'device:pixel-10',
+        name: 'My phone',
+        principal: 'device:my-phone',
         role: 'operator',
         unconfirmed: true,
       },
       { technical: true, relativeTime: '2m ago' },
     ),
-    'Pairing not finished · device:pixel-10 · operator · paired 2m ago',
+    'Pairing not finished · device:my-phone · operator · paired 2m ago',
   );
   // Confirmed devices (or entries from older machines omitting `unconfirmed`) keep normal wording.
   assert.equal(
     formatIncomingDeviceSubtitle(
       {
-        name: 'Pixel 10',
-        principal: 'device:pixel-10',
+        name: 'My phone',
+        principal: 'device:my-phone',
         role: 'operator',
       },
       {

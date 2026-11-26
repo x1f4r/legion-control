@@ -7,7 +7,6 @@ import {
   computeFileCapabilities,
   createCapabilitiesStore,
   describeMissingFeatures,
-  isNeedsNewerLegionError,
   makeNeedsNewerLegionError,
   parseUnknownFieldError,
 } from '../capabilities.js';
@@ -271,7 +270,6 @@ test('guarded call drops undeclared refinements, blocks absent tools/essential a
   await assert.rejects(
     () => store.call('fs.thumb', { paths: ['/home/me/a.jpg'] }, { on: 'studio' }),
     (err) => {
-      assert.equal(isNeedsNewerLegionError(err), true);
       assert.equal(err.code, 'needs_newer_legion');
       assert.equal(err.machine, 'studio');
       assert.equal(err.tool, 'fs.thumb');
@@ -284,7 +282,7 @@ test('guarded call drops undeclared refinements, blocks absent tools/essential a
   await assert.rejects(
     () => store.call('fs.transfer', { from: 'studio:~/a', to: 'tower:~/a', move: true }, { on: 'studio', optional: ['background'] }),
     (err) => {
-      assert.equal(isNeedsNewerLegionError(err), true);
+      assert.equal(err.code, 'needs_newer_legion');
       assert.deepEqual(err.missingArgs, ['move']);
       return true;
     },

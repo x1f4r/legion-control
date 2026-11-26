@@ -304,8 +304,6 @@ pub(crate) enum WorkerOutcome {
     /// its exact live-heap cap. Eligible for an expiring per-`(file, size, fit)` bad-file record.
     MemoryLimitExceeded {
         error: ErrorBody,
-        #[allow(dead_code)]
-        peak_rss_bytes: u64,
     },
     /// The worker exceeded the wall-clock decode timeout (not permanently cached as bad).
     TimedOut {
@@ -323,15 +321,8 @@ pub(crate) enum WorkerOutcome {
 pub(crate) enum AudioTagsWorkerOutcome {
     Ok(ParsedAudioTags),
     Rejected(ErrorBody),
-    MemoryLimitExceeded {
-        error: ErrorBody,
-        #[allow(dead_code)]
-        peak_rss_bytes: u64,
-    },
-    TimedOut {
-        error: ErrorBody,
-        cpu_busy: bool,
-    },
+    MemoryLimitExceeded { error: ErrorBody },
+    TimedOut { error: ErrorBody, cpu_busy: bool },
     TransientFailure(ErrorBody),
 }
 
@@ -347,8 +338,6 @@ pub(crate) enum AudioCoverWorkerOutcome {
     Rejected(ErrorBody),
     MemoryLimitExceeded {
         error: ErrorBody,
-        #[allow(dead_code)]
-        peak_rss_bytes: u64,
     },
     TimedOut {
         error: ErrorBody,
@@ -1315,14 +1304,8 @@ pub(crate) async fn run_audio_cover_worker(
 }
 
 enum CommonWorkerStop {
-    TimedOut {
-        error: ErrorBody,
-        cpu_busy: bool,
-    },
-    MemoryLimitExceeded {
-        error: ErrorBody,
-        peak_rss_bytes: u64,
-    },
+    TimedOut { error: ErrorBody, cpu_busy: bool },
+    MemoryLimitExceeded { error: ErrorBody },
     TransientFailure(ErrorBody),
 }
 
@@ -1392,10 +1375,7 @@ fn classify_common_worker_stop(
             "limit_bytes": rss_limit_bytes,
             "peak_rss_bytes": output.peak_rss_bytes,
         }));
-        return Ok(Some(CommonWorkerStop::MemoryLimitExceeded {
-            error: err,
-            peak_rss_bytes: output.peak_rss_bytes,
-        }));
+        return Ok(Some(CommonWorkerStop::MemoryLimitExceeded { error: err }));
     }
 
     if output.killed_for_memory {
@@ -1479,13 +1459,9 @@ fn classify_audio_tags_output(
             CommonWorkerStop::TimedOut { error, cpu_busy } => {
                 AudioTagsWorkerOutcome::TimedOut { error, cpu_busy }
             }
-            CommonWorkerStop::MemoryLimitExceeded {
-                error,
-                peak_rss_bytes,
-            } => AudioTagsWorkerOutcome::MemoryLimitExceeded {
-                error,
-                peak_rss_bytes,
-            },
+            CommonWorkerStop::MemoryLimitExceeded { error } => {
+                AudioTagsWorkerOutcome::MemoryLimitExceeded { error }
+            }
             CommonWorkerStop::TransientFailure(err) => {
                 AudioTagsWorkerOutcome::TransientFailure(err)
             }
@@ -1521,13 +1497,9 @@ fn classify_audio_cover_output(
             CommonWorkerStop::TimedOut { error, cpu_busy } => {
                 AudioCoverWorkerOutcome::TimedOut { error, cpu_busy }
             }
-            CommonWorkerStop::MemoryLimitExceeded {
-                error,
-                peak_rss_bytes,
-            } => AudioCoverWorkerOutcome::MemoryLimitExceeded {
-                error,
-                peak_rss_bytes,
-            },
+            CommonWorkerStop::MemoryLimitExceeded { error } => {
+                AudioCoverWorkerOutcome::MemoryLimitExceeded { error }
+            }
             CommonWorkerStop::TransientFailure(err) => {
                 AudioCoverWorkerOutcome::TransientFailure(err)
             }
@@ -1614,10 +1586,7 @@ fn classify_worker_output(
             "limit_bytes": rss_limit_bytes,
             "peak_rss_bytes": output.peak_rss_bytes,
         }));
-        return Ok(WorkerOutcome::MemoryLimitExceeded {
-            error: err,
-            peak_rss_bytes: output.peak_rss_bytes,
-        });
+        return Ok(WorkerOutcome::MemoryLimitExceeded { error: err });
     }
 
     // A backstop kill (RSS watchdog or OS limit) while `CappedAlloc` stayed under `heap_cap_bytes`
@@ -1857,7 +1826,7 @@ mod tests {
         )
         .unwrap();
         match outcome2 {
-            WorkerOutcome::MemoryLimitExceeded { error, .. } => {
+            WorkerOutcome::MemoryLimitExceeded { error } => {
                 let d = error.details.expect("allocator cap details");
                 assert_eq!(d["killed_for_memory"], json!(true));
                 assert_eq!(d["enforced_by"], json!("allocator_cap"));

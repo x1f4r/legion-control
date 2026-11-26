@@ -545,6 +545,10 @@ pub struct LinkBackend {
     next_call_seq: AtomicU64,
     /// In-flight pairing cancellation tokens, cleared via [`ActivePairGuard`] on exit.
     active_pairs: Arc<Mutex<Vec<(u64, CancellationToken)>>>,
+    /// Test-only explicit hand-over signal fired immediately after a pairing registers its
+    /// cancellation token in `active_pairs`.
+    #[cfg(test)]
+    pair_registered: Arc<Notify>,
     /// Nodes currently running an in-flight `pair` or `restore_pairing` (through store commit),
     /// preventing concurrent pairings for the same machine from racing and persisting out of order.
     pairing_nodes: Arc<Mutex<HashSet<String>>>,
@@ -769,6 +773,8 @@ impl LinkBackend {
             mutate_lock: AsyncMutex::new(()),
             next_call_seq: AtomicU64::new(1),
             active_pairs: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            pair_registered: Arc::new(Notify::new()),
             pairing_nodes: Arc::new(Mutex::new(HashSet::new())),
             in_flight_ops: Arc::new(AtomicUsize::new(0)),
             bg_refreshes: Arc::new(BackgroundRefreshTracker::with_clock(drain_clock)),
@@ -1246,6 +1252,8 @@ impl Backend for LinkBackend {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .push((pair_seq, cancel.clone()));
             }
+            #[cfg(test)]
+            self.pair_registered.notify_waiters();
             let _pair_guard = ActivePairGuard {
                 active_pairs: Arc::clone(&self.active_pairs),
                 seq: pair_seq,
@@ -1336,6 +1344,8 @@ impl Backend for LinkBackend {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .push((pair_seq, cancel.clone()));
             }
+            #[cfg(test)]
+            self.pair_registered.notify_waiters();
             let _pair_guard = ActivePairGuard {
                 active_pairs: Arc::clone(&self.active_pairs),
                 seq: pair_seq,
@@ -2654,13 +2664,13 @@ mod tests {
         data.upsert_meta(StoredNodeMeta {
             node: "tower".to_owned(),
             role: Some("operator".to_owned()),
-            device: Some("pixel-phone".to_owned()),
+            device: Some("my-phone".to_owned()),
             role_checked_at: None,
         });
         data.upsert_meta(StoredNodeMeta {
             node: "pi".to_owned(),
             role: Some("observer".to_owned()),
-            device: Some("pixel-phone".to_owned()),
+            device: Some("my-phone".to_owned()),
             role_checked_at: None,
         });
         store.save(&data)?;
@@ -2675,9 +2685,9 @@ mod tests {
 
         let unpaired = backend.unpair("tower".to_owned()).await?;
         assert_eq!(unpaired.node, "tower");
-        assert_eq!(unpaired.device, "pixel-phone");
+        assert_eq!(unpaired.device, "my-phone");
         assert!(unpaired.message.contains("legion device.remove"));
-        assert!(unpaired.message.contains("pixel-phone"));
+        assert!(unpaired.message.contains("my-phone"));
 
         let after = backend.state().await?;
         assert_eq!(after.nodes.len(), 1);
@@ -3533,13 +3543,13 @@ mod tests {
                 user: "me".to_owned(),
                 host_keys: vec![key_a.clone()],
             },
-            Some("device:pixel".to_owned()),
+            Some("device:phone".to_owned()),
         ));
         initial.current_node = Some("tower".to_owned());
         initial.upsert_meta(StoredNodeMeta {
             node: "tower".to_owned(),
             role: Some("owner".to_owned()),
-            device: Some("pixel".to_owned()),
+            device: Some("phone".to_owned()),
             role_checked_at: None,
         });
         store.save(&initial)?;
@@ -3807,7 +3817,7 @@ mod tests {
                 user: "me".to_owned(),
                 host_keys: vec![key_a],
             },
-            Some("device:pixel".to_owned()),
+            Some("device:phone".to_owned()),
         ));
         initial.link.upsert_node(pi);
         store.save(&initial)?;
@@ -3884,9 +3894,9 @@ mod tests {
                 user: "me".to_owned(),
                 host_keys: vec!["ssh-ed25519 AAAA".to_owned()],
             },
-            principal: "device:pixel".to_owned(),
+            principal: "device:phone".to_owned(),
             role: "owner".to_owned(),
-            device: "pixel".to_owned(),
+            device: "phone".to_owned(),
             fleet,
             not_synced_to: vec!["pi".to_owned()],
             sync_command: Some("legion fleet.sync".to_owned()),
@@ -4539,7 +4549,7 @@ mod tests {
                     user: "me".to_owned(),
                     host_keys: vec![DeviceKey::from_seed([82u8; 32]).public_key_line("studio")?],
                 },
-                Some("device:pixel".to_owned()),
+                Some("device:phone".to_owned()),
             );
             guard.data.link.upsert_node(paired_studio);
             guard.set_fresh_epoch("studio");
@@ -4792,22 +4802,19 @@ mod tests {
         }
         .encode()?;
 
+        let registered = backend.pair_registered.notified();
+        tokio::pin!(registered);
+        registered.as_mut().enable();
+
         let backend_pair = Arc::clone(&backend);
         let pair_task =
             tokio::spawn(async move { backend_pair.pair(invite, "phone".to_owned()).await });
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            let active = backend
-                .active_pairs
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .len();
-            if active > 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        tokio::time::timeout(Duration::from_secs(30), registered)
+            .await
+            .map_err(|_| {
+                "cancel_pair test: pair() never registered its cancellation token before waiting on mutate_lock"
+            })?;
         assert_eq!(
             backend
                 .active_pairs
@@ -4818,8 +4825,9 @@ mod tests {
         );
 
         backend.cancel_pair().await?;
-        let err = pair_task
-            .await?
+        let err = tokio::time::timeout(Duration::from_secs(30), pair_task)
+            .await
+            .map_err(|_| "cancel_pair test: pair() never exited after cancel_pair()")??
             .err()
             .ok_or("expected pair to return cancelled error")?;
         drop(held);
@@ -4851,16 +4859,21 @@ mod tests {
         store.save(&initial)?;
         let backend = Arc::new(LinkBackend::with_local_program(store, None));
 
-        // Bind a loopback listener that accepts TCP connections and holds them open without
-        // sending an SSH banner so `pair()` waits in network I/O.
+        // Bind a loopback listener that accepts TCP connections and holds them open until
+        // explicitly released so `pair()` stays in network I/O without any wall-clock race.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         let accepted = Arc::new(tokio::sync::Notify::new());
+        let accepted_wait = accepted.notified();
+        tokio::pin!(accepted_wait);
+        accepted_wait.as_mut().enable();
+        let server_release = Arc::new(tokio::sync::Notify::new());
         let accepted_c = Arc::clone(&accepted);
+        let release_c = Arc::clone(&server_release);
         let server = tokio::spawn(async move {
             if let Ok((stream, _)) = listener.accept().await {
                 accepted_c.notify_one();
-                tokio::time::sleep(Duration::from_secs(30)).await;
+                release_c.notified().await;
                 drop(stream);
             }
         });
@@ -4887,33 +4900,50 @@ mod tests {
             tokio::spawn(async move { backend_pair.pair(invite, "phone".to_owned()).await });
 
         // Wait until `pair()` has actually entered the network wait (connected to the listener).
-        tokio::time::timeout(Duration::from_secs(3), accepted.notified()).await?;
+        tokio::time::timeout(Duration::from_secs(30), accepted_wait)
+            .await
+            .map_err(
+                |_| "pair_releases_mutate_lock test: pair() never connected to loopback listener",
+            )?;
 
-        // While `pair()` waits on the network, `select_node` and `unpair` MUST proceed promptly
-        // without blocking on `mutate_lock`.
+        // While `pair()` waits on the network, `select_node` and `unpair` MUST proceed without
+        // blocking on `mutate_lock` (the listener stays open indefinitely until `server_release`,
+        // so holding `mutate_lock` would hang until the guard fires).
         let selected = tokio::time::timeout(
-            Duration::from_secs(1),
+            Duration::from_secs(15),
             backend.select_node("beta".to_owned()),
         )
-        .await??;
+        .await
+        .map_err(|_| {
+            "pair_releases_mutate_lock test: select_node() blocked while pair() waited on network"
+        })??;
         assert_eq!(
             selected.nodes.first().map(|n| n.node.as_str()),
             Some("beta")
         );
 
-        let unpaired =
-            tokio::time::timeout(Duration::from_secs(1), backend.unpair("alpha".to_owned()))
-                .await??;
+        let unpaired = tokio::time::timeout(
+            Duration::from_secs(15),
+            backend.unpair("alpha".to_owned()),
+        )
+        .await
+        .map_err(
+            |_| "pair_releases_mutate_lock test: unpair() blocked while pair() waited on network",
+        )??;
         assert_eq!(unpaired.node, "alpha");
 
         backend.cancel_pair().await?;
-        let pair_err = tokio::time::timeout(Duration::from_secs(2), pair_task)
-            .await??
+        let pair_err = tokio::time::timeout(Duration::from_secs(30), pair_task)
+            .await
+            .map_err(
+                |_| "pair_releases_mutate_lock test: pair() never exited after cancel_pair()",
+            )??
             .err()
             .ok_or("expected slow pair to be cancelled")?;
         assert_eq!(pair_err.code, ErrorCode::Cancelled);
 
-        server.abort();
+        server_release.notify_one();
+        let _ = server.await;
         Ok(())
     }
 

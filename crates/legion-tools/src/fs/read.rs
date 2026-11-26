@@ -1,9 +1,11 @@
 //! Read-only inspection tools: `fs.list`, `fs.stat`, `fs.read` and `fs.hash`.
 
+use std::cmp::Ordering;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -17,7 +19,7 @@ use serde_json::json;
 use super::{
     Encoding, EntryKind, MAX_REPLY_BYTES, OwnDirFilter, Progress, SortField, SortOrder,
     cancelled_error, check_fs_path, compare_by_sort, format_blake3, format_mtime, is_hidden,
-    map_io_error, path_to_string, platform, run_blocking,
+    map_io_error, natural_cmp, path_to_string, platform, run_blocking,
 };
 
 const MAX_LIST_DEPTH: u32 = 8;
@@ -289,6 +291,190 @@ impl ListWalk<'_> {
     }
 }
 
+/// Partitions `items` in linear time so the `[offset..offset+limit]` page sits in exact sorted
+/// order under `cmp` without sorting the rest of the directory.
+fn select_and_sort_page<T, F>(items: &mut [T], offset: usize, limit: usize, mut cmp: F) -> &mut [T]
+where
+    F: FnMut(&T, &T) -> Ordering,
+{
+    let len = items.len();
+    if offset >= len || limit == 0 {
+        return &mut [];
+    }
+    let page_end = offset.saturating_add(limit).min(len);
+    if offset > 0 {
+        items.select_nth_unstable_by(offset, &mut cmp);
+    }
+    let rest = &mut items[offset..];
+    let take = page_end - offset;
+    if take < rest.len() {
+        rest.select_nth_unstable_by(take, &mut cmp);
+    }
+    let page = &mut rest[..take];
+    page.sort_by(&mut cmp);
+    page
+}
+
+fn push_list_entry(
+    walk: &mut ListWalk<'_>,
+    name: String,
+    child_path: &Path,
+    meta: &fs::Metadata,
+    kind: EntryKind,
+    precomputed_media: Option<(Option<Category>, Option<&'static str>)>,
+) -> bool {
+    if walk.entries.len() == walk.limit {
+        *walk.page_full = true;
+        return false;
+    }
+    let (category, mime) = precomputed_media.unwrap_or_else(|| {
+        if kind == EntryKind::File {
+            let info = classify_path(child_path);
+            (Some(info.category), Some(info.mime))
+        } else {
+            (None, None)
+        }
+    });
+    let target = if kind == EntryKind::Symlink {
+        fs::read_link(child_path)
+            .ok()
+            .map(|link| path_to_string(&link))
+    } else {
+        None
+    };
+    let entry = ListEntry {
+        name,
+        path: path_to_string(child_path),
+        kind,
+        size: meta.len(),
+        mtime: format_mtime(meta),
+        mode: platform::unix_mode(meta),
+        target,
+        category,
+        mime: mime.map(str::to_owned),
+    };
+    let entry_bytes =
+        serde_json::to_vec(&entry).map_or(0, |v| v.len()) + usize::from(!walk.entries.is_empty());
+    if !walk.entries.is_empty() && walk.reply_bytes.saturating_add(entry_bytes) > MAX_REPLY_BYTES {
+        *walk.page_full = true;
+        return false;
+    }
+    walk.reply_bytes = walk.reply_bytes.saturating_add(entry_bytes);
+    walk.entries.push(entry);
+    let count = walk.entries.len();
+    walk.progress.maybe_emit(|| json!({"entries": count}));
+    true
+}
+
+/// Fast single-level listing when `depth == 1`, sorting by name, on platforms where hiddenness
+/// depends only on the filename, and with no protected-directory filter entries to inspect:
+/// uses `DirEntry::file_type()` (`d_type`) during the scan, partitions only the requested page
+/// with `select_nth_unstable_by`, and runs `symlink_metadata` only for the returned page entries.
+fn list_dir_shallow_by_name(
+    dir: &Path,
+    read_dir: fs::ReadDir,
+    walk: &mut ListWalk<'_>,
+) -> Result<(), ToolError> {
+    struct ShallowChild {
+        name: String,
+        raw_name: Option<OsString>,
+        kind: EntryKind,
+    }
+
+    let mut children: Vec<ShallowChild> = Vec::new();
+    for item in read_dir {
+        *walk.visited = walk.visited.saturating_add(1);
+        if walk.visited.is_multiple_of(32) && walk.cancel.is_cancelled() {
+            return Err(cancelled_error("fs.list"));
+        }
+        let Ok(entry) = item else {
+            continue;
+        };
+        let file_name = entry.file_name();
+        let (name, raw_name) = match file_name.into_string() {
+            Ok(s) => (s, None),
+            Err(os) => (os.to_string_lossy().into_owned(), Some(os)),
+        };
+        if !walk.include_hidden && name.starts_with('.') {
+            continue;
+        }
+        let kind = match entry.file_type() {
+            Ok(ft) => EntryKind::from_file_type(ft),
+            Err(_) => {
+                let child_path = dir.join(raw_name.as_deref().unwrap_or_else(|| OsStr::new(&name)));
+                let Ok(meta) = fs::symlink_metadata(&child_path) else {
+                    continue;
+                };
+                EntryKind::from_file_type(meta.file_type())
+            }
+        };
+        if let Some(wanted) = walk.categories
+            && kind != EntryKind::Dir
+        {
+            if kind != EntryKind::File {
+                continue;
+            }
+            let name_path = Path::new(raw_name.as_deref().unwrap_or_else(|| OsStr::new(&name)));
+            let info = classify_path(name_path);
+            if !wanted.contains(&info.category) {
+                continue;
+            }
+        }
+        children.push(ShallowChild {
+            name,
+            raw_name,
+            kind,
+        });
+    }
+
+    *walk.total = children.len();
+    if walk.offset >= children.len() || walk.limit == 0 {
+        return Ok(());
+    }
+
+    let order = walk.order;
+    let page = select_and_sort_page(&mut children, walk.offset, walk.limit, |a, b| {
+        let a_rank = usize::from(a.kind != EntryKind::Dir);
+        let b_rank = usize::from(b.kind != EntryKind::Dir);
+        a_rank.cmp(&b_rank).then_with(|| {
+            let primary = natural_cmp(&a.name, &b.name);
+            let ordered = match order {
+                SortOrder::Asc => primary,
+                SortOrder::Desc => primary.reverse(),
+            };
+            ordered.then_with(|| a.raw_name.cmp(&b.raw_name))
+        })
+    });
+
+    for child in page {
+        if walk.cancel.is_cancelled() {
+            return Err(cancelled_error("fs.list"));
+        }
+        let child_path = dir.join(
+            child
+                .raw_name
+                .as_deref()
+                .unwrap_or_else(|| OsStr::new(&child.name)),
+        );
+        let Ok(meta) = fs::symlink_metadata(&child_path) else {
+            *walk.total = walk.total.saturating_sub(1);
+            continue;
+        };
+        let kind = EntryKind::from_file_type(meta.file_type());
+        if !push_list_entry(
+            walk,
+            std::mem::take(&mut child.name),
+            &child_path,
+            &meta,
+            kind,
+            None,
+        ) {
+            break;
+        }
+    }
+    Ok(())
+}
+
 fn list_dir(dir: &Path, depth: u32, walk: &mut ListWalk<'_>) -> Result<(), ToolError> {
     if walk.cancel.is_cancelled() {
         return Err(cancelled_error("fs.list"));
@@ -304,15 +490,27 @@ fn list_dir(dir: &Path, depth: u32, walk: &mut ListWalk<'_>) -> Result<(), ToolE
         Err(_) => return Ok(()),
     };
 
+    if depth == 1
+        && walk.max_depth == 1
+        && walk.sort == SortField::Name
+        && !platform::IS_WINDOWS
+        && walk.own_dirs.is_empty()
+    {
+        return list_dir_shallow_by_name(dir, read_dir, walk);
+    }
+
     struct ChildItem {
         name: String,
         path: PathBuf,
         meta: fs::Metadata,
+        mtime: Option<SystemTime>,
+        size: u64,
         kind: EntryKind,
-        category: Option<Category>,
-        mime: Option<&'static str>,
+        media: Option<(Option<Category>, Option<&'static str>)>,
     }
 
+    let need_mtime_for_sort = walk.sort == SortField::Modified;
+    let need_media_for_filter = walk.categories.is_some();
     let mut children: Vec<ChildItem> = Vec::new();
     for item in read_dir {
         *walk.visited = walk.visited.saturating_add(1);
@@ -341,53 +539,83 @@ fn list_dir(dir: &Path, depth: u32, walk: &mut ListWalk<'_>) -> Result<(), ToolE
             continue;
         }
         let kind = EntryKind::from_file_type(meta.file_type());
-        let (category, mime) = if kind == EntryKind::File {
-            let info = classify_path(&child_path);
-            (Some(info.category), Some(info.mime))
+        let media = if need_media_for_filter {
+            let pair = if kind == EntryKind::File {
+                let info = classify_path(&child_path);
+                (Some(info.category), Some(info.mime))
+            } else {
+                (None, None)
+            };
+            if let Some(wanted) = walk.categories
+                && kind != EntryKind::Dir
+                && !pair.0.is_some_and(|cat| wanted.contains(&cat))
+            {
+                continue;
+            }
+            Some(pair)
         } else {
-            (None, None)
+            None
         };
-        if let Some(wanted) = walk.categories
-            && kind != EntryKind::Dir
-            && !category.is_some_and(|cat| wanted.contains(&cat))
-        {
-            continue;
-        }
+        let mtime = need_mtime_for_sort.then(|| meta.modified().ok()).flatten();
+        let size = meta.len();
         children.push(ChildItem {
             name,
             path: child_path,
             meta,
+            mtime,
+            size,
             kind,
-            category,
-            mime,
+            media,
         });
     }
 
-    children.sort_by(|a, b| {
+    let sort = walk.sort;
+    let order = walk.order;
+    let cmp_children = |a: &ChildItem, b: &ChildItem| {
         let a_rank = usize::from(a.kind != EntryKind::Dir);
         let b_rank = usize::from(b.kind != EntryKind::Dir);
-        a_rank.cmp(&b_rank).then_with(|| {
-            compare_by_sort(
-                walk.sort,
-                walk.order,
-                &a.name,
-                &b.name,
-                a.meta.modified().ok(),
-                b.meta.modified().ok(),
-                a.meta.len(),
-                b.meta.len(),
-            )
-        })
-    });
+        a_rank
+            .cmp(&b_rank)
+            .then_with(|| {
+                compare_by_sort(
+                    sort, order, &a.name, &b.name, a.mtime, b.mtime, a.size, b.size,
+                )
+            })
+            .then_with(|| a.path.cmp(&b.path))
+    };
+
+    if depth == 1 && walk.max_depth == 1 {
+        *walk.total = children.len();
+        let page = select_and_sort_page(&mut children, walk.offset, walk.limit, cmp_children);
+        for child in page {
+            if walk.cancel.is_cancelled() {
+                return Err(cancelled_error("fs.list"));
+            }
+            if !push_list_entry(
+                walk,
+                std::mem::take(&mut child.name),
+                &child.path,
+                &child.meta,
+                child.kind,
+                child.media.take(),
+            ) {
+                break;
+            }
+        }
+        return Ok(());
+    }
+
+    children.sort_by(cmp_children);
 
     for child in children {
         let ChildItem {
             name,
             path: child_path,
             meta,
+            mtime: _,
+            size: _,
             kind,
-            category,
-            mime,
+            media,
         } = child;
         if walk.cancel.is_cancelled() {
             return Err(cancelled_error("fs.list"));
@@ -403,40 +631,7 @@ fn list_dir(dir: &Path, depth: u32, walk: &mut ListWalk<'_>) -> Result<(), ToolE
         *walk.total = walk.total.saturating_add(1);
 
         if index >= walk.offset && !*walk.page_full {
-            if walk.entries.len() == walk.limit {
-                *walk.page_full = true;
-            } else {
-                let target = if kind == EntryKind::Symlink {
-                    fs::read_link(&child_path)
-                        .ok()
-                        .map(|link| path_to_string(&link))
-                } else {
-                    None
-                };
-                let entry = ListEntry {
-                    name,
-                    path: path_to_string(&child_path),
-                    kind,
-                    size: meta.len(),
-                    mtime: format_mtime(&meta),
-                    mode: platform::unix_mode(&meta),
-                    target,
-                    category,
-                    mime: mime.map(str::to_owned),
-                };
-                let entry_bytes = serde_json::to_vec(&entry).map_or(0, |v| v.len())
-                    + usize::from(!walk.entries.is_empty());
-                if !walk.entries.is_empty()
-                    && walk.reply_bytes.saturating_add(entry_bytes) > MAX_REPLY_BYTES
-                {
-                    *walk.page_full = true;
-                } else {
-                    walk.reply_bytes = walk.reply_bytes.saturating_add(entry_bytes);
-                    walk.entries.push(entry);
-                    let count = walk.entries.len();
-                    walk.progress.maybe_emit(|| json!({"entries": count}));
-                }
-            }
+            let _ = push_list_entry(walk, name, &child_path, &meta, kind, media);
         }
 
         if kind == EntryKind::Dir
@@ -909,5 +1104,119 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.code, ErrorCode::Failed);
         assert!(err.hint.is_some());
+    }
+
+    #[test]
+    fn select_and_sort_page_matches_full_sort_across_every_slice() {
+        let base: Vec<i32> = (0..100).map(|i| (i * 37) % 100).collect();
+        let mut full = base.clone();
+        full.sort();
+
+        for (offset, limit) in [(0, 10), (10, 15), (90, 20), (100, 10), (0, 0), (0, 200)] {
+            let mut copy = base.clone();
+            let got = select_and_sort_page(&mut copy, offset, limit, Ord::cmp).to_vec();
+            let expected: Vec<i32> = full.iter().copied().skip(offset).take(limit).collect();
+            assert_eq!(got, expected, "offset={offset} limit={limit}");
+        }
+    }
+
+    #[test]
+    fn list_dir_shallow_fast_path_matches_general_path_across_pages_and_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for name in ["dir10", "dir2", "AlphaDir", ".hidden_dir"] {
+            fs::create_dir_all(root.join(name)).unwrap();
+        }
+        let files = [
+            "file1.jpg",
+            "file2.png",
+            "file02.jpg",
+            "file10.txt",
+            "Beta.md",
+            "alpha.mp4",
+            "Über2.txt",
+            "über10.jpg",
+            ".hidden.jpg",
+            ".dotfile",
+        ];
+        for (i, name) in files.iter().enumerate() {
+            fs::write(root.join(name), vec![b'x'; (i + 1) * 7]).unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("file1.jpg"), root.join("link.jpg")).unwrap();
+
+        let run_walk = |sort: SortField,
+                        order: SortOrder,
+                        hidden: bool,
+                        categories: Option<&[Category]>,
+                        offset: usize,
+                        limit: usize|
+         -> (Vec<(String, EntryKind, u64)>, usize) {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let own_dirs = OwnDirFilter::allow_all_for_test();
+            let cancel = CancellationToken::new();
+            let mut progress = Progress::for_test(tx);
+            let mut entries = Vec::new();
+            let mut skipped = Vec::new();
+            let mut total = 0usize;
+            let mut visited = 0usize;
+            let mut page_full = false;
+            let mut stopped_early = false;
+            let mut state = ListWalk {
+                max_depth: 1,
+                include_hidden: hidden,
+                limit,
+                offset,
+                sort,
+                order,
+                categories,
+                root_device: None,
+                count_cap: None,
+                visit_cap: None,
+                deadline: None,
+                reply_bytes: 112,
+                own_dirs: &own_dirs,
+                cancel: &cancel,
+                progress: &mut progress,
+                entries: &mut entries,
+                skipped: &mut skipped,
+                total: &mut total,
+                visited: &mut visited,
+                page_full: &mut page_full,
+                stopped_early: &mut stopped_early,
+            };
+            list_dir(root, 1, &mut state).unwrap();
+            let summary = entries
+                .into_iter()
+                .map(|e| (e.name, e.kind, e.size))
+                .collect();
+            (summary, total)
+        };
+
+        let img_cats = [Category::Image];
+        for order in [SortOrder::Asc, SortOrder::Desc] {
+            for hidden in [true, false] {
+                for cats in [None, Some(img_cats.as_slice())] {
+                    let (full, full_total) = run_walk(SortField::Name, order, hidden, cats, 0, 100);
+                    assert_eq!(full.len(), full_total);
+                    // Verify paging slices reconstruct the exact full listing.
+                    let mut paged = Vec::new();
+                    let mut off = 0;
+                    while off < full_total {
+                        let (chunk, total) = run_walk(SortField::Name, order, hidden, cats, off, 3);
+                        assert_eq!(total, full_total);
+                        paged.extend(chunk);
+                        off += 3;
+                    }
+                    assert_eq!(paged, full);
+
+                    // Verify past-end offset returns empty with exact total.
+                    let (empty, total) =
+                        run_walk(SortField::Name, order, hidden, cats, full_total + 5, 3);
+                    assert!(empty.is_empty());
+                    assert_eq!(total, full_total);
+                }
+            }
+        }
     }
 }

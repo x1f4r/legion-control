@@ -19,14 +19,12 @@ import {
   isThumbEligible,
   parentFilePath,
   plainCategoryLabel,
-  selectAllEntries,
   selectionSummary,
   shouldDefaultToGrid,
   sizePresetBounds,
   sortDescription,
   sortEntries,
   splitFileCrumbs,
-  toggleSelection,
 } from '../lib/files.js';
 import {
   readFolderViewMode,
@@ -4439,5 +4437,3 @@ export function FilesDock({ route, filesState, filesActions, onNavigateHref }) {
 
   return null;
 }
-
-export { selectAllEntries, selectionSummary, toggleSelection };

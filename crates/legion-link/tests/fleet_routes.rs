@@ -345,7 +345,7 @@ async fn real_two_sshd_fleet_learn_direct_routing_failover_and_revocation() {
         &user_a,
         &[
             "device.invite",
-            "name=pixel",
+            "name=handset",
             "role=owner",
             "allow_owner=true",
         ],
@@ -360,7 +360,7 @@ async fn real_two_sshd_fleet_learn_direct_routing_failover_and_revocation() {
             ..LinkOptions::default()
         },
     );
-    let enrolled = link.pair(invite_text, "pixel").await.unwrap();
+    let enrolled = link.pair(invite_text, "handset").await.unwrap();
     assert_eq!(enrolled.node, "tower");
     assert_eq!(enrolled.role, "owner");
     assert_eq!(
@@ -497,7 +497,7 @@ async fn real_two_sshd_fleet_learn_direct_routing_failover_and_revocation() {
     ));
     shared_link.close().await;
 
-    // 7. Stop A, remove `pixel` on B while A is stopped: B refuses with `device_removed_or_unknown`.
+    // 7. Stop A, remove `handset` on B while A is stopped: B refuses with `device_removed_or_unknown`.
     //    Then start A and push `devices.toml` from B to A: A also refuses with
     //    `device_removed_or_unknown`.
     link.close().await;
@@ -506,7 +506,7 @@ async fn real_two_sshd_fleet_learn_direct_routing_failover_and_revocation() {
         &legion_bin,
         &home_b,
         &user_b,
-        &["device.remove", "name=pixel"],
+        &["device.remove", "name=handset"],
     );
 
     let err_b_revoked = link
@@ -610,7 +610,7 @@ async fn real_node_endpoint_superset_host_keys_does_not_flag_identity_changed() 
         &user_a,
         &[
             "device.invite",
-            "name=pixel",
+            "name=handset",
             "role=owner",
             "allow_owner=true",
         ],
@@ -624,7 +624,7 @@ async fn real_node_endpoint_superset_host_keys_does_not_flag_identity_changed() 
             ..LinkOptions::default()
         },
     );
-    link.pair(invite_text, "pixel").await.unwrap();
+    link.pair(invite_text, "handset").await.unwrap();
     assert_eq!(
         link.config()
             .node("tower")
@@ -836,7 +836,7 @@ async fn real_two_sshd_relayed_streams_then_learn_switches_to_direct() {
         &user_a,
         &[
             "device.invite",
-            "name=pixel",
+            "name=handset",
             "role=owner",
             "allow_owner=true",
         ],
@@ -849,7 +849,7 @@ async fn real_two_sshd_relayed_streams_then_learn_switches_to_direct() {
             ..LinkOptions::default()
         },
     );
-    link.pair(invite_text, "pixel").await.unwrap();
+    link.pair(invite_text, "handset").await.unwrap();
     assert!(link.config().node("pi").is_none());
 
     // 2. Relayed ranged `open_content` on `pi` through `tower`.
@@ -1095,7 +1095,7 @@ async fn real_two_sshd_direct_and_relayed_put_if_exists_fail_refuses_raced_file_
         &user_a,
         &[
             "device.invite",
-            "name=pixel",
+            "name=handset",
             "role=owner",
             "allow_owner=true",
         ],
@@ -1108,7 +1108,7 @@ async fn real_two_sshd_direct_and_relayed_put_if_exists_fail_refuses_raced_file_
             ..LinkOptions::default()
         },
     );
-    link.pair(invite_text, "pixel").await.unwrap();
+    link.pair(invite_text, "handset").await.unwrap();
     assert!(link.config().node("pi").is_none());
 
     // 1. Direct upload on `tower`: create the colliding file *between `fs.stat` and `put`*.
@@ -1408,7 +1408,7 @@ async fn real_two_sshd_learn_surfaces_name_mismatch_rejection_from_node() {
         &user_a,
         &[
             "device.invite",
-            "name=pixel",
+            "name=handset",
             "role=owner",
             "allow_owner=true",
         ],
@@ -1421,7 +1421,7 @@ async fn real_two_sshd_learn_surfaces_name_mismatch_rejection_from_node() {
             ..LinkOptions::default()
         },
     );
-    link.pair(invite_text, "pixel").await.unwrap();
+    link.pair(invite_text, "handset").await.unwrap();
 
     let report = link.learn().await.unwrap();
     assert!(
