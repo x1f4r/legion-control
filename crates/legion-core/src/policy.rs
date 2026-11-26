@@ -2526,8 +2526,7 @@ fn is_disallowed_windows_device_namespace(path: &[u8]) -> bool {
                 let mut parts = after_unc.split(|byte| Platform::Windows.separates(*byte));
                 let server = parts.next().unwrap_or_default();
                 let share = parts.next().unwrap_or_default();
-                let valid_segment =
-                    |seg: &[u8]| !seg.is_empty() && seg != b"." && seg != b"..";
+                let valid_segment = |seg: &[u8]| !seg.is_empty() && seg != b"." && seg != b"..";
                 if valid_segment(server) && valid_segment(share) {
                     return false;
                 }

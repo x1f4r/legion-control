@@ -1045,7 +1045,10 @@ mod tests {
         ] {
             let logged = redact_log_path(&sample);
             assert!(!logged.contains(ticket), "{sample} leaked into {logged}");
-            assert!(!logged.contains("lgn_"), "{sample} leaked query into {logged}");
+            assert!(
+                !logged.contains("lgn_"),
+                "{sample} leaked query into {logged}"
+            );
             assert!(logged.contains("<redacted>"), "{sample} -> {logged}");
         }
 

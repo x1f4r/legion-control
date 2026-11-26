@@ -2289,10 +2289,7 @@ paths = [{docs_toml}]
             ui_lower.contains("cross-origin-resource-policy: same-origin"),
             "{ui_head}"
         );
-        assert!(
-            ui_lower.contains("frame-ancestors 'none'"),
-            "{ui_head}"
-        );
+        assert!(ui_lower.contains("frame-ancestors 'none'"), "{ui_head}");
         assert!(
             ui_lower.contains("x-content-type-options: nosniff"),
             "{ui_head}"
@@ -2357,7 +2354,9 @@ paths = [{docs_toml}]
         // 4. DNS rebinding Host is refused with 421.
         let (rebind_head, _) = raw_req(
             port,
-            &format!("GET /v1/health HTTP/1.1\r\nHost: evil.example:{port}\r\nConnection: close\r\n\r\n"),
+            &format!(
+                "GET /v1/health HTTP/1.1\r\nHost: evil.example:{port}\r\nConnection: close\r\n\r\n"
+            ),
         )
         .await;
         assert!(rebind_head.starts_with("HTTP/1.1 421 "), "{rebind_head}");
@@ -2406,14 +2405,18 @@ paths = [{docs_toml}]
 
             let (content_head, _) = raw_req(
                 port,
-                &format!("GET {url} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+                &format!(
+                    "GET {url} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                ),
             )
             .await;
             let content_lower = content_head.to_ascii_lowercase();
             assert!(content_head.starts_with("HTTP/1.1 200 "), "{content_head}");
             assert!(content_lower.contains(expected_ct), "{content_head}");
             assert!(
-                content_lower.contains("content-security-policy: sandbox; default-src 'none'; frame-ancestors 'none'"),
+                content_lower.contains(
+                    "content-security-policy: sandbox; default-src 'none'; frame-ancestors 'none'"
+                ),
                 "{content_head}"
             );
             if expect_attachment {
