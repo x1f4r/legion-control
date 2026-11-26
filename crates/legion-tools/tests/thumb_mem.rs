@@ -804,6 +804,7 @@ async fn benchmark_realistic_photo_timings_and_cold_32_batch() {
         let p = home.join(name);
         let src = format!("testsrc2=size={size}:duration=0.1:rate=10");
         let mut args = vec![
+            "-nostdin",
             "-hide_banner",
             "-loglevel",
             "error",
@@ -821,6 +822,7 @@ async fn benchmark_realistic_photo_timings_and_cold_32_batch() {
         args.push(&p_str);
         let st = std::process::Command::new("ffmpeg")
             .args(&args)
+            .stdin(std::process::Stdio::null())
             .status()
             .unwrap();
         assert!(st.success(), "ffmpeg failed for {name}");

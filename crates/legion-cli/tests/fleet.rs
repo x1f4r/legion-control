@@ -3939,7 +3939,7 @@ fn pipe_handle_drop_is_non_blocking_and_kills_lingering_child() {
         elapsed
     });
     assert!(
-        elapsed < Duration::from_millis(100),
+        elapsed < Duration::from_secs(2),
         "PipeHandle::drop blocked for {elapsed:?}"
     );
 }

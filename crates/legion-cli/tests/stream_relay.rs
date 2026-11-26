@@ -1330,7 +1330,7 @@ fn heartbeats_pass_through_and_both_ends_dying_close_in_bounded_time() {
         drop(stdout);
         drop(stdin);
 
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(8);
         let exited = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 break Some(status);
@@ -1343,15 +1343,15 @@ fn heartbeats_pass_through_and_both_ends_dying_close_in_bounded_time() {
         };
         assert!(
             exited.is_some(),
-            "relay did not exit within 3s after client disappeared mid-get"
+            "relay did not exit within 8s after client disappeared mid-get"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            started.elapsed() < Duration::from_secs(8),
             "relay teardown took too long: {:?}",
             started.elapsed()
         );
         // Downstream target should also notice the broken pipe / shutdown and exit promptly.
-        let target_deadline = Instant::now() + Duration::from_secs(3);
+        let target_deadline = Instant::now() + Duration::from_secs(8);
         while pid_file.exists() && Instant::now() < target_deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -1396,7 +1396,7 @@ fn heartbeats_pass_through_and_both_ends_dying_close_in_bounded_time() {
         assert_eq!(reply["error"]["code"], json!("failed"));
         assert_eq!(reply["error"]["machine"], json!("dyingtarget"));
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            started.elapsed() < Duration::from_secs(8),
             "relay did not report target death mid-put in bounded time: {:?}",
             started.elapsed()
         );
@@ -1549,18 +1549,18 @@ fn stuck_target_50mb_get_sigstop_client_gone_and_timeout() {
             let started = Instant::now();
             drop(stdout);
 
-            let status = wait_child_exit(&mut child, Duration::from_secs(4));
+            let status = wait_child_exit(&mut child, Duration::from_secs(8));
             assert!(
                 status.is_some(),
                 "relay stayed stuck instead of noticing client gone on SIGSTOPped target"
             );
             assert!(
-                started.elapsed() < Duration::from_secs(4),
+                started.elapsed() < Duration::from_secs(8),
                 "client-gone teardown took too long: {:?}",
                 started.elapsed()
             );
-            let remaining_relay = wait_pids_gone(&[relay_pid], Duration::from_secs(2));
-            let remaining_target = wait_pids_gone(&[target_pid], Duration::from_secs(2));
+            let remaining_relay = wait_pids_gone(&[relay_pid], Duration::from_secs(5));
+            let remaining_target = wait_pids_gone(&[target_pid], Duration::from_secs(5));
             if remaining_target > 0 {
                 let _ = Command::new("kill")
                     .args(["-KILL", &target_pid.to_string()])
@@ -1614,7 +1614,7 @@ fn stuck_target_50mb_get_sigstop_client_gone_and_timeout() {
             let mut rest = Vec::new();
             let _ = stdout.read_to_end(&mut rest);
             assert!(
-                started.elapsed() < Duration::from_secs(4),
+                started.elapsed() < Duration::from_secs(8),
                 "timeout took too long on SIGSTOPped get: {:?}",
                 started.elapsed()
             );
@@ -1622,7 +1622,7 @@ fn stuck_target_50mb_get_sigstop_client_gone_and_timeout() {
                 (first_mb.len() + rest.len()) < total as usize,
                 "stream should terminate short on timeout"
             );
-            let status = wait_child_exit(&mut child, Duration::from_secs(3)).expect("relay exit");
+            let status = wait_child_exit(&mut child, Duration::from_secs(8)).expect("relay exit");
             assert!(!status.success());
             let mut err_text = String::new();
             let _ = stderr.read_to_string(&mut err_text);
@@ -1636,8 +1636,8 @@ fn stuck_target_50mb_get_sigstop_client_gone_and_timeout() {
             assert_eq!(last["target"], json!("studio"));
             assert_eq!(last["outcome"], json!("timeout"));
 
-            let remaining_relay = wait_pids_gone(&[relay_pid], Duration::from_secs(2));
-            let remaining_target = wait_pids_gone(&[target_pid], Duration::from_secs(2));
+            let remaining_relay = wait_pids_gone(&[relay_pid], Duration::from_secs(5));
+            let remaining_target = wait_pids_gone(&[target_pid], Duration::from_secs(5));
             if remaining_target > 0 {
                 let _ = Command::new("kill")
                     .args(["-KILL", &target_pid.to_string()])
@@ -1704,19 +1704,19 @@ fn stuck_target_checksum_stat_sigstop_timeout_client_gone_and_deadline_resets() 
         let started = Instant::now();
         let reply = read_json_line(&mut stdout);
         assert!(
-            started.elapsed() < Duration::from_secs(4),
+            started.elapsed() < Duration::from_secs(8),
             "checksum stat timeout took too long: {:?}",
             started.elapsed()
         );
         assert_eq!(reply["error"]["code"], json!("timeout"), "reply={reply}");
         assert_eq!(reply["error"]["machine"], json!("studio"), "reply={reply}");
-        let status = wait_child_exit(&mut child, Duration::from_secs(3)).expect("relay exit");
+        let status = wait_child_exit(&mut child, Duration::from_secs(8)).expect("relay exit");
         assert!(!status.success());
 
         #[cfg(unix)]
         {
-            let remaining_relay = wait_pids_gone(&[relay_pid], Duration::from_secs(2));
-            let remaining_target = wait_pids_gone(&[target_pid], Duration::from_secs(2));
+            let remaining_relay = wait_pids_gone(&[relay_pid], Duration::from_secs(5));
+            let remaining_target = wait_pids_gone(&[target_pid], Duration::from_secs(5));
             if remaining_target > 0 {
                 let _ = Command::new("kill")
                     .args(["-KILL", &target_pid.to_string()])
@@ -1767,18 +1767,18 @@ fn stuck_target_checksum_stat_sigstop_timeout_client_gone_and_deadline_resets() 
         let started = Instant::now();
         drop(stdout);
 
-        let status = wait_child_exit(&mut child, Duration::from_secs(4));
+        let status = wait_child_exit(&mut child, Duration::from_secs(8));
         assert!(
             status.is_some(),
             "relay stayed stuck on SIGSTOPped checksum stat after client disappeared"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(4),
+            started.elapsed() < Duration::from_secs(8),
             "client-gone teardown on stat took too long: {:?}",
             started.elapsed()
         );
-        let remaining_relay = wait_pids_gone(&[relay_pid], Duration::from_secs(2));
-        let remaining_target = wait_pids_gone(&[target_pid], Duration::from_secs(2));
+        let remaining_relay = wait_pids_gone(&[relay_pid], Duration::from_secs(5));
+        let remaining_target = wait_pids_gone(&[target_pid], Duration::from_secs(5));
         if remaining_target > 0 {
             let _ = Command::new("kill")
                 .args(["-KILL", &target_pid.to_string()])

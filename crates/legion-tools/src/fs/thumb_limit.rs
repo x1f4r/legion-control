@@ -115,6 +115,16 @@ impl Drop for WaitGuard {
 }
 
 impl FairPool {
+    #[cfg(test)]
+    fn queued_waiters(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .queues
+            .values()
+            .map(VecDeque::len)
+            .sum()
+    }
     /// Creates a new pool allowing up to `max_units` total units and `max_slots` simultaneous
     /// holders.
     pub(crate) fn new(max_units: u64, max_slots: usize) -> Arc<FairPool> {
@@ -561,27 +571,39 @@ mod tests {
             let o = Arc::clone(&order);
             alice_tasks.push(tokio::spawn(async move {
                 let _permit = p
-                    .acquire("alice", 1, Duration::from_secs(2), &c)
+                    .acquire("alice", 1, Duration::from_secs(5), &c)
                     .await
                     .unwrap();
                 o.lock().unwrap().push("alice");
             }));
         }
-        tokio::task::yield_now().await;
-        tokio::time::sleep(Duration::from_millis(15)).await;
+        let alice_wait_deadline = Instant::now() + Duration::from_secs(5);
+        while pool.queued_waiters() < 4 {
+            assert!(
+                Instant::now() < alice_wait_deadline,
+                "timed out waiting for alice's 4 tasks to queue in FairPool"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
 
         let bob_pool = Arc::clone(&pool);
         let bob_cancel = cancel.clone();
         let bob_order = Arc::clone(&order);
         let bob_task = tokio::spawn(async move {
             let _permit = bob_pool
-                .acquire("bob", 1, Duration::from_secs(2), &bob_cancel)
+                .acquire("bob", 1, Duration::from_secs(5), &bob_cancel)
                 .await
                 .unwrap();
             bob_order.lock().unwrap().push("bob");
         });
-        tokio::task::yield_now().await;
-        tokio::time::sleep(Duration::from_millis(15)).await;
+        let bob_wait_deadline = Instant::now() + Duration::from_secs(5);
+        while pool.queued_waiters() < 5 {
+            assert!(
+                Instant::now() < bob_wait_deadline,
+                "timed out waiting for bob's task to queue in FairPool"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
 
         drop(hold1);
         bob_task.await.unwrap();
@@ -602,7 +624,7 @@ mod tests {
         let pool = FairPool::new(1, 1);
         let hold_cancel = CancellationToken::new();
         let hold = pool
-            .acquire("alice", 1, Duration::from_secs(1), &hold_cancel)
+            .acquire("alice", 1, Duration::from_secs(5), &hold_cancel)
             .await
             .unwrap();
 
@@ -615,13 +637,20 @@ mod tests {
                 .await
                 .err()
         });
-        tokio::time::sleep(Duration::from_millis(15)).await;
+        let waiter_deadline = Instant::now() + Duration::from_secs(5);
+        while pool.queued_waiters() < 1 {
+            assert!(
+                Instant::now() < waiter_deadline,
+                "timed out waiting for bob waiter to queue before cancellation"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         waiter_cancel.cancel();
         assert_eq!(handle.await.unwrap(), Some(AcquireError::Cancelled));
 
         drop(hold);
         let _reacquired = pool
-            .acquire("carol", 1, Duration::from_secs(1), &hold_cancel)
+            .acquire("carol", 1, Duration::from_secs(5), &hold_cancel)
             .await
             .unwrap();
     }
@@ -633,7 +662,7 @@ mod tests {
 
         // Seed 100 MiB in flight so a 250 MiB request cannot fit yet.
         let initial_small = pool
-            .acquire("alice", 100 * MIB, Duration::from_secs(1), &cancel)
+            .acquire("alice", 100 * MIB, Duration::from_secs(5), &cancel)
             .await
             .unwrap();
 
@@ -643,21 +672,28 @@ mod tests {
         let large_flag = Arc::clone(&large_granted);
         let large_task = tokio::spawn(async move {
             let _permit = large_pool
-                .acquire("bob", 250 * MIB, Duration::from_secs(2), &large_cancel)
+                .acquire("bob", 250 * MIB, Duration::from_secs(5), &large_cancel)
                 .await
                 .unwrap();
             large_flag.store(true, Ordering::SeqCst);
         });
 
-        tokio::time::sleep(Duration::from_millis(15)).await;
+        let large_wait_deadline = Instant::now() + Duration::from_secs(5);
+        while pool.queued_waiters() < 1 {
+            assert!(
+                Instant::now() < large_wait_deadline,
+                "timed out waiting for bob's large request to queue in FairPool"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
 
         // First two small requests bypass bob (hitting max_bypasses = 2).
         let s1 = pool
-            .acquire("alice", 50 * MIB, Duration::from_secs(1), &cancel)
+            .acquire("alice", 50 * MIB, Duration::from_secs(5), &cancel)
             .await
             .unwrap();
         let s2 = pool
-            .acquire("alice", 50 * MIB, Duration::from_secs(1), &cancel)
+            .acquire("alice", 50 * MIB, Duration::from_secs(5), &cancel)
             .await
             .unwrap();
 
@@ -668,13 +704,20 @@ mod tests {
         let s3_flag = Arc::clone(&small3_done);
         let s3_task = tokio::spawn(async move {
             let _permit = s3_pool
-                .acquire("carol", 50 * MIB, Duration::from_secs(2), &s3_cancel)
+                .acquire("carol", 50 * MIB, Duration::from_secs(5), &s3_cancel)
                 .await
                 .unwrap();
             s3_flag.store(true, Ordering::SeqCst);
         });
 
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        let small3_wait_deadline = Instant::now() + Duration::from_secs(5);
+        while pool.queued_waiters() < 2 {
+            assert!(
+                Instant::now() < small3_wait_deadline,
+                "timed out waiting for carol's third small request to queue behind bob"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert!(
             !small3_done.load(Ordering::SeqCst),
             "small request must not keep jumping ahead once large waiter hits anti-starvation threshold"

@@ -260,6 +260,9 @@ fn helper(mode: &str, args: Vec<String>) -> ExitCode {
         // Sleeps, ignoring the polite request to stop where there is one (SIGTERM).
         "stubborn" => {
             let _ignoring = ignore_terminate();
+            if let Some(ready_path) = args.iter().find_map(|a| a.strip_prefix("--ready=")) {
+                write_atomically(Path::new(ready_path), "ready");
+            }
             let _ = writeln!(stdout, "sleeping");
             let _ = stdout.flush();
             std::thread::sleep(Duration::from_secs(60));

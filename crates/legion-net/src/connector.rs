@@ -142,20 +142,24 @@ impl PipeHandle {
     }
 
     /// Waits briefly for the process to exit and for stderr draining to flush, returning the exit
-    /// code (if exited) and the captured stderr tail.
+    /// code (if exited) and the captured stderr tail. Both waits share a single `wait_limit`
+    /// budget; if the child is still running when it expires, stderr draining is left for `close`.
     pub async fn collect_exit_info(&mut self, wait_limit: Duration) -> (Option<i32>, String) {
-        let exit_code = match self.child.try_wait() {
-            Ok(Some(status)) => status.code(),
-            _ => match tokio::time::timeout(wait_limit, self.child.wait()).await {
-                Ok(Ok(status)) => status.code(),
-                _ => None,
+        let deadline = tokio::time::Instant::now() + wait_limit;
+        let (exited, exit_code) = match self.child.try_wait() {
+            Ok(Some(status)) => (true, status.code()),
+            _ if wait_limit.is_zero() => (false, None),
+            _ => match tokio::time::timeout_at(deadline, self.child.wait()).await {
+                Ok(Ok(status)) => (true, status.code()),
+                _ => (false, None),
             },
         };
-        if let Some(task) = self.stderr_task.take() {
-            let mut task = task;
-            if tokio::time::timeout(wait_limit, &mut task).await.is_err() {
-                task.abort();
-            }
+        if exited
+            && !wait_limit.is_zero()
+            && let Some(mut task) = self.stderr_task.take()
+            && tokio::time::timeout_at(deadline, &mut task).await.is_err()
+        {
+            task.abort();
         }
         (exit_code, self.stderr.text())
     }
@@ -429,5 +433,34 @@ mod tests {
         assert!(!text.contains("line-0"), "{text}");
         assert!(text.contains("line-49"), "{text}");
         assert!(text.len() <= 8 * 1024 + 200);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn collect_exit_info_bounds_total_wait_for_running_child_to_single_limit() {
+        let pipe = Pipe::spawn_command(
+            &[
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "exec sleep 30".to_owned(),
+            ],
+            Subcommand::Rpc,
+        )
+        .unwrap();
+        let (_stdin, _stdout, mut handle) = pipe.into_parts();
+        let limit = Duration::from_millis(600);
+        let started = std::time::Instant::now();
+        let (code, _stderr) = handle.collect_exit_info(limit).await;
+        let elapsed = started.elapsed();
+        assert_eq!(code, None);
+        assert!(
+            handle.stderr_task.is_some(),
+            "collect_exit_info must not wait on or abort stderr_task while the child is still running"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1100),
+            "collect_exit_info waited twice ({elapsed:?}) for a single {limit:?} limit"
+        );
+        handle.close(Duration::from_millis(50)).await;
     }
 }
