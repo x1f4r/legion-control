@@ -832,9 +832,15 @@ export function createMusicController({
 
     const nextMachine = typeof raw.machine === 'string' ? raw.machine : state.machine;
     const nextPath = typeof raw.path === 'string' ? raw.path : state.path;
+    const hydratedSiblings =
+      state.siblings.length > 0
+        ? state.siblings
+        : Array.isArray(raw.tracks) && raw.tracks.length > 0
+          ? raw.tracks
+          : state.siblings;
     const trackChanged = nextPath && nextPath !== state.path;
     const matchingSibling =
-      (nextPath && state.siblings.find((s) => s.path === nextPath)) ||
+      (nextPath && hydratedSiblings.find((s) => s.path === nextPath)) ||
       (trackChanged
         ? { name: raw.name || baseFileName(nextPath), path: nextPath, kind: 'file' }
         : state.entry);
@@ -846,7 +852,7 @@ export function createMusicController({
       : state.queue.shuffledPaths;
     const nextQueue = nextPath
       ? resolveMusicQueueState(
-          state.siblings.length > 0 ? state.siblings : matchingSibling ? [matchingSibling] : [],
+          hydratedSiblings.length > 0 ? hydratedSiblings : matchingSibling ? [matchingSibling] : [],
           nextPath,
           {
             shuffle: nextShuffle,
@@ -886,6 +892,7 @@ export function createMusicController({
       path: nextPath,
       entry: matchingSibling,
       name: nextName,
+      siblings: hydratedSiblings,
       queue: nextQueue,
       shuffle: nextShuffle,
       repeat: nextRepeat,
