@@ -857,7 +857,7 @@ export function VideoPlayer({
   }, [commitZoomMode]);
 
   // Reset zoom outside full screen; auto-apply remembered fill on entering full screen iff <= 15% crop.
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!isFullscreen) {
       zoomAutoAppliedRef.current = false;
       setPinchScale(null);
