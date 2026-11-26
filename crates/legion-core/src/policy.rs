@@ -2492,11 +2492,57 @@ fn names_a_stream(path: &[u8], platform: Platform) -> bool {
     platform == Platform::Windows && volume(path, platform).1.contains(&b':')
 }
 
+/// Whether `path` uses the Windows Win32 device namespace (`\\.\...`) or an extended-length
+/// verbatim prefix (`\\?\...`) that is neither a standard drive (`\\?\C:\...`) nor a standard
+/// UNC share (`\\?\UNC\server\share\...`). Such paths bypass drive/share matching (for example
+/// `\\?\Volume{<guid>}\Users\me\.ssh` or `\\?\GLOBALROOT\...`) or open raw devices/pipes
+/// (`\\.\PhysicalDrive0`, `\\.\pipe\...`).
+fn is_disallowed_windows_device_namespace(path: &[u8]) -> bool {
+    let sep = |b: Option<&u8>| b.is_some_and(|byte| Platform::Windows.separates(*byte));
+    if !sep(path.first()) || !sep(path.get(1)) {
+        return false;
+    }
+    match path.get(2) {
+        Some(b'.') if path.get(3).is_none() || sep(path.get(3)) => true,
+        Some(b'?') if path.get(3).is_none() || sep(path.get(3)) => {
+            let Some(rest) = path.get(4..) else {
+                return true;
+            };
+            let is_drive = rest.first().is_some_and(u8::is_ascii_alphabetic)
+                && rest.get(1) == Some(&b':')
+                && rest
+                    .get(2)
+                    .is_none_or(|byte| Platform::Windows.separates(*byte));
+            if is_drive {
+                return false;
+            }
+            if rest
+                .get(..3)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"UNC"))
+                && sep(rest.get(3))
+            {
+                let after_unc = &rest[4..];
+                let mut parts = after_unc.split(|byte| Platform::Windows.separates(*byte));
+                let server = parts.next().unwrap_or_default();
+                let share = parts.next().unwrap_or_default();
+                let valid_segment =
+                    |seg: &[u8]| !seg.is_empty() && seg != b"." && seg != b"..";
+                if valid_segment(server) && valid_segment(share) {
+                    return false;
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Pure platform-specific path component check run by [`Grant::check_path`].
 ///
 /// On Windows, Win32 silently strips trailing dots and spaces from path components (so `.kube.`
 /// opens `.kube` and `.ssh ` opens `.ssh`), treats a colon after the drive/share prefix as an NTFS
-/// alternate data stream, and redirects reserved DOS device names (`CON`, `NUL`, `COM1`..`COM9`,
+/// alternate data stream, opens raw devices/pipes or alternate volume spellings under `\\.\` and
+/// non-drive `\\?\`, and redirects reserved DOS device names (`CON`, `NUL`, `COM1`..`COM9`,
 /// `LPT1`..`LPT9`, etc.) regardless of extension. Parameterised by [`Platform`] so every rule is
 /// tested on every host OS.
 fn validate_platform_path(
@@ -2506,6 +2552,18 @@ fn validate_platform_path(
 ) -> Result<(), ErrorBody> {
     if platform != Platform::Windows {
         return Ok(());
+    }
+    if is_disallowed_windows_device_namespace(path) {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            format!(
+                "{} uses a Windows device namespace or non-drive verbatim path, which Legion does not open.",
+                display.display()
+            ),
+        )
+        .with_hint(
+            "Use a normal Windows drive path (C:\\...) or UNC share path (\\\\server\\share\\...).",
+        ));
     }
     if names_a_stream(path, platform) {
         return Err(ErrorBody::new(
@@ -3953,11 +4011,32 @@ role = "wide"
             r"C:\Users\me\projects\console.txt",
             r"C:\Users\me\projects\COM0",
             r"\\?\C:\Users\me\projects\readme.md",
+            r"\\?\UNC\tower\share\projects\readme.md",
         ] {
             assert!(
                 check(good_windows, Platform::Windows).is_ok(),
                 "{good_windows}"
             );
+        }
+
+        // Win32 device namespace (`\\.\...`) and non-drive/non-UNC verbatim prefixes
+        // (`\\?\Volume{...}`, `\\?\GLOBALROOT\...`, `\\?\Pipe\...`) are always refused.
+        for device_ns in [
+            r"\\.\PhysicalDrive0",
+            r"\\.\pipe\docker_engine",
+            r"\\.\C:\Users\me\.ssh\id_ed25519",
+            "//./NUL",
+            r"\\.\COM1",
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\Users\me\.ssh\authorized_keys",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\Users\me\.ssh\id_ed25519",
+            r"\\?\Pipe\mypipe",
+            r"\\?\C:relative",
+            r"\\?\UNC\tower",
+            r"\\?\UNC\.\share\file",
+            r"\\?\",
+        ] {
+            let err = check(device_ns, Platform::Windows).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidArgs, "{device_ns}");
         }
 
         // Unix and macOS do not strip trailing dots/spaces or reserve DOS device names.
