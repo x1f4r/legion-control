@@ -38,6 +38,14 @@ pub struct DevicesState {
     /// Paired devices, keyed by unique device name.
     #[serde(default)]
     pub devices: BTreeMap<String, DeviceRecord>,
+    /// Local-only records for devices enrolled on THIS machine that have not yet opened an
+    /// authenticated `legion gate` session with their permanent key, keyed by `pairing_id`.
+    ///
+    /// Written to `state/devices.json` before `devices.toml`, `policy.toml`, and `authorized_keys`
+    /// are mutated during enrolment so any crash mid-enrolment can be repaired on the next run,
+    /// and never written into the fleet-synced `devices.toml`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub unconfirmed: BTreeMap<String, UnconfirmedRecord>,
 }
 
 fn default_version() -> u32 {
@@ -76,6 +84,37 @@ pub struct InviteRecord {
     pub expires: String,
     /// `SHA256:...` fingerprint of the temporary public key.
     pub fingerprint: String,
+    /// Sorted, deduplicated `SHA256:...` fingerprints of the host keys pinned into this invite,
+    /// used to verify proof-of-possession signatures bound to this machine identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_key_fingerprints: Vec<String>,
+}
+
+/// Local-only record of an enrolment on THIS machine awaiting its first authenticated session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnconfirmedRecord {
+    /// Pairing identifier allocated for this enrolment.
+    pub pairing_id: String,
+    /// Single-use invite identifier that created this enrolment, used to remove a leftover invite
+    /// if the process was killed after `devices.toml` committed.
+    pub invite_id: String,
+    /// Unique sanitised device name chosen for this enrolment.
+    pub name: String,
+    /// Principal pinned for this enrolment.
+    pub principal: String,
+    /// `SHA256:...` fingerprint of the enrolled device public key.
+    pub fingerprint: String,
+    /// RFC 3339 UTC timestamp when enrolment began.
+    pub created: String,
+    /// Previous unconfirmed leftover's `pairing_id` that this enrolment is replacing, if any.
+    ///
+    /// Step 1 records this without removing the old `state.unconfirmed` entry; if the process is
+    /// killed before step 2 commits `devices.toml`, repair rolls back by dropping only this new
+    /// record so the old leftover stays unconfirmed and the invite stays usable. Once step 2
+    /// commits, repair (and step 4) rolls forward by removing the invite, dropping the replaced
+    /// record, and restoring the new permanent `authorized_keys` line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces_pairing_id: Option<String>,
 }
 
 /// Non-secret metadata for one paired device.
@@ -198,6 +237,7 @@ pub fn load_state(paths: &Paths) -> Result<DevicesState, ErrorBody> {
             version: 1,
             invites: BTreeMap::new(),
             devices: BTreeMap::new(),
+            unconfirmed: BTreeMap::new(),
         }),
         Err(error) => Err(ErrorBody::new(
             ErrorCode::Failed,
@@ -344,7 +384,7 @@ pub fn unique_device_name(raw: &str, existing: &HashSet<String>) -> String {
     }
 }
 
-fn state_path(paths: &Paths) -> PathBuf {
+pub(crate) fn state_path(paths: &Paths) -> PathBuf {
     paths.state_dir().join("devices.json")
 }
 
@@ -440,6 +480,7 @@ mod tests {
                         created: "2026-11-24T11:44:00Z".to_owned(),
                         expires: format_rfc3339(past),
                         fingerprint: key1.fingerprint,
+                        host_key_fingerprints: Vec::new(),
                     },
                 ),
                 (
@@ -456,6 +497,7 @@ mod tests {
                         created: "2026-11-24T11:55:00Z".to_owned(),
                         expires: format_rfc3339(future),
                         fingerprint: key3.fingerprint,
+                        host_key_fingerprints: Vec::new(),
                     },
                 ),
                 (
@@ -472,10 +514,12 @@ mod tests {
                         created: "2026-11-24T11:55:00Z".to_owned(),
                         expires: format_rfc3339(future),
                         fingerprint: "SHA256:abc".to_owned(),
+                        host_key_fingerprints: Vec::new(),
                     },
                 ),
             ]),
             devices: BTreeMap::new(),
+            unconfirmed: BTreeMap::new(),
         };
 
         let (auth_changed, state_changed) = sweep(&mut auth, &mut state, now);

@@ -217,10 +217,24 @@ async fn run(command: Command) -> ExitCode {
             code
         }
         Command::Rpc { pinned } => {
+            if let Ok(node_file) = node.config().get::<legion_core::config::NodeFile>() {
+                legion_tools::device::registry::repair_incomplete_enrolments_at_start(
+                    node.paths(),
+                    &node.name(),
+                    &node_file,
+                );
+            }
             let shutdown = install_shutdown_token();
             serve_rpc(node, router, pinned, Door::Rpc, None, None, shutdown).await
         }
         Command::Mcp { pinned, compact } => {
+            if let Ok(node_file) = node.config().get::<legion_core::config::NodeFile>() {
+                legion_tools::device::registry::repair_incomplete_enrolments_at_start(
+                    node.paths(),
+                    &node.name(),
+                    &node_file,
+                );
+            }
             let shutdown = install_shutdown_token();
             serve_mcp(node, router, pinned, compact, shutdown).await
         }
@@ -237,6 +251,13 @@ async fn run(command: Command) -> ExitCode {
             account,
             ..
         }) => {
+            if let Ok(node_file) = node.config().get::<legion_core::config::NodeFile>() {
+                legion_tools::device::registry::repair_incomplete_enrolments_at_start(
+                    node.paths(),
+                    &node.name(),
+                    &node_file,
+                );
+            }
             let shutdown = install_shutdown_token();
             gate(
                 node, fleet, router, pinned, device, pairing, account, shutdown,
@@ -254,6 +275,13 @@ async fn run(command: Command) -> ExitCode {
             code
         }
         Command::Serve { listen, help } => {
+            if let Ok(node_file) = node.config().get::<legion_core::config::NodeFile>() {
+                legion_tools::device::registry::repair_incomplete_enrolments_at_start(
+                    node.paths(),
+                    &node.name(),
+                    &node_file,
+                );
+            }
             let shutdown = install_shutdown_token();
             serve::run(node, router, listen, help, shutdown).await
         }
@@ -551,34 +579,24 @@ async fn enrol(
     account: Option<String>,
     shutdown: CancellationToken,
 ) -> ExitCode {
-    let reply = if let Err(error) =
-        legion_tools::device::authkeys::verify_gate_account(account.as_deref())
-    {
-        EnrolReply::from_error(error)
-    } else {
-        tokio::select! {
-            reply = legion_tools::device::enrol::run_enrol(&node, &id, tokio::io::stdin()) => reply,
-            () = shutdown.cancelled() => EnrolReply::from_error(ErrorBody::new(
-                ErrorCode::Cancelled,
-                "Device enrolment was cancelled by signal.",
-            )),
+    if let Err(error) = legion_tools::device::authkeys::verify_gate_account(account.as_deref()) {
+        router.shutdown().await;
+        let reply = EnrolReply::from_error(error);
+        if let Ok(line) = serde_json::to_string(&reply) {
+            out(&format!("{line}\n"));
         }
-    };
-    router.shutdown().await;
-    match serde_json::to_string(&reply) {
-        Ok(line) => out(&format!("{line}\n")),
-        Err(error) => {
-            let fallback = EnrolReply::from_error(ErrorBody::new(
-                ErrorCode::Internal,
-                format!("The enrolment reply cannot be written as JSON: {error}."),
-            ));
-            if let Ok(line) = serde_json::to_string(&fallback) {
-                out(&format!("{line}\n"));
-            }
-            return ExitCode::from(FAILED);
-        }
+        return ExitCode::from(FAILED);
     }
-    if reply.is_ok() {
+    let result = legion_tools::device::enrol::run_enrol_io(
+        &node,
+        &id,
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        shutdown.cancelled(),
+    )
+    .await;
+    router.shutdown().await;
+    if result.reply.is_ok() && result.delivered {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(FAILED)

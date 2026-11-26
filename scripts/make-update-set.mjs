@@ -16,7 +16,7 @@
 //   node scripts/make-update-set.mjs verify --dir <dir> --public-key <public-key>
 //   node scripts/make-update-set.mjs check-artifact \
 //     --file <path> --kind <binary|apk|deb|appimage|app-tar|nsis|app-bundle|ipa> \
-//     --sequence <SEQ> [--forbid-preview-key] [--build-log <path>]
+//     --sequence <SEQ> [--forbid-preview-key | --expect-preview-key <SHA256:...|pem-path>] [--build-log <path>]
 //
 // Default preview key locations (always outside the repository, mode 600 for private):
 //   private key: ~/.legion-control/preview-update.key
@@ -560,6 +560,46 @@ function assertNoPreviewKeyInMarkers(previewMarkers, context) {
   if (bad.length > 0) {
     throw new Error(
       `${context} trusts a compiled-in preview update key (${[...new Set(bad)].join(', ')}); official release and CI artifacts must contain no preview key.`,
+    );
+  }
+}
+
+function normalizeExpectedPreviewFingerprint(rawExpected) {
+  const trimmed = String(rawExpected || '').trim();
+  if (!trimmed) {
+    throw new Error('Expected preview key fingerprint or public key PEM path cannot be empty.');
+  }
+  if (/^SHA256:[A-Za-z0-9+/]{43}$/.test(trimmed)) {
+    return trimmed;
+  }
+  if (trimmed.includes('PRIVATE KEY')) {
+    throw new Error('Refusing private key material in --expect-preview-key; pass a SHA256:<fingerprint> or public key PEM.');
+  }
+  if (trimmed.includes('-----BEGIN PUBLIC KEY-----')) {
+    return publicKeyFingerprint(trimmed);
+  }
+  if (fs.existsSync(trimmed) && fs.statSync(trimmed).isFile()) {
+    const pem = fs.readFileSync(trimmed, 'utf8');
+    if (pem.includes('PRIVATE KEY')) {
+      throw new Error(`Refusing private key file ${trimmed} in --expect-preview-key.`);
+    }
+    return publicKeyFingerprint(pem);
+  }
+  throw new Error(
+    `Invalid --expect-preview-key value ${JSON.stringify(trimmed)}: expected SHA256:<43-char-base64> or a path to an Ed25519 SPKI public key PEM.`,
+  );
+}
+
+function assertExpectedPreviewKeyInMarkers(previewMarkers, expectedFp, context) {
+  if (!Array.isArray(previewMarkers) || previewMarkers.length === 0) {
+    throw new Error(
+      `${context} is missing a compiled LEGION_UPDATE_PREVIEW_KEY marker; expected ${expectedFp}.`,
+    );
+  }
+  const unique = [...new Set(previewMarkers)];
+  if (unique.length !== 1 || unique[0] !== expectedFp) {
+    throw new Error(
+      `${context} has compiled LEGION_UPDATE_PREVIEW_KEY=${unique.join(', ')}, expected ${expectedFp}.`,
     );
   }
 }
@@ -1325,6 +1365,9 @@ function inspectAppImageSquashfs(filePath) {
  * 3. When `requireExactlyOne` is true, each compiled binary contains literally 1 sequence marker.
  * 4. When `forbidPreviewKey` is true, every compiled binary contains `LEGION_UPDATE_PREVIEW_KEY=none`
  *    and zero preview key fingerprints, and optional `buildLogPath` contains no preview key warning.
+ * 5. When `expectPreviewKey` is set (either `SHA256:<base64>` or a public key PEM/path), every
+ *    compiled binary contains `LEGION_UPDATE_PREVIEW_KEY=<expected>` and optional `buildLogPath`
+ *    does not report a release-only or mismatched preview key.
  */
 export function checkShippedArtifact({
   filePath,
@@ -1333,17 +1376,38 @@ export function checkShippedArtifact({
   sequence,
   requireExactlyOne = false,
   forbidPreviewKey = false,
+  expectPreviewKey = null,
   buildLogPath = null,
 }) {
+  if (forbidPreviewKey && expectPreviewKey) {
+    throw new Error('--forbid-preview-key and --expect-preview-key cannot be combined.');
+  }
+  const expectedPreviewFp = expectPreviewKey
+    ? normalizeExpectedPreviewFingerprint(expectPreviewKey)
+    : null;
   const expectedStr = String(sequence);
   const label = `${name} (${kind})`;
 
-  if (forbidPreviewKey && buildLogPath) {
+  if (buildLogPath) {
     const logText = fs.readFileSync(buildLogPath, 'utf8');
-    if (/preview update key compiled in/i.test(logText)) {
+    if (forbidPreviewKey && /preview update key compiled in/i.test(logText)) {
       throw new Error(
         `${label}: build log ${buildLogPath} reports a compiled-in preview update key; refusing to ship.`,
       );
+    }
+    if (expectedPreviewFp) {
+      if (/release update key only \(no preview key\)/i.test(logText)) {
+        throw new Error(
+          `${label}: build log ${buildLogPath} reports release update key only (no preview key); expected ${expectedPreviewFp}.`,
+        );
+      }
+      for (const match of logText.matchAll(/preview update key compiled in \(([^)]+)\)/gi)) {
+        if (match[1].trim() !== expectedPreviewFp) {
+          throw new Error(
+            `${label}: build log ${buildLogPath} reports preview key ${match[1].trim()}, expected ${expectedPreviewFp}.`,
+          );
+        }
+      }
     }
   }
 
@@ -1352,6 +1416,9 @@ export function checkShippedArtifact({
     assertSequenceMarkersMatch(report.seqMarkers, expectedStr, ctx, { requireExactlyOne });
     if (forbidPreviewKey) {
       assertNoPreviewKeyInMarkers(report.previewMarkers, ctx);
+    }
+    if (expectedPreviewFp) {
+      assertExpectedPreviewKeyInMarkers(report.previewMarkers, expectedPreviewFp, ctx);
     }
   };
 
@@ -1960,7 +2027,7 @@ function usage() {
     '  node scripts/make-update-set.mjs tauri-config --os <linux|macos|windows> --version VER --sequence SEQ',
     '  node scripts/make-update-set.mjs create --out DIR --channel <preview|stable> --version VER --build REV [--sequence SEQ] [--notes TEXT | --notes-file PATH] --key KEY [--public-key PUB] --artifact SPEC [--artifact SPEC ...] [--force]',
     '  node scripts/make-update-set.mjs verify --dir DIR --public-key PUB',
-    '  node scripts/make-update-set.mjs check-artifact --file PATH --kind KIND --sequence SEQ [--forbid-preview-key] [--build-log PATH]',
+    '  node scripts/make-update-set.mjs check-artifact --file PATH --kind KIND --sequence SEQ [--forbid-preview-key | --expect-preview-key FP_OR_PEM] [--build-log PATH]',
   ].join('\n');
 }
 
@@ -2059,12 +2126,14 @@ function runCli(argv) {
     let kind;
     let sequence;
     let forbidPreviewKey = false;
+    let expectPreviewKey = null;
     let buildLogPath = null;
     for (let i = 0; i < rest.length; i += 1) {
       if (rest[i] === '--file') filePath = rest[++i];
       else if (rest[i] === '--kind') kind = rest[++i];
       else if (rest[i] === '--sequence') sequence = Number(rest[++i]);
       else if (rest[i] === '--forbid-preview-key') forbidPreviewKey = true;
+      else if (rest[i] === '--expect-preview-key') expectPreviewKey = rest[++i];
       else if (rest[i] === '--build-log') buildLogPath = rest[++i];
       else throw new Error(`Unknown option: ${rest[i]}`);
     }
@@ -2077,10 +2146,16 @@ function runCli(argv) {
       sequence,
       requireExactlyOne: true,
       forbidPreviewKey,
+      expectPreviewKey,
       buildLogPath,
     });
+    const keyNote = forbidPreviewKey
+      ? ', no preview key'
+      : expectPreviewKey
+        ? `, preview key ${normalizeExpectedPreviewFingerprint(expectPreviewKey)}`
+        : '';
     console.log(
-      `Verified shipped artifact ${path.basename(filePath)} (${kind}): sequence ${sequence}${forbidPreviewKey ? ', no preview key' : ''}.`,
+      `Verified shipped artifact ${path.basename(filePath)} (${kind}): sequence ${sequence}${keyNote}.`,
     );
     return;
   }

@@ -1,9 +1,17 @@
 //! Device identity keys (Ed25519) in OpenSSH format.
 
+use std::collections::BTreeSet;
+
 use legion_proto::{ErrorBody, ErrorCode};
 use russh::keys::ssh_key::private::Ed25519Keypair;
 use russh::keys::ssh_key::{HashAlg, LineEnding, PrivateKey, PublicKey};
 use zeroize::{Zeroize, Zeroizing};
+
+/// OpenSSH `SSHSIG` namespace used for enrolment proof-of-possession signatures.
+pub const ENROL_PROOF_NAMESPACE: &str = "legion-enrol";
+
+/// Fixed prefix of the canonical enrolment proof message.
+pub const ENROL_PROOF_PREFIX: &str = "legion-enrol-proof-v1";
 
 /// An Ed25519 SSH identity key owned by a controller device.
 ///
@@ -103,6 +111,49 @@ impl DeviceKey {
             .public_key()
             .fingerprint(HashAlg::Sha256)
             .to_string()
+    }
+
+    /// Produces an OpenSSH `SSHSIG` PEM proof of possession (namespace `legion-enrol`, SHA-512)
+    /// proving this key owns its private half for `invite_id`, `node`, and `host_keys`.
+    pub fn sign_enrol_proof(
+        &self,
+        invite_id: &str,
+        node: &str,
+        host_keys: &[String],
+    ) -> Result<String, ErrorBody> {
+        let canonical_pub = self.public_key_line("")?;
+        let mut fps = BTreeSet::new();
+        for raw in host_keys {
+            if let Some(fp) = public_key_fingerprint(raw) {
+                fps.insert(fp);
+            }
+        }
+        if fps.is_empty() {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                "Invite carries no valid host keys for proof signing.",
+            ));
+        }
+        let joined: Vec<&str> = fps.iter().map(String::as_str).collect();
+        let msg = format!(
+            "{ENROL_PROOF_PREFIX}\nid={invite_id}\npublic_key={canonical_pub}\nnode={node}\nhost_keys={}\n",
+            joined.join(",")
+        );
+        let sig = self
+            .inner
+            .sign(ENROL_PROOF_NAMESPACE, HashAlg::Sha512, msg.as_bytes())
+            .map_err(|err| {
+                ErrorBody::new(
+                    ErrorCode::Internal,
+                    format!("Could not sign enrolment proof: {err}."),
+                )
+            })?;
+        sig.to_pem(LineEnding::LF).map_err(|err| {
+            ErrorBody::new(
+                ErrorCode::Internal,
+                format!("Could not encode enrolment proof as SSHSIG PEM: {err}."),
+            )
+        })
     }
 
     pub(crate) fn private_key(&self) -> &PrivateKey {
@@ -205,5 +256,65 @@ mod tests {
         let err = DeviceKey::from_openssh("not a key").unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgs);
         assert!(err.hint.is_some());
+    }
+
+    #[test]
+    fn enrol_proof_verifies_with_ssh_key_and_ssh_keygen() {
+        use russh::keys::ssh_key::SshSig;
+
+        let key = DeviceKey::from_seed([0x33u8; 32]);
+        let host_key = DeviceKey::from_seed([0x44u8; 32])
+            .public_key_line("")
+            .unwrap();
+        let proof = key
+            .sign_enrol_proof("inv-abc", "tower", std::slice::from_ref(&host_key))
+            .unwrap();
+        assert!(proof.starts_with("-----BEGIN SSH SIGNATURE-----"));
+        assert!(proof.trim_end().ends_with("-----END SSH SIGNATURE-----"));
+
+        let parsed = SshSig::from_pem(&proof).unwrap();
+        assert_eq!(parsed.namespace(), ENROL_PROOF_NAMESPACE);
+        let canonical = key.public_key_line("").unwrap();
+        let host_fp = public_key_fingerprint(&host_key).unwrap();
+        let expected_msg = format!(
+            "{ENROL_PROOF_PREFIX}\nid=inv-abc\npublic_key={canonical}\nnode=tower\nhost_keys={host_fp}\n"
+        );
+        key.private_key()
+            .public_key()
+            .verify(ENROL_PROOF_NAMESPACE, expected_msg.as_bytes(), &parsed)
+            .unwrap();
+
+        if Command::new("ssh-keygen").arg("-?").output().is_ok() {
+            let dir = tempfile::tempdir().unwrap();
+            let allowed = dir.path().join("allowed_signers");
+            let sig_path = dir.path().join("proof.sig");
+            std::fs::write(&allowed, format!("device {canonical}\n")).unwrap();
+            std::fs::write(&sig_path, &proof).unwrap();
+            let mut child = Command::new("ssh-keygen")
+                .args(["-Y", "verify", "-f"])
+                .arg(&allowed)
+                .args(["-I", "device", "-n", ENROL_PROOF_NAMESPACE, "-s"])
+                .arg(&sig_path)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            {
+                use std::io::Write;
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(expected_msg.as_bytes())
+                    .unwrap();
+            }
+            let out = child.wait_with_output().unwrap();
+            assert!(
+                out.status.success(),
+                "ssh-keygen -Y verify rejected proof: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 }

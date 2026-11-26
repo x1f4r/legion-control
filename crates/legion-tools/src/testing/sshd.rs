@@ -78,9 +78,21 @@ impl TestSshd {
         };
 
         let user = legion_os::user::current_username().map_err(|e| e.to_string())?;
-        let dir = if let Some(base) = std::env::var_os("CARGO_TARGET_TMPDIR") {
-            let base_path = PathBuf::from(base);
+        let strict_base = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("CARGO_TARGET_DIR")
+                    .filter(|v| !v.is_empty())
+                    .map(|dir| PathBuf::from(dir).join("tmp"))
+            });
+        let dir = if let Some(base_path) = strict_base {
             let _ = fs::create_dir_all(&base_path);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&base_path, fs::Permissions::from_mode(0o700));
+            }
             tempfile::tempdir_in(&base_path).map_err(|e| format!("create sshd tempdir: {e}"))?
         } else {
             TempDir::new().map_err(|e| format!("create sshd tempdir: {e}"))?

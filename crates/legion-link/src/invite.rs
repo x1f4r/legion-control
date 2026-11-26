@@ -45,13 +45,22 @@ pub struct SshTarget {
     pub host_keys: Vec<String>,
 }
 
+/// Default timeout waiting for a node to confirm device enrolment after the request is sent.
+///
+/// Enrolment persists `policy.toml`, `devices.toml`, and `authorized_keys` and then pushes
+/// `devices.toml` to reachable fleet peers before replying, so it can legitimately take longer
+/// than a routine `hello` handshake on slow links or loaded hosts.
+pub const DEFAULT_ENROL_TIMEOUT: Duration = Duration::from_secs(45);
+
 /// Timeouts and keepalive settings for connecting to a node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SshTimeouts {
     /// Per-host TCP connect + SSH handshake + auth timeout.
     pub connect: Duration,
-    /// Timeout for the Legion `hello` handshake (and live `hello` probes / enrolment reply).
+    /// Timeout for the Legion `hello` handshake and live `hello` probes.
     pub handshake: Duration,
+    /// Timeout waiting for a node to confirm device enrolment after the request is sent.
+    pub enrol: Duration,
     /// Interval between SSH keepalive probes when the connection is quiet (`None` disables).
     pub keepalive_interval: Option<Duration>,
     /// Number of unanswered keepalives before closing the connection.
@@ -63,6 +72,7 @@ impl Default for SshTimeouts {
         SshTimeouts {
             connect: Duration::from_secs(10),
             handshake: Duration::from_secs(10),
+            enrol: DEFAULT_ENROL_TIMEOUT,
             keepalive_interval: Some(Duration::from_secs(15)),
             keepalive_max: 3,
         }
@@ -422,6 +432,10 @@ pub struct FleetPushOutcome {
     pub reason: Option<String>,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Information returned by a node when enrolment succeeds, carrying everything needed to reconnect
 /// later using the permanent device key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -445,24 +459,34 @@ pub struct Enrolled {
     /// Exact sync command reported by the node when `not_synced_to` is non-empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync_command: Option<String>,
+    /// `true` when this pairing was confirmed via the pinned-key recovery probe rather than the
+    /// direct enrolment reply line (so `fleet` / `not_synced_to` were not returned by the node).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub recovered: bool,
 }
 
-#[cfg(feature = "ssh")]
-pub use self::enrol_client::enrol;
 #[cfg(all(test, feature = "ssh"))]
 pub(crate) use self::enrol_client::enrol_exchange;
+#[cfg(feature = "ssh")]
+pub(crate) use self::enrol_client::enrol_with_recovery;
+#[cfg(feature = "ssh")]
+pub use self::enrol_client::{enrol, restore_pairing};
 
 #[cfg(feature = "ssh")]
 mod enrol_client {
+    use std::collections::BTreeMap;
+    use std::future::Future;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
-    use legion_proto::{ErrorBody, ErrorCode};
+    use legion_proto::{CallParams, ErrorBody, ErrorCode, EventSink};
     use serde::{Deserialize, Serialize};
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
     use tokio_util::sync::CancellationToken;
 
     use super::{Enrolled, Invite};
+    use crate::command::Subcommand;
     use crate::key::DeviceKey;
     use crate::session::{Line, TransportHandle, read_line};
     use crate::ssh::{SshTimeouts, open_exec_raw};
@@ -479,6 +503,8 @@ mod enrol_client {
         id: &'a str,
         public_key: &'a str,
         name: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        proof: Option<&'a str>,
     }
 
     #[derive(Deserialize)]
@@ -502,15 +528,458 @@ mod enrol_client {
         error: Option<Value>,
     }
 
+    pub(crate) enum EnrolAttemptOutcome {
+        Ok(Enrolled),
+        ConnectErr(ErrorBody),
+        ExchangeErr { err: ErrorBody, request_sent: bool },
+    }
+
+    /// Which pairing identity a device-key recovery probe should accept.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum ProbeMode {
+        /// Confirm the device is enrolled on `invite.node` under `invite.principal`.
+        InvitePrincipal,
+        /// Discover any active pairing for `device_key` on `invite.node` (used after `Conflict`
+        /// on a `device:` invite so Restore pairing works even when the machine omits `details`).
+        ExistingOnNode,
+    }
+
+    /// Outcome of probing a node with the permanent device key after an ambiguous,
+    /// post-send-cancelled, or conflicting enrolment attempt.
+    pub(crate) enum ProbeOutcome {
+        /// The node authenticated `device_key` and confirmed `invite.node` (and `invite.principal`
+        /// in [`ProbeMode::InvitePrincipal`]).
+        Confirmed(Box<Enrolled>),
+        /// The node answered and definitively showed this device is not enrolled as expected.
+        NotEnrolled,
+        /// The node could not be reached or did not answer definitively; pairing may still have
+        /// completed on the node.
+        Unreachable,
+    }
+
+    /// Returns `true` when an older (`origin/main`) node rejected `EnrolRequest` purely because it
+    /// did not recognise the additive `proof` field (before consuming the invite).
+    fn is_unknown_proof_field_error(err: &ErrorBody) -> bool {
+        err.code == ErrorCode::InvalidArgs
+            && err.message.contains("unknown field")
+            && err.message.contains("proof")
+    }
+
+    fn is_auth_failed(err: &ErrorBody) -> bool {
+        err.details
+            .as_ref()
+            .and_then(|d| d.get("reason"))
+            .and_then(Value::as_str)
+            == Some(crate::ssh::REASON_AUTH_FAILED)
+    }
+
+    fn is_device_removed_or_unknown(err: &ErrorBody) -> bool {
+        err.details
+            .as_ref()
+            .and_then(|d| d.get("reason"))
+            .and_then(Value::as_str)
+            == Some(crate::REASON_DEVICE_REMOVED_OR_UNKNOWN)
+    }
+
+    fn is_device_principal(principal: &str) -> bool {
+        principal
+            .strip_prefix("device:")
+            .is_some_and(|suffix| !suffix.is_empty())
+    }
+
+    fn cancelled_unsent_error(node: &str) -> ErrorBody {
+        ErrorBody::new(
+            ErrorCode::Cancelled,
+            format!("Enrolment with {node} was cancelled."),
+        )
+        .with_machine(node)
+        .with_details(json!({ crate::DETAIL_SENT: false }))
+    }
+
+    fn cancelled_not_finished_error(node: &str) -> ErrorBody {
+        ErrorBody::new(
+            ErrorCode::Cancelled,
+            format!(
+                "Stopped waiting. {node} had not finished pairing when Legion checked. If it finishes, pairing again picks it up."
+            ),
+        )
+        .with_hint("Keep this invite and try pairing again to check whether it finished.")
+        .with_machine(node)
+        .with_details(json!({
+            crate::DETAIL_SENT: true,
+            "outcome": "not_finished",
+        }))
+    }
+
+    fn cancelled_uncertain_error(node: &str) -> ErrorBody {
+        ErrorBody::new(
+            ErrorCode::Cancelled,
+            format!("Pairing may have finished on {node}. Try again to check."),
+        )
+        .with_machine(node)
+        .with_details(json!({
+            crate::DETAIL_SENT: true,
+            "outcome": "uncertain",
+        }))
+    }
+
     /// Enrols `device_key` on the node described by `invite` under `device_name`.
     ///
     /// Connects with the invite's temporary key and pinned host keys, requests the literal command
     /// `legion enrol` (which the node's forced command ignores), exchanges the one-line JSON
-    /// enrolment handshake, and returns [`Enrolled`] with everything needed to reconnect later.
+    /// enrolment handshake (waiting up to `timeouts.enrol`), and returns [`Enrolled`] with
+    /// everything needed to reconnect later.
+    ///
+    /// If the node finishes enrolling after the enrolment reply timed out or the channel dropped
+    /// (or after a prior timed-out attempt swapped out the single-use invite key), reconciles by
+    /// authenticating with `device_key` against the invite's pinned host keys and verifying
+    /// `meta.whoami` matches both `invite.node` and `invite.principal`.
     pub async fn enrol(
         invite: &Invite,
         device_key: &DeviceKey,
         device_name: &str,
+        timeouts: SshTimeouts,
+        cancel: CancellationToken,
+    ) -> Result<Enrolled, ErrorBody> {
+        enrol_with_recovery(invite, device_key, device_name, timeouts, cancel, true).await
+    }
+
+    pub(crate) async fn enrol_with_recovery(
+        invite: &Invite,
+        device_key: &DeviceKey,
+        device_name: &str,
+        timeouts: SshTimeouts,
+        cancel: CancellationToken,
+        allow_auth_failed_recovery: bool,
+    ) -> Result<Enrolled, ErrorBody> {
+        let name = device_name.trim();
+        if name.is_empty() || name.chars().any(|c| c.is_control()) {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                "Device name must be a non-empty single-line string.",
+            )
+            .with_hint("Pass a short label such as `phone` or `tablet`."));
+        }
+        if cancel.is_cancelled() {
+            return Err(cancelled_unsent_error(&invite.node));
+        }
+        let seed = invite.key_seed()?;
+        let temp_key = DeviceKey::from_seed(*seed);
+        let target = invite.target();
+        let public_key = device_key.public_key_line(name)?;
+        let proof = device_key.sign_enrol_proof(&invite.id, &invite.node, &invite.host_keys)?;
+
+        enrol_flow(
+            invite,
+            cancel.clone(),
+            allow_auth_failed_recovery,
+            || async {
+                let run_once = |with_proof: bool| {
+                    let target = &target;
+                    let temp_key = &temp_key;
+                    let public_key = &public_key;
+                    let proof_opt = with_proof.then_some(proof.as_str());
+                    let cancel = cancel.clone();
+                    async move {
+                        let pipe = match open_exec_raw(
+                            target,
+                            temp_key,
+                            ENROL_COMMAND,
+                            timeouts,
+                            cancel.clone(),
+                        )
+                        .await
+                        {
+                            Ok(pipe) => pipe,
+                            Err(err) => return EnrolAttemptOutcome::ConnectErr(err),
+                        };
+
+                        let (reader, writer, mut handle) = pipe.into_parts();
+                        let stderr = handle.stderr_tail();
+                        let (result, request_sent) = enrol_exchange_with_sent(
+                            reader,
+                            writer,
+                            Some(&mut handle),
+                            Some(&stderr),
+                            invite,
+                            public_key,
+                            name,
+                            proof_opt,
+                            timeouts.enrol,
+                            cancel.clone(),
+                        )
+                        .await;
+                        Box::new(handle).close(CLOSE_GRACE).await;
+                        match result {
+                            Ok(enrolled) => EnrolAttemptOutcome::Ok(enrolled),
+                            Err(err) => EnrolAttemptOutcome::ExchangeErr { err, request_sent },
+                        }
+                    }
+                };
+
+                match run_once(true).await {
+                    EnrolAttemptOutcome::ExchangeErr { ref err, .. }
+                        if is_unknown_proof_field_error(err) && !cancel.is_cancelled() =>
+                    {
+                        // Older (`origin/main`) machines parse `EnrolRequest` with
+                        // `deny_unknown_fields` before touching the invite; fall back once without
+                        // `proof` on a fresh channel over the same pinned host keys.
+                        run_once(false).await
+                    }
+                    other => other,
+                }
+            },
+            // Probe uses a fresh token (bounded by `timeouts.connect` and `timeouts.handshake`) so
+            // stopping the enrolment wait after the request left still checks the machine once.
+            |mode| async move {
+                match mode {
+                    ProbeMode::InvitePrincipal => {
+                        probe_enrolled_with_device_key(invite, device_key, name, timeouts).await
+                    }
+                    ProbeMode::ExistingOnNode => {
+                        probe_enrolled_with_device_key_for_principal(
+                            invite,
+                            device_key,
+                            name,
+                            None,
+                            timeouts,
+                            CancellationToken::new(),
+                        )
+                        .await
+                    }
+                }
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn enrol_flow<A, AFut, P, PFut>(
+        invite: &Invite,
+        cancel: CancellationToken,
+        allow_auth_failed_recovery: bool,
+        attempt: A,
+        probe: P,
+    ) -> Result<Enrolled, ErrorBody>
+    where
+        A: FnOnce() -> AFut,
+        AFut: Future<Output = EnrolAttemptOutcome>,
+        P: FnOnce(ProbeMode) -> PFut,
+        PFut: Future<Output = ProbeOutcome>,
+    {
+        if cancel.is_cancelled() {
+            return Err(cancelled_unsent_error(&invite.node));
+        }
+        match attempt().await {
+            EnrolAttemptOutcome::Ok(enrolled) => {
+                // Never discard a confirmation that has already arrived.
+                Ok(enrolled)
+            }
+            EnrolAttemptOutcome::ConnectErr(err) => {
+                if cancel.is_cancelled() || err.code == ErrorCode::Cancelled {
+                    return Err(cancelled_unsent_error(&invite.node));
+                }
+                if is_auth_failed(&err) {
+                    if allow_auth_failed_recovery
+                        && is_device_principal(&invite.principal)
+                        && let ProbeOutcome::Confirmed(enrolled) =
+                            probe(ProbeMode::InvitePrincipal).await
+                    {
+                        return Ok(*enrolled);
+                    }
+                    return Err(err.with_hint(format!(
+                        "The invite key was rejected; invites are single-use and this invite expires at {}. Generate a fresh invite with `legion pair`.",
+                        invite.expires
+                    )));
+                }
+                Err(err)
+            }
+            EnrolAttemptOutcome::ExchangeErr {
+                mut err,
+                request_sent,
+            } => {
+                if !request_sent {
+                    if cancel.is_cancelled() || err.code == ErrorCode::Cancelled {
+                        return Err(cancelled_unsent_error(&invite.node));
+                    }
+                    return Err(err);
+                }
+                if cancel.is_cancelled() || err.code == ErrorCode::Cancelled {
+                    // Once the request left the device, Cancel means "stop waiting", not "undo":
+                    // ask the machine once with the pinned key whether enrolment finished.
+                    return match probe(ProbeMode::InvitePrincipal).await {
+                        ProbeOutcome::Confirmed(enrolled) => Ok(*enrolled),
+                        ProbeOutcome::NotEnrolled => {
+                            Err(cancelled_not_finished_error(&invite.node))
+                        }
+                        ProbeOutcome::Unreachable => Err(cancelled_uncertain_error(&invite.node)),
+                    };
+                }
+                if err.code == ErrorCode::Conflict && is_device_principal(&invite.principal) {
+                    // Offer Restore pairing whenever a `device:` invite hits `Conflict` by probing
+                    // the invite's machine with this device's own key against the pinned host keys,
+                    // even when the machine returned no `details` (e.g. an `origin/main` machine).
+                    match probe(ProbeMode::ExistingOnNode).await {
+                        ProbeOutcome::Confirmed(enrolled) => {
+                            let existing_device = err
+                                .details
+                                .as_ref()
+                                .and_then(|d| d.get("existing_device"))
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| enrolled.device.clone());
+                            err.details = Some(json!({
+                                "existing_principal": enrolled.principal,
+                                "existing_device": existing_device,
+                                "node": enrolled.node,
+                                "restorable": true,
+                            }));
+                        }
+                        ProbeOutcome::NotEnrolled => {
+                            if let Some(obj) = err.details.as_mut().and_then(Value::as_object_mut) {
+                                obj.remove("existing_principal");
+                                obj.remove("existing_device");
+                                obj.remove("restorable");
+                                if obj.is_empty() {
+                                    err.details = None;
+                                }
+                            }
+                        }
+                        ProbeOutcome::Unreachable => {}
+                    }
+                    return Err(err);
+                }
+                let should_recover =
+                    matches!(err.code, ErrorCode::Timeout | ErrorCode::Unreachable)
+                        || (err.code == ErrorCode::NotFound
+                            && allow_auth_failed_recovery
+                            && is_device_principal(&invite.principal));
+                if should_recover {
+                    if let ProbeOutcome::Confirmed(enrolled) =
+                        probe(ProbeMode::InvitePrincipal).await
+                    {
+                        return Ok(*enrolled);
+                    }
+                    if err.hint.is_none() {
+                        return Err(err.with_hint(
+                            "If the machine finished pairing late, try this invite once more to confirm without creating a new invite.",
+                        ));
+                    }
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Verifies whether `device_key` is already accepted on `invite.node` under `invite.principal`
+    /// using the invite's pinned host keys, distinguishing definitive refusal from unreachability.
+    async fn probe_enrolled_with_device_key(
+        invite: &Invite,
+        device_key: &DeviceKey,
+        device_name: &str,
+        timeouts: SshTimeouts,
+    ) -> ProbeOutcome {
+        probe_enrolled_with_device_key_for_principal(
+            invite,
+            device_key,
+            device_name,
+            Some(&invite.principal),
+            timeouts,
+            CancellationToken::new(),
+        )
+        .await
+    }
+
+    async fn probe_enrolled_with_device_key_for_principal(
+        invite: &Invite,
+        device_key: &DeviceKey,
+        device_name: &str,
+        expected_principal: Option<&str>,
+        timeouts: SshTimeouts,
+        probe_cancel: CancellationToken,
+    ) -> ProbeOutcome {
+        let target = invite.target();
+        let session = match crate::ssh::open(
+            &invite.node,
+            &target,
+            device_key,
+            Subcommand::Rpc,
+            timeouts,
+            probe_cancel.clone(),
+        )
+        .await
+        {
+            Ok(session) => session,
+            Err(err) => {
+                if is_auth_failed(&err) || is_device_removed_or_unknown(&err) {
+                    return ProbeOutcome::NotEnrolled;
+                }
+                return ProbeOutcome::Unreachable;
+            }
+        };
+
+        let whoami_res = tokio::time::timeout(
+            timeouts.handshake,
+            session.call(
+                CallParams {
+                    tool: "meta.whoami".to_owned(),
+                    args: json!({}),
+                    as_principal: None,
+                    on: None,
+                    hops: 0,
+                },
+                probe_cancel,
+                EventSink::discard(),
+            ),
+        )
+        .await;
+        session.close().await;
+
+        let Ok(Ok(whoami)) = whoami_res else {
+            return ProbeOutcome::Unreachable;
+        };
+        let Some(node) = whoami.get("node").and_then(Value::as_str) else {
+            return ProbeOutcome::Unreachable;
+        };
+        let Some(principal) = whoami.get("principal").and_then(Value::as_str) else {
+            return ProbeOutcome::Unreachable;
+        };
+        let Some(role) = whoami.get("role").and_then(Value::as_str) else {
+            return ProbeOutcome::Unreachable;
+        };
+        let principal_matches = match expected_principal {
+            Some(expected) => principal == expected,
+            None => !principal.is_empty(),
+        };
+        if node != invite.node || !principal_matches || role.is_empty() {
+            return ProbeOutcome::NotEnrolled;
+        }
+        let device = principal
+            .strip_prefix("device:")
+            .filter(|s| !s.is_empty())
+            .unwrap_or(device_name.trim())
+            .to_owned();
+        ProbeOutcome::Confirmed(Box::new(Enrolled {
+            node: node.to_owned(),
+            target,
+            principal: principal.to_owned(),
+            role: role.to_owned(),
+            device,
+            fleet: BTreeMap::new(),
+            not_synced_to: Vec::new(),
+            sync_command: None,
+            recovered: true,
+        }))
+    }
+
+    /// Restores an existing pairing on `invite.node` by authenticating with `device_key` against
+    /// the invite's pinned host keys and verifying `meta.whoami` matches `invite.node` (and
+    /// `expected_principal` when non-empty).
+    pub async fn restore_pairing(
+        invite: &Invite,
+        device_key: &DeviceKey,
+        device_name: &str,
+        expected_principal: &str,
         timeouts: SshTimeouts,
         cancel: CancellationToken,
     ) -> Result<Enrolled, ErrorBody> {
@@ -522,55 +991,69 @@ mod enrol_client {
             )
             .with_hint("Pass a short label such as `phone` or `tablet`."));
         }
-        let seed = invite.key_seed()?;
-        let temp_key = DeviceKey::from_seed(*seed);
-        let target = invite.target();
-        let public_key = device_key.public_key_line(name)?;
-
-        let pipe = open_exec_raw(&target, &temp_key, ENROL_COMMAND, timeouts, cancel.clone())
-            .await
-            .map_err(|err| {
-                // If authentication failed using the invite's temporary key, note the invite's
-                // expiry timestamp so the user knows it may have expired or already been used.
-                if err
-                    .details
-                    .as_ref()
-                    .and_then(|d| d.get("reason"))
-                    .and_then(Value::as_str)
-                    == Some(crate::ssh::REASON_AUTH_FAILED)
-                {
-                    err.with_hint(format!(
-                        "The invite key was rejected; invites are single-use and this invite expires at {}. Generate a fresh invite with `legion pair`.",
-                        invite.expires
-                    ))
-                } else {
-                    err
-                }
-            })?;
-
-        let (reader, writer, mut handle) = pipe.into_parts();
-        let stderr = handle.stderr_tail();
-        let result = enrol_exchange(
-            reader,
-            writer,
-            Some(&mut handle),
-            Some(&stderr),
+        let expected = expected_principal.trim();
+        if expected.chars().any(|c| c.is_control()) {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                "Existing principal must be a single-line string.",
+            ));
+        }
+        let expected_opt = (!expected.is_empty()).then_some(expected);
+        if cancel.is_cancelled() {
+            return Err(cancelled_unsent_error(&invite.node));
+        }
+        match probe_enrolled_with_device_key_for_principal(
             invite,
-            &public_key,
+            device_key,
             name,
-            timeouts.handshake,
-            cancel,
+            expected_opt,
+            timeouts,
+            cancel.clone(),
         )
-        .await;
-        Box::new(handle).close(CLOSE_GRACE).await;
-        result
+        .await
+        {
+            ProbeOutcome::Confirmed(enrolled) => Ok(*enrolled),
+            ProbeOutcome::NotEnrolled => Err(ErrorBody::new(
+                ErrorCode::Denied,
+                match expected_opt {
+                    Some(principal) => format!(
+                        "{} did not confirm this device under {principal}.",
+                        invite.node
+                    ),
+                    None => format!(
+                        "{} did not confirm an existing pairing for this device.",
+                        invite.node
+                    ),
+                },
+            )
+            .with_machine(&invite.node)
+            .with_hint(
+                "Remove any old entry for this device on the machine and create a fresh invite with `legion pair`.",
+            )),
+            ProbeOutcome::Unreachable => {
+                if cancel.is_cancelled() {
+                    Err(cancelled_unsent_error(&invite.node))
+                } else {
+                    Err(ErrorBody::new(
+                        ErrorCode::Unreachable,
+                        format!(
+                            "Could not reach {} to restore the existing pairing.",
+                            invite.node
+                        ),
+                    )
+                    .with_machine(&invite.node)
+                    .with_hint("Check that the machine is online and try again."))
+                }
+            }
+        }
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn enrol_exchange<R, W>(
         reader: R,
-        mut writer: W,
-        mut handle: Option<&mut dyn TransportHandle>,
+        writer: W,
+        handle: Option<&mut dyn TransportHandle>,
         stderr: Option<&std::sync::Arc<StderrTail>>,
         invite: &Invite,
         public_key: &str,
@@ -582,21 +1065,53 @@ mod enrol_client {
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
     {
+        enrol_exchange_with_sent(
+            reader, writer, handle, stderr, invite, public_key, name, None, timeout, cancel,
+        )
+        .await
+        .0
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn enrol_exchange_with_sent<R, W>(
+        reader: R,
+        mut writer: W,
+        mut handle: Option<&mut dyn TransportHandle>,
+        stderr: Option<&std::sync::Arc<StderrTail>>,
+        invite: &Invite,
+        public_key: &str,
+        name: &str,
+        proof: Option<&str>,
+        timeout: Duration,
+        cancel: CancellationToken,
+    ) -> (Result<Enrolled, ErrorBody>, bool)
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
         let target = invite.target();
         let req = EnrolRequest {
             enrol: 1,
             id: &invite.id,
             public_key,
             name,
+            proof,
         };
-        let mut line = serde_json::to_string(&req).map_err(|err| {
-            ErrorBody::new(
-                ErrorCode::Internal,
-                format!("Could not encode enrolment request: {err}."),
-            )
-        })?;
+        let mut line = match serde_json::to_string(&req) {
+            Ok(line) => line,
+            Err(err) => {
+                return (
+                    Err(ErrorBody::new(
+                        ErrorCode::Internal,
+                        format!("Could not encode enrolment request: {err}."),
+                    )),
+                    false,
+                );
+            }
+        };
         line.push('\n');
 
+        let sent = AtomicBool::new(false);
         let exchange = async {
             writer.write_all(line.as_bytes()).await.map_err(|err| {
                 ErrorBody::new(
@@ -607,6 +1122,7 @@ mod enrol_client {
                     ),
                 )
             })?;
+            sent.store(true, Ordering::Release);
             writer.flush().await.map_err(|err| {
                 ErrorBody::new(
                     ErrorCode::Unreachable,
@@ -689,13 +1205,10 @@ mod enrol_client {
             }
         };
 
-        tokio::select! {
+        // Prefer an already-ready confirmation over a simultaneous cancel so a reply that has
+        // already arrived is never thrown away.
+        let result = tokio::select! {
             biased;
-            () = cancel.cancelled() => Err(ErrorBody::new(
-                ErrorCode::Cancelled,
-                format!("Enrolment with {} was cancelled.", invite.node),
-            )
-            .with_machine(&invite.node)),
             res = tokio::time::timeout(timeout, exchange) => match res {
                 Ok(outcome) => outcome,
                 Err(_) => {
@@ -713,8 +1226,10 @@ mod enrol_client {
                     }
                     Err(err)
                 }
-            }
-        }
+            },
+            () = cancel.cancelled() => Err(cancelled_unsent_error(&invite.node)),
+        };
+        (result, sent.load(Ordering::Acquire))
     }
 
     fn parse_enrol_response(
@@ -746,6 +1261,7 @@ mod enrol_client {
                 fleet: resp.fleet,
                 not_synced_to: resp.not_synced_to,
                 sync_command: resp.sync_command,
+                recovered: false,
             });
         }
 
@@ -1168,5 +1684,664 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.code, ErrorCode::Failed);
         assert!(err.hint.is_some());
+    }
+
+    #[test]
+    fn default_enrol_timeout_is_45_seconds() {
+        let timeouts = SshTimeouts::default();
+        assert_eq!(timeouts.enrol, Duration::from_secs(45));
+        assert_eq!(timeouts.enrol, DEFAULT_ENROL_TIMEOUT);
+        assert_eq!(timeouts.handshake, Duration::from_secs(10));
+        assert_eq!(timeouts.connect, Duration::from_secs(10));
+    }
+
+    #[cfg(feature = "ssh")]
+    #[tokio::test]
+    async fn enrol_exchange_waits_for_slow_confirmation_and_cancels_cleanly() {
+        use std::time::Duration;
+
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio_util::sync::CancellationToken;
+
+        let invite = sample_invite();
+        let pub_line = format!("{SAMPLE_HOST_KEY} phone");
+
+        // 1. Slow confirmation arriving within the enrolment timeout succeeds.
+        let (client, server) = tokio::io::duplex(4 * 1024);
+        let (client_r, client_w) = tokio::io::split(client);
+        let (server_r, mut server_w) = tokio::io::split(server);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(server_r).lines();
+            let _ = lines.next_line().await;
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let _ = server_w
+                .write_all(
+                    b"{\"ok\":true,\"node\":\"tower\",\"principal\":\"phone\",\"role\":\"operator\",\"device\":\"phone\"}\n",
+                )
+                .await;
+            let _ = server_w.flush().await;
+        });
+        let (res, sent) = enrol_client::enrol_exchange_with_sent(
+            client_r,
+            client_w,
+            None,
+            None,
+            &invite,
+            &pub_line,
+            "phone",
+            None,
+            Duration::from_secs(2),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(sent);
+        let enrolled = res.unwrap();
+        assert_eq!(enrolled.node, "tower");
+        assert_eq!(enrolled.role, "operator");
+
+        // 2. Cancelling mid-wait stops promptly with Cancelled.
+        let (client, server) = tokio::io::duplex(4 * 1024);
+        let (client_r, client_w) = tokio::io::split(client);
+        let (server_r, _server_w) = tokio::io::split(server);
+        let cancel = CancellationToken::new();
+        let cancel_trigger = cancel.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(server_r).lines();
+            let _ = lines.next_line().await;
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            cancel_trigger.cancel();
+            // Hold the server end open so only cancellation ends the wait.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let (res, sent) = enrol_client::enrol_exchange_with_sent(
+            client_r,
+            client_w,
+            None,
+            None,
+            &invite,
+            &pub_line,
+            "phone",
+            None,
+            Duration::from_secs(45),
+            cancel,
+        )
+        .await;
+        assert!(sent);
+        let err = res.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Cancelled);
+        assert_eq!(err.machine.as_deref(), Some("tower"));
+    }
+
+    #[cfg(feature = "ssh")]
+    #[tokio::test]
+    async fn enrol_flow_reconciles_late_confirmation_retry_and_respects_cancel() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use tokio_util::sync::CancellationToken;
+
+        let invite = sample_invite();
+        let sample_enrolled = || Enrolled {
+            node: invite.node.clone(),
+            target: invite.target(),
+            principal: invite.principal.clone(),
+            role: "operator".to_owned(),
+            device: "phone".to_owned(),
+            fleet: BTreeMap::new(),
+            not_synced_to: Vec::new(),
+            sync_command: None,
+            recovered: true,
+        };
+
+        // 1. Timeout after request was sent -> probe sees device key already enrolled -> succeeds.
+        let probes = Arc::new(AtomicUsize::new(0));
+        let probes_c = Arc::clone(&probes);
+        let recovered = enrol_client::enrol_flow(
+            &invite,
+            CancellationToken::new(),
+            true,
+            || async {
+                enrol_client::EnrolAttemptOutcome::ExchangeErr {
+                    err: ErrorBody::new(ErrorCode::Timeout, "Timed out waiting for tower.")
+                        .with_machine("tower"),
+                    request_sent: true,
+                }
+            },
+            |_| {
+                let expected = sample_enrolled();
+                async move {
+                    probes_c.fetch_add(1, Ordering::SeqCst);
+                    enrol_client::ProbeOutcome::Confirmed(Box::new(expected))
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.node, "tower");
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+
+        // 2. Timeout after request was sent while node has NOT finished yet -> probe says
+        //    NotEnrolled -> Timeout error carries retry hint, and subsequent retry seeing
+        //    REASON_AUTH_FAILED (after node finished late) recovers cleanly via device-key probe.
+        let timeout_err = enrol_client::enrol_flow(
+            &invite,
+            CancellationToken::new(),
+            true,
+            || async {
+                enrol_client::EnrolAttemptOutcome::ExchangeErr {
+                    err: ErrorBody::new(ErrorCode::Timeout, "Timed out waiting for tower.")
+                        .with_machine("tower"),
+                    request_sent: true,
+                }
+            },
+            |_| async { enrol_client::ProbeOutcome::NotEnrolled },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(timeout_err.code, ErrorCode::Timeout);
+        assert!(
+            timeout_err
+                .hint
+                .as_deref()
+                .is_some_and(|h| h.contains("try this invite once more")),
+            "{timeout_err:?}"
+        );
+
+        let mut device_invite = sample_invite();
+        device_invite.principal = "device:phone".to_owned();
+        let sample_device_enrolled = || Enrolled {
+            node: device_invite.node.clone(),
+            target: device_invite.target(),
+            principal: device_invite.principal.clone(),
+            role: "operator".to_owned(),
+            device: "phone".to_owned(),
+            fleet: BTreeMap::new(),
+            not_synced_to: Vec::new(),
+            sync_command: None,
+            recovered: true,
+        };
+
+        let retry_recovered = enrol_client::enrol_flow(
+            &device_invite,
+            CancellationToken::new(),
+            true,
+            || async {
+                enrol_client::EnrolAttemptOutcome::ConnectErr(
+                    ErrorBody::new(ErrorCode::Denied, "SSH key auth failed.")
+                        .with_machine("tower")
+                        .with_details(json!({ "reason": crate::ssh::REASON_AUTH_FAILED })),
+                )
+            },
+            |_| {
+                let expected = sample_device_enrolled();
+                async move { enrol_client::ProbeOutcome::Confirmed(Box::new(expected)) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(retry_recovered.principal, "device:phone");
+
+        // 2b. Refused single-use key for a shared (non-`device:`) principal must NOT probe or
+        //     recover so another device consuming the invite is never masked.
+        let shared_probes = Arc::new(AtomicUsize::new(0));
+        let shared_probes_c = Arc::clone(&shared_probes);
+        let shared_auth_err = enrol_client::enrol_flow(
+            &invite,
+            CancellationToken::new(),
+            true,
+            || async {
+                enrol_client::EnrolAttemptOutcome::ConnectErr(
+                    ErrorBody::new(ErrorCode::Denied, "SSH key auth failed.")
+                        .with_machine("tower")
+                        .with_details(json!({ "reason": crate::ssh::REASON_AUTH_FAILED })),
+                )
+            },
+            |_| {
+                let expected = sample_enrolled();
+                async move {
+                    shared_probes_c.fetch_add(1, Ordering::SeqCst);
+                    enrol_client::ProbeOutcome::Confirmed(Box::new(expected))
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(shared_auth_err.code, ErrorCode::Denied);
+        assert_eq!(shared_probes.load(Ordering::SeqCst), 0);
+        assert!(
+            shared_auth_err
+                .hint
+                .as_deref()
+                .is_some_and(|h| h.contains("single-use")),
+            "{shared_auth_err:?}"
+        );
+
+        // 3. Already paired under the same `device:` principal (`allow_auth_failed_recovery = false`):
+        //    a stale/replayed invite failing auth must NOT falsely recover.
+        let blocked_probes = Arc::new(AtomicUsize::new(0));
+        let blocked_probes_c = Arc::clone(&blocked_probes);
+        let auth_err = enrol_client::enrol_flow(
+            &device_invite,
+            CancellationToken::new(),
+            false,
+            || async {
+                enrol_client::EnrolAttemptOutcome::ConnectErr(
+                    ErrorBody::new(ErrorCode::Denied, "SSH key auth failed.")
+                        .with_machine("tower")
+                        .with_details(json!({ "reason": crate::ssh::REASON_AUTH_FAILED })),
+                )
+            },
+            |_| {
+                let expected = sample_device_enrolled();
+                async move {
+                    blocked_probes_c.fetch_add(1, Ordering::SeqCst);
+                    enrol_client::ProbeOutcome::Confirmed(Box::new(expected))
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(auth_err.code, ErrorCode::Denied);
+        assert_eq!(blocked_probes.load(Ordering::SeqCst), 0);
+        assert!(
+            auth_err
+                .hint
+                .as_deref()
+                .is_some_and(|h| h.contains("single-use"))
+        );
+
+        // 4. Genuine auth failure on a `device:` invite (probe returns NotEnrolled) returns
+        //    Denied with expiry hint.
+        let genuine_err = enrol_client::enrol_flow(
+            &device_invite,
+            CancellationToken::new(),
+            true,
+            || async {
+                enrol_client::EnrolAttemptOutcome::ConnectErr(
+                    ErrorBody::new(ErrorCode::Denied, "SSH key auth failed.")
+                        .with_machine("tower")
+                        .with_details(json!({ "reason": crate::ssh::REASON_AUTH_FAILED })),
+                )
+            },
+            |_| async { enrol_client::ProbeOutcome::NotEnrolled },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(genuine_err.code, ErrorCode::Denied);
+        assert!(
+            genuine_err
+                .hint
+                .as_deref()
+                .is_some_and(|h| h.contains(&device_invite.expires))
+        );
+
+        // 5a. Cancel before request left the device (`ConnectErr` or `request_sent = false`)
+        //     stops immediately without probing and marks `sent: false`.
+        let pre_send_probes = Arc::new(AtomicUsize::new(0));
+        let pre_send_probes_c = Arc::clone(&pre_send_probes);
+        let cancel_before = CancellationToken::new();
+        let cancel_before_attempt = cancel_before.clone();
+        let pre_send_err = enrol_client::enrol_flow(
+            &invite,
+            cancel_before,
+            true,
+            || async move {
+                cancel_before_attempt.cancel();
+                enrol_client::EnrolAttemptOutcome::ConnectErr(ErrorBody::new(
+                    ErrorCode::Cancelled,
+                    "Cancelled.",
+                ))
+            },
+            |_| {
+                let expected = sample_enrolled();
+                async move {
+                    pre_send_probes_c.fetch_add(1, Ordering::SeqCst);
+                    enrol_client::ProbeOutcome::Confirmed(Box::new(expected))
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(pre_send_err.code, ErrorCode::Cancelled);
+        assert_eq!(
+            pre_send_err.details.as_ref().unwrap()[crate::DETAIL_SENT],
+            json!(false)
+        );
+        assert_eq!(pre_send_probes.load(Ordering::SeqCst), 0);
+
+        // 5b. Cancel after confirmation already arrived MUST NEVER discard the confirmation.
+        let cancel_after_ok = CancellationToken::new();
+        let cancel_after_ok_attempt = cancel_after_ok.clone();
+        let mut direct_enrolled = sample_enrolled();
+        direct_enrolled.recovered = false;
+        let kept_ok = enrol_client::enrol_flow(
+            &invite,
+            cancel_after_ok,
+            true,
+            || async move {
+                cancel_after_ok_attempt.cancel();
+                enrol_client::EnrolAttemptOutcome::Ok(direct_enrolled)
+            },
+            |_| async { panic!("probe must not run when confirmation already arrived") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(kept_ok.node, "tower");
+        assert!(!kept_ok.recovered);
+
+        // 5c. Cancel after request left (`request_sent = true`) probes once; if the machine
+        //     confirmed late, returns Ok(enrolled) instead of leaving the device half-paired.
+        let late_cancel_probes = Arc::new(AtomicUsize::new(0));
+        let late_cancel_probes_c = Arc::clone(&late_cancel_probes);
+        let cancel_late = CancellationToken::new();
+        let cancel_late_attempt = cancel_late.clone();
+        let late_confirmed = enrol_client::enrol_flow(
+            &invite,
+            cancel_late,
+            true,
+            || async move {
+                cancel_late_attempt.cancel();
+                enrol_client::EnrolAttemptOutcome::ExchangeErr {
+                    err: ErrorBody::new(ErrorCode::Cancelled, "Cancelled."),
+                    request_sent: true,
+                }
+            },
+            |_| {
+                let expected = sample_enrolled();
+                async move {
+                    late_cancel_probes_c.fetch_add(1, Ordering::SeqCst);
+                    enrol_client::ProbeOutcome::Confirmed(Box::new(expected))
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(late_confirmed.node, "tower");
+        assert!(late_confirmed.recovered);
+        assert_eq!(late_cancel_probes.load(Ordering::SeqCst), 1);
+
+        // 5d. Cancel after request left when machine had not enrolled yet (`NotEnrolled`):
+        //     returns Cancelled with `sent: true, outcome: "not_finished"` and honest wording
+        //     (never falsely claiming "Nothing was saved").
+        let cancel_denied = CancellationToken::new();
+        let cancel_denied_attempt = cancel_denied.clone();
+        let denied_err = enrol_client::enrol_flow(
+            &invite,
+            cancel_denied,
+            true,
+            || async move {
+                cancel_denied_attempt.cancel();
+                enrol_client::EnrolAttemptOutcome::ExchangeErr {
+                    err: ErrorBody::new(ErrorCode::Cancelled, "Cancelled."),
+                    request_sent: true,
+                }
+            },
+            |_| async { enrol_client::ProbeOutcome::NotEnrolled },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(denied_err.code, ErrorCode::Cancelled);
+        assert_eq!(
+            denied_err.details.as_ref().unwrap()[crate::DETAIL_SENT],
+            json!(true)
+        );
+        assert_eq!(
+            denied_err.details.as_ref().unwrap()["outcome"],
+            json!("not_finished")
+        );
+        assert!(
+            !denied_err
+                .message
+                .to_ascii_lowercase()
+                .contains("nothing was saved"),
+            "{}",
+            denied_err.message
+        );
+        assert_eq!(
+            denied_err.message,
+            "Stopped waiting. tower had not finished pairing when Legion checked. If it finishes, pairing again picks it up."
+        );
+
+        // 5e. Cancel after request left when machine is unreachable (`Unreachable`):
+        //     returns Cancelled with `sent: true, outcome: "uncertain"` and the exact retry message.
+        let cancel_unreach = CancellationToken::new();
+        let cancel_unreach_attempt = cancel_unreach.clone();
+        let unreach_err = enrol_client::enrol_flow(
+            &invite,
+            cancel_unreach,
+            true,
+            || async move {
+                cancel_unreach_attempt.cancel();
+                enrol_client::EnrolAttemptOutcome::ExchangeErr {
+                    err: ErrorBody::new(ErrorCode::Cancelled, "Cancelled."),
+                    request_sent: true,
+                }
+            },
+            |_| async { enrol_client::ProbeOutcome::Unreachable },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unreach_err.code, ErrorCode::Cancelled);
+        assert_eq!(
+            unreach_err.message,
+            "Pairing may have finished on tower. Try again to check."
+        );
+        assert_eq!(
+            unreach_err.details.as_ref().unwrap()[crate::DETAIL_SENT],
+            json!(true)
+        );
+        assert_eq!(
+            unreach_err.details.as_ref().unwrap()["outcome"],
+            json!("uncertain")
+        );
+
+        // 6. Failure before request left the client (`request_sent = false`) does not probe.
+        let unsent_probes = Arc::new(AtomicUsize::new(0));
+        let unsent_probes_c = Arc::clone(&unsent_probes);
+        let unsent_err = enrol_client::enrol_flow(
+            &invite,
+            CancellationToken::new(),
+            true,
+            || async {
+                enrol_client::EnrolAttemptOutcome::ExchangeErr {
+                    err: ErrorBody::new(ErrorCode::Unreachable, "Write failed."),
+                    request_sent: false,
+                }
+            },
+            |_| {
+                let expected = sample_enrolled();
+                async move {
+                    unsent_probes_c.fetch_add(1, Ordering::SeqCst);
+                    enrol_client::ProbeOutcome::Confirmed(Box::new(expected))
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unsent_err.code, ErrorCode::Unreachable);
+        assert_eq!(unsent_probes.load(Ordering::SeqCst), 0);
+
+        // 7. NotFound after request was sent recovers ONLY for `device:` principals (and when
+        //    `allow_auth_failed_recovery` is true), matching `REASON_AUTH_FAILED` so a shared-
+        //    principal invite consumed by another device is never masked.
+        let not_found_probes = Arc::new(AtomicUsize::new(0));
+        let not_found_probes_c = Arc::clone(&not_found_probes);
+        let not_found_recovered = enrol_client::enrol_flow(
+            &device_invite,
+            CancellationToken::new(),
+            true,
+            || async {
+                enrol_client::EnrolAttemptOutcome::ExchangeErr {
+                    err: ErrorBody::new(
+                        ErrorCode::NotFound,
+                        "This pairing invite is no longer valid or has already been used.",
+                    )
+                    .with_machine("tower"),
+                    request_sent: true,
+                }
+            },
+            |_| {
+                let expected = sample_device_enrolled();
+                async move {
+                    not_found_probes_c.fetch_add(1, Ordering::SeqCst);
+                    enrol_client::ProbeOutcome::Confirmed(Box::new(expected))
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert!(not_found_recovered.recovered);
+        assert_eq!(not_found_recovered.principal, "device:phone");
+        assert_eq!(not_found_probes.load(Ordering::SeqCst), 1);
+
+        // Shared principal (`phone`) receiving post-send NotFound MUST NOT probe or recover.
+        let shared_nf_probes = Arc::new(AtomicUsize::new(0));
+        let shared_nf_probes_c = Arc::clone(&shared_nf_probes);
+        let shared_nf_err = enrol_client::enrol_flow(
+            &invite,
+            CancellationToken::new(),
+            true,
+            || async {
+                enrol_client::EnrolAttemptOutcome::ExchangeErr {
+                    err: ErrorBody::new(
+                        ErrorCode::NotFound,
+                        "This pairing invite is no longer valid or has already been used.",
+                    )
+                    .with_machine("tower"),
+                    request_sent: true,
+                }
+            },
+            |_| {
+                let expected = sample_enrolled();
+                async move {
+                    shared_nf_probes_c.fetch_add(1, Ordering::SeqCst);
+                    enrol_client::ProbeOutcome::Confirmed(Box::new(expected))
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(shared_nf_err.code, ErrorCode::NotFound);
+        assert_eq!(shared_nf_probes.load(Ordering::SeqCst), 0);
+
+        // Already paired under the same `device:` principal (`allow_auth_failed_recovery = false`):
+        // post-send NotFound MUST NOT probe or recover.
+        let blocked_nf_probes = Arc::new(AtomicUsize::new(0));
+        let blocked_nf_probes_c = Arc::clone(&blocked_nf_probes);
+        let blocked_nf_err = enrol_client::enrol_flow(
+            &device_invite,
+            CancellationToken::new(),
+            false,
+            || async {
+                enrol_client::EnrolAttemptOutcome::ExchangeErr {
+                    err: ErrorBody::new(
+                        ErrorCode::NotFound,
+                        "This pairing invite is no longer valid or has already been used.",
+                    )
+                    .with_machine("tower"),
+                    request_sent: true,
+                }
+            },
+            |_| {
+                let expected = sample_device_enrolled();
+                async move {
+                    blocked_nf_probes_c.fetch_add(1, Ordering::SeqCst);
+                    enrol_client::ProbeOutcome::Confirmed(Box::new(expected))
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(blocked_nf_err.code, ErrorCode::NotFound);
+        assert_eq!(blocked_nf_probes.load(Ordering::SeqCst), 0);
+
+        // NotFound before the request left the client does not probe.
+        let unsent_nf_probes = Arc::new(AtomicUsize::new(0));
+        let unsent_nf_probes_c = Arc::clone(&unsent_nf_probes);
+        let unsent_nf_err = enrol_client::enrol_flow(
+            &device_invite,
+            CancellationToken::new(),
+            true,
+            || async {
+                enrol_client::EnrolAttemptOutcome::ExchangeErr {
+                    err: ErrorBody::new(ErrorCode::NotFound, "Missing invite."),
+                    request_sent: false,
+                }
+            },
+            |_| {
+                let expected = sample_device_enrolled();
+                async move {
+                    unsent_nf_probes_c.fetch_add(1, Ordering::SeqCst);
+                    enrol_client::ProbeOutcome::Confirmed(Box::new(expected))
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unsent_nf_err.code, ErrorCode::NotFound);
+        assert_eq!(unsent_nf_probes.load(Ordering::SeqCst), 0);
+
+        // 8. Conflict on a `device:` invite WITHOUT machine `details` (e.g. `origin/main` machine)
+        //    still probes with `ProbeMode::ExistingOnNode` and marks the error `restorable: true`
+        //    with the discovered principal so Restore pairing works against `origin/main`.
+        let conflict_probes = Arc::new(AtomicUsize::new(0));
+        let conflict_probes_c = Arc::clone(&conflict_probes);
+        let mut existing = sample_device_enrolled();
+        existing.principal = "device:old-pixel".to_owned();
+        existing.device = "old-pixel".to_owned();
+        let conflict_err = enrol_client::enrol_flow(
+            &device_invite,
+            CancellationToken::new(),
+            true,
+            || async {
+                enrol_client::EnrolAttemptOutcome::ExchangeErr {
+                    err: ErrorBody::new(
+                        ErrorCode::Conflict,
+                        "That public key is already present in authorized_keys.",
+                    )
+                    .with_machine("tower"),
+                    request_sent: true,
+                }
+            },
+            |mode| {
+                assert_eq!(mode, enrol_client::ProbeMode::ExistingOnNode);
+                async move {
+                    conflict_probes_c.fetch_add(1, Ordering::SeqCst);
+                    enrol_client::ProbeOutcome::Confirmed(Box::new(existing))
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(conflict_err.code, ErrorCode::Conflict);
+        assert_eq!(conflict_probes.load(Ordering::SeqCst), 1);
+        let details = conflict_err.details.as_ref().unwrap();
+        assert_eq!(details["existing_principal"], json!("device:old-pixel"));
+        assert_eq!(details["existing_device"], json!("old-pixel"));
+        assert_eq!(details["node"], json!("tower"));
+        assert_eq!(details["restorable"], json!(true));
+
+        // 8b. Conflict on a `device:` invite for a foreign (non-Legion) key returns NotEnrolled on
+        //     probe and does NOT offer restore.
+        let foreign_conflict = enrol_client::enrol_flow(
+            &device_invite,
+            CancellationToken::new(),
+            true,
+            || async {
+                enrol_client::EnrolAttemptOutcome::ExchangeErr {
+                    err: ErrorBody::new(
+                        ErrorCode::Conflict,
+                        "That public key is already present in authorized_keys.",
+                    )
+                    .with_machine("tower"),
+                    request_sent: true,
+                }
+            },
+            |_| async { enrol_client::ProbeOutcome::NotEnrolled },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(foreign_conflict.code, ErrorCode::Conflict);
+        assert!(foreign_conflict.details.is_none());
     }
 }

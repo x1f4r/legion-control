@@ -6,6 +6,8 @@ pub mod content;
 pub mod keep_screen_on;
 pub mod link_backend;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod transfers;
 pub mod updater;
 
@@ -626,6 +628,8 @@ pub fn run() {
                 commands::call,
                 commands::cancel,
                 commands::pair,
+                commands::restore_pairing,
+                commands::cancel_pair,
                 commands::unpair,
                 commands::select_node,
                 commands::repair_store,

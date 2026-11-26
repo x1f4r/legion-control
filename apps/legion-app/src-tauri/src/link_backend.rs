@@ -4,15 +4,15 @@
 //! rpc`) on desktops when a `legion` binary is installed. State is persisted atomically in
 //! [`AppStore`] without ever logging keys or invites.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use legion_link::proto::Target;
 use legion_link::{
-    DeviceKey, Invite, Link, LinkConfig, LinkOptions, MachineRouteStatus, NodeLink as LinkNode,
-    NodeOrigin, parse_optional_target, public_key_fingerprint,
+    CancellationToken, DeviceKey, Invite, Link, LinkConfig, LinkOptions, MachineRouteStatus,
+    NodeLink as LinkNode, NodeOrigin, parse_optional_target, public_key_fingerprint,
 };
 use serde_json::Value;
 use tauri::ipc::Channel;
@@ -481,6 +481,60 @@ impl Drop for BackgroundRefreshGuard {
     }
 }
 
+/// RAII guard unregistering an in-flight pairing cancellation token when pairing ends.
+struct ActivePairGuard {
+    active_pairs: Arc<Mutex<Vec<(u64, CancellationToken)>>>,
+    seq: u64,
+}
+
+impl Drop for ActivePairGuard {
+    fn drop(&mut self) {
+        self.active_pairs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|(seq, _)| *seq != self.seq);
+    }
+}
+
+struct NodePairingGuard {
+    pairing_nodes: Arc<Mutex<HashSet<String>>>,
+    node: String,
+}
+
+impl NodePairingGuard {
+    fn try_acquire(
+        pairing_nodes: &Arc<Mutex<HashSet<String>>>,
+        node: &str,
+    ) -> Result<Self, AppError> {
+        let mut active = pairing_nodes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !active.insert(node.to_owned()) {
+            let mut err = AppError::new(
+                ErrorCode::Busy,
+                format!("Pairing with {node} is already in progress."),
+            )
+            .with_hint("Wait for the current pairing attempt to finish, then try again.")
+            .with_details(serde_json::json!({ "sent": false }));
+            err.machine = Some(node.to_owned());
+            return Err(err);
+        }
+        Ok(Self {
+            pairing_nodes: Arc::clone(pairing_nodes),
+            node: node.to_owned(),
+        })
+    }
+}
+
+impl Drop for NodePairingGuard {
+    fn drop(&mut self) {
+        self.pairing_nodes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.node);
+    }
+}
+
 /// Production backend implementation over [`legion_link::Link`].
 pub struct LinkBackend {
     store: AppStore,
@@ -489,6 +543,11 @@ pub struct LinkBackend {
     /// and store writes never race.
     mutate_lock: AsyncMutex<()>,
     next_call_seq: AtomicU64,
+    /// In-flight pairing cancellation tokens, cleared via [`ActivePairGuard`] on exit.
+    active_pairs: Arc<Mutex<Vec<(u64, CancellationToken)>>>,
+    /// Nodes currently running an in-flight `pair` or `restore_pairing` (through store commit),
+    /// preventing concurrent pairings for the same machine from racing and persisting out of order.
+    pairing_nodes: Arc<Mutex<HashSet<String>>>,
     /// Count of currently active user-started or state-mutating native operations.
     in_flight_ops: Arc<AtomicUsize>,
     /// Tracker for currently active passive non-streaming background refresh calls.
@@ -709,6 +768,8 @@ impl LinkBackend {
             state: Mutex::new(state),
             mutate_lock: AsyncMutex::new(()),
             next_call_seq: AtomicU64::new(1),
+            active_pairs: Arc::new(Mutex::new(Vec::new())),
+            pairing_nodes: Arc::new(Mutex::new(HashSet::new())),
             in_flight_ops: Arc::new(AtomicUsize::new(0)),
             bg_refreshes: Arc::new(BackgroundRefreshTracker::with_clock(drain_clock)),
         }
@@ -844,6 +905,137 @@ impl LinkBackend {
             }
         }
         machine.to_owned()
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    async fn filter_local_self_from_learn_report(
+        &self,
+        link: &Link,
+        report: &mut legion_link::LearnReport,
+    ) {
+        let local_self_name = {
+            let guard = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if guard.local_program.is_some() {
+                guard
+                    .attached_local_node
+                    .as_deref()
+                    .filter(|name| {
+                        !guard
+                            .data
+                            .link
+                            .node(name)
+                            .is_some_and(|n| n.origin == NodeOrigin::Paired)
+                    })
+                    .map(str::to_owned)
+            } else {
+                None
+            }
+        };
+        if let Some(ref local_name) = local_self_name {
+            if link
+                .config()
+                .node(local_name)
+                .is_some_and(|n| n.origin == NodeOrigin::Learned)
+            {
+                let _ = link.remove_node(local_name).await;
+            }
+            let is_local_self = |m: &str| m == LOCAL_NODE_ID || m == local_name.as_str();
+            report.added.retain(|m| !is_local_self(m));
+            report.updated.retain(|m| !is_local_self(m));
+            report.identity_changed.retain(|m| !is_local_self(m));
+            report.disagreements.retain(|m| !is_local_self(m));
+            report
+                .disagreement_details
+                .retain(|d| !is_local_self(&d.machine));
+            report.unreachable.retain(|m| !is_local_self(m));
+            report.rejected.retain(|m| !is_local_self(m));
+            report
+                .rejected_details
+                .retain(|r| !is_local_self(&r.machine));
+        }
+    }
+
+    async fn commit_enrolled_pairing(
+        &self,
+        enrolled: legion_link::Enrolled,
+        #[cfg_attr(any(target_os = "android", target_os = "ios"), allow(unused_mut))]
+        mut learn_report: Option<legion_link::LearnReport>,
+    ) -> Result<AppState, AppError> {
+        let pair_summary = build_pair_summary(&enrolled);
+        let node_entry = LinkNode::from(enrolled.clone());
+        let node_name = enrolled.node.clone();
+        let meta = StoredNodeMeta {
+            node: enrolled.node.clone(),
+            role: Some(enrolled.role.clone()),
+            device: Some(enrolled.device.clone()),
+            role_checked_at: Some(now_rfc3339_utc()),
+        };
+
+        let _mutation = self.mutate_lock.lock().await;
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if let Some(report) = learn_report.as_mut() {
+            let link = {
+                let guard = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.link.clone()
+            };
+            self.filter_local_self_from_learn_report(&link, report)
+                .await;
+        }
+        let app_state = {
+            let mut guard = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(err) = &guard.store_error {
+                return Err(err.clone());
+            }
+            let mut updated_data = guard.data.clone();
+            if learn_report.is_some() {
+                let live_cfg = guard.link.config();
+                updated_data.link = persisted_link_config(&live_cfg, &guard.data.link);
+            }
+            updated_data.link.upsert_node(node_entry);
+            updated_data.upsert_meta(meta);
+            updated_data.current_node = Some(node_name.clone());
+            self.store.save(&updated_data)?;
+            guard.data = updated_data;
+            guard.active_node = Some(node_name.clone());
+            guard.preferred_relay = None;
+            guard.last_paired = Some(pair_summary);
+            guard.sync_pairing_epochs();
+            guard.set_fresh_epoch(&node_name);
+            guard.bump_fleet_epoch();
+            guard.learned_fleet_epochs.remove(&node_name);
+            if let Some(report) = &learn_report {
+                let current_fleet_epoch = guard.fleet_pairing_epoch;
+                for added in &report.added {
+                    if guard
+                        .data
+                        .link
+                        .node(added)
+                        .is_some_and(|n| n.origin == NodeOrigin::Learned)
+                    {
+                        guard
+                            .learned_fleet_epochs
+                            .insert(added.clone(), current_fleet_epoch);
+                    }
+                }
+                guard.prune_learned_fleet_epochs();
+                guard.disagreements = build_disagreement_views(report);
+                guard.learn_rejections = build_learn_rejection_views(report);
+            }
+            guard.disagreements.retain(|d| d.machine != node_name);
+            guard.learn_rejections.retain(|r| r.machine != node_name);
+            build_app_state(&guard, self.store.path())
+        };
+
+        Ok(app_state)
     }
 }
 
@@ -1003,6 +1195,22 @@ impl Backend for LinkBackend {
         })
     }
 
+    fn cancel_pair(&self) -> BoxFuture<'_, Result<CancelResult, AppError>> {
+        Box::pin(async move {
+            let tokens: Vec<CancellationToken> = self
+                .active_pairs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .map(|(_, tok)| tok.clone())
+                .collect();
+            for token in tokens {
+                token.cancel();
+            }
+            Ok(CancelResult {})
+        })
+    }
+
     fn pair(&self, invite: String, name: String) -> BoxFuture<'_, Result<AppState, AppError>> {
         Box::pin(async move {
             let _op = self.track_operation();
@@ -1017,7 +1225,10 @@ impl Backend for LinkBackend {
                 );
             }
 
-            let _parsed = Invite::parse(trimmed_invite).map_err(AppError::from)?;
+            let parsed = Invite::parse(trimmed_invite).map_err(AppError::from)?;
+            let target_node_name = parsed.node.clone();
+            let _node_pair_guard =
+                NodePairingGuard::try_acquire(&self.pairing_nodes, &target_node_name)?;
             let device_label = {
                 let trimmed = name.trim();
                 if trimmed.is_empty() {
@@ -1027,11 +1238,34 @@ impl Backend for LinkBackend {
                 }
             };
 
-            let _mutation = self.mutate_lock.lock().await;
+            let pair_seq = self.next_call_seq.fetch_add(1, Ordering::Relaxed);
+            let cancel = CancellationToken::new();
+            {
+                self.active_pairs
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push((pair_seq, cancel.clone()));
+            }
+            let _pair_guard = ActivePairGuard {
+                active_pairs: Arc::clone(&self.active_pairs),
+                seq: pair_seq,
+            };
 
-            // Ensure this device has a persisted Ed25519 key BEFORE enrolling so a failed store
-            // save can never leave a node holding a public key whose private half was lost.
+            // Hold `mutate_lock` only while ensuring and persisting the device key BEFORE network
+            // I/O so `unpair` and `select_node` are never blocked while pairing waits.
             let link = {
+                let _mutation = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {
+                        return Err(AppError::new(
+                            ErrorCode::Cancelled,
+                            format!("Pairing with {target_node_name} was cancelled."),
+                        )
+                        .with_details(serde_json::json!({ "sent": false })));
+                    }
+                    guard = self.mutate_lock.lock() => guard,
+                };
+
                 let mut guard = self
                     .state
                     .lock()
@@ -1051,47 +1285,101 @@ impl Backend for LinkBackend {
                 guard.link.clone()
             };
 
-            // Enrol in place via `Link::pair`, reusing the persisted device key and keeping any
-            // other live sessions and in-flight calls undisturbed.
-            let enrolled = link
-                .pair(trimmed_invite, &device_label)
+            // Enrol in place via `Link::pair_cancellable_with_learn`, reusing the persisted device
+            // key and keeping any other live sessions, `unpair`, and `select_node` undisturbed.
+            let (enrolled, learn_report) = link
+                .pair_cancellable_with_learn(trimmed_invite, &device_label, cancel)
                 .await
                 .map_err(AppError::from)?;
 
-            let pair_summary = build_pair_summary(&enrolled);
-            let node_entry = LinkNode::from(enrolled.clone());
-            let node_name = enrolled.node.clone();
-            let meta = StoredNodeMeta {
-                node: enrolled.node.clone(),
-                role: Some(enrolled.role.clone()),
-                device: Some(enrolled.device.clone()),
-                role_checked_at: Some(now_rfc3339_utc()),
+            self.commit_enrolled_pairing(enrolled, learn_report).await
+        })
+    }
+
+    fn restore_pairing(
+        &self,
+        invite: String,
+        existing_principal: String,
+        name: String,
+    ) -> BoxFuture<'_, Result<AppState, AppError>> {
+        Box::pin(async move {
+            let _op = self.track_operation();
+            self.require_healthy_store()?;
+            let trimmed_invite = invite.trim();
+            if trimmed_invite.is_empty() {
+                return Err(
+                    AppError::new(ErrorCode::InvalidArgs, "Invite text cannot be empty.")
+                        .with_hint(
+                            "Scan the QR code or paste the invite line printed by `legion pair`.",
+                        ),
+                );
+            }
+            let trimmed_principal = existing_principal.trim();
+            let parsed = Invite::parse(trimmed_invite).map_err(AppError::from)?;
+            let target_node_name = parsed.node.clone();
+            let _node_pair_guard =
+                NodePairingGuard::try_acquire(&self.pairing_nodes, &target_node_name)?;
+            let device_label = {
+                let trimmed = name.trim();
+                if trimmed.is_empty() {
+                    default_device_name()
+                } else {
+                    trimmed.to_owned()
+                }
             };
 
-            // Compute, save, and swap under the single state lock while still holding mutate_lock.
-            let app_state = {
-                let mut guard = self
+            let pair_seq = self.next_call_seq.fetch_add(1, Ordering::Relaxed);
+            let cancel = CancellationToken::new();
+            {
+                self.active_pairs
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push((pair_seq, cancel.clone()));
+            }
+            let _pair_guard = ActivePairGuard {
+                active_pairs: Arc::clone(&self.active_pairs),
+                seq: pair_seq,
+            };
+
+            let link = {
+                let _mutation = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {
+                        return Err(AppError::new(
+                            ErrorCode::Cancelled,
+                            format!("Restoring pairing with {target_node_name} was cancelled."),
+                        )
+                        .with_details(serde_json::json!({ "sent": false })));
+                    }
+                    guard = self.mutate_lock.lock() => guard,
+                };
+                let guard = self
                     .state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let mut updated_data = guard.data.clone();
-                updated_data.link.upsert_node(node_entry);
-                updated_data.upsert_meta(meta);
-                updated_data.current_node = Some(node_name.clone());
-                self.store.save(&updated_data)?;
-                guard.data = updated_data;
-                guard.active_node = Some(node_name.clone());
-                guard.preferred_relay = None;
-                guard.last_paired = Some(pair_summary);
-                guard.disagreements.retain(|d| d.machine != node_name);
-                guard.learn_rejections.retain(|r| r.machine != node_name);
-                guard.set_fresh_epoch(&node_name);
-                guard.bump_fleet_epoch();
-                guard.learned_fleet_epochs.remove(&node_name);
-                build_app_state(&guard, self.store.path())
+                if let Some(err) = &guard.store_error {
+                    return Err(err.clone());
+                }
+                if guard.data.link.device_key.is_none() {
+                    return Err(AppError::new(
+                        ErrorCode::Denied,
+                        "This device does not have a saved key to restore.",
+                    ));
+                }
+                guard.link.clone()
             };
 
-            Ok(app_state)
+            let (enrolled, learn_report) = link
+                .restore_pairing_with_learn(
+                    trimmed_invite,
+                    trimmed_principal,
+                    &device_label,
+                    cancel,
+                )
+                .await
+                .map_err(AppError::from)?;
+
+            self.commit_enrolled_pairing(enrolled, learn_report).await
         })
     }
 
@@ -1421,39 +1709,8 @@ impl Backend for LinkBackend {
                     }
                 }
                 guard.prune_learned_fleet_epochs();
-                guard.disagreements = report
-                    .disagreement_details
-                    .iter()
-                    .map(|d| DisagreementView {
-                        machine: d.machine.clone(),
-                        reports: d
-                            .reports
-                            .iter()
-                            .map(|r| DisagreementEntryView {
-                                reported_by: r.reported_by.clone(),
-                                hosts: r.target.hosts.clone(),
-                                port: r.target.port,
-                                user: r.target.user.clone(),
-                                fingerprints: r
-                                    .target
-                                    .host_keys
-                                    .iter()
-                                    .filter_map(|k| public_key_fingerprint(k))
-                                    .collect(),
-                            })
-                            .collect(),
-                    })
-                    .collect();
-                guard.learn_rejections = report
-                    .rejected_details
-                    .iter()
-                    .map(|r| LearnRejectionView {
-                        machine: r.machine.clone(),
-                        code: r.code.clone(),
-                        reason: r.reason.clone(),
-                        reported_by: r.reported_by.clone(),
-                    })
-                    .collect();
+                guard.disagreements = build_disagreement_views(&report);
+                guard.learn_rejections = build_learn_rejection_views(&report);
                 build_app_state(&guard, self.store.path())
             };
 
@@ -1756,6 +2013,45 @@ impl Backend for LinkBackend {
         }
         None
     }
+}
+
+fn build_disagreement_views(report: &legion_link::LearnReport) -> Vec<DisagreementView> {
+    report
+        .disagreement_details
+        .iter()
+        .map(|d| DisagreementView {
+            machine: d.machine.clone(),
+            reports: d
+                .reports
+                .iter()
+                .map(|r| DisagreementEntryView {
+                    reported_by: r.reported_by.clone(),
+                    hosts: r.target.hosts.clone(),
+                    port: r.target.port,
+                    user: r.target.user.clone(),
+                    fingerprints: r
+                        .target
+                        .host_keys
+                        .iter()
+                        .filter_map(|k| public_key_fingerprint(k))
+                        .collect(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn build_learn_rejection_views(report: &legion_link::LearnReport) -> Vec<LearnRejectionView> {
+    report
+        .rejected_details
+        .iter()
+        .map(|r| LearnRejectionView {
+            machine: r.machine.clone(),
+            code: r.code.clone(),
+            reason: r.reason.clone(),
+            reported_by: r.reported_by.clone(),
+        })
+        .collect()
 }
 
 fn build_pair_summary(enrolled: &legion_link::Enrolled) -> PairSummary {
@@ -3594,6 +3890,7 @@ mod tests {
             fleet,
             not_synced_to: vec!["pi".to_owned()],
             sync_command: Some("legion fleet.sync".to_owned()),
+            recovered: false,
         };
         let summary = build_pair_summary(&enrolled);
         assert_eq!(summary.synced, vec!["studio".to_owned()]);
@@ -4465,6 +4762,232 @@ mod tests {
         assert_eq!(ct.link_node, LOCAL_NODE_ID);
         assert_eq!(ct.principal, "local");
         assert!(ct.holder.starts_with("pairing:local:"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancel_pair_stops_waiting_pair_without_persisting_node()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = AppStore::in_dir(dir.path());
+        let backend = Arc::new(LinkBackend::with_local_program(store, None));
+
+        // Hold mutate_lock so `pair()` blocks deterministically before network I/O, then call
+        // `cancel_pair()` and verify `pair()` exits promptly with Cancelled and saves nothing.
+        let held = backend.mutate_lock.lock().await;
+        let invite = Invite {
+            v: 1,
+            id: "inv-cancel-1".to_owned(),
+            node: "tower".to_owned(),
+            hosts: vec!["192.0.2.1".to_owned()],
+            port: 22,
+            user: "me".to_owned(),
+            host_keys: vec![
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea"
+                    .to_owned(),
+            ],
+            key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            principal: "device:phone".to_owned(),
+            expires: "2026-11-26T12:00:00Z".to_owned(),
+        }
+        .encode()?;
+
+        let backend_pair = Arc::clone(&backend);
+        let pair_task =
+            tokio::spawn(async move { backend_pair.pair(invite, "phone".to_owned()).await });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            let active = backend
+                .active_pairs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .len();
+            if active > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            backend
+                .active_pairs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .len(),
+            1
+        );
+
+        backend.cancel_pair().await?;
+        let err = pair_task
+            .await?
+            .err()
+            .ok_or("expected pair to return cancelled error")?;
+        drop(held);
+
+        assert_eq!(err.code, ErrorCode::Cancelled);
+        assert_eq!(
+            backend
+                .active_pairs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .len(),
+            0
+        );
+        let st = backend.state().await?;
+        assert!(st.nodes.is_empty());
+        assert_eq!(st.needs, Some(Needs::Pairing));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pair_releases_mutate_lock_during_network_wait_allowing_select_and_unpair()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = AppStore::in_dir(dir.path());
+        let mut initial = AppStoreData::default();
+        initial.link.upsert_node(sample_ssh_node("alpha"));
+        initial.link.upsert_node(sample_ssh_node("beta"));
+        initial.current_node = Some("alpha".to_owned());
+        store.save(&initial)?;
+        let backend = Arc::new(LinkBackend::with_local_program(store, None));
+
+        // Bind a loopback listener that accepts TCP connections and holds them open without
+        // sending an SSH banner so `pair()` waits in network I/O.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let accepted = Arc::new(tokio::sync::Notify::new());
+        let accepted_c = Arc::clone(&accepted);
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                accepted_c.notify_one();
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                drop(stream);
+            }
+        });
+
+        let invite = Invite {
+            v: 1,
+            id: "inv-nonblocking-1".to_owned(),
+            node: "slowbox".to_owned(),
+            hosts: vec!["127.0.0.1".to_owned()],
+            port,
+            user: "me".to_owned(),
+            host_keys: vec![
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea"
+                    .to_owned(),
+            ],
+            key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            principal: "device:phone".to_owned(),
+            expires: "2026-11-26T12:00:00Z".to_owned(),
+        }
+        .encode()?;
+
+        let backend_pair = Arc::clone(&backend);
+        let pair_task =
+            tokio::spawn(async move { backend_pair.pair(invite, "phone".to_owned()).await });
+
+        // Wait until `pair()` has actually entered the network wait (connected to the listener).
+        tokio::time::timeout(Duration::from_secs(3), accepted.notified()).await?;
+
+        // While `pair()` waits on the network, `select_node` and `unpair` MUST proceed promptly
+        // without blocking on `mutate_lock`.
+        let selected = tokio::time::timeout(
+            Duration::from_secs(1),
+            backend.select_node("beta".to_owned()),
+        )
+        .await??;
+        assert_eq!(
+            selected.nodes.first().map(|n| n.node.as_str()),
+            Some("beta")
+        );
+
+        let unpaired =
+            tokio::time::timeout(Duration::from_secs(1), backend.unpair("alpha".to_owned()))
+                .await??;
+        assert_eq!(unpaired.node, "alpha");
+
+        backend.cancel_pair().await?;
+        let pair_err = tokio::time::timeout(Duration::from_secs(2), pair_task)
+            .await??
+            .err()
+            .ok_or("expected slow pair to be cancelled")?;
+        assert_eq!(pair_err.code, ErrorCode::Cancelled);
+
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commit_recovered_pairing_persists_learned_peers_and_keeps_store_aligned()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let store = AppStore::in_dir(dir.path());
+        let backend = LinkBackend::with_local_program(store.clone(), None);
+
+        let target = SshTarget {
+            hosts: vec!["tower.example".to_owned()],
+            port: 22,
+            user: "me".to_owned(),
+            host_keys: vec![
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINdamAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea"
+                    .to_owned(),
+            ],
+        };
+        let pi_target = SshTarget {
+            hosts: vec!["pi.example".to_owned()],
+            port: 22,
+            user: "me".to_owned(),
+            host_keys: vec![
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIC4h9C6W8Z0V1e2yV7J6kN0pT8rW9xY1zA2bC3dE4fG5"
+                    .to_owned(),
+            ],
+        };
+        let enrolled = legion_link::Enrolled {
+            node: "tower".to_owned(),
+            target: target.clone(),
+            principal: "device:phone".to_owned(),
+            role: "operator".to_owned(),
+            device: "phone".to_owned(),
+            fleet: BTreeMap::new(),
+            not_synced_to: Vec::new(),
+            sync_command: None,
+            recovered: true,
+        };
+
+        // Simulate `Link::pair_cancellable_with_learn` having updated `Link` with `tower` and
+        // learned `pi` via `learn()`.
+        {
+            let guard = backend.state.lock().unwrap_or_else(|p| p.into_inner());
+            guard.link.upsert_node(LinkNode::from(enrolled.clone()));
+            guard
+                .link
+                .upsert_node(LinkNode::learned("pi", pi_target, None, "tower"));
+        }
+        let report = legion_link::LearnReport {
+            introducer: "tower".to_owned(),
+            introducers: vec!["tower".to_owned()],
+            added: vec!["pi".to_owned()],
+            ..legion_link::LearnReport::default()
+        };
+
+        let app_state = backend
+            .commit_enrolled_pairing(enrolled, Some(report))
+            .await?;
+        assert!(app_state.ready);
+        assert!(app_state.nodes.iter().any(|n| n.node == "tower"));
+        assert!(
+            app_state
+                .nodes
+                .iter()
+                .any(|n| n.node == "pi" && n.origin == "learned"),
+            "recovered pairing must include learned fleet peers: {:?}",
+            app_state.nodes
+        );
+
+        // Reloading from disk must match memory (`tower` + learned `pi` both saved).
+        let on_disk = store.load()?;
+        assert!(on_disk.link.node("tower").is_some());
+        assert!(on_disk.link.node("pi").is_some());
         Ok(())
     }
 }
