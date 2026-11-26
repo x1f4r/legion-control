@@ -61,6 +61,11 @@ pub struct WriteOptions {
     /// exclusive rename is unsupported by the filesystem. If neither atomic primitive is
     /// supported, returns [`OsError::Unsupported`] rather than falling back to a replacing rename.
     pub no_replace: bool,
+    /// When `true`, skip `sync_all()` on the temporary file and parent directory while keeping
+    /// sibling temporary staging and atomic rename. Intended strictly for regenerable caches
+    /// (such as thumbnail and audio-tag caches) where concurrent readers must never observe
+    /// partial bytes, but durability across power loss is not required.
+    pub no_sync: bool,
 }
 
 impl WriteOptions {
@@ -70,6 +75,7 @@ impl WriteOptions {
             mode: Some(mode),
             force_mode: false,
             no_replace: false,
+            no_sync: false,
         }
     }
 
@@ -79,6 +85,7 @@ impl WriteOptions {
             mode: None,
             force_mode: false,
             no_replace: true,
+            no_sync: false,
         }
     }
 
@@ -97,6 +104,12 @@ impl WriteOptions {
     /// Require that the target path does not already exist.
     pub fn no_replace(mut self, no_replace: bool) -> Self {
         self.no_replace = no_replace;
+        self
+    }
+
+    /// Skip `fsync` on the staged file and parent directory (regenerable caches only).
+    pub fn no_sync(mut self, no_sync: bool) -> Self {
+        self.no_sync = no_sync;
         self
     }
 }
@@ -170,12 +183,14 @@ where
             err,
         )
     })?;
-    file.sync_all().map_err(|err| {
-        OsError::from_io(
-            format!("failed syncing temporary file for {}", target.display()),
-            err,
-        )
-    })?;
+    if !options.no_sync {
+        file.sync_all().map_err(|err| {
+            OsError::from_io(
+                format!("failed syncing temporary file for {}", target.display()),
+                err,
+            )
+        })?;
+    }
 
     apply_final_permissions(&file, existing_meta.as_ref(), options, target)?;
 
@@ -191,7 +206,9 @@ where
         replace_file(&guard.path, target)?;
         guard.disarm();
     }
-    sync_parent_dir(parent);
+    if !options.no_sync {
+        sync_parent_dir(parent);
+    }
     Ok(written)
 }
 
@@ -227,12 +244,14 @@ where
             err,
         )
     })?;
-    async_file.sync_all().await.map_err(|err| {
-        OsError::from_io(
-            format!("failed syncing temporary file for {}", target.display()),
-            err,
-        )
-    })?;
+    if !options.no_sync {
+        async_file.sync_all().await.map_err(|err| {
+            OsError::from_io(
+                format!("failed syncing temporary file for {}", target.display()),
+                err,
+            )
+        })?;
+    }
 
     let std_file = async_file.into_std().await;
     apply_final_permissions(&std_file, existing_meta.as_ref(), options, target)?;
@@ -245,8 +264,10 @@ where
         guard.disarm();
     }
 
-    let parent_owned = parent.to_path_buf();
-    let _ = tokio::task::spawn_blocking(move || sync_parent_dir(&parent_owned)).await;
+    if !options.no_sync {
+        let parent_owned = parent.to_path_buf();
+        let _ = tokio::task::spawn_blocking(move || sync_parent_dir(&parent_owned)).await;
+    }
     Ok(written)
 }
 
@@ -1332,5 +1353,27 @@ mod tests {
         assert_eq!(successes, 1);
         assert_eq!(already_exists, threads - 1);
         assert_eq!(list_dir_names(dir.path()), vec!["race.txt"]);
+    }
+
+    #[test]
+    fn no_sync_replaces_atomically_and_preserves_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("cache.thumb");
+        let opts = WriteOptions::with_mode(0o600).no_sync(true);
+
+        write_atomic(&target, b"first-entry", opts).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"first-entry");
+        assert_eq!(list_dir_names(dir.path()), vec!["cache.thumb"]);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        write_atomic(&target, b"replaced-entry", opts).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"replaced-entry");
+        assert_eq!(list_dir_names(dir.path()), vec!["cache.thumb"]);
     }
 }

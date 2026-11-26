@@ -282,6 +282,7 @@ async fn tags(ctx: &Ctx, args: TagsArgs) -> Result<TagsResult, ToolError> {
     }
 
     let cache = ThumbCache::for_dir(ctx.paths().thumb_cache_dir());
+    let cover_cache = FolderCoverCache::new();
     let grant = ctx.grant().clone();
     let principal = ctx.principal().to_owned();
     let cancel = ctx.cancel_token().clone();
@@ -290,7 +291,8 @@ async fn tags(ctx: &Ctx, args: TagsArgs) -> Result<TagsResult, ToolError> {
         let grant = grant.clone();
         let principal = principal.clone();
         let cache = cache.clone();
-        async move { tags_one(&grant, &principal, &cache, raw_path, cancel).await }
+        let cover_cache = cover_cache.clone();
+        async move { tags_one(&grant, &principal, &cache, &cover_cache, raw_path, cancel).await }
     })
     .await?;
 
@@ -477,25 +479,61 @@ fn prepare_tags_open_once(path: &Path, cache: &ThumbCache) -> Result<TagsPrep, E
     })
 }
 
+/// Deduplicates `find_folder_cover` directory scans across concurrent tasks in one `fs.tags`
+/// batch so a directory containing many songs without embedded artwork is read at most once.
+#[derive(Clone, Default)]
+struct FolderCoverCache {
+    dirs: Arc<std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::OnceCell<bool>>>>>,
+}
+
+impl FolderCoverCache {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    async fn has_cover<F>(&self, parent: &Path, probe: F) -> Result<bool, ToolError>
+    where
+        F: FnOnce() -> bool + Send + 'static,
+    {
+        let cell = {
+            let mut map = self.dirs.lock().unwrap_or_else(|p| p.into_inner());
+            Arc::clone(
+                map.entry(parent.to_path_buf())
+                    .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
+            )
+        };
+        cell.get_or_try_init(|| async move {
+            tokio::task::spawn_blocking(probe).await.map_err(|err| {
+                ErrorBody::new(
+                    ErrorCode::Internal,
+                    format!("fs.tags folder cover check stopped unexpectedly: {err}."),
+                )
+            })
+        })
+        .await
+        .copied()
+    }
+}
+
 async fn finish_with_cover(
     grant: &Grant,
+    cover_cache: &FolderCoverCache,
     resolved: &Path,
     raw_path: String,
     parsed: ParsedAudioTags,
 ) -> Result<TagsItem, ToolError> {
     let cover = if parsed.has_embedded_cover {
         true
-    } else {
+    } else if let Some(parent) = resolved.parent() {
         let grant_c = grant.clone();
         let resolved_c = resolved.to_path_buf();
-        tokio::task::spawn_blocking(move || find_folder_cover(&grant_c, &resolved_c).is_some())
-            .await
-            .map_err(|err| {
-                ErrorBody::new(
-                    ErrorCode::Internal,
-                    format!("fs.tags folder cover check stopped unexpectedly: {err}."),
-                )
-            })?
+        cover_cache
+            .has_cover(parent, move || {
+                find_folder_cover(&grant_c, &resolved_c).is_some()
+            })
+            .await?
+    } else {
+        false
     };
     Ok(TagsItem::from_parsed(raw_path, parsed, cover))
 }
@@ -504,6 +542,7 @@ async fn tags_one(
     grant: &Grant,
     principal: &str,
     cache: &ThumbCache,
+    cover_cache: &FolderCoverCache,
     raw_path: String,
     cancel: CancellationToken,
 ) -> Result<TagsItem, ToolError> {
@@ -581,7 +620,7 @@ async fn tags_one(
         baseline_rss_bytes,
     ) = match prep {
         Ok(TagsPrep::CacheHit(hit)) => {
-            return finish_with_cover(grant, &resolved, raw_path, hit).await;
+            return finish_with_cover(grant, cover_cache, &resolved, raw_path, hit).await;
         }
         Ok(TagsPrep::CachedBad(err)) => return Ok(TagsItem::from_error(raw_path, err)),
         Ok(TagsPrep::Ready {
@@ -697,7 +736,7 @@ async fn tags_one(
                 let _ =
                     tokio::task::spawn_blocking(move || cache_put.put_tags(&tags_key, &parsed_put))
                         .await;
-                finish_with_cover(grant, &resolved, raw_path, parsed).await
+                finish_with_cover(grant, cover_cache, &resolved, raw_path, parsed).await
             }
             AudioTagsWorkerOutcome::Rejected(err)
             | AudioTagsWorkerOutcome::TransientFailure(err) => {
@@ -776,7 +815,7 @@ async fn tags_one(
             let parsed_put = parsed.clone();
             let _ = tokio::task::spawn_blocking(move || cache_put.put_tags(&tags_key, &parsed_put))
                 .await;
-            finish_with_cover(grant, &resolved, raw_path, parsed).await
+            finish_with_cover(grant, cover_cache, &resolved, raw_path, parsed).await
         }
         Err(err) if err.code == ErrorCode::Cancelled => Err(err),
         Err(err) => Ok(TagsItem::from_error(raw_path, err)),
@@ -807,5 +846,72 @@ pub(super) fn parse_audio_format_cli_name(s: &str) -> Option<AudioFormat> {
         "mp4" => Some(AudioFormat::Mp4),
         "generic" => Some(AudioFormat::GenericAudio),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[tokio::test]
+    async fn folder_cover_cache_scans_each_parent_dir_once_per_batch() {
+        let cache = FolderCoverCache::new();
+        let dir_a = PathBuf::from("/tmp/album-a");
+        let dir_b = PathBuf::from("/tmp/album-b");
+        let scans_a = Arc::new(AtomicUsize::new(0));
+        let scans_b = Arc::new(AtomicUsize::new(0));
+
+        let mut set = JoinSet::new();
+        for _ in 0..16 {
+            let cache = cache.clone();
+            let dir_a = dir_a.clone();
+            let scans_a = Arc::clone(&scans_a);
+            set.spawn(async move {
+                cache
+                    .has_cover(&dir_a, move || {
+                        scans_a.fetch_add(1, Ordering::SeqCst);
+                        true
+                    })
+                    .await
+                    .unwrap()
+            });
+        }
+        for _ in 0..8 {
+            let cache = cache.clone();
+            let dir_b = dir_b.clone();
+            let scans_b = Arc::clone(&scans_b);
+            set.spawn(async move {
+                cache
+                    .has_cover(&dir_b, move || {
+                        scans_b.fetch_add(1, Ordering::SeqCst);
+                        false
+                    })
+                    .await
+                    .unwrap()
+            });
+        }
+
+        let mut trues = 0usize;
+        let mut falses = 0usize;
+        while let Some(res) = set.join_next().await {
+            if res.unwrap() {
+                trues += 1;
+            } else {
+                falses += 1;
+            }
+        }
+        assert_eq!(trues, 16);
+        assert_eq!(falses, 8);
+        assert_eq!(
+            scans_a.load(Ordering::SeqCst),
+            1,
+            "directory A must be scanned once across 16 concurrent songs"
+        );
+        assert_eq!(
+            scans_b.load(Ordering::SeqCst),
+            1,
+            "directory B must be scanned once across 8 concurrent songs"
+        );
     }
 }

@@ -799,6 +799,7 @@ fn copy_regular_file(
         mode,
         force_mode: false,
         no_replace: !opts.overwrite,
+        no_sync: false,
     };
     let copied = match write_atomic_from_reader(to, &mut reader, write_opts) {
         Ok(copied) => copied,
