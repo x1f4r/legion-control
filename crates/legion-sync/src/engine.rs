@@ -321,6 +321,14 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                         }
 
                         if !index_damaged && folder_problem.is_none() {
+                            let has_live_entries = match fs.walk(&IgnoreMatcher::default()) {
+                                Ok(w) => !w.entries.is_empty(),
+                                Err(SyncError::Fs {
+                                    kind: crate::FsErrorKind::NotFound,
+                                    ..
+                                }) => false,
+                                Err(err) => return Err(err),
+                            };
                             let avoid_inc = existing_marker.as_ref().map(|m| m.incarnation);
                             let inc =
                                 choose_fresh_incarnation(config.initial_incarnation, avoid_inc)?;
@@ -334,7 +342,8 @@ impl<F: SyncFs, S: IndexStore> SyncEngine<F, S> {
                             fs.write_marker(&marker)?;
                             token_store.write_token(&config.id, &token)?;
 
-                            let meta = FolderMeta::new(&config, inc, token);
+                            let mut meta = FolderMeta::new(&config, inc, token);
+                            meta.join_mode = has_live_entries;
                             let batch = StoreBatch {
                                 folder_meta: Some(meta),
                                 ..StoreBatch::default()

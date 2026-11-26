@@ -3987,11 +3987,24 @@ impl SimWorld {
             .map(|m| m.id.clone())
             .collect();
         let fs = HonestSimFs::new(caps, self.members.len().is_multiple_of(2));
+        let skew = self.rng.range_i64(-2 * 86_400, 2 * 86_400);
+        let now = Timestamp::new(self.global_secs + skew, 0);
+        let count = 1 + self.rng.range(2);
+        for j in 0..count {
+            let path = if j == 0 && self.rng.chance(1, 2) {
+                self.pick_path()
+            } else {
+                format!("joined/{new_id}_{j}.txt")
+            };
+            let (bytes, hash) = self.fresh_bytes();
+            fs.user_write_file(&path, bytes, hash, now);
+            self.note_created(&new_id, hash);
+            self.clear_universally_deleted_for_path(&path);
+        }
         let store = FaultyIndexStore::new();
         let token_store = MemoryInstanceTokenStore::new();
         let mut engine = SyncEngine::open(cfg, fs, store, token_store.clone()).unwrap();
         engine.set_deletion_brake(brake_disabled());
-        let skew = self.rng.range_i64(-2 * 86_400, 2 * 86_400);
         let new_idx = self.members.len();
         self.members.push(SimMember {
             id: new_id.clone(),
@@ -4002,23 +4015,6 @@ impl SimWorld {
             group: 0,
             ignore: IgnoreMatcher::default(),
         });
-
-        let count = 1 + self.rng.range(2);
-        let now = self.members[new_idx].local_time(self.global_secs);
-        for j in 0..count {
-            let path = if j == 0 && self.rng.chance(1, 2) {
-                self.pick_path()
-            } else {
-                format!("joined/{new_id}_{j}.txt")
-            };
-            let (bytes, hash) = self.fresh_bytes();
-            self.members[new_idx]
-                .engine
-                .fs()
-                .user_write_file(&path, bytes, hash, now);
-            self.note_created(&new_id, hash);
-            self.clear_universally_deleted_for_path(&path);
-        }
         self.scan_member(new_idx);
         self.log(|| format!("join {new_id} with {count} pre-existing files"));
     }
@@ -6695,22 +6691,33 @@ fn run_two_joiners_same_old_copy_seed(root_seed: u64, seed: u64, _record_trace: 
             .unwrap();
     }
 
-    // Two new joiners (m2, m3) start from the exact same old USB copy!
+    // Two new joiners (m2, m3) start from the exact same old USB copy already on disk before open!
     let all4 = ["m0", "m1", "m2", "m3"];
     m0.add_member("m2").unwrap();
     m0.add_member("m3").unwrap();
     m1.add_member("m2").unwrap();
     m1.add_member("m3").unwrap();
-    let mut m2 = mk("m2", &all4);
-    let mut m3 = mk("m3", &all4);
     let t2 = Timestamp::new(t0.secs + 20, 0);
-    for m in [&mut m2, &mut m3] {
-        m.fs()
-            .user_write_file("old.pdf", old_bytes.clone(), old_h, t0);
-        m.fs()
-            .user_write_file("keep.txt", keep_bytes.clone(), keep_h, t0);
-        m.scan(t2).unwrap();
-    }
+    let mut open_usb_joiner = |id: &str| {
+        let mut cfg =
+            FolderConfig::new("sim", id.to_string(), all4.iter().map(|s| (*s).to_string()));
+        cfg.initial_incarnation = Some(rng.next_u64() | 1);
+        let fs = HonestSimFs::new(FsCapabilities::unix(), true);
+        fs.user_write_file("old.pdf", old_bytes.clone(), old_h, t0);
+        fs.user_write_file("keep.txt", keep_bytes.clone(), keep_h, t0);
+        let mut e = SyncEngine::open(
+            cfg,
+            fs,
+            FaultyIndexStore::new(),
+            MemoryInstanceTokenStore::new(),
+        )
+        .unwrap();
+        e.set_deletion_brake(brake_disabled());
+        e.scan(t2).unwrap();
+        e
+    };
+    let mut m2 = open_usb_joiner("m2");
+    let mut m3 = open_usb_joiner("m3");
 
     // Joiners meet EACH OTHER first before meeting m0 or m1!
     m2.pull_from_peer(&SimPeer::new(&m3, "m2", "m3", PeerFault::None), t2)
@@ -6820,6 +6827,7 @@ fn run_lifetime_rotations_and_vv_pruning_seed(root_seed: u64, seed: u64, _record
     let n = names.len();
     let tokens: Vec<MemoryInstanceTokenStore> =
         (0..n).map(|_| MemoryInstanceTokenStore::new()).collect();
+    let b0 = format!("base-0-{seed}").into_bytes();
     let mut es: Vec<SyncEngine<HonestSimFs, FaultyIndexStore>> = names
         .iter()
         .enumerate()
@@ -6830,24 +6838,20 @@ fn run_lifetime_rotations_and_vv_pruning_seed(root_seed: u64, seed: u64, _record
                 names.iter().map(|s| (*s).to_string()),
             );
             cfg.initial_incarnation = Some(rng.next_u64() | 1);
-            let mut e = SyncEngine::open(
-                cfg,
-                HonestSimFs::new(FsCapabilities::unix(), true),
-                FaultyIndexStore::new(),
-                tokens[i].clone(),
-            )
-            .unwrap();
+            let fs = HonestSimFs::new(FsCapabilities::unix(), true);
+            if i == 0 {
+                // `f0.txt` already on disk before open -> born Unversioned.
+                fs.user_write_file("f0.txt", b0.clone(), hash_bytes(&b0), t0);
+            }
+            let mut e =
+                SyncEngine::open(cfg, fs, FaultyIndexStore::new(), tokens[i].clone()).unwrap();
             e.set_deletion_brake(brake_disabled());
             e
         })
         .collect();
 
-    // `f0.txt` is born pre-initial-scan (Unversioned); `f1.txt` and `f2.txt` are born post-scan
+    // `f0.txt` is born pre-open (Unversioned); `f1.txt` and `f2.txt` are born post-scan
     // (Versioned). Neither untouched `f0.txt` nor untouched `f2.txt` may grow keys!
-    let b0 = format!("base-0-{seed}").into_bytes();
-    es[0]
-        .fs()
-        .user_write_file("f0.txt", b0.clone(), hash_bytes(&b0), t0);
     es[0].scan(t0).unwrap();
     for i in 1..=2 {
         let b = format!("base-{i}-{seed}").into_bytes();
@@ -9247,13 +9251,13 @@ const REGRESSION_SEEDS: &[u64] = &[
     951, 1137, 1225, 1326, 1337, 1346, 1435, 1451, 1476, 1532, 1576, 1617, 2026, 2478, 5635, 11146,
     11338, 15197, 19883, 25021, 25180, 27850, 31444, 32580, 35879, 48566, 49954, 56498, 60211,
     71221, 85172, 85757, 89687, 90830, 94963, 248230, 257640, 338474, 405410, 521801, 612202,
-    640064, 656614, 834066, 859170, 1234029, 1252407, 1276023, 1325262, 1381582, 1442864, 1631700,
-    1735939, 1845682, 1905590, 1914338, 2132430, 2212240, 2242736, 2469631, 2508764, 2594599,
-    2770489, 2777393, 2838112, 2844675, 2909715, 2972224, 3132684, 3137180, 3286448, 3660488,
-    3739249, 3804523, 3810856, 3954961, 4066064, 4139193, 4319726, 4376094, 4377839, 4395930,
-    4560644, 4628071, 4689380, 4717156, 5028251, 6102439, 6250401, 6656918, 6972988, 7227298,
-    7504275, 7909139, 8482679, 8730315, 8855009, 9067232, 9625426, 13635160, 17469556, 18877611,
-    19447454, 37147542,
+    640064, 656614, 834066, 859170, 1125206, 1234029, 1252407, 1276023, 1325262, 1381582, 1442864,
+    1631700, 1735939, 1845682, 1905590, 1914338, 2132430, 2212240, 2242736, 2469631, 2508764,
+    2594599, 2770489, 2777393, 2838112, 2844675, 2909715, 2972224, 3132684, 3137180, 3286448,
+    3660488, 3739249, 3804523, 3810856, 3954961, 4066064, 4139193, 4319726, 4376094, 4377839,
+    4395930, 4560644, 4628071, 4689380, 4717156, 5028251, 6102439, 6250401, 6656918, 6972988,
+    7227298, 7504275, 7909139, 8482679, 8730315, 8855009, 9067232, 9625426, 13635160, 17469556,
+    18877611, 19447454, 37147542,
 ];
 
 #[test]
