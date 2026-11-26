@@ -229,6 +229,43 @@ export function hasImageMagic(buf, mime) {
   return false;
 }
 
+/**
+ * Validates one `fs.thumb` reply for a single probe image: no dev unsandboxed override, one `ok`
+ * result with an image MIME type, positive dimensions no larger than `requestedSize`, and base64
+ * bytes matching that format's magic header. Returns `{ mime, width, height, byteLength }` or
+ * throws a descriptive Error.
+ */
+export function validateThumbReply(thumb, requestedSize) {
+  if (thumb?.details?.sandbox === 'disabled') {
+    throw new Error('fs.thumb reported dev unsandboxed override');
+  }
+  if (!Array.isArray(thumb?.results) || thumb.results.length !== 1) {
+    throw new Error('fs.thumb returned unexpected results array');
+  }
+  const entry = thumb.results[0];
+  const img = entry?.ok;
+  if (!img || typeof img !== 'object') {
+    throw new Error(`fs.thumb failed to decode probe PNG: ${JSON.stringify(entry)}`);
+  }
+  if (typeof img.mime !== 'string' || !img.mime.startsWith('image/')) {
+    throw new Error(`fs.thumb did not return an image MIME type: ${JSON.stringify(img)}`);
+  }
+  if (typeof img.content !== 'string' || img.content.length === 0) {
+    throw new Error('fs.thumb returned empty image content');
+  }
+  if (
+    !Number.isInteger(img.width) || img.width <= 0 || img.width > requestedSize
+    || !Number.isInteger(img.height) || img.height <= 0 || img.height > requestedSize
+  ) {
+    throw new Error(`fs.thumb returned out-of-range dimensions ${img.width}x${img.height} (requested <= ${requestedSize})`);
+  }
+  const bytes = Buffer.from(img.content, 'base64');
+  if (!hasImageMagic(bytes, img.mime)) {
+    throw new Error(`fs.thumb reply is not a valid ${img.mime} image (head=${bytes.subarray(0, 12).toString('hex')})`);
+  }
+  return { mime: img.mime, width: img.width, height: img.height, byteLength: bytes.length };
+}
+
 const knownSecrets = new Set();
 
 function rememberSecret(value) {
@@ -649,21 +686,20 @@ step('b6 meta.doctor on near now pings far too', () => {
 });
 
 step('b7 fs.thumb --on far decodes a real PNG through the sandboxed worker over sshd', () => {
+  const requestedSize = 128;
   const localPng = path.join(data, 'sandbox-probe.png');
   fs.writeFileSync(localPng, buildTestPng(64, 48));
   const remotePng = `${farRoot}/sandbox/sandbox-probe.png`;
   const sent = cp(localPng, `far:${remotePng}`);
   check(sent.files_sent === 1, 'legion cp did not copy probe PNG to far', sent);
-  const thumb = ok('fs.thumb', { paths: [remotePng], size: 128 }, { on: 'far' });
-  check(thumb.details?.sandbox !== 'disabled', 'fs.thumb --on far reported dev unsandboxed override', thumb);
-  check(Array.isArray(thumb.results) && thumb.results.length === 1, 'fs.thumb --on far returned unexpected results array', thumb);
-  const item = thumb.results[0];
-  check(item?.ok === true, 'fs.thumb --on far failed to decode probe PNG', item);
-  check(typeof item.data === 'string' && item.data.length > 0, 'fs.thumb --on far returned empty image data', item);
-  check(Number.isInteger(item.width) && item.width > 0 && Number.isInteger(item.height) && item.height > 0, 'fs.thumb --on far returned invalid image dimensions', item);
-  const bytes = Buffer.from(item.data, 'base64');
-  check(hasImageMagic(bytes, item.mime), `fs.thumb --on far reply is not a valid ${item.mime} image`, { mime: item.mime, width: item.width, height: item.height, bytes: bytes.length, headHex: bytes.subarray(0, 12).toString('hex') });
-  return `${item.mime} ${item.width}x${item.height} (${bytes.length} bytes)`;
+  const thumb = ok('fs.thumb', { paths: [remotePng], size: requestedSize }, { on: 'far' });
+  let verified;
+  try {
+    verified = validateThumbReply(thumb, requestedSize);
+  } catch (err) {
+    throw new Failure(redactSecrets(`${err.message}\n${JSON.stringify(thumb, null, 2)}`));
+  }
+  return `${verified.mime} ${verified.width}x${verified.height} (${verified.byteLength} bytes)`;
 });
 
 // --- c. routed calls -----------------------------------------------------------------------------

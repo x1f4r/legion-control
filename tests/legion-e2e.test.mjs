@@ -12,6 +12,7 @@ import {
   realPowerRefusal,
   redactSecrets,
   shouldRunStep,
+  validateThumbReply,
   windowsForcedCommandError,
 } from '../scripts/legion-e2e.mjs';
 
@@ -118,10 +119,29 @@ test('shouldRunStep combines --only and --skip prefix filters', () => {
   assert.equal(shouldRunStep('b6 meta.doctor', ['a', 'b'], ['b6']), false);
 });
 
-test('buildTestPng produces a valid PNG recognized by hasImageMagic', () => {
-  const png = buildTestPng(32, 24);
+test('buildTestPng produces a valid PNG recognized by hasImageMagic and validateThumbReply', () => {
+  const png = buildTestPng(64, 48);
   assert.equal(hasImageMagic(png, 'image/png'), true);
   assert.equal(hasImageMagic(png, 'image/jpeg'), false);
-  assert.equal(hasImageMagic(Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0]), 'image/jpeg'), true);
+  const jpegBytes = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0]);
+  assert.equal(hasImageMagic(jpegBytes, 'image/jpeg'), true);
   assert.equal(hasImageMagic(Buffer.from('not an image'), 'image/png'), false);
+
+  const okReply = {
+    results: [
+      {
+        path: '~/sandbox-probe.png',
+        ok: { mime: 'image/jpeg', content: jpegBytes.toString('base64'), width: 64, height: 48 },
+      },
+    ],
+  };
+  assert.deepEqual(validateThumbReply(okReply, 128), {
+    mime: 'image/jpeg',
+    width: 64,
+    height: 48,
+    byteLength: 8,
+  });
+  assert.throws(() => validateThumbReply({ ...okReply, details: { sandbox: 'disabled' } }, 128), /dev unsandboxed/);
+  assert.throws(() => validateThumbReply(okReply, 32), /out-of-range dimensions/);
+  assert.throws(() => validateThumbReply({ results: [{ path: '~/x.png', error: { code: 'unsupported' } }] }, 128), /failed to decode/);
 });
