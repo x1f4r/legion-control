@@ -91,14 +91,6 @@ export function hasNativeEdgeBack(win = typeof window !== 'undefined' ? window :
   return Boolean(win && win.__LEGION_ANDROID__);
 }
 
-export function prefersReducedMotion(win = typeof window !== 'undefined' ? window : null) {
-  try {
-    return Boolean(win?.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches);
-  } catch {
-    return false;
-  }
-}
-
 /**
  * Steps to the previous or next item in an ordered list (clamped, no wrap-around).
  */
