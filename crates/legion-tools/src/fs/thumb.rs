@@ -104,6 +104,7 @@ use legion_os::OsError;
 use legion_os::file_id::{self, FileId};
 use legion_os::mem_limit::effective_memory_bytes;
 use legion_os::run::{RunOptions, run};
+use legion_os::sandbox::SandboxPolicy;
 use legion_os::shell::CommandSpec;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -157,7 +158,12 @@ const VIDEO_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const JPEG_QUALITY: u8 = 82;
 const FFMPEG_TIMEOUT: Duration = Duration::from_secs(15);
 const FFMPEG_KILL_GRACE: Duration = Duration::from_secs(1);
+#[cfg_attr(windows, allow(dead_code))]
 const FFMPEG_CAPTURE_LIMIT: usize = 32 * 1024;
+/// Maximum PNG poster frame bytes accepted over stdout `pipe:1` (16 MiB, well above any 1024×1024
+/// PNG frame).
+#[allow(dead_code)]
+const FFMPEG_PIPE_FRAME_LIMIT: usize = 16 * 1024 * 1024;
 /// Resident memory limit for sniffed <=1080p videos (256 MiB; up to 2 fit in a 512 MiB budget).
 const VIDEO_SMALL_RSS_LIMIT: u64 = 256 * 1024 * 1024;
 /// Resident memory limit for >1080p (4K/8K) or unknown-resolution videos (768 MiB; covers measured
@@ -181,6 +187,7 @@ const MAX_TIMEOUT_BACKOFF_ENTRIES: usize = 1024;
 
 /// Strictly allow only local file I/O in `ffmpeg` — blocks `http`, `https`, `concat`, `crypto`,
 /// `data`, `pipe`, `subfile`, and all network/virtual protocols.
+#[cfg_attr(windows, allow(dead_code))]
 const FFMPEG_PROTOCOL_WHITELIST: &str = "file";
 /// Whitelist when opening MOV/MP4 containers, always paired with `-enable_drefs 0` and
 /// `-use_absolute_path 0` so external data references cannot open other files.
@@ -2860,6 +2867,7 @@ fn minimal_ffmpeg_env(temp_dir: &Path) -> Vec<(OsString, OsString)> {
 }
 
 /// Builds the locked-down `ffmpeg` argument list for single-frame video poster extraction.
+#[cfg_attr(windows, allow(dead_code))]
 fn build_ffmpeg_args(
     input_arg: &str,
     frame_arg: &str,
@@ -2928,6 +2936,141 @@ fn build_ffmpeg_args(
     args
 }
 
+/// Input strategy when extracting a single PNG poster over `pipe:1`.
+#[allow(dead_code)]
+enum FfmpegPipeInput<'a> {
+    /// Inherited open regular file on `stdin` (`-fd 0 -i fd:`), allowing zero-capability Windows
+    /// AppContainer sandboxing without granting path read ACLs on user files.
+    StdinFd,
+    /// Explicit local file path (`-protocol_whitelist file,pipe -i <arg>`), used when `ffmpeg`
+    /// predates the `fd:` input protocol.
+    FilePath(&'a str),
+}
+
+/// Builds locked-down `ffmpeg` arguments that emit the scaled poster PNG directly to `pipe:1`
+/// (requiring zero filesystem writes).
+#[allow(dead_code)]
+fn build_ffmpeg_pipe_args(
+    input: FfmpegPipeInput<'_>,
+    seek: Option<&str>,
+    container: VideoContainer,
+) -> Vec<String> {
+    let mut args = vec![
+        "-hide_banner".to_owned(),
+        "-loglevel".to_owned(),
+        "error".to_owned(),
+    ];
+    let proto_whitelist = match input {
+        FfmpegPipeInput::StdinFd => "fd,pipe",
+        FfmpegPipeInput::FilePath(_) => {
+            args.push("-nostdin".to_owned());
+            "file,pipe"
+        }
+    };
+    args.extend([
+        "-y".to_owned(),
+        "-threads".to_owned(),
+        "1".to_owned(),
+        "-max_pixels".to_owned(),
+        FFMPEG_MAX_PIXELS.to_owned(),
+        "-max_alloc".to_owned(),
+        FFMPEG_MAX_ALLOC.to_owned(),
+        "-protocol_whitelist".to_owned(),
+        proto_whitelist.to_owned(),
+    ]);
+    match container {
+        VideoContainer::MovFamily => {
+            args.extend([
+                "-format_whitelist".to_owned(),
+                FFMPEG_MOV_FORMAT_WHITELIST.to_owned(),
+                "-enable_drefs".to_owned(),
+                "0".to_owned(),
+                "-use_absolute_path".to_owned(),
+                "0".to_owned(),
+            ]);
+        }
+        VideoContainer::Other => {
+            args.extend([
+                "-format_whitelist".to_owned(),
+                FFMPEG_OTHER_FORMAT_WHITELIST.to_owned(),
+            ]);
+        }
+    }
+    if let Some(ss) = seek {
+        args.push("-ss".to_owned());
+        args.push(ss.to_owned());
+    }
+    match input {
+        FfmpegPipeInput::StdinFd => {
+            args.extend([
+                "-fd".to_owned(),
+                "0".to_owned(),
+                "-i".to_owned(),
+                "fd:".to_owned(),
+            ]);
+        }
+        FfmpegPipeInput::FilePath(path_arg) => {
+            args.extend(["-i".to_owned(), path_arg.to_owned()]);
+        }
+    }
+    args.extend([
+        "-map".to_owned(),
+        "0:v:0".to_owned(),
+        "-frames:v".to_owned(),
+        "1".to_owned(),
+        "-threads".to_owned(),
+        "1".to_owned(),
+        "-filter_threads".to_owned(),
+        "1".to_owned(),
+        "-an".to_owned(),
+        "-sn".to_owned(),
+        "-dn".to_owned(),
+        "-vf".to_owned(),
+        "scale=min(1024\\,iw):min(1024\\,ih):force_original_aspect_ratio=decrease".to_owned(),
+        "-f".to_owned(),
+        "image2pipe".to_owned(),
+        "-vcodec".to_owned(),
+        "png".to_owned(),
+        "pipe:1".to_owned(),
+    ]);
+    args
+}
+
+#[cfg(windows)]
+fn ffmpeg_supports_fd_protocol(ffmpeg_bin: &Path) -> bool {
+    static SUPPORTS_FD: OnceLock<bool> = OnceLock::new();
+    *SUPPORTS_FD.get_or_init(|| {
+        let Ok(out) = std::process::Command::new(ffmpeg_bin)
+            .args(["-hide_banner", "-protocols"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+        else {
+            return false;
+        };
+        if !out.status.success() {
+            return false;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut in_input_section = false;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.eq_ignore_ascii_case("Input:") {
+                in_input_section = true;
+                continue;
+            }
+            if trimmed.eq_ignore_ascii_case("Output:") {
+                break;
+            }
+            if in_input_section && trimmed == "fd" {
+                return true;
+            }
+        }
+        false
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn extract_video_poster(
     resolved: &Path,
@@ -2958,13 +3101,75 @@ async fn extract_video_poster(
                 format!("Cannot create temporary directory for video thumbnail: {err}."),
             )
         })?;
-    let frame_path = temp_dir.path().join("frame.png");
+
+    let frame_bytes = extract_ffmpeg_png_bytes(
+        &ffmpeg_bin,
+        temp_dir.path(),
+        resolved,
+        container,
+        rss_limit,
+        deadline,
+        cancel,
+    )
+    .await?;
+
+    let resolved_check = resolved.to_path_buf();
+    let frame_label = temp_dir.path().join("frame.png");
+    tokio::task::spawn_blocking(move || {
+        let after_meta = fs::metadata(&resolved_check)
+            .map_err(|err| map_io_error("stat", &resolved_check, err))?;
+        if FileStamp::from_path(&resolved_check, &after_meta) != expected_stamp {
+            return Err(changed_while_reading(&resolved_check));
+        }
+        if frame_bytes.len() as u64 > MAX_SOURCE_BYTES {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "Extracted video frame for {} exceeded the 64 MiB limit.",
+                    resolved_check.display()
+                ),
+            ));
+        }
+        let (decode_bytes, profile, override_orientation) =
+            select_decode_source(&frame_label, frame_bytes)?;
+        let no_abort = AtomicBool::new(false);
+        decode_and_render_image_checked(
+            &frame_label,
+            decode_bytes,
+            profile,
+            override_orientation,
+            target_size,
+            fit,
+            &no_abort,
+        )
+    })
+    .await
+    .map_err(|err| {
+        ErrorBody::new(
+            ErrorCode::Internal,
+            format!("fs.thumb video poster encode stopped unexpectedly: {err}."),
+        )
+    })?
+}
+
+#[cfg(not(windows))]
+#[allow(clippy::too_many_arguments)]
+async fn extract_ffmpeg_png_bytes(
+    ffmpeg_bin: &Path,
+    temp_dir: &Path,
+    resolved: &Path,
+    container: VideoContainer,
+    rss_limit: u64,
+    deadline: Instant,
+    cancel: CancellationToken,
+) -> Result<Vec<u8>, ErrorBody> {
+    let frame_path = temp_dir.join("frame.png");
     let frame_arg = frame_path.to_string_lossy().into_owned();
     let input_arg = platform::ffmpeg_input_arg(resolved);
 
     let seek_outcome = run_ffmpeg_extract(
-        &ffmpeg_bin,
-        temp_dir.path(),
+        ffmpeg_bin,
+        temp_dir,
         resolved,
         &input_arg,
         &frame_arg,
@@ -2996,16 +3201,8 @@ async fn extract_video_poster(
             }
         }
         let fallback_outcome = run_ffmpeg_extract(
-            &ffmpeg_bin,
-            temp_dir.path(),
-            resolved,
-            &input_arg,
-            &frame_arg,
-            None,
-            container,
-            rss_limit,
-            deadline,
-            cancel.clone(),
+            ffmpeg_bin, temp_dir, resolved, &input_arg, &frame_arg, None, container, rss_limit,
+            deadline, cancel,
         )
         .await?;
         let fallback_ready = fs::metadata(&frame_path)
@@ -3029,51 +3226,171 @@ async fn extract_video_poster(
         }
     }
 
-    let resolved_check = resolved.to_path_buf();
-    let frame_for_decode = frame_path.clone();
+    let frame_for_read = frame_path.clone();
     tokio::task::spawn_blocking(move || {
-        let after_meta = fs::metadata(&resolved_check)
-            .map_err(|err| map_io_error("stat", &resolved_check, err))?;
-        if FileStamp::from_path(&resolved_check, &after_meta) != expected_stamp {
-            return Err(changed_while_reading(&resolved_check));
-        }
-        let mut frame_bytes = Vec::new();
-        File::open(&frame_for_decode)
-            .map_err(|err| map_io_error("read", &frame_for_decode, err))?
+        let mut bytes = Vec::new();
+        File::open(&frame_for_read)
+            .map_err(|err| map_io_error("read", &frame_for_read, err))?
             .take(MAX_SOURCE_BYTES + 1)
-            .read_to_end(&mut frame_bytes)
-            .map_err(|err| map_io_error("read", &frame_for_decode, err))?;
-        if frame_bytes.len() as u64 > MAX_SOURCE_BYTES {
-            return Err(ErrorBody::new(
-                ErrorCode::Failed,
-                format!(
-                    "Extracted video frame for {} exceeded the 64 MiB limit.",
-                    resolved_check.display()
-                ),
-            ));
-        }
-        let (decode_bytes, profile, override_orientation) =
-            select_decode_source(&frame_for_decode, frame_bytes)?;
-        let no_abort = AtomicBool::new(false);
-        decode_and_render_image_checked(
-            &frame_for_decode,
-            decode_bytes,
-            profile,
-            override_orientation,
-            target_size,
-            fit,
-            &no_abort,
-        )
+            .read_to_end(&mut bytes)
+            .map_err(|err| map_io_error("read", &frame_for_read, err))?;
+        Ok::<Vec<u8>, ErrorBody>(bytes)
     })
     .await
     .map_err(|err| {
         ErrorBody::new(
             ErrorCode::Internal,
-            format!("fs.thumb video poster encode stopped unexpectedly: {err}."),
+            format!("fs.thumb video poster read stopped unexpectedly: {err}."),
         )
     })?
 }
 
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+async fn extract_ffmpeg_png_bytes(
+    ffmpeg_bin: &Path,
+    temp_dir: &Path,
+    resolved: &Path,
+    container: VideoContainer,
+    rss_limit: u64,
+    deadline: Instant,
+    cancel: CancellationToken,
+) -> Result<Vec<u8>, ErrorBody> {
+    let use_fd = ffmpeg_supports_fd_protocol(ffmpeg_bin);
+    let seek_outcome = run_ffmpeg_pipe_extract(
+        ffmpeg_bin,
+        temp_dir,
+        resolved,
+        use_fd,
+        Some("1"),
+        container,
+        rss_limit,
+        deadline,
+        cancel.clone(),
+    )
+    .await?;
+
+    if !seek_outcome.stdout_bytes.is_empty() && !seek_outcome.stdout.truncated {
+        return Ok(seek_outcome.stdout_bytes);
+    }
+    if !seek_outcome.success() {
+        let detail = seek_outcome.stderr.text.trim();
+        if !detail.is_empty() && !detail.to_ascii_lowercase().contains("output file is empty") {
+            return Err(ErrorBody::new(
+                ErrorCode::Failed,
+                format!(
+                    "ffmpeg could not extract a frame from {}: {}",
+                    resolved.display(),
+                    first_line(detail)
+                ),
+            )
+            .with_hint("The file may be corrupted, exceed pixel/memory limits, reference external data (blocked for safety), or use a codec this node's ffmpeg cannot decode."));
+        }
+    }
+
+    let fallback_outcome = run_ffmpeg_pipe_extract(
+        ffmpeg_bin, temp_dir, resolved, use_fd, None, container, rss_limit, deadline, cancel,
+    )
+    .await?;
+    if !fallback_outcome.stdout_bytes.is_empty() && !fallback_outcome.stdout.truncated {
+        return Ok(fallback_outcome.stdout_bytes);
+    }
+
+    let detail = fallback_outcome.stderr.text.trim();
+    let reason = if detail.is_empty() {
+        "no video frame was produced".to_owned()
+    } else {
+        first_line(detail).to_owned()
+    };
+    Err(ErrorBody::new(
+        ErrorCode::Failed,
+        format!(
+            "ffmpeg could not extract a poster frame from {}: {reason}.",
+            resolved.display()
+        ),
+    )
+    .with_hint("The video file may have no decodable video stream or be corrupted."))
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+async fn run_ffmpeg_pipe_extract(
+    ffmpeg_bin: &Path,
+    temp_dir: &Path,
+    resolved: &Path,
+    use_fd: bool,
+    seek: Option<&str>,
+    container: VideoContainer,
+    rss_limit: u64,
+    deadline: Instant,
+    cancel: CancellationToken,
+) -> Result<legion_os::run::RunOutput, ErrorBody> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(ErrorBody::new(
+            ErrorCode::Timeout,
+            "Extracting a video poster frame exceeded the time limit.",
+        )
+        .with_hint("The video may be very slow to seek or on slow storage."));
+    }
+
+    let (args, stdin_file, sandbox_input) = if use_fd {
+        let resolved_open = resolved.to_path_buf();
+        let (file, _) = tokio::task::spawn_blocking(move || {
+            open_regular_file(
+                &resolved_open,
+                "thumbnail",
+                "Pass a regular file path to fs.thumb; directories cannot be thumbnailed.",
+            )
+        })
+        .await
+        .map_err(|err| {
+            ErrorBody::new(
+                ErrorCode::Internal,
+                format!("fs.thumb video open stopped unexpectedly: {err}."),
+            )
+        })??;
+        (
+            build_ffmpeg_pipe_args(FfmpegPipeInput::StdinFd, seek, container),
+            Some(file),
+            None,
+        )
+    } else {
+        let input_arg = platform::ffmpeg_input_arg(resolved);
+        (
+            build_ffmpeg_pipe_args(FfmpegPipeInput::FilePath(&input_arg), seek, container),
+            None,
+            Some(resolved.to_path_buf()),
+        )
+    };
+
+    let mut options = RunOptions::new(CommandSpec::Argv {
+        program: ffmpeg_bin.as_os_str().to_os_string(),
+        args: args.into_iter().map(Into::into).collect(),
+    })
+    .env_clear(true)
+    .envs(minimal_ffmpeg_env(temp_dir))
+    .memory_limit(rss_limit)
+    .rlimit_as_headroom(FFMPEG_RLIMIT_AS_HEADROOM)
+    .timeout(remaining)
+    .kill_grace(FFMPEG_KILL_GRACE)
+    .capture_limit(FFMPEG_PIPE_FRAME_LIMIT)
+    .raw_stdout(true)
+    .sandbox(SandboxPolicy::Ffmpeg {
+        ffmpeg_bin: ffmpeg_bin.to_path_buf(),
+        input_file: sandbox_input,
+        temp_dir: temp_dir.to_path_buf(),
+    })
+    .cancel(cancel);
+    if let Some(file) = stdin_file {
+        options = options.stdin_file(file);
+    }
+
+    let output = run(options).await.map_err(map_ffmpeg_spawn_error)?;
+    classify_ffmpeg_run_output(resolved, output, rss_limit, remaining)
+}
+
+#[cfg(not(windows))]
 #[allow(clippy::too_many_arguments)]
 async fn run_ffmpeg_extract(
     ffmpeg_bin: &Path,
@@ -3108,9 +3425,19 @@ async fn run_ffmpeg_extract(
     .timeout(remaining)
     .kill_grace(FFMPEG_KILL_GRACE)
     .capture_limit(FFMPEG_CAPTURE_LIMIT)
+    .sandbox(SandboxPolicy::Ffmpeg {
+        ffmpeg_bin: ffmpeg_bin.to_path_buf(),
+        input_file: Some(resolved.to_path_buf()),
+        temp_dir: temp_dir.to_path_buf(),
+    })
     .cancel(cancel);
 
-    let output = run(options).await.map_err(|err| match err {
+    let output = run(options).await.map_err(map_ffmpeg_spawn_error)?;
+    classify_ffmpeg_run_output(resolved, output, rss_limit, remaining)
+}
+
+fn map_ffmpeg_spawn_error(err: OsError) -> ErrorBody {
+    match err {
         OsError::ProgramNotFound { .. } | OsError::NotFound { .. } => ErrorBody::new(
             ErrorCode::Unsupported,
             "Video thumbnails are not available on this node because ffmpeg is not on PATH.",
@@ -3118,12 +3445,29 @@ async fn run_ffmpeg_extract(
         .with_hint(
             "Install ffmpeg on this node and ensure it is on PATH to generate video thumbnails.",
         ),
+        OsError::Unsupported { detail } => ErrorBody::new(
+            ErrorCode::Unsupported,
+            format!("Video thumbnails are disabled because the OS ffmpeg sandbox is unavailable: {detail}."),
+        )
+        .with_hint("Run Legion on a host with OS sandboxing available so ffmpeg can extract video posters safely.")
+        .with_details(json!({
+            "reason": "sandbox_unavailable",
+            "missing": "ffmpeg OS sandbox",
+            "detail": detail,
+        })),
         other => ErrorBody::new(
             ErrorCode::Failed,
             format!("Running ffmpeg for video thumbnail failed: {other}."),
         ),
-    })?;
+    }
+}
 
+fn classify_ffmpeg_run_output(
+    resolved: &Path,
+    output: legion_os::run::RunOutput,
+    rss_limit: u64,
+    remaining: Duration,
+) -> Result<legion_os::run::RunOutput, ErrorBody> {
     if output.cancelled {
         return Err(cancelled_error("fs.thumb"));
     }
@@ -3283,6 +3627,28 @@ mod tests {
         assert!(mov_args.contains(&"-dn".to_owned()));
         let map_pos = idx(&mov_args, "-map").expect("-map missing");
         assert_eq!(mov_args[map_pos + 1], "0:v:0");
+
+        let fd_args = build_ffmpeg_pipe_args(
+            FfmpegPipeInput::StdinFd,
+            Some("1"),
+            VideoContainer::MovFamily,
+        );
+        let fd_proto = idx(&fd_args, "-protocol_whitelist").expect("fd protocol_whitelist");
+        assert_eq!(fd_args[fd_proto + 1], "fd,pipe");
+        assert!(!fd_args.contains(&"-nostdin".to_owned()));
+        let fd_flag = idx(&fd_args, "-fd").expect("-fd missing");
+        assert_eq!(fd_args[fd_flag + 1], "0");
+        assert_eq!(fd_args.last().map(String::as_str), Some("pipe:1"));
+
+        let file_pipe_args = build_ffmpeg_pipe_args(
+            FfmpegPipeInput::FilePath("C:\\clip.mp4"),
+            None,
+            VideoContainer::Other,
+        );
+        let fp_proto = idx(&file_pipe_args, "-protocol_whitelist").expect("file,pipe whitelist");
+        assert_eq!(file_pipe_args[fp_proto + 1], "file,pipe");
+        assert!(file_pipe_args.contains(&"-nostdin".to_owned()));
+        assert_eq!(file_pipe_args.last().map(String::as_str), Some("pipe:1"));
         let mov_formats: Vec<&str> = mov_args[fmt_pos + 1].split(',').collect();
         for forbidden in ["dash", "hls", "concat", "m3u8", "http", "https"] {
             assert!(
