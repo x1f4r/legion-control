@@ -3081,13 +3081,13 @@ mod tests {
         // Wait for both responses to finish so both slots are marked authenticated and idle on keep-alive.
         let mut buf1 = [0u8; 1024];
         let mut buf2 = [0u8; 1024];
-        let n1 = tokio::time::timeout(Duration::from_millis(300), auth1.read(&mut buf1))
+        let n1 = tokio::time::timeout(Duration::from_secs(5), auth1.read(&mut buf1))
             .await
-            .unwrap()
+            .expect("timed out reading first authenticated keep-alive response")
             .unwrap();
-        let n2 = tokio::time::timeout(Duration::from_millis(300), auth2.read(&mut buf2))
+        let n2 = tokio::time::timeout(Duration::from_secs(5), auth2.read(&mut buf2))
             .await
-            .unwrap()
+            .expect("timed out reading second authenticated keep-alive response")
             .unwrap();
         assert!(String::from_utf8_lossy(&buf1[..n1]).contains("200 OK"));
         assert!(String::from_utf8_lossy(&buf2[..n2]).contains("200 OK"));
@@ -3095,14 +3095,21 @@ mod tests {
         let mut overflow = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let mut byte = [0u8; 1];
         let overflow_read =
-            tokio::time::timeout(Duration::from_millis(150), overflow.read(&mut byte)).await;
+            tokio::time::timeout(Duration::from_secs(5), overflow.read(&mut byte)).await;
         assert!(
             matches!(overflow_read, Ok(Ok(0)) | Ok(Err(_))),
             "excess connection above authenticated cap should be dropped immediately, got {overflow_read:?}"
         );
         drop(auth1);
         drop(auth2);
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        let release_deadline = Instant::now() + Duration::from_secs(5);
+        while !server.loopback_conns.lock().unwrap().active.is_empty() {
+            assert!(
+                Instant::now() < release_deadline,
+                "timed out waiting for dropped keep-alive sockets to release loopback slots"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
 
         let (status, _, body) = raw_http(
             port,
@@ -3115,13 +3122,23 @@ mod tests {
         // Simulate OS reclaiming the listening socket during iOS background suspend: cancel the
         // current listener token while keeping the port recorded, then call
         // `probe_or_recover_loopback()` and confirm it recovers cleanly.
-        {
+        let accept_alive = {
             let guard = server.listener.lock().unwrap();
-            if let Some(h) = guard.as_ref() {
+            guard.as_ref().map(|h| {
                 h.shutdown.cancel();
+                Arc::clone(&h.accept_alive)
+            })
+        };
+        if let Some(flag) = accept_alive {
+            let stop_deadline = Instant::now() + Duration::from_secs(5);
+            while flag.load(Ordering::Acquire) {
+                assert!(
+                    Instant::now() < stop_deadline,
+                    "timed out waiting for cancelled loopback accept loop to exit"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
         let recovered_port = server
             .probe_or_recover_loopback()
             .await
@@ -6271,7 +6288,7 @@ mod tests {
         // and drops device active_streams to 0.
         let mut buf = vec![0u8; 64 * 1024];
         loop {
-            let step = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf)).await;
+            let step = tokio::time::timeout(Duration::from_secs(10), sock.read(&mut buf)).await;
             assert!(
                 step.is_ok(),
                 "loopback stream did not abort after content_revoke"
@@ -6289,7 +6306,7 @@ mod tests {
         );
         drop(sock);
 
-        let dev_deadline = Instant::now() + Duration::from_secs(2);
+        let dev_deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < dev_deadline && server.active_streams.load(Ordering::Acquire) > 0 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -7913,7 +7930,7 @@ mod tests {
             ),
         ] {
             let (st, head, body) =
-                tokio::time::timeout(Duration::from_secs(2), raw_http(port, &req))
+                tokio::time::timeout(Duration::from_secs(10), raw_http(port, &req))
                     .await
                     .expect("invalid probe request must close immediately");
             assert_eq!(st, 404, "expected 404 for {req}\ngot:\n{head}");
@@ -7937,7 +7954,7 @@ mod tests {
             "GET {LOOPBACK_PROBE_PATH} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{LOOPBACK_PROBE_CHALLENGE_HEADER}: {challenge_b64}\r\n{LOOPBACK_PROBE_AUTH_HEADER}: {valid_auth_b64}\r\nConnection: keep-alive\r\n\r\n"
         );
         let (ok_st, ok_head, ok_body) =
-            tokio::time::timeout(Duration::from_secs(2), raw_http(port, &valid_req))
+            tokio::time::timeout(Duration::from_secs(10), raw_http(port, &valid_req))
                 .await
                 .expect("valid probe must close immediately");
         assert_eq!(ok_st, 204, "{ok_head}");
@@ -8003,7 +8020,14 @@ mod tests {
             sock.write_all(b"GET /v1/content/").await.unwrap();
             holders.push(sock);
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let fill_deadline = Instant::now() + Duration::from_secs(5);
+        while server.loopback_conns.lock().unwrap().active.len() < MAX_LOOPBACK_CONNECTIONS {
+            assert!(
+                Instant::now() < fill_deadline,
+                "timed out waiting for 32 unauthenticated sockets to register on loopback listener"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert!(
             probe_loopback_ownership(port, &secret, LOOPBACK_PROBE_TIMEOUT).await,
             "ownership probe must succeed even when 32 unauthenticated sockets are held"

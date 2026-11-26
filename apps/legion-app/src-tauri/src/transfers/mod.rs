@@ -5683,23 +5683,69 @@ mod tests {
         }
     }
 
+    async fn wait_for_entry(
+        mgr: &TransferManager,
+        id: &str,
+        step: &str,
+        predicate: impl Fn(&DeviceTransfer) -> bool,
+    ) -> DeviceTransfer {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if let Some(t) = mgr.list().into_iter().find(|t| t.id == id)
+                && predicate(&t)
+            {
+                return t;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "timed out waiting for transfer {id} ({step}); current: {:?}",
+            mgr.list()
+        );
+    }
+
+    async fn wait_for_finalized_path(
+        mgr: &TransferManager,
+        id: &str,
+        step: &str,
+    ) -> DeviceTransfer {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let recorded = {
+                let guard = mgr
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                !guard.running.contains_key(id)
+                    && guard
+                        .items
+                        .iter()
+                        .find(|r| r.transfer.id == id)
+                        .is_some_and(|r| r.finalized_local_path.is_some())
+            };
+            let persisted = recorded
+                && fs::read_to_string(mgr.queue_file_path())
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<PersistedQueue>(&raw).ok())
+                    .and_then(|q| q.items.into_iter().find(|r| r.transfer.id == id))
+                    .is_some_and(|r| r.finalized_local_path.is_some());
+            if persisted && let Some(t) = mgr.list().into_iter().find(|t| t.id == id) {
+                return t;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "timed out waiting for transfer {id} ({step}); current: {:?}",
+            mgr.list()
+        );
+    }
+
     async fn wait_for_state(
         mgr: &TransferManager,
         id: &str,
         predicate: impl Fn(TransferState) -> bool,
     ) -> DeviceTransfer {
-        for _ in 0..200 {
-            if let Some(t) = mgr.list().into_iter().find(|t| t.id == id)
-                && predicate(t.state)
-            {
-                return t;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!(
-            "timed out waiting for transfer {id}; current: {:?}",
-            mgr.list()
-        );
+        wait_for_entry(mgr, id, "target state", |t| predicate(t.state)).await
     }
 
     #[tokio::test]
@@ -6295,8 +6341,12 @@ mod tests {
             .await
             .unwrap();
         platform.finalize_release.notify_waiters();
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        let still_paused = mgr.list().into_iter().find(|t| t.id == id2).unwrap();
+        let still_paused = wait_for_finalized_path(
+            &mgr,
+            &id2,
+            "paused finalize_download recording finalized_local_path",
+        )
+        .await;
         assert_eq!(still_paused.state, TransferState::Paused);
         assert!(
             !platform
@@ -7166,7 +7216,12 @@ mod tests {
             .await
             .unwrap();
         platform.finalize_release.notify_waiters();
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        let _ = wait_for_finalized_path(
+            &mgr,
+            &id2,
+            "paused Android finalize_download recording content URI",
+        )
+        .await;
         assert_eq!(platform.live_content_uris.lock().unwrap().len(), 1);
 
         let c2 = mgr
@@ -7227,7 +7282,12 @@ mod tests {
                 .await
                 .unwrap();
             platform.finalize_release.notify_waiters();
-            tokio::time::sleep(Duration::from_millis(80)).await;
+            let _ = wait_for_finalized_path(
+                &mgr,
+                &id,
+                "paused cache finalize_download recording finalized_local_path",
+            )
+            .await;
             assert_eq!(fs::read_dir(&platform.cache_dir).unwrap().count(), 1);
             assert_eq!(fs::read_dir(&platform.downloads_dir).unwrap().count(), 0);
 
@@ -7302,7 +7362,12 @@ mod tests {
                 .await
                 .unwrap();
             platform.finalize_release.notify_waiters();
-            tokio::time::sleep(Duration::from_millis(80)).await;
+            let _ = wait_for_finalized_path(
+                &mgr,
+                &id,
+                "paused Android cache finalize_download recording FileProvider URI",
+            )
+            .await;
             assert!(
                 platform
                     .live_content_uris

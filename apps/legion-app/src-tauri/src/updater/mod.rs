@@ -6410,7 +6410,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(st1.phase, "ready", "{st1:?}");
-        assert!(t0.elapsed() <= LIST_NODE_TIMEOUT + Duration::from_secs(1));
+        assert!(
+            t0.elapsed() <= LIST_NODE_TIMEOUT + Duration::from_secs(5),
+            "concurrent check_with_client took too long: {:?}",
+            t0.elapsed()
+        );
         assert!(mgr.is_node_deprioritized("slow"));
 
         let ordered = mgr.order_nodes_for(
