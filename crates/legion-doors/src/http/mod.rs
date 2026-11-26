@@ -45,7 +45,8 @@ use axum::extract::{Request, State};
 use axum::http::header::{
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
     ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_MAX_AGE, ALLOW, CONTENT_SECURITY_POLICY,
-    CONTENT_TYPE, HeaderValue, REFERRER_POLICY, VARY, WWW_AUTHENTICATE, X_CONTENT_TYPE_OPTIONS,
+    CONTENT_TYPE, HeaderName, HeaderValue, REFERRER_POLICY, VARY, WWW_AUTHENTICATE,
+    X_CONTENT_TYPE_OPTIONS,
 };
 use axum::http::{Method, Response, StatusCode};
 use axum::middleware::{self, Next};
@@ -877,6 +878,14 @@ async fn gate(
         );
         headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
         headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+        headers.insert(
+            HeaderName::from_static("cross-origin-resource-policy"),
+            if accepted_origin.is_some() {
+                HeaderValue::from_static("cross-origin")
+            } else {
+                HeaderValue::from_static("same-origin")
+            },
+        );
     }
     if let Some(origin) = accepted_origin {
         headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin);
@@ -2182,6 +2191,287 @@ paths = [{photo_toml}]
             after_revoke_head.starts_with("HTTP/1.1 404 "),
             "revoking the token must revoke remaining tickets of the holder, got: {after_revoke_head}"
         );
+
+        shutdown.cancel();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_door_security_headers_guards_and_ticket_isolation() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("legion");
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(home.join("config")).unwrap();
+        std::fs::create_dir_all(home.join("state")).unwrap();
+        std::fs::create_dir_all(&docs).unwrap();
+
+        let html_file = docs.join("evil.html");
+        std::fs::write(&html_file, b"<script>alert(1)</script>").unwrap();
+        let svg_file = docs.join("evil.svg");
+        std::fs::write(
+            &svg_file,
+            b"<svg xmlns='http://www.w3.org/2000/svg' onload='alert(1)'/>",
+        )
+        .unwrap();
+        let pdf_file = docs.join("doc.pdf");
+        std::fs::write(&pdf_file, b"%PDF-1.7\n").unwrap();
+
+        let paths = legion_core::Paths::under(&home);
+        std::fs::write(
+            paths.config_file("node.toml"),
+            "name = \"tower\"\n[serve]\norigins = [\"https://allowed.example\"]\n",
+        )
+        .unwrap();
+        let docs_toml = serde_json::to_string(&docs.to_string_lossy()).unwrap();
+        std::fs::write(
+            paths.config_file("policy.toml"),
+            format!(
+                "\
+[principals.reader]
+role = \"observer\"
+
+[roles.observer]
+allow = [\"effect:read\"]
+paths = [{docs_toml}]
+"
+            ),
+        )
+        .unwrap();
+
+        let node = Node::new(paths.clone(), legion_tools::registry());
+        let token = node
+            .call(legion_core::Call::new(
+                legion_core::Door::Cli,
+                "token.add",
+                serde_json::json!({ "name": "reader-tok", "principal": "reader" }),
+            ))
+            .await
+            .unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let door = HttpDoor::new(node.clone(), Arc::new(legion_core::Local)).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
+        let server_task = tokio::spawn(async move {
+            let _ = door.serve(listener, stop.cancelled()).await;
+        });
+
+        async fn raw_req(port: u16, req: &str) -> (String, Vec<u8>) {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            s.write_all(req.as_bytes()).await.unwrap();
+            let mut resp = Vec::new();
+            s.read_to_end(&mut resp).await.unwrap();
+            let sep = resp
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .expect("HTTP response header separator");
+            (
+                String::from_utf8_lossy(&resp[..sep]).into_owned(),
+                resp[sep + 4..].to_vec(),
+            )
+        }
+
+        // 1. UI asset carries CORP: same-origin, CSP frame-ancestors 'none', and nosniff.
+        let (ui_head, _) = raw_req(
+            port,
+            &format!("GET /icons/legion.svg HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        let ui_lower = ui_head.to_ascii_lowercase();
+        assert!(ui_head.starts_with("HTTP/1.1 200 "), "{ui_head}");
+        assert!(
+            ui_lower.contains("cross-origin-resource-policy: same-origin"),
+            "{ui_head}"
+        );
+        assert!(ui_lower.contains("frame-ancestors 'none'"), "{ui_head}");
+        assert!(
+            ui_lower.contains("x-content-type-options: nosniff"),
+            "{ui_head}"
+        );
+
+        // 2. API JSON replies carry CORP: same-origin and Cache-Control: no-store.
+        let (tools_head, _) = raw_req(
+            port,
+            &format!(
+                "GET /v1/tools HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        let tools_lower = tools_head.to_ascii_lowercase();
+        assert!(tools_head.starts_with("HTTP/1.1 200 "), "{tools_head}");
+        assert!(
+            tools_lower.contains("cross-origin-resource-policy: same-origin"),
+            "{tools_head}"
+        );
+        assert!(
+            tools_lower.contains("cache-control: no-store"),
+            "{tools_head}"
+        );
+
+        // 3. An explicitly listed Origin receives CORP: cross-origin and ACAO; unlisted Origin gets 403.
+        let (allowed_head, _) = raw_req(
+            port,
+            &format!(
+                "GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: https://allowed.example\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        let allowed_lower = allowed_head.to_ascii_lowercase();
+        assert!(allowed_head.starts_with("HTTP/1.1 200 "), "{allowed_head}");
+        assert!(
+            allowed_lower.contains("cross-origin-resource-policy: cross-origin"),
+            "{allowed_head}"
+        );
+        assert!(
+            allowed_lower.contains("access-control-allow-origin: https://allowed.example"),
+            "{allowed_head}"
+        );
+
+        let (evil_origin_head, _) = raw_req(
+            port,
+            &format!(
+                "GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: https://evil.example\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(
+            evil_origin_head.starts_with("HTTP/1.1 403 "),
+            "{evil_origin_head}"
+        );
+        assert!(
+            evil_origin_head
+                .to_ascii_lowercase()
+                .contains("cache-control: no-store"),
+            "{evil_origin_head}"
+        );
+
+        // 4. DNS rebinding Host is refused with 421.
+        let (rebind_head, _) = raw_req(
+            port,
+            &format!(
+                "GET /v1/health HTTP/1.1\r\nHost: evil.example:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(rebind_head.starts_with("HTTP/1.1 421 "), "{rebind_head}");
+
+        // 5. A bearer token passed in the URL query string never authenticates.
+        let (query_tok_head, _) = raw_req(
+            port,
+            &format!(
+                "GET /v1/tools?token={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(
+            query_tok_head.starts_with("HTTP/1.1 401 "),
+            "{query_tok_head}"
+        );
+
+        // 6. Content URLs for HTML, SVG, and PDF enforce safe Content-Type / attachment rules plus
+        // unconditional sandbox CSP + nosniff + CORP + no-store; range requests cannot read outside
+        // the file, and tickets cannot be replayed on other routes or filenames.
+        for (file, expected_ct, expect_attachment) in [
+            (&html_file, "content-type: text/plain; charset=utf-8", false),
+            (&svg_file, "content-type: image/svg+xml", false),
+            (&pdf_file, "content-type: application/octet-stream", true),
+        ] {
+            let body = serde_json::json!({ "path": file.to_string_lossy() }).to_string();
+            let (mint_head, mint_body) = raw_req(
+                port,
+                &format!(
+                    "POST /v1/content HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ),
+            )
+            .await;
+            assert!(mint_head.starts_with("HTTP/1.1 200 "), "{mint_head}");
+            let url = serde_json::from_slice::<serde_json::Value>(&mint_body).unwrap()["url"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let ticket = url
+                .strip_prefix("/v1/content/")
+                .unwrap()
+                .split_once('/')
+                .unwrap()
+                .0;
+
+            let (content_head, _) = raw_req(
+                port,
+                &format!(
+                    "GET {url} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                ),
+            )
+            .await;
+            let content_lower = content_head.to_ascii_lowercase();
+            assert!(content_head.starts_with("HTTP/1.1 200 "), "{content_head}");
+            assert!(content_lower.contains(expected_ct), "{content_head}");
+            assert!(
+                content_lower.contains(
+                    "content-security-policy: sandbox; default-src 'none'; frame-ancestors 'none'"
+                ),
+                "{content_head}"
+            );
+            if expect_attachment {
+                assert!(
+                    content_lower.contains("content-disposition: attachment;"),
+                    "{content_head}"
+                );
+            }
+            assert!(
+                content_lower.contains("x-content-type-options: nosniff"),
+                "{content_head}"
+            );
+            assert!(
+                content_lower.contains("cross-origin-resource-policy: same-origin"),
+                "{content_head}"
+            );
+            assert!(
+                content_lower.contains("cache-control: private, no-store"),
+                "{content_head}"
+            );
+
+            // Out-of-bounds range is refused with 416.
+            let (oob_head, _) = raw_req(
+                port,
+                &format!(
+                    "GET {url} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nRange: bytes=99999-100000\r\nConnection: close\r\n\r\n"
+                ),
+            )
+            .await;
+            assert!(oob_head.starts_with("HTTP/1.1 416 "), "{oob_head}");
+
+            // Ticket cannot be replayed on another route or filename.
+            let (replay_api_head, _) = raw_req(
+                port,
+                &format!(
+                    "GET /v1/tools HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {ticket}\r\nConnection: close\r\n\r\n"
+                ),
+            )
+            .await;
+            assert!(
+                replay_api_head.starts_with("HTTP/1.1 401 "),
+                "{replay_api_head}"
+            );
+            let (wrong_name_head, _) = raw_req(
+                port,
+                &format!(
+                    "GET /v1/content/{ticket}/other.txt HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                ),
+            )
+            .await;
+            assert!(
+                wrong_name_head.starts_with("HTTP/1.1 404 "),
+                "{wrong_name_head}"
+            );
+        }
 
         shutdown.cancel();
         server_task.await.unwrap();

@@ -107,7 +107,7 @@ impl Node {
     /// The state directory is created now if it can be, so the first call has somewhere to write
     /// its audit line; if it cannot, every call says so on stderr and `meta.doctor` says why.
     pub fn new(paths: Paths, registry: Registry) -> Node {
-        let _ = std::fs::create_dir_all(paths.state_dir());
+        let _ = audit::create_private_dir_all(paths.state_dir());
         Node {
             inner: Arc::new(Inner {
                 config: ConfigStore::new(paths.config_dir()),

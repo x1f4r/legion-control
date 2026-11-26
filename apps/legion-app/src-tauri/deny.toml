@@ -1,0 +1,46 @@
+# Dependency policy for the Tauri desktop/mobile app (`apps/legion-app/src-tauri/Cargo.lock`).
+# Every allow-listed advisory requires an explicit `reason`.
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono 0.4.45 is unmaintained (no security vulnerability); pulled in transitively by russh-util 0.52.0 via russh 0.65.4. Legion itself uses jiff." },
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error 1.0.4 is unmaintained (build-time proc-macro only, no runtime code); pulled in transitively by gtk/glib-macros 0.18 via tauri/wry on Linux." },
+    { id = "RUSTSEC-2024-0429", reason = "glib 0.18.5 VariantStrIter unsoundness is pulled in transitively by gtk/webkit2gtk/wry/tauri on Linux; Legion never calls glib::VariantStrIter and cannot upgrade until Tauri moves off GTK3." },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant 5.15.1 was merged into zbus 6.x (no security vulnerability); pulled in by zbus 5.19.0 and tauri-plugin-single-instance 2.5.5 until upstream migrates to zbus 6." },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names 4.3.5 was merged into zbus 6.x (no security vulnerability); pulled in by zbus 5.19.0 and tauri-plugin-single-instance 2.5.5 until upstream migrates to zbus 6." },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive 5.15.1 was merged into zbus 6.x (build-time macro only, no security vulnerability); pulled in by zvariant 5.15.1 / zbus 5.19.0." },
+]
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
