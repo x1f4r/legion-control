@@ -354,3 +354,11 @@ test('createCoalescedRefetch never overlaps and coalesces multiple bursts into o
   assert.equal(maxConcurrent, 1);
   assert.equal(runner.isRunning(), false);
 });
+
+test('folderChanges.getHome returns registered home path for custom home locations', () => {
+  const store = createFolderChangesStore();
+  assert.equal(store.getHome('tower'), null);
+  store.registerHome('tower', '/var/home/me/');
+  assert.equal(store.getHome('tower'), '/var/home/me');
+  assert.equal(store.getHome('pi'), null);
+});

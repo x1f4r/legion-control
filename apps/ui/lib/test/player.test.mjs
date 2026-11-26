@@ -5,6 +5,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import { extractThumbMap } from '../files.js';
+import { createMusicController } from '../music-controller.js';
 import { canBrowserImmersive, createBrowserImmersive } from '../immersive-browser.js';
 import { createAppLink, detectAppImmersiveCapability } from '../../link/app.js';
 import {
@@ -1749,4 +1750,105 @@ test('iOS/iPadOS background audio declares UIBackgroundModes audio, links AVFoun
   assert.match(audioSwift, /oldDeviceUnavailable/);
   assert.match(audioSwift, /securityOrigin\.protocol == "tauri"/);
   assert.match(audioSwift, /securityOrigin\.host == "localhost"/);
+});
+
+test('createMusicController preserves started playback when loadedmetadata fires late, and respects explicit pause while loading', async () => {
+  const clock = createFakeClock();
+  const storage = createMemoryStorage();
+  const link = {
+    kind: 'http',
+    async contentUrl({ path: p }) {
+      return { url: `http://127.0.0.1/media?p=${encodeURIComponent(p)}` };
+    },
+    revokeContentUrl() {},
+    call: async () => ({ results: [] }),
+  };
+
+  function makeFakeAudio() {
+    let srcAttr = null;
+    const el = {
+      paused: true,
+      ended: false,
+      readyState: 0,
+      duration: 180,
+      currentTime: 0,
+      playbackRate: 1,
+      volume: 1,
+      muted: false,
+      buffered: { length: 0 },
+      playCalls: 0,
+      pauseCalls: 0,
+      getAttribute(name) {
+        return name === 'src' ? srcAttr : null;
+      },
+      hasAttribute(name) {
+        return name === 'src' && srcAttr !== null;
+      },
+      setAttribute(name, val) {
+        if (name === 'src') srcAttr = String(val);
+      },
+      removeAttribute(name) {
+        if (name === 'src') srcAttr = null;
+      },
+      load() {},
+      play() {
+        this.playCalls += 1;
+        this.paused = false;
+        return Promise.resolve();
+      },
+      pause() {
+        this.pauseCalls += 1;
+        this.paused = true;
+      },
+    };
+    return el;
+  }
+
+  const ctrl = createMusicController({
+    link,
+    storage,
+    clock,
+  });
+  const audio = makeFakeAudio();
+  ctrl.bindAudioElement(audio);
+
+  // 1. Open track (no queued intent: autoPlayTarget is null). Playback starts directly on audio
+  //    before a late loadedmetadata event arrives -> must NOT pause it, and state.playing stays true.
+  ctrl.openTrack({
+    machine: 'tower',
+    path: '/home/me/Music/track1.flac',
+    entry: { name: 'track1.flac', path: '/home/me/Music/track1.flac', kind: 'file' },
+    caps: { known: true, hasContentUrl: true },
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.ok(audio.getAttribute('src'));
+
+  await audio.play();
+  ctrl.audioHandlers.onPlay({ currentTarget: audio });
+  ctrl.audioHandlers.onLoadedMetadata({ currentTarget: audio });
+  assert.equal(audio.paused, false, 'late loadedmetadata must not pause already-started playback');
+  assert.equal(ctrl.getState().playing, true);
+
+  // 2. Switch to next track while playing -> carry-over play intent is true -> user explicitly
+  //    toggles pause while loading -> autoPlayTarget becomes { play: false } -> loadedmetadata pauses.
+  ctrl.openTrack({
+    machine: 'tower',
+    path: '/home/me/Music/track2.flac',
+    entry: { name: 'track2.flac', path: '/home/me/Music/track2.flac', kind: 'file' },
+    caps: { known: true, hasContentUrl: true },
+  });
+  // Before URL finishes minting / readyState >= 1, toggle pause explicitly.
+  audio.readyState = 0;
+  ctrl.togglePlay();
+  assert.equal(ctrl.getState().playing, false);
+  await Promise.resolve();
+  await Promise.resolve();
+  // Even if audio were unpaused, explicit pause intent (false) pauses on loadedmetadata.
+  audio.paused = false;
+  ctrl.audioHandlers.onLoadedMetadata({ currentTarget: audio });
+  assert.equal(audio.paused, true, 'explicit pause while loading must pause on loadedmetadata');
+  assert.equal(ctrl.getState().playing, false);
+
+  ctrl.dispose();
 });

@@ -1205,6 +1205,7 @@ export function createMusicController({
       setState({ playing: true });
       return;
     }
+    autoPlayTarget = null;
     if (a.ended) {
       try {
         a.currentTime = 0;
@@ -1222,13 +1223,15 @@ export function createMusicController({
 
   function pause() {
     if (!state.loaded) return;
-    autoPlayTarget = null;
     if (usingNative) {
+      autoPlayTarget = null;
       nativeAudio.command('pause').catch(() => {});
       setState({ playing: false }, { syncMedia: false });
       return;
     }
     const a = audioEl;
+    const loadingNext = !a || !state.mediaUrl || a.readyState < 1;
+    autoPlayTarget = loadingNext ? { path: state.path, play: false } : null;
     if (a && !a.paused) {
       try {
         a.pause();
@@ -1259,7 +1262,7 @@ export function createMusicController({
         autoPlayTarget?.play && (!autoPlayTarget.path || autoPlayTarget.path === state.path),
       );
       const nextWant = !currentWant;
-      autoPlayTarget = nextWant ? { path: state.path, play: true } : null;
+      autoPlayTarget = { path: state.path, play: nextWant };
       setState({ playing: nextWant });
       return;
     }
@@ -1560,10 +1563,14 @@ export function createMusicController({
       const pendingAuto = autoPlayTarget;
       autoPlayTarget = null;
       if (!recovered) {
-        if (pendingAuto?.play && (!pendingAuto.path || pendingAuto.path === state.path)) {
+        const matchesTrack = !pendingAuto?.path || pendingAuto.path === state.path;
+        if (pendingAuto?.play && matchesTrack) {
+          patch.playing = true;
           iosAudio?.activateSession?.();
-          a.play().catch(() => {});
-        } else {
+          a.play().catch(() => {
+            setState({ playing: false });
+          });
+        } else if (pendingAuto && pendingAuto.play === false && matchesTrack) {
           if (!a.paused) {
             try {
               a.pause();
@@ -1572,6 +1579,9 @@ export function createMusicController({
             }
           }
           patch.playing = false;
+        } else {
+          // Preserve playback that already started before the queued loadedmetadata event fired.
+          patch.playing = !a.paused && !a.ended;
         }
       }
       setState(patch);
