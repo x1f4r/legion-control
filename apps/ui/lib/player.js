@@ -807,6 +807,7 @@ export function classifyPlayerKey(
   }
   if (lower === 'm') return 'toggle_mute';
   if (lower === 'f' && mode === 'video') return 'toggle_fullscreen';
+  if (lower === 'z' && mode === 'video' && isFullscreen) return 'toggle_zoom';
   if (lower === 'n') return 'next';
   if (lower === 'p') return 'prev';
   return null;
@@ -1236,3 +1237,31 @@ export function createTurnWatcher({
     dispose,
   };
 }
+
+export {
+  applyPinchResistance,
+  computeVideoZoomMetrics,
+  createPictureGestureRecognizer,
+  createSpaceHoldController,
+  formatScrubDelta,
+  GESTURE_EDGE_MARGIN_PX,
+  GESTURE_HOLD_DELAY_MS,
+  GESTURE_HORIZONTAL_MAX_DEG,
+  GESTURE_HORIZONTAL_MAX_SLOPE,
+  GESTURE_MOVE_SLOP_PX,
+  HOLD_PILL_FADE_MS,
+  HOLD_PLAYBACK_RATE,
+  PINCH_VELOCITY_THRESHOLD,
+  readZoomPreference,
+  resolvePinchZoomTarget,
+  SCRUB_FINE_OFFSET_PX,
+  SCRUB_HALF_OFFSET_PX,
+  SCRUB_QUARTER_OFFSET_PX,
+  scrubRateForOffset,
+  writeZoomPreference,
+  ZOOM_AUTO_APPLY_MAX_CROP,
+  ZOOM_CHIP_DURATION_MS,
+  ZOOM_MIN_DIFF,
+  ZOOM_SETTLE_MS,
+  ZOOM_STORAGE_KEY,
+} from './player-gestures.js';

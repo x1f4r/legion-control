@@ -739,6 +739,7 @@ test('createAppLink routes immersive and keepScreenOn across Android, iOS, and d
     // 1. Android bridge
     const androidImmersive = [];
     const androidKeep = [];
+    const androidHaptics = [];
     globalThis.window = {
       __LEGION_ANDROID__: {
         setImmersive: (on, orientation) => {
@@ -749,20 +750,28 @@ test('createAppLink routes immersive and keepScreenOn across Android, iOS, and d
           androidKeep.push(on);
           return Promise.resolve(Boolean(on));
         },
+        haptic: (kind) => {
+          androidHaptics.push(kind);
+        },
       },
       __TAURI__: { core: { invoke: () => Promise.resolve({}) } },
     };
     const androidLink = createAppLink();
     assert.equal(androidLink.canImmersive(), true);
+    assert.equal(typeof androidLink.haptic, 'function');
     assert.deepEqual(await androidLink.immersive(true, { orientation: 'landscape' }), { active: true, mode: 'android' });
     assert.deepEqual(await androidLink.immersive(false), { active: false, mode: 'android' });
     assert.equal(await androidLink.keepScreenOn(true), true);
     assert.equal(await androidLink.keepScreenOn(false), false);
+    androidLink.haptic('tick');
+    androidLink.haptic('tap');
+    androidLink.haptic('unknown');
     assert.deepEqual(androidImmersive, [
       { on: true, orientation: 'landscape' },
       { on: false, orientation: 'none' },
     ]);
     assert.deepEqual(androidKeep, [true, false]);
+    assert.deepEqual(androidHaptics, ['tick', 'tap']);
 
     // 2. iOS bridge
     const iosMessages = [];
@@ -782,16 +791,22 @@ test('createAppLink routes immersive and keepScreenOn across Android, iOS, and d
     };
     const iosLink = createAppLink();
     assert.equal(iosLink.canImmersive(), true);
+    assert.equal(typeof iosLink.haptic, 'function');
     await iosLink.immersive(true, { orientation: 'portrait' });
     await iosLink.keepScreenOn(true);
+    iosLink.haptic('tick');
+    iosLink.haptic('tap');
+    iosLink.haptic('invalid');
     await iosLink.immersive(false);
     assert.deepEqual(iosMessages, [
       { type: 'immersive', on: true, orientation: 'portrait' },
       { type: 'keep_screen_on', on: true },
+      { type: 'haptic', kind: 'tick' },
+      { type: 'haptic', kind: 'tap' },
       { type: 'immersive', on: false, orientation: 'none' },
     ]);
 
-    // 3. Desktop Tauri commands
+    // 3. Desktop Tauri commands (haptic is absent on desktop)
     Object.defineProperty(globalThis, 'navigator', {
       configurable: true,
       value: { userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15' },
@@ -815,6 +830,7 @@ test('createAppLink routes immersive and keepScreenOn across Android, iOS, and d
     };
     const desktopLink = createAppLink();
     assert.equal(desktopLink.canImmersive(), true);
+    assert.equal(desktopLink.haptic, undefined);
     assert.deepEqual(await desktopLink.immersive(true, { orientation: 'landscape' }), {
       active: true,
       fullscreen: true,

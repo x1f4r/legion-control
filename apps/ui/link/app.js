@@ -2233,6 +2233,32 @@ export function createAppLink() {
     return false;
   }
 
+  function haptic(kind) {
+    if (kind !== 'tick' && kind !== 'tap') return;
+    const cap = currentImmersiveCap();
+    if (cap.mode === 'android') {
+      const android = androidBridge();
+      if (typeof android?.haptic === 'function') {
+        try {
+          android.haptic(kind);
+        } catch {
+          // Best-effort tactile feedback.
+        }
+      }
+      return;
+    }
+    if (cap.mode === 'ios') {
+      const ios = iosImmersiveHandler();
+      if (ios) {
+        try {
+          ios.postMessage({ type: 'haptic', kind });
+        } catch {
+          // Best-effort tactile feedback.
+        }
+      }
+    }
+  }
+
   const link = {
     kind: 'app',
     supportsContent: true,
@@ -2279,6 +2305,11 @@ export function createAppLink() {
     onWindowHidden,
     keepScreenOn,
   };
+
+  // Tactile feedback exists only on Android and iOS/iPadOS; leave it absent on desktop.
+  if (typeof androidBridge()?.haptic === 'function' || Boolean(iosImmersiveHandler())) {
+    link.haptic = haptic;
+  }
 
   // On iOS/iPadOS, native file-picker uploads and open-in-another-app are not yet wired; omit
   // those methods so the interface hides unsupported actions instead of showing dead controls.

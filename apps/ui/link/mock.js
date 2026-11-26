@@ -2419,10 +2419,12 @@ export function createMockLink(mode = '') {
   }
 
   const isNoFullscreen = flags.has('no-fullscreen');
+  const isNoHaptic = flags.has('no-haptic');
   const isBrowserFs = flags.has('browser-fs');
   const browserImmersive = isBrowserFs ? createBrowserImmersive() : null;
   const immersiveCalls = [];
   const keepScreenOnCalls = [];
+  const hapticCalls = [];
   const immersiveListeners = new Set();
   const windowHiddenListeners = new Set();
   let mockImmersiveActive = false;
@@ -2430,6 +2432,7 @@ export function createMockLink(mode = '') {
   if (typeof window !== 'undefined') {
     window.__LEGION_MOCK_IMMERSIVE_CALLS__ = immersiveCalls;
     window.__LEGION_MOCK_KEEP_SCREEN_ON_CALLS__ = keepScreenOnCalls;
+    window.__LEGION_MOCK_HAPTIC_CALLS__ = hapticCalls;
     window.__LEGION_MOCK_TRIGGER_WINDOW_HIDDEN__ = () => {
       if (mockImmersiveActive) {
         mockImmersiveActive = false;
@@ -2507,6 +2510,11 @@ export function createMockLink(mode = '') {
     return active;
   }
 
+  function haptic(kind) {
+    if (kind !== 'tick' && kind !== 'tap') return;
+    hapticCalls.push({ kind, at: Date.now() });
+  }
+
   const baseApi = {
     kind,
     mockFlags: flags,
@@ -2531,8 +2539,10 @@ export function createMockLink(mode = '') {
     onImmersiveChange,
     onWindowHidden,
     keepScreenOn,
+    ...(isNoHaptic ? {} : { haptic }),
     immersiveCalls,
     keepScreenOnCalls,
+    hapticCalls,
     ...filesState.optionalLinkMethods,
   };
 
