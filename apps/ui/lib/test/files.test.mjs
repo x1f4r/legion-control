@@ -907,3 +907,85 @@ test('createThumbQueue batches at most 32 paths and retries busy errors with exp
   );
   qOldAudio.dispose();
 });
+
+test('createThumbQueue pauses queued flushes and retry backoff while hidden and resumes once visible', async () => {
+  const timers = new Map();
+  let nextTimerId = 1;
+  const schedule = (fn, ms) => {
+    const id = nextTimerId++;
+    timers.set(id, { fn, ms });
+    return id;
+  };
+  const cancel = (id) => {
+    timers.delete(id);
+  };
+  const runAllTimers = async () => {
+    while (timers.size > 0) {
+      const [id, item] = timers.entries().next().value;
+      timers.delete(id);
+      await item.fn();
+    }
+  };
+
+  let visible = false;
+  let calls = 0;
+  let failBusy = true;
+  const link = {
+    async call(tool, args) {
+      assert.equal(tool, 'fs.thumb');
+      calls += 1;
+      if (failBusy) {
+        return { results: args.paths.map((p) => ({ path: p, error: { code: 'busy', message: 'busy' } })) };
+      }
+      return {
+        results: args.paths.map((p) => ({
+          path: p,
+          ok: { mime: 'image/jpeg', content: 'UEhPVE8=', width: 128, height: 128 },
+        })),
+      };
+    },
+  };
+
+  const cache = createThumbCache();
+  const q = createThumbQueue({
+    machine: 'nas',
+    link,
+    thumbCache: cache,
+    isVisible: () => visible,
+    schedule,
+    cancel,
+  });
+
+  // Enqueueing while hidden schedules no timer and makes zero calls.
+  q.enqueue({ path: '/home/me/Photos/a.jpg', mtime: '1' });
+  assert.equal(timers.size, 0);
+  await runAllTimers();
+  assert.equal(calls, 0);
+
+  // Becoming visible flushes once; busy error schedules a retry timer.
+  visible = true;
+  q.onVisibilityChange();
+  assert.equal(timers.size, 1);
+  // Run only the flush timer so retry timer is pending.
+  const [firstId, firstTimer] = timers.entries().next().value;
+  timers.delete(firstId);
+  await firstTimer.fn();
+  assert.equal(calls, 1);
+  assert.equal(timers.size, 1, 'busy item should schedule backoff retry while visible');
+
+  // Hiding cancels the pending retry timer immediately and re-queues the item without firing.
+  visible = false;
+  q.onVisibilityChange();
+  assert.equal(timers.size, 0, 'hidden queue must cancel pending backoff retry timers');
+  await runAllTimers();
+  assert.equal(calls, 1);
+
+  // Returning to visible flushes the deferred retry item once and populates cache.
+  failBusy = false;
+  visible = true;
+  q.onVisibilityChange();
+  await runAllTimers();
+  assert.equal(calls, 2);
+  assert.equal(cache.get(thumbCacheKey('nas', '/home/me/Photos/a.jpg', '1', 128))?.url, 'data:image/jpeg;base64,UEhPVE8=');
+  q.dispose();
+});

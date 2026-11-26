@@ -148,6 +148,7 @@ export function createAppLink() {
   let nativeResumeReady = null;
   let nativeResumeToken = null;
   let sawNativeSuspend = false;
+  let desktopWindowHidden = false;
 
   function notifyAppResume(source) {
     for (const listener of appResumeListeners) {
@@ -177,6 +178,7 @@ export function createAppLink() {
     nativeResumeToken = token;
     const onResumed = () => {
       sawNativeSuspend = false;
+      desktopWindowHidden = false;
       notifyAppResume('tauri://resumed');
     };
     const onSuspended = () => {
@@ -184,15 +186,44 @@ export function createAppLink() {
       notifyAppSuspend('tauri://suspended');
     };
     const onFocus = () => {
-      if (!sawNativeSuspend) return;
+      if (!sawNativeSuspend && !desktopWindowHidden) return;
       sawNativeSuspend = false;
+      desktopWindowHidden = false;
       notifyAppResume('tauri://focus');
     };
-    nativeResumeReady = Promise.all([
+    const onDesktopHidden = () => {
+      if (desktopWindowHidden) return;
+      desktopWindowHidden = true;
+      notifyAppSuspend('legion://window-hidden');
+    };
+    const onDesktopShown = () => {
+      if (!desktopWindowHidden) return;
+      desktopWindowHidden = false;
+      notifyAppResume('legion://window-shown');
+    };
+    const onDesktopVisibility = (event) => {
+      const visible = Boolean(event?.payload);
+      if (!visible && !desktopWindowHidden) {
+        desktopWindowHidden = true;
+        notifyAppSuspend('legion://window-visibility');
+      } else if (visible && desktopWindowHidden) {
+        desktopWindowHidden = false;
+        notifyAppResume('legion://window-visibility');
+      }
+    };
+    const listeners = [
       Promise.resolve(ev.listen('tauri://resumed', onResumed)).catch(() => null),
       Promise.resolve(ev.listen('tauri://suspended', onSuspended)).catch(() => null),
       Promise.resolve(ev.listen('tauri://focus', onFocus)).catch(() => null),
-    ]).then((unlistens) => {
+    ];
+    if (!androidPlatform && !iosPlatform) {
+      listeners.push(
+        Promise.resolve(ev.listen('legion://window-hidden', onDesktopHidden)).catch(() => null),
+        Promise.resolve(ev.listen('legion://window-shown', onDesktopShown)).catch(() => null),
+        Promise.resolve(ev.listen('legion://window-visibility', onDesktopVisibility)).catch(() => null),
+      );
+    }
+    nativeResumeReady = Promise.all(listeners).then((unlistens) => {
       const active = unlistens.filter((fn) => typeof fn === 'function');
       if (
         nativeResumeToken !== token ||
@@ -218,6 +249,7 @@ export function createAppLink() {
     nativeResumeToken = null;
     nativeResumeReady = null;
     sawNativeSuspend = false;
+    desktopWindowHidden = false;
     const active = nativeResumeUnlistens;
     nativeResumeUnlistens = null;
     if (Array.isArray(active)) {
@@ -257,7 +289,7 @@ export function createAppLink() {
   }
 
   function isAppSuspended() {
-    return sawNativeSuspend;
+    return sawNativeSuspend || desktopWindowHidden;
   }
 
   function machineKey(machine) {

@@ -71,6 +71,7 @@ export function createWakeController({
   getMachines = () => [],
   getLocalNode = () => null,
   getAllowedSet = () => null,
+  isVisible = () => true,
   onWakeSent = null,
   onWakeTimeout = null,
   onMachineAwake = null,
@@ -271,20 +272,72 @@ export function createWakeController({
 
     if (entry.finished || entry.phase !== 'waking') return;
 
-    entry.tickTimer = clock.setInterval(() => {
-      if (entry.finished || entry.phase !== 'waking') return;
+    startEntryTimers(entry);
+  }
+
+  function startEntryTimers(entry) {
+    if (entry.finished || entry.phase !== 'waking') return;
+    if (!isVisible()) {
+      entry.pausedHidden = true;
+      stopTimers(entry);
+      return;
+    }
+    entry.pausedHidden = false;
+    if (entry.tickTimer === null) {
+      entry.tickTimer = clock.setInterval(() => {
+        if (entry.finished || entry.phase !== 'waking') return;
+        if (!isVisible()) {
+          entry.pausedHidden = true;
+          stopTimers(entry);
+          return;
+        }
+        const elapsedMs = Math.max(0, clock.now() - entry.startedAt);
+        entry.elapsedS = Math.floor(elapsedMs / 1000);
+        if (elapsedMs >= timeoutMs) {
+          handleTimeout(entry);
+          return;
+        }
+        emit();
+      }, WAKE_ELAPSED_TICK_MS);
+    }
+
+    if (entry.pollTimer === null) {
+      entry.pollTimer = clock.setInterval(() => {
+        if (!isVisible()) {
+          entry.pausedHidden = true;
+          stopTimers(entry);
+          return;
+        }
+        pollOnce(entry);
+      }, pollIntervalMs);
+    }
+  }
+
+  function onVisibilityChange() {
+    if (!isVisible()) {
+      for (const entry of entries.values()) {
+        if (!entry.finished && entry.phase === 'waking') {
+          entry.pausedHidden = true;
+          stopTimers(entry);
+        }
+      }
+      return;
+    }
+    for (const entry of entries.values()) {
+      if (entry.finished || entry.phase !== 'waking') continue;
+      const wasPaused = entry.pausedHidden || entry.pollTimer === null;
       const elapsedMs = Math.max(0, clock.now() - entry.startedAt);
       entry.elapsedS = Math.floor(elapsedMs / 1000);
       if (elapsedMs >= timeoutMs) {
         handleTimeout(entry);
-        return;
+        continue;
       }
-      emit();
-    }, WAKE_ELAPSED_TICK_MS);
-
-    entry.pollTimer = clock.setInterval(() => {
-      pollOnce(entry);
-    }, pollIntervalMs);
+      startEntryTimers(entry);
+      if (wasPaused) {
+        emit();
+        pollOnce(entry);
+      }
+    }
   }
 
   /**
@@ -348,6 +401,7 @@ export function createWakeController({
         visible: true,
         finished: false,
         pingInFlight: false,
+        pausedHidden: false,
         pollTimer: null,
         tickTimer: null,
         waiters: [waiter],
@@ -499,6 +553,7 @@ export function createWakeController({
     retry,
     dismiss,
     leaveScreen,
+    onVisibilityChange,
     getState,
     subscribe,
     dispose,

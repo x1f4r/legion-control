@@ -391,6 +391,7 @@ export function createOverviewPoller({
   let lastFreshAt = clock.now();
   let stale = false;
   let generation = 0;
+  let pausedWhileHidden = false;
 
   function setStale(next) {
     if (stale === next) return;
@@ -399,8 +400,42 @@ export function createOverviewPoller({
   }
 
   function checkStale() {
-    if (!active) return;
+    if (!active || !isVisible()) return;
     setStale(clock.now() - lastFreshAt > staleMs);
+  }
+
+  function stopTimers() {
+    if (pollTimer !== null) {
+      clock.clearInterval(pollTimer);
+      pollTimer = null;
+    }
+    if (staleTimer !== null) {
+      clock.clearInterval(staleTimer);
+      staleTimer = null;
+    }
+  }
+
+  function startTimers() {
+    if (pollTimer === null) {
+      pollTimer = clock.setInterval(() => {
+        if (!isVisible()) {
+          pausedWhileHidden = true;
+          stopTimers();
+          return;
+        }
+        runTick();
+      }, pollMs);
+    }
+    if (staleTimer === null) {
+      staleTimer = clock.setInterval(() => {
+        if (!isVisible()) {
+          pausedWhileHidden = true;
+          stopTimers();
+          return;
+        }
+        checkStale();
+      }, 1000);
+    }
   }
 
   async function runTick() {
@@ -433,14 +468,15 @@ export function createOverviewPoller({
     generation += 1;
     lastFreshAt = clock.now();
     setStale(false);
-    pollTimer = clock.setInterval(() => {
-      runTick();
-    }, pollMs);
-    staleTimer = clock.setInterval(() => {
-      checkStale();
-    }, 1000);
-    if (immediate) {
-      runTick();
+    if (isVisible()) {
+      pausedWhileHidden = false;
+      startTimers();
+      if (immediate) {
+        runTick();
+      }
+    } else {
+      pausedWhileHidden = true;
+      stopTimers();
     }
   }
 
@@ -448,20 +484,22 @@ export function createOverviewPoller({
     active = false;
     generation += 1;
     inFlight = false;
-    if (pollTimer !== null) {
-      clock.clearInterval(pollTimer);
-      pollTimer = null;
-    }
-    if (staleTimer !== null) {
-      clock.clearInterval(staleTimer);
-      staleTimer = null;
-    }
+    pausedWhileHidden = false;
+    stopTimers();
   }
 
   function onVisibilityChange() {
     if (!active) return;
-    if (isVisible()) {
-      checkStale();
+    if (!isVisible()) {
+      pausedWhileHidden = true;
+      stopTimers();
+      return;
+    }
+    const wasPaused = pausedWhileHidden || pollTimer === null;
+    pausedWhileHidden = false;
+    startTimers();
+    checkStale();
+    if (wasPaused) {
       runTick();
     }
   }
@@ -472,7 +510,13 @@ export function createOverviewPoller({
     refreshNow: runTick,
     onVisibilityChange,
     getState() {
-      return { active, inFlight, stale, lastFreshAt };
+      return {
+        active,
+        inFlight,
+        stale,
+        lastFreshAt,
+        timersRunning: pollTimer !== null || staleTimer !== null,
+      };
     },
   };
 }

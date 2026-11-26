@@ -231,12 +231,18 @@ export function FileNameList({
   const visibleIdsRef = useRef(new Set());
   const ioRef = useRef(null);
   const rafRef = useRef(0);
+  const dirtyHiddenRef = useRef(false);
   const nextIdRef = useRef(1);
   const defaultsRef = useRef({ lines, dim });
   defaultsRef.current = { lines, dim };
 
   const flushMeasure = useCallback(() => {
     rafRef.current = 0;
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+      dirtyHiddenRef.current = true;
+      return;
+    }
+    dirtyHiddenRef.current = false;
     const items = itemsRef.current;
     const visibleIds = visibleIdsRef.current;
     if (visibleIds.size === 0) return;
@@ -346,6 +352,10 @@ export function FileNameList({
   }, []);
 
   const scheduleMeasure = useCallback(() => {
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+      dirtyHiddenRef.current = true;
+      return;
+    }
     if (rafRef.current) return;
     if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
       rafRef.current = window.requestAnimationFrame(flushMeasure);
@@ -404,7 +414,20 @@ export function FileNameList({
       scheduleMeasure();
     });
 
+    const onVis = () => {
+      if (document.visibilityState === 'visible' && dirtyHiddenRef.current) {
+        dirtyHiddenRef.current = false;
+        scheduleMeasure();
+      }
+    };
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', onVis);
+    }
+
     return () => {
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', onVis);
+      }
       if (rafRef.current && typeof window !== 'undefined' && typeof window.cancelAnimationFrame === 'function') {
         window.cancelAnimationFrame(rafRef.current);
       }
@@ -534,7 +557,13 @@ export function FileName({
     const el = elRef.current;
     if (!el) return undefined;
 
+    let dirtyWhileHidden = false;
     const compute = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        dirtyWhileHidden = true;
+        return;
+      }
+      dirtyWhileHidden = false;
       const rawWidth = el.getBoundingClientRect().width;
       if (!(rawWidth > 1)) return;
       const width = Math.max(1, Math.floor(rawWidth) - 1);
@@ -554,7 +583,18 @@ export function FileName({
       ro.observe(el);
     }
     const unsubFont = subscribeFontChanges(compute);
+    const onVis = () => {
+      if (document.visibilityState === 'visible' && dirtyWhileHidden) {
+        compute();
+      }
+    };
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', onVis);
+    }
     return () => {
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', onVis);
+      }
       if (ro) ro.disconnect();
       unsubFont();
     };

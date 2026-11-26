@@ -14,6 +14,7 @@ import {
 } from '../lib/files.js';
 import { readRecentDestinations, recordRecentDestination } from '../lib/files-store.js';
 import { formatBytes, formatRelativeTime, primaryDisk } from '../lib/format.js';
+import { isForegroundVisible, subscribeForegroundVisibility } from '../lib/resume.js';
 import { CopyButton, Notice, Sheet } from './common.js';
 import { FileName, FileNameList, FileNameSingle } from './file-name.js';
 
@@ -111,11 +112,38 @@ export function SendToSheet({
 
   useEffect(() => {
     if (!hasWakingOffMachine || typeof onRefreshFleet !== 'function') return undefined;
-    const timer = window.setInterval(() => {
-      onRefreshFleet({ background: true, forceOffline: true });
-    }, 600);
-    return () => window.clearInterval(timer);
-  }, [hasWakingOffMachine, onRefreshFleet]);
+    let timer = null;
+    const stopTimer = () => {
+      if (timer !== null) {
+        window.clearInterval(timer);
+        timer = null;
+      }
+    };
+    const startTimer = () => {
+      if (timer === null && isForegroundVisible(link)) {
+        timer = window.setInterval(() => {
+          if (!isForegroundVisible(link)) {
+            stopTimer();
+            return;
+          }
+          onRefreshFleet({ background: true, forceOffline: true });
+        }, 600);
+      }
+    };
+    startTimer();
+    const unsubVis = subscribeForegroundVisibility(link, ({ visible }) => {
+      if (!visible) {
+        stopTimer();
+      } else {
+        startTimer();
+        onRefreshFleet({ background: true, forceOffline: true });
+      }
+    });
+    return () => {
+      unsubVis();
+      stopTimer();
+    };
+  }, [hasWakingOffMachine, onRefreshFleet, link]);
 
   const pinnedDirsForDest = useMemo(() => {
     if (!dest || dest === '__device__') return [];

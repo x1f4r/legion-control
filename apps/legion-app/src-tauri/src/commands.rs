@@ -122,6 +122,14 @@ pub const EVENT_IMMERSIVE_CHANGED: &str = "legion://immersive-changed";
 /// screen.
 pub const EVENT_WINDOW_HIDDEN: &str = "legion://window-hidden";
 
+/// Native desktop event emitted to the web view when a previously hidden desktop window is shown
+/// again (for example via single-instance reopen or macOS dock click).
+pub const EVENT_WINDOW_SHOWN: &str = "legion://window-shown";
+
+/// Native desktop event carrying a boolean visibility flag (`true` = visible, `false` = minimized
+/// or withdrawn) so background polling stops when nobody is looking at the desktop window.
+pub const EVENT_WINDOW_VISIBILITY: &str = "legion://window-visibility";
+
 /// Tracks whether Legion entered desktop full screen so leaving only undoes what Legion did.
 ///
 /// If the window was already full screen when immersive started, entering changes nothing and

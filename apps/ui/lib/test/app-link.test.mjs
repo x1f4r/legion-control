@@ -960,6 +960,9 @@ test('createAppLink onAppResume listens to native tauri://resumed and deduplicat
     assert.ok(handlers.has('tauri://resumed'));
     assert.ok(handlers.has('tauri://suspended'));
     assert.ok(handlers.has('tauri://focus'));
+    assert.ok(handlers.has('legion://window-hidden'));
+    assert.ok(handlers.has('legion://window-shown'));
+    assert.ok(handlers.has('legion://window-visibility'));
     assert.equal(link.isAppSuspended(), false);
 
     // Focus alone without prior suspend (e.g. startup or desktop focus) never triggers resume.
@@ -987,10 +990,30 @@ test('createAppLink onAppResume listens to native tauri://resumed and deduplicat
     assert.deepEqual(events, ['tauri://resumed', 'tauri://resumed', 'tauri://focus']);
     assert.deepEqual(suspends, ['tauri://suspended', 'tauri://suspended']);
 
+    // Desktop hidden/minimized -> shown/visible pauses and resumes cleanly without duplicate fires.
+    handlers.get('legion://window-hidden')({});
+    assert.equal(link.isAppSuspended(), true);
+    handlers.get('legion://window-visibility')({ payload: false });
+    assert.equal(link.isAppSuspended(), true);
+    handlers.get('legion://window-shown')({});
+    assert.equal(link.isAppSuspended(), false);
+    handlers.get('legion://window-visibility')({ payload: true });
+    assert.equal(link.isAppSuspended(), false);
+    assert.deepEqual(suspends, ['tauri://suspended', 'tauri://suspended', 'legion://window-hidden']);
+    assert.deepEqual(events, ['tauri://resumed', 'tauri://resumed', 'tauri://focus', 'legion://window-shown']);
+
+    // Minimized -> unminimized via legion://window-visibility toggles suspended state cleanly.
+    handlers.get('legion://window-visibility')({ payload: false });
+    assert.equal(link.isAppSuspended(), true);
+    handlers.get('legion://window-visibility')({ payload: true });
+    assert.equal(link.isAppSuspended(), false);
+    assert.equal(suspends.at(-1), 'legion://window-visibility');
+    assert.equal(events.at(-1), 'legion://window-visibility');
+
     unsub();
     assert.equal(unlistenCount, 0);
     unsubSuspend();
-    assert.equal(unlistenCount, 3);
+    assert.equal(unlistenCount, 6);
     assert.equal(handlers.size, 0);
   } finally {
     if (prevWindow === undefined) {
@@ -1403,6 +1426,32 @@ test('createForegroundResumeController runs session invalidation on native resum
   await resumePromise;
   assert.equal(slowCtrl.isResuming(), false);
   assert.deepEqual(resumingStates, [true, false]);
+
+  // 5) Browser path (invalidateSessions: null): visibilitychange -> visible followed immediately
+  // by window focus produces exactly ONE refresh, never a burst.
+  let browserVis = 'hidden';
+  let browserClock = 50_000;
+  let browserRefreshes = 0;
+  const browserCtrl = createForegroundResumeController({
+    getVisibilityState: () => browserVis,
+    invalidateSessions: null,
+    onRefresh: () => {
+      browserRefreshes += 1;
+    },
+    dedupeMs: 1500,
+    now: () => browserClock,
+  });
+  await browserCtrl.handleVisibilityChange();
+  assert.equal(browserRefreshes, 0);
+  browserVis = 'visible';
+  assert.equal(await browserCtrl.handleVisibilityChange(), true);
+  assert.equal(browserRefreshes, 1);
+  browserClock += 20;
+  assert.equal(browserCtrl.handleFocus(), false, 'focus right after visibility return must not duplicate refresh');
+  assert.equal(browserRefreshes, 1);
+  browserClock += 2000;
+  assert.equal(browserCtrl.handleFocus(), true, 'focus after dedupe window refreshes once');
+  assert.equal(browserRefreshes, 2);
 });
 
 test('createAppLink onImmersiveChange and debug verifyDesktopImmersive cover both WM full-screen sequences', async () => {

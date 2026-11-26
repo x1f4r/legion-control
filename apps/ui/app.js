@@ -39,7 +39,11 @@ import {
 } from './lib/local-machine.js';
 import { createPairingController } from './lib/pairing.js';
 import { createMusicController } from './lib/music-controller.js';
-import { createForegroundResumeController } from './lib/resume.js';
+import {
+  createForegroundResumeController,
+  isForegroundVisible,
+  subscribeForegroundVisibility,
+} from './lib/resume.js';
 import { createThumbCache } from './lib/thumb-cache.js';
 import {
   classifyHorizontalSwipe,
@@ -1554,19 +1558,40 @@ function App() {
     };
   }, [link]);
 
-  // Trigger periodic (6h) update checks while the app is open and visible, and retry sooner (5m)
-  // after a transient check or download error.
+  // Trigger periodic (6h) update checks only while the app is open and visible; pause timers
+  // while hidden/suspended (returning to foreground checks once via resumeController when due).
   useEffect(() => {
     if (!linkState?.ready || typeof link.checkUpdates !== 'function') return;
 
-    const periodicTimer = window.setInterval(() => {
-      if (document.visibilityState === 'visible' && !link.isAppSuspended?.()) {
-        checkUpdatesQuietly();
+    let periodicTimer = null;
+    const stopPeriodic = () => {
+      if (periodicTimer !== null) {
+        window.clearInterval(periodicTimer);
+        periodicTimer = null;
       }
-    }, PERIODIC_CHECK_INTERVAL_MS);
+    };
+    const syncPeriodic = () => {
+      if (isForegroundVisible(link)) {
+        if (periodicTimer === null) {
+          periodicTimer = window.setInterval(() => {
+            if (isForegroundVisible(link)) {
+              checkUpdatesQuietly();
+            } else {
+              stopPeriodic();
+            }
+          }, PERIODIC_CHECK_INTERVAL_MS);
+        }
+      } else {
+        stopPeriodic();
+      }
+    };
+
+    syncPeriodic();
+    const unsubVis = subscribeForegroundVisibility(link, syncPeriodic);
 
     return () => {
-      window.clearInterval(periodicTimer);
+      unsubVis();
+      stopPeriodic();
     };
   }, [link, linkState?.ready, checkUpdatesQuietly]);
 
@@ -1579,13 +1604,32 @@ function App() {
     ) {
       return;
     }
-    const retryTimer = window.setTimeout(() => {
-      if (document.visibilityState === 'visible' && !link.isAppSuspended?.()) {
-        checkUpdatesQuietly();
+    let retryTimer = null;
+    const stopRetry = () => {
+      if (retryTimer !== null) {
+        window.clearTimeout(retryTimer);
+        retryTimer = null;
       }
-    }, ERROR_RETRY_INTERVAL_MS);
+    };
+    const syncRetry = () => {
+      if (isForegroundVisible(link)) {
+        if (retryTimer === null) {
+          retryTimer = window.setTimeout(() => {
+            retryTimer = null;
+            if (isForegroundVisible(link)) {
+              checkUpdatesQuietly();
+            }
+          }, ERROR_RETRY_INTERVAL_MS);
+        }
+      } else {
+        stopRetry();
+      }
+    };
+    syncRetry();
+    const unsubVis = subscribeForegroundVisibility(link, syncRetry);
     return () => {
-      window.clearTimeout(retryTimer);
+      unsubVis();
+      stopRetry();
     };
   }, [link, linkState?.ready, updateState?.phase, updateState?.failed_update, updateState?.last_checked_at, checkUpdatesQuietly]);
 
@@ -1677,21 +1721,46 @@ function App() {
     };
   }, [link, hydrate]);
 
-  // Poll on the user's configured interval while visible and refresh on resume/focus.
+  // Poll on the user's configured interval only while visible; stop timers when hidden/suspended
+  // and fire one immediate deduplicated refresh on return (never a burst).
   useEffect(() => {
     if (!linkState?.ready || !nodeInfo) return;
 
-    const isForegroundVisible = () =>
-      document.visibilityState === 'visible' && !link.isAppSuspended?.();
+    const checkVisible = () => isForegroundVisible(link);
+    let timer = null;
+
+    const stopPollTimer = () => {
+      if (timer !== null) {
+        window.clearInterval(timer);
+        timer = null;
+      }
+    };
+
+    const restartPollTimer = () => {
+      stopPollTimer();
+      if (settings.refreshSeconds > 0 && checkVisible()) {
+        timer = window.setInterval(() => {
+          if (!checkVisible()) {
+            stopPollTimer();
+            return;
+          }
+          if (!resumeController.isResuming()) {
+            resumeController.recordRefresh();
+            refreshFleet(nodeInfo, { background: true });
+          }
+        }, settings.refreshSeconds * 1000);
+      }
+    };
 
     const resumeController = createForegroundResumeController({
-      getVisibilityState: () => (isForegroundVisible() ? 'visible' : 'hidden'),
+      getVisibilityState: () => (checkVisible() ? 'visible' : 'hidden'),
       invalidateSessions:
         typeof link.invalidateSessions === 'function' ? () => link.invalidateSessions() : null,
       onResumingChange: (active) => {
         resumingRef.current = active;
       },
       onBackground: () => {
+        stopPollTimer();
         if (
           typeof link.maybeAutoInstall === 'function' &&
           isSafeForAutoInstall({
@@ -1718,6 +1787,7 @@ function App() {
       },
       onRefresh: () => {
         refreshFleet(nodeInfo, { background: true });
+        restartPollTimer();
       },
       onCheckUpdates: () => {
         if (
@@ -1731,6 +1801,7 @@ function App() {
     });
 
     const onVisibilityChange = () => {
+      if (!checkVisible()) stopPollTimer();
       resumeController.handleVisibilityChange().catch(() => {});
     };
 
@@ -1744,34 +1815,23 @@ function App() {
     const unsubNativeSuspend =
       typeof link.onAppSuspend === 'function'
         ? link.onAppSuspend(() => {
+            stopPollTimer();
             resumeController.handleVisibilityChange().catch(() => {});
           })
         : () => {};
 
     const onFocus = () => {
-      if (
-        isForegroundVisible() &&
-        !resumeController.isHidden() &&
-        !resumeController.isResuming() &&
-        settings.refreshSeconds > 0
-      ) {
-        refreshFleet(nodeInfo, { background: true });
+      if (settings.refreshSeconds > 0 && checkVisible()) {
+        resumeController.handleFocus();
       }
     };
 
-    const timer =
-      settings.refreshSeconds > 0
-        ? window.setInterval(() => {
-            if (isForegroundVisible() && !resumeController.isResuming()) {
-              refreshFleet(nodeInfo, { background: true });
-            }
-          }, settings.refreshSeconds * 1000)
-        : null;
+    restartPollTimer();
 
     window.addEventListener('focus', onFocus);
     document.addEventListener('visibilitychange', onVisibilityChange);
     return () => {
-      if (timer !== null) window.clearInterval(timer);
+      stopPollTimer();
       resumingRef.current = false;
       unsubNativeResume();
       unsubNativeSuspend();
@@ -1913,6 +1973,7 @@ function App() {
     const ctrl = createWakeController({
       link,
       clock: customClock,
+      isVisible: () => isForegroundVisible(link),
       getMachines: () => snapshotRef.current?.machines || [],
       getLocalNode: () => nodeInfoRef.current?.node || null,
       getAllowedSet: () => allowedSetRef.current,
@@ -1958,12 +2019,14 @@ function App() {
     setDefaultWakeController(wakeController);
     setWakeUiState(wakeController.getState());
     const unsub = wakeController.subscribe((st) => setWakeUiState(st));
+    const unsubVis = subscribeForegroundVisibility(link, () => wakeController.onVisibilityChange());
     return () => {
+      unsubVis();
       unsub();
       wakeController.dispose();
       setDefaultWakeController(null);
     };
-  }, [wakeController]);
+  }, [wakeController, link]);
 
   const ensureAwakeMachine = useCallback(
     (machine, options) => wakeController.ensureAwake(machine, options),

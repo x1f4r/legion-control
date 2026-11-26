@@ -44,6 +44,7 @@ import {
   PENDING_LOCAL_MACHINE_NAME,
 } from '../lib/local-machine.js';
 import { routeHref } from '../lib/route.js';
+import { isForegroundVisible, subscribeForegroundVisibility } from '../lib/resume.js';
 import { thumbCacheKey } from '../lib/thumb-cache.js';
 import { Notice, OlderMachineNote, ProgressBar, SwipeRow } from './common.js';
 import {
@@ -314,10 +315,13 @@ function useBatchedThumbs({
       link,
       capsStore,
       thumbCache,
+      isVisible: () => isForegroundVisible(link),
       onUpdate: () => setTick((n) => n + 1),
     });
     queueRef.current = q;
+    const unsubVis = subscribeForegroundVisibility(link, () => q.onVisibilityChange());
     return () => {
+      unsubVis();
       q.dispose();
       if (queueRef.current === q) queueRef.current = null;
     };
@@ -412,7 +416,11 @@ function useMultiMachineThumbs({ itemsByMachine, enabled, link, capsStore = null
 
   useEffect(() => {
     const queues = queuesRef.current;
+    const unsubVis = subscribeForegroundVisibility(link, () => {
+      for (const q of queues.values()) q.onVisibilityChange();
+    });
     return () => {
+      unsubVis();
       for (const q of queues.values()) q.dispose();
       queues.clear();
     };
@@ -441,6 +449,7 @@ function useMultiMachineThumbs({ itemsByMachine, enabled, link, capsStore = null
           link,
           capsStore,
           thumbCache,
+          isVisible: () => isForegroundVisible(link),
           onUpdate: () => setTick((n) => n + 1),
         });
         queues.set(mName, q);
@@ -907,11 +916,38 @@ export function FolderBrowser({
     if ((reachable && error?.code !== 'unreachable') || !isWaking || typeof onRefreshFleet !== 'function') {
       return undefined;
     }
-    const timer = window.setInterval(() => {
-      onRefreshFleet({ background: true, forceOffline: true });
-    }, 600);
-    return () => window.clearInterval(timer);
-  }, [reachable, error?.code, isWaking, onRefreshFleet]);
+    let timer = null;
+    const stopTimer = () => {
+      if (timer !== null) {
+        window.clearInterval(timer);
+        timer = null;
+      }
+    };
+    const startTimer = () => {
+      if (timer === null && isForegroundVisible(link)) {
+        timer = window.setInterval(() => {
+          if (!isForegroundVisible(link)) {
+            stopTimer();
+            return;
+          }
+          onRefreshFleet({ background: true, forceOffline: true });
+        }, 600);
+      }
+    };
+    startTimer();
+    const unsubVis = subscribeForegroundVisibility(link, ({ visible }) => {
+      if (!visible) {
+        stopTimer();
+      } else {
+        startTimer();
+        onRefreshFleet({ background: true, forceOffline: true });
+      }
+    });
+    return () => {
+      unsubVis();
+      stopTimer();
+    };
+  }, [reachable, error?.code, isWaking, onRefreshFleet, link]);
 
   const runDirectoryFetch = useCallback(async ({ quiet = false, highlightNew = false, signal = null } = {}) => {
     const p = propsRef.current;
@@ -1218,25 +1254,31 @@ export function FolderBrowser({
   // Refetch quietly for external changes when returning to foreground/focus if older than 10s.
   useEffect(() => {
     if (!machine || !reachable) return undefined;
+    let lastCheckedAt = -Infinity;
     const checkStaleOnVisible = () => {
-      if (document.visibilityState !== 'visible') return;
+      if (!isForegroundVisible(link)) return;
+      const now = Date.now();
+      if (now - lastCheckedAt < 1500) return;
       const loadedAt = loadedAtRef.current;
       if (typeof loadedAt !== 'number') return;
       const targetPath = resolvedPathRef.current || path || '~';
       const stale = folderChanges
         ? folderChanges.isStale(machine, targetPath, { loadedAt, maxAgeMs: STALE_AFTER_MS })
-        : Date.now() - loadedAt > STALE_AFTER_MS;
+        : now - loadedAt > STALE_AFTER_MS;
       if (stale) {
+        lastCheckedAt = now;
         coalescedRef.current?.trigger({ highlightNew: false });
       }
     };
-    document.addEventListener('visibilitychange', checkStaleOnVisible);
+    const unsubVis = subscribeForegroundVisibility(link, ({ visible }) => {
+      if (visible) checkStaleOnVisible();
+    });
     window.addEventListener('focus', checkStaleOnVisible);
     return () => {
-      document.removeEventListener('visibilitychange', checkStaleOnVisible);
+      unsubVis();
       window.removeEventListener('focus', checkStaleOnVisible);
     };
-  }, [folderChanges, machine, path, reachable]);
+  }, [folderChanges, machine, path, reachable, link]);
 
   // Register this folder's quiet refetch with the shell's pull-to-refresh container.
   useEffect(() => {
@@ -1345,7 +1387,7 @@ export function FolderBrowser({
         if (!hits.some((h) => h.isIntersecting)) return;
         if (hasMoreToRender) {
           setRenderLimit((n) => n + RENDER_STEP);
-        } else if (hasMorePages) {
+        } else if (hasMorePages && isForegroundVisible(link)) {
           loadNextPage();
         }
       },

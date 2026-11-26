@@ -416,18 +416,25 @@ fn build_main_webview_window(app: &tauri::AppHandle) -> tauri::Result<tauri::Web
             }
             let state_app = app.clone();
             let state_label = window.label().to_owned();
+            let last_window_hidden = std::sync::Arc::new(AtomicBool::new(false));
             gtk_win.connect_window_state_event(move |_, event| {
-                let is_fs = event
-                    .new_window_state()
-                    .contains(gtk::gdk::WindowState::FULLSCREEN);
-                let changed_fs = event
-                    .changed_mask()
-                    .contains(gtk::gdk::WindowState::FULLSCREEN);
+                let new_state = event.new_window_state();
+                let changed = event.changed_mask();
+                let is_fs = new_state.contains(gtk::gdk::WindowState::FULLSCREEN);
+                let changed_fs = changed.contains(gtk::gdk::WindowState::FULLSCREEN);
                 if let Some(immersive) = state_app.try_state::<commands::DesktopImmersiveState>()
                     && immersive.record_window_state_fullscreen(is_fs, changed_fs)
                     && let Some(win) = state_app.get_webview_window(&state_label)
                 {
                     let _ = win.emit(commands::EVENT_IMMERSIVE_CHANGED, false);
+                }
+                let hidden_now = new_state.intersects(
+                    gtk::gdk::WindowState::ICONIFIED | gtk::gdk::WindowState::WITHDRAWN,
+                );
+                if last_window_hidden.swap(hidden_now, Ordering::AcqRel) != hidden_now
+                    && let Some(win) = state_app.get_webview_window(&state_label)
+                {
+                    let _ = win.emit(commands::EVENT_WINDOW_VISIBILITY, !hidden_now);
                 }
                 gtk::glib::Propagation::Proceed
             });
@@ -528,6 +535,8 @@ pub fn run() {
                 let _ = window.unminimize();
                 let _ = window.show();
                 let _ = window.set_focus();
+                let _ = window.emit(commands::EVENT_WINDOW_SHOWN, ());
+                let _ = window.emit(commands::EVENT_WINDOW_VISIBILITY, true);
             }
         }))
     } else {
@@ -856,6 +865,8 @@ pub fn run() {
                 let _ = window.unminimize();
                 let _ = window.show();
                 let _ = window.set_focus();
+                let _ = window.emit(commands::EVENT_WINDOW_SHOWN, ());
+                let _ = window.emit(commands::EVENT_WINDOW_VISIBILITY, true);
             }
         }
         #[cfg(any(target_os = "android", target_os = "ios"))]
