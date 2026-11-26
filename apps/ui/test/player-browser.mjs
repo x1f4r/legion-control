@@ -447,13 +447,24 @@ test('Player: video controls, viewer Fullscreen API, controlled-clock timing, si
     });
     await page.locator('.list a.row', { hasText: 'Episode 12.mp3' }).click();
     await page.locator('.music-screen').waitFor();
+    await page.locator('audio[data-legion-music-audio][src]').waitFor({ state: 'attached', timeout: 5000 });
     await page.evaluate(() => {
-      const a = document.querySelector('.viewer audio');
+      const a = document.querySelector('audio[data-legion-music-audio]');
       a.currentTime = 125;
       a.dispatchEvent(new Event('seeked'));
     });
     await page.locator('.music-top button[aria-label="Close"]').click();
     await page.locator('.viewer').waitFor({ state: 'hidden' });
+    await page.locator('.mini-player').waitFor();
+    // Dismiss the small player so reopening Episode 12 cold-loads from the resume store.
+    {
+      const miniBox = await page.locator('.mini-player').boundingBox();
+      await page.mouse.move(miniBox.x + miniBox.width / 2, miniBox.y + 12);
+      await page.mouse.down();
+      await page.mouse.move(miniBox.x + miniBox.width / 2, miniBox.y + 56, { steps: 6 });
+      await page.mouse.up();
+      await page.locator('.mini-player').waitFor({ state: 'detached' });
+    }
 
     // Reopen Episode 12.mp3 -> resumes at 2:05 with "Resumed at 2:05 · Start over" chip.
     await page.locator('.list a.row', { hasText: 'Episode 12.mp3' }).click();
@@ -463,7 +474,7 @@ test('Player: video controls, viewer Fullscreen API, controlled-clock timing, si
     assert.match(chipText, /Start over/);
     await page.locator('.player-resume-chip button', { hasText: 'Start over' }).click();
     await page.locator('.player-resume-chip').waitFor({ state: 'hidden' });
-    const afterStartOver = await page.evaluate(() => document.querySelector('.viewer audio')?.currentTime);
+    const afterStartOver = await page.evaluate(() => document.querySelector('audio[data-legion-music-audio]')?.currentTime);
     assert.equal(afterStartOver, 0);
     await page.locator('.music-top button[aria-label="Close"]').click();
     await page.locator('.viewer').waitFor({ state: 'hidden' });
@@ -619,10 +630,10 @@ test('Player: instance and full screen survive file changes (next, prev, song en
     });
     await page.locator('.list a.row', { hasText: '01 - Morning Light.flac' }).click();
     await page.locator('.music-screen').waitFor();
-    await page.locator('.viewer audio[src]').waitFor({ state: 'attached', timeout: 5000 });
+    await page.locator('audio[data-legion-music-audio][src]').waitFor({ state: 'attached', timeout: 5000 });
     await page.evaluate(() => {
       window.__LEGION_MUSIC_NODE_REF__ = document.querySelector('.music-screen');
-      document.querySelector('.viewer audio').dispatchEvent(new Event('ended'));
+      document.querySelector('audio[data-legion-music-audio]').dispatchEvent(new Event('ended'));
     });
     await page.locator('.music-title', { hasText: 'Rain on Glass' }).waitFor({ timeout: 5000 });
     const sameMusicNode = await page.evaluate(
@@ -813,7 +824,7 @@ test('Player: music screen, tags, covers in listing, MediaSession, auto-advance,
     await page.locator('.music-top button[aria-label="More options"]').click();
     await page.locator('.sheet .music-speed-chips button', { hasText: '1.25×' }).click();
     await page.waitForFunction(
-      () => document.querySelector('.viewer audio')?.playbackRate === 1.25,
+      () => document.querySelector('audio[data-legion-music-audio]')?.playbackRate === 1.25,
       null,
       { timeout: 3000 },
     );
@@ -822,23 +833,23 @@ test('Player: music screen, tags, covers in listing, MediaSession, auto-advance,
 
     // Ending a song auto-advances to the next track (`02 - Rain on Glass.mp3`), revokes the previous URL,
     // and keeps the Play button at the exact same horizontal position.
-    const firstSongUrl = await page.evaluate(() => document.querySelector('.viewer audio')?.getAttribute('src') || '');
+    const firstSongUrl = await page.evaluate(() => document.querySelector('audio[data-legion-music-audio]')?.getAttribute('src') || '');
     assert.ok(firstSongUrl.length > 0);
     await page.evaluate(() => {
-      document.querySelector('.viewer audio').dispatchEvent(new Event('ended'));
+      document.querySelector('audio[data-legion-music-audio]').dispatchEvent(new Event('ended'));
     });
     await page.locator('.music-title', { hasText: 'Rain on Glass' }).waitFor({ timeout: 5000 });
     const midPlayX = await page.evaluate(() => document.querySelector('.music-play-btn').getBoundingClientRect().x);
     assert.ok(Math.abs(midPlayX - firstPlayBox.x) < 0.5, `Play button shifted: ${firstPlayBox.x} -> ${midPlayX}`);
     const afterAutoNext = await page.evaluate((prev) => ({
       revokedPrev: Array.isArray(window.__LEGION_MOCK_REVOKED_URLS__) && window.__LEGION_MOCK_REVOKED_URLS__.includes(prev),
-      nextUrl: document.querySelector('.viewer audio')?.getAttribute('src') || '',
+      nextUrl: document.querySelector('audio[data-legion-music-audio]')?.getAttribute('src') || '',
     }), firstSongUrl);
     assert.equal(afterAutoNext.revokedPrev, true, 'Auto-advancing to next song must revoke previous content URL');
     assert.notEqual(afterAutoNext.nextUrl, firstSongUrl);
 
-    // Ensure track is playing -> MediaSession reflects "playing"; closing the music player clears
-    // metadata to null and playbackState to "none".
+    // Ensure track is playing -> MediaSession stays "playing" after leaving the song screen
+    // (small player takes over), and clears metadata to null / playbackState to "none" on dismiss.
     const playBtnLabel = await page.locator('.music-play-btn').getAttribute('aria-label');
     if (playBtnLabel === 'Play') {
       await page.locator('.music-play-btn').click();
@@ -850,6 +861,20 @@ test('Player: music screen, tags, covers in listing, MediaSession, auto-advance,
     );
     await page.locator('.music-top button[aria-label="Close"]').click();
     await page.locator('.viewer').waitFor({ state: 'hidden' });
+    await page.locator('.mini-player').waitFor();
+    const activeInMini = await page.evaluate(() => ({
+      title: navigator.mediaSession?.metadata?.title || '',
+      playbackState: navigator.mediaSession?.playbackState || '',
+    }));
+    assert.equal(activeInMini.title, 'Rain on Glass');
+    assert.equal(activeInMini.playbackState, 'playing');
+
+    const miniRect = await page.locator('.mini-player').boundingBox();
+    await page.mouse.move(miniRect.x + miniRect.width / 2, miniRect.y + 12);
+    await page.mouse.down();
+    await page.mouse.move(miniRect.x + miniRect.width / 2, miniRect.y + 56, { steps: 6 });
+    await page.mouse.up();
+    await page.locator('.mini-player').waitFor({ state: 'detached' });
     const clearedSession = await page.evaluate(() => ({
       metadata: navigator.mediaSession?.metadata ?? null,
       playbackState: navigator.mediaSession?.playbackState || '',
@@ -1144,17 +1169,17 @@ test('Player: hiding the desktop window pauses video and music in place and leav
       waitUntil: 'domcontentloaded',
     });
     await page.locator('.list a.row', { hasText: '01 - Morning Light.flac' }).click();
-    await page.locator('.viewer audio[src]').waitFor({ state: 'attached', timeout: 5000 });
+    await page.locator('audio[data-legion-music-audio][src]').waitFor({ state: 'attached', timeout: 5000 });
     await page.waitForFunction(
       () => {
-        const a = document.querySelector('.viewer audio');
+        const a = document.querySelector('audio[data-legion-music-audio]');
         return a && a.readyState >= 1 && Number.isFinite(a.duration) && a.duration > 0;
       },
       null,
       { timeout: 5000 },
     );
     const targetAudioTime = await page.evaluate(async () => {
-      const a = document.querySelector('.viewer audio');
+      const a = document.querySelector('audio[data-legion-music-audio]');
       const t = Math.min(0.25, Math.max(0.05, a.duration * 0.3));
       a.currentTime = t;
       await a.play();
@@ -1162,7 +1187,7 @@ test('Player: hiding the desktop window pauses video and music in place and leav
     });
     await page.waitForFunction(
       () => {
-        const a = document.querySelector('.viewer audio');
+        const a = document.querySelector('audio[data-legion-music-audio]');
         return a && !a.paused;
       },
       null,
@@ -1171,7 +1196,7 @@ test('Player: hiding the desktop window pauses video and music in place and leav
     await page.evaluate(() => window.__LEGION_MOCK_TRIGGER_WINDOW_HIDDEN__());
     await page.locator('.music-play-btn[aria-label="Play"]').waitFor({ timeout: 3000 });
     const audioAfterHide = await page.evaluate(() => {
-      const a = document.querySelector('.viewer audio');
+      const a = document.querySelector('audio[data-legion-music-audio]');
       return { paused: a?.paused, currentTime: a?.currentTime ?? 0 };
     });
     assert.equal(audioAfterHide.paused, true);
@@ -1268,10 +1293,10 @@ test('Player: Space play/pause intent pressed while next file loads applies once
       waitUntil: 'domcontentloaded',
     });
     await page.locator('.list a.row', { hasText: '01 - Morning Light.flac' }).click();
-    await page.locator('.viewer audio[src]').waitFor({ state: 'attached', timeout: 5000 });
+    await page.locator('audio[data-legion-music-audio][src]').waitFor({ state: 'attached', timeout: 5000 });
     await page.waitForFunction(
       () => {
-        const a = document.querySelector('.viewer audio');
+        const a = document.querySelector('audio[data-legion-music-audio]');
         return a && a.readyState >= 1 && a.paused;
       },
       null,
@@ -1280,14 +1305,14 @@ test('Player: Space play/pause intent pressed while next file loads applies once
     await page.keyboard.press('n');
     await page.locator('.music-title', { hasText: 'Rain on Glass' }).waitFor({ timeout: 5000 });
     assert.equal(
-      await page.evaluate(() => document.querySelector('.viewer audio')?.hasAttribute('src')),
+      await page.evaluate(() => document.querySelector('audio[data-legion-music-audio]')?.hasAttribute('src')),
       false,
     );
     await page.keyboard.press('Space');
-    await page.locator('.viewer audio[src]').waitFor({ state: 'attached', timeout: 5000 });
+    await page.locator('audio[data-legion-music-audio][src]').waitFor({ state: 'attached', timeout: 5000 });
     await page.waitForFunction(
       () => {
-        const a = document.querySelector('.viewer audio');
+        const a = document.querySelector('audio[data-legion-music-audio]');
         return a && a.readyState >= 1 && !a.paused;
       },
       null,
@@ -1490,7 +1515,7 @@ test('Player: deleting a picture, full-screen video, music track, or deep-linked
       const albumHash = await page.evaluate(() => window.location.hash);
 
       await page.locator('a.row', { hasText: '01 - Morning Light.flac' }).click();
-      await page.locator('.viewer audio[src]').waitFor({ state: 'attached', timeout: 5000 });
+      await page.locator('audio[data-legion-music-audio][src]').waitFor({ state: 'attached', timeout: 5000 });
       await page.locator('.viewer button[aria-label="More options"]').click();
       await page.locator('.sheet button', { hasText: 'Delete' }).click();
       await page.locator('.sheet button.danger', { hasText: 'Delete' }).click();
@@ -1950,19 +1975,19 @@ test('Player: wide 1440x900 two-pane split layout isolates inert panes and rail,
     await musicRow.waitFor({ timeout: 5000 });
     await musicRow.focus();
     await musicRow.click();
-    await page.locator('.viewer audio[src]').waitFor({ state: 'attached', timeout: 5000 });
+    await page.locator('audio[data-legion-music-audio][src]').waitFor({ state: 'attached', timeout: 5000 });
     await assertShellInert(true);
 
     await page.evaluate(async () => {
-      const a = document.querySelector('.viewer audio');
+      const a = document.querySelector('audio[data-legion-music-audio]');
       await a.play();
     });
     await page.waitForFunction(() => {
-      const a = document.querySelector('.viewer audio');
+      const a = document.querySelector('audio[data-legion-music-audio]');
       return Boolean(a && !a.paused);
     });
     await page.evaluate(() => window.__LEGION_MOCK_TRIGGER_WINDOW_HIDDEN__?.());
-    assert.equal(await page.evaluate(() => document.querySelector('.viewer audio')?.paused), true);
+    assert.equal(await page.evaluate(() => document.querySelector('audio[data-legion-music-audio]')?.paused), true);
 
     await page.keyboard.press('Escape');
     await page.locator('.viewer').waitFor({ state: 'detached', timeout: 5000 });
@@ -2306,7 +2331,7 @@ test('Player: real legion serve music screen reads title, artist, album, and cov
     // Real WAV audio stream plays from `/v1/content/`.
     await page.waitForFunction(
       () => {
-        const a = document.querySelector('.viewer audio');
+        const a = document.querySelector('audio[data-legion-music-audio]');
         return Boolean(a && a.readyState >= 1 && Number.isFinite(a.duration) && a.duration > 0);
       },
       null,
@@ -2315,7 +2340,7 @@ test('Player: real legion serve music screen reads title, artist, album, and cov
     await page.locator('.music-play-btn').click();
     await page.waitForFunction(
       () => {
-        const a = document.querySelector('.viewer audio');
+        const a = document.querySelector('audio[data-legion-music-audio]');
         return Boolean(a && !a.paused);
       },
       null,

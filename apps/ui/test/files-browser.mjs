@@ -272,10 +272,10 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
     // 9. Royalty-free Opus Ogg audio playback loads cleanly in the music player.
     await page.locator('.list a.row', { hasText: 'Voice note.ogg' }).click();
     await page.locator('.viewer .music-screen').waitFor();
-    await page.locator('.viewer audio').waitFor({ state: 'attached' });
+    await page.locator('audio[data-legion-music-audio][src]').waitFor({ state: 'attached' });
     await page.waitForFunction(
       () => {
-        const a = document.querySelector('.viewer audio');
+        const a = document.querySelector('audio[data-legion-music-audio]');
         return a && a.readyState >= 1 && Number.isFinite(a.duration) && a.duration > 0.5;
       },
       null,
@@ -283,6 +283,15 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
     );
     await page.locator('.viewer-top button[aria-label="Close"]').click();
     await page.locator('.viewer').waitFor({ state: 'hidden' });
+    // Dismiss the small player bar via swipe down before continuing.
+    const miniBox = await page.locator('.mini-player').boundingBox();
+    if (miniBox) {
+      await page.mouse.move(miniBox.x + miniBox.width / 2, miniBox.y + 12);
+      await page.mouse.down();
+      await page.mouse.move(miniBox.x + miniBox.width / 2, miniBox.y + 56, { steps: 6 });
+      await page.mouse.up();
+      await page.locator('.mini-player').waitFor({ state: 'detached' });
+    }
 
     // 9b. 123-char no-spaces filename fits cleanly with zero horizontal overflow in list, viewer, and Send to.
     const longNamePrefix = 'quarterly_photogrammetry_orthomosaic';
@@ -1016,7 +1025,7 @@ test('Files viewer: honest media errors, in-place Open in another app progress/c
     // 2. Known-unplayable formats (WMA, AVI) skip the media player and offer Open in another app.
     await page.locator('.list a.row', { hasText: 'legacy-track.wma' }).click();
     await page.locator('.viewer').getByText("This phone can't play WMA audio directly").waitFor();
-    assert.equal(await page.locator('.viewer audio').count(), 0);
+    assert.equal(await page.locator('audio[data-legion-music-audio][src]').count(), 0);
     await page.locator('.viewer').getByRole('button', { name: 'Open in another app' }).waitFor();
     await page.locator('.viewer-top button[aria-label="Close"]').click();
 
@@ -1060,10 +1069,10 @@ test('Files viewer: honest media errors, in-place Open in another app progress/c
     }
 
     // 6. "Open in another app" shows visible in-place "Getting it ready… X of Y" progress + Cancel,
-    // and closing the viewer immediately revokes the minted content URL.
+    // leaving the song's screen keeps it in the small player, and dismissing the small player revokes its URL.
     await page.locator('.list a.row', { hasText: 'studio-master.flac' }).click();
     await page.locator('.viewer .music-screen').waitFor();
-    const flacAudio = page.locator('.viewer audio[src]');
+    const flacAudio = page.locator('audio[data-legion-music-audio][src]');
     await flacAudio.waitFor({ state: 'attached' });
     const flacUrl = await flacAudio.getAttribute('src');
     assert.ok(flacUrl, 'expected minted audio content URL');
@@ -1076,6 +1085,13 @@ test('Files viewer: honest media errors, in-place Open in another app progress/c
     await banner.waitFor({ state: 'hidden' });
     await page.locator('.music-top button[aria-label="Close"]').click();
     await page.locator('.viewer').waitFor({ state: 'hidden' });
+    await page.locator('.mini-player').waitFor();
+    const miniRect = await page.locator('.mini-player').boundingBox();
+    await page.mouse.move(miniRect.x + miniRect.width / 2, miniRect.y + 12);
+    await page.mouse.down();
+    await page.mouse.move(miniRect.x + miniRect.width / 2, miniRect.y + 56, { steps: 6 });
+    await page.mouse.up();
+    await page.locator('.mini-player').waitFor({ state: 'detached' });
     const revokedAfterClose = await page.evaluate(() => window.__LEGION_MOCK_REVOKED_URLS__ || []);
     assert.ok(
       revokedAfterClose.includes(flacUrl),
