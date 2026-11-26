@@ -85,8 +85,8 @@ pub const LOOPBACK_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// ticket) may take to send complete HTTP request headers before being closed (2 seconds).
 pub const LOOPBACK_UNAUTH_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Maximum total time allowed for a loopback proof-of-ownership liveness probe (400 ms).
-pub const LOOPBACK_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
+/// Maximum total time allowed for a loopback proof-of-ownership liveness probe (1.5 seconds).
+pub const LOOPBACK_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// Maximum age of a verified loopback proof before `mint_url` re-probes ownership (2 seconds).
 pub const LOOPBACK_PROBE_FRESHNESS: Duration = Duration::from_secs(2);
@@ -7732,7 +7732,7 @@ mod tests {
             .expect("tarpit timeout must trigger rebind");
         assert_ne!(recovered, tarpit_port);
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            started.elapsed() < Duration::from_secs(5),
             "tarpit probe should time out promptly (elapsed={:?})",
             started.elapsed()
         );
@@ -7749,6 +7749,102 @@ mod tests {
 
         tarpit_stop.cancel();
         let _ = tarpit_task.await;
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn loopback_probe_tolerates_busy_loopback_delay_past_400ms_without_rebinding() {
+        let payload = b"slow-probe-payload".to_vec();
+        let mut files = HashMap::new();
+        files.insert("/home/me/song.flac".to_owned(), payload);
+
+        let backend = Arc::new(MockContentBackend::new(files));
+        let server = Arc::new(AppContentServer::with_config(
+            backend,
+            ContentMountMode::Loopback,
+            TicketConfig::default(),
+            Duration::from_secs(30),
+            vec!["http://tauri.localhost".to_owned()],
+        ));
+        let _ = server
+            .mint_url("tower", "/home/me/song.flac", false)
+            .await
+            .unwrap();
+
+        // Bind a mock probe responder that takes 600 ms (representing a busy host or mobile
+        // resume spike) before replying with a valid keyed BLAKE3 proof.
+        let secret = [0x5Au8; 32];
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let slow_port = listener.local_addr().unwrap().port();
+        let responder = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req_buf = Vec::new();
+            let mut chunk = [0u8; 512];
+            while !req_buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                req_buf.extend_from_slice(&chunk[..n]);
+            }
+            let req_text = String::from_utf8_lossy(&req_buf);
+            let challenge_b64 = req_text
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.trim()
+                        .eq_ignore_ascii_case(LOOPBACK_PROBE_CHALLENGE_HEADER.as_str())
+                        .then(|| value.trim().to_owned())
+                })
+                .expect("probe challenge header");
+            let challenge: [u8; 32] = URL_SAFE_NO_PAD
+                .decode(&challenge_b64)
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let proof = probe_mac(&secret, LOOPBACK_PROBE_RESP_DOMAIN, &challenge);
+            let proof_b64 = URL_SAFE_NO_PAD.encode(proof.as_bytes());
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            let resp = format!(
+                "HTTP/1.1 204 No Content\r\n\
+                 {LOOPBACK_PROBE_PROOF_HEADER}: {proof_b64}\r\n\
+                 Connection: close\r\n\r\n"
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+
+        {
+            let mut slot = server.listener.lock().unwrap();
+            if let Some(old) = slot.take() {
+                old.shutdown.cancel();
+            }
+            let fake_shutdown = CancellationToken::new();
+            let fake_shutdown_task = fake_shutdown.clone();
+            let fake_accept_task = tokio::spawn(async move {
+                fake_shutdown_task.cancelled().await;
+            });
+            *slot = Some(ListenerHandle {
+                port: slow_port,
+                shutdown: fake_shutdown,
+                accept_alive: Arc::new(AtomicBool::new(true)),
+                accept_task: fake_accept_task,
+                probe_secret: secret,
+                last_verified: Instant::now() - Duration::from_secs(10),
+            });
+        }
+
+        let kept = server
+            .probe_or_recover_loopback()
+            .await
+            .unwrap()
+            .expect("listener should stay alive");
+        assert_eq!(
+            kept, slow_port,
+            "a 600 ms loopback probe reply must not tear down and rebind a healthy listener"
+        );
+
+        let _ = responder.await;
         server.shutdown();
     }
 
