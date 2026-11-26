@@ -19,6 +19,7 @@ pub mod session;
 mod state;
 pub mod stream;
 mod stream_relay;
+mod stream_tunnel;
 pub mod sync;
 pub mod tools;
 pub mod transfer;

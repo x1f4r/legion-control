@@ -14,7 +14,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use legion_core::config::ConfigStore;
-use legion_core::policy::Policy;
+use legion_core::policy::{NOBODY, Policy};
 use legion_core::{CancellationToken, Door, Paths};
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
 use serde_json::{Map, Value, json};
@@ -26,11 +26,13 @@ use crate::config::validate_machine_name;
 use crate::connector::{PipeHandle, StderrTail};
 use crate::pool::{Fleet, MAX_HOPS, RelayPipe};
 use crate::stream::{
-    CAP_STREAM_RELAY, GetAuditBucket, GetReady, Header, Host, NextHeader, OPS, OUTPUT_BUFFER, Op,
-    PutReady, QUEUED_CHUNKS, RECHECK_INTERVAL_BYTES, RECHECK_INTERVAL_TIME, RECHECK_POLL_INTERVAL,
-    STREAM_PROTOCOL, StreamServeOptions, check_pairing_not_revoked, gone, machine_or,
-    read_next_header, record_for_target, reply_error, unsupported, validate_op_enabled,
+    CAP_STREAM_RELAY, CAP_STREAM_RELAY_TUNNEL, CAP_STREAM_TUNNEL, GetAuditBucket, GetReady, Header,
+    Host, NextHeader, OPS, OUTPUT_BUFFER, Op, PutReady, QUEUED_CHUNKS, RECHECK_INTERVAL_BYTES,
+    RECHECK_INTERVAL_TIME, RECHECK_POLL_INTERVAL, STREAM_PROTOCOL, StreamServeOptions,
+    check_pairing_not_revoked, gone, machine_or, read_next_header, record_for_target, reply_error,
+    unsupported, validate_op_enabled,
 };
+use crate::stream_tunnel::{authorise_tunnel_principal, validate_tunnel_fields};
 
 /// Maximum time to wait for a downstream node's opening `{"protocol": 1}` greeting line.
 const DOWNSTREAM_GREETING_TIMEOUT: Duration = Duration::from_secs(30);
@@ -80,7 +82,7 @@ fn downstream_timeout_error(target: &str, timeout: Duration) -> ErrorBody {
     .with_machine(target)
 }
 
-fn client_gone_error(relay: &str) -> ErrorBody {
+pub(crate) fn client_gone_error(relay: &str) -> ErrorBody {
     ErrorBody::new(
         ErrorCode::Cancelled,
         "The client closed the relayed stream.",
@@ -88,7 +90,7 @@ fn client_gone_error(relay: &str) -> ErrorBody {
     .with_machine(relay)
 }
 
-fn relay_shutdown_error(relay: &str) -> ErrorBody {
+pub(crate) fn relay_shutdown_error(relay: &str) -> ErrorBody {
     ErrorBody::new(
         ErrorCode::Cancelled,
         "The stream stopped because the node is shutting down.",
@@ -214,6 +216,9 @@ pub(crate) fn parse_relay_inner(
             .with_hint("Set `on` to the final target machine instead of nesting relay headers.")
             .with_machine(host.name()));
         }
+        Some("tunnel") => {
+            validate_tunnel_fields(fields).map_err(|err| err.with_machine(host.name()))?;
+        }
         Some(op) if OPS.contains(&op) => {}
         Some(op) => {
             return Err(unsupported(format!(
@@ -261,6 +266,9 @@ fn authorise_relay(
     as_principal: Option<&str>,
     inner_op: &Op,
 ) -> Result<String, (Option<String>, ErrorBody)> {
+    if matches!(inner_op, Op::Tunnel) {
+        return authorise_tunnel_principal(host, config, pinned, pairing_id, as_principal);
+    }
     if let Some(pid) = pairing_id
         && let Err(error) = check_pairing_not_revoked(config, pid)
     {
@@ -280,18 +288,24 @@ fn authorise_relay(
     Ok(principal)
 }
 
+/// Authorisation rule re-checked live by [`RelayAuthCheck`].
+#[derive(Clone, Copy)]
+pub(crate) enum RelayAuthTarget {
+    Tool(&'static str, Effect),
+    Tunnel,
+}
+
 /// Live relay-side permission and device-revocation checker matching [`StreamAuthCheck`] on direct
 /// streams: re-verifies every `recheck_bytes` or `recheck_interval` (whichever comes first) and
 /// from [`RelayRevokeWatchdog`] even when no bytes are flowing.
 #[derive(Clone)]
-struct RelayAuthCheck {
+pub(crate) struct RelayAuthCheck {
     host_name: String,
     paths: Paths,
     pinned: Option<String>,
     pairing_id: Option<String>,
     as_principal: Arc<Mutex<Option<String>>>,
-    tool: &'static str,
-    effect: Effect,
+    target: RelayAuthTarget,
     recheck_bytes: u64,
     recheck_interval: Duration,
     last_check: Arc<Mutex<Instant>>,
@@ -301,13 +315,12 @@ struct RelayAuthCheck {
 }
 
 impl RelayAuthCheck {
-    fn new(
+    pub(crate) fn new(
         host: &Host,
         pinned: Option<&str>,
         as_principal: Option<&str>,
         options: &StreamServeOptions,
-        tool: &'static str,
-        effect: Effect,
+        target: RelayAuthTarget,
     ) -> Self {
         Self {
             host_name: host.name().to_owned(),
@@ -315,8 +328,7 @@ impl RelayAuthCheck {
             pinned: pinned.map(str::to_owned),
             pairing_id: options.pairing_id.clone(),
             as_principal: Arc::new(Mutex::new(as_principal.map(str::to_owned))),
-            tool,
-            effect,
+            target,
             recheck_bytes: options.recheck_bytes.clamp(1, RECHECK_INTERVAL_BYTES),
             recheck_interval: options.recheck_interval.min(RECHECK_INTERVAL_TIME),
             last_check: Arc::new(Mutex::new(Instant::now())),
@@ -332,15 +344,15 @@ impl RelayAuthCheck {
         }
     }
 
-    fn revoke_token(&self) -> &CancellationToken {
+    pub(crate) fn revoke_token(&self) -> &CancellationToken {
         &self.revoked
     }
 
-    fn denied_error(&self) -> Option<ErrorBody> {
+    pub(crate) fn denied_error(&self) -> Option<ErrorBody> {
         self.denied.lock().ok().and_then(|slot| slot.clone())
     }
 
-    fn denied_or_generic(&self) -> ErrorBody {
+    pub(crate) fn denied_or_generic(&self) -> ErrorBody {
         self.denied_error()
             .unwrap_or_else(|| relay_revoked_error(&self.host_name))
     }
@@ -366,15 +378,34 @@ impl RelayAuthCheck {
         let principal = policy
             .resolve(as_principal.as_deref(), self.pinned.as_deref())
             .map_err(|err| machine_or(err, &self.host_name))?;
-        let spec = ToolSpec {
-            name: self.tool.to_owned(),
-            description: String::new(),
-            effect: self.effect,
-            input_schema: json!({"type": "object"}),
-        };
-        let _ = policy
-            .authorize(&principal, &spec, &self.paths)
-            .map_err(|err| machine_or(err, &self.host_name))?;
+        match self.target {
+            RelayAuthTarget::Tool(tool, effect) => {
+                let spec = ToolSpec {
+                    name: tool.to_owned(),
+                    description: String::new(),
+                    effect,
+                    input_schema: json!({"type": "object"}),
+                };
+                let _ = policy
+                    .authorize(&principal, &spec, &self.paths)
+                    .map_err(|err| machine_or(err, &self.host_name))?;
+            }
+            RelayAuthTarget::Tunnel => {
+                let (role_name, _) = policy.role_of(&principal);
+                if role_name == NOBODY {
+                    return Err(ErrorBody::new(
+                        ErrorCode::Denied,
+                        format!(
+                            "{principal} has the {NOBODY} role and may not hold an open stream tunnel."
+                        ),
+                    )
+                    .with_hint(
+                        "Assign a role other than nobody in policy.toml to allow sealed sessions.",
+                    )
+                    .with_machine(&self.host_name));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -480,7 +511,7 @@ impl RelayAuthCheck {
         Ok(())
     }
 
-    async fn maybe_recheck_async(
+    pub(crate) async fn maybe_recheck_async(
         &self,
         bytes_since: &mut u64,
         stop: Option<&CancellationToken>,
@@ -508,13 +539,13 @@ impl RelayAuthCheck {
 /// Background watchdog started for every relayed operation so revocation on the relay stops the
 /// stream within the same bound as a direct stream even when no bytes are flowing or output is
 /// stalled.
-struct RelayRevokeWatchdog {
+pub(crate) struct RelayRevokeWatchdog {
     stop: Arc<(Mutex<bool>, Condvar)>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl RelayRevokeWatchdog {
-    fn start(check: RelayAuthCheck) -> Self {
+    pub(crate) fn start(check: RelayAuthCheck) -> Self {
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let stop_bg = Arc::clone(&stop);
         let poll_interval = RECHECK_POLL_INTERVAL
@@ -628,13 +659,13 @@ fn build_downstream_header(
     bytes
 }
 
-enum RuntimeChoice {
+pub(crate) enum RuntimeChoice {
     Borrowed(tokio::runtime::Handle),
     Owned(tokio::runtime::Runtime),
 }
 
 impl RuntimeChoice {
-    fn acquire(options: &StreamServeOptions, host: &Host) -> Result<Self, ErrorBody> {
+    pub(crate) fn acquire(options: &StreamServeOptions, host: &Host) -> Result<Self, ErrorBody> {
         if let Some(handle) = options
             .runtime
             .clone()
@@ -656,7 +687,7 @@ impl RuntimeChoice {
             })
     }
 
-    fn handle(&self) -> &tokio::runtime::Handle {
+    pub(crate) fn handle(&self) -> &tokio::runtime::Handle {
         match self {
             RuntimeChoice::Borrowed(handle) => handle,
             RuntimeChoice::Owned(runtime) => runtime.handle(),
@@ -802,15 +833,14 @@ pub(crate) fn serve_relay_remote_spawned<R: Read + Send + 'static, W: Write>(
     };
     let relay_fleet = RelayFleet::acquire(host, options);
     let handle = rt.handle().clone();
-    let (tool_name, tool_effect) = inner_op.authorised_as();
-    let auth_check = RelayAuthCheck::new(
-        host,
-        pinned,
-        as_principal.as_deref(),
-        options,
-        tool_name,
-        tool_effect,
-    );
+    let auth_target = if matches!(inner_op, Op::Tunnel) {
+        RelayAuthTarget::Tunnel
+    } else {
+        let (tool_name, tool_effect) = inner_op.authorised_as();
+        RelayAuthTarget::Tool(tool_name, tool_effect)
+    };
+    let auth_check =
+        RelayAuthCheck::new(host, pinned, as_principal.as_deref(), options, auth_target);
     let _watchdog = RelayRevokeWatchdog::start(auth_check.clone());
 
     if matches!(
@@ -949,6 +979,26 @@ pub(crate) fn serve_relay_remote_spawned<R: Read + Send + 'static, W: Write>(
                 )
                 .await
             }
+            Op::Tunnel => {
+                relay_tunnel_spawned(
+                    host,
+                    &config,
+                    &relay_fleet.fleet,
+                    door,
+                    device,
+                    options,
+                    &auth_check,
+                    &on,
+                    principal,
+                    inner_map,
+                    next_hops,
+                    recorded,
+                    started,
+                    input,
+                    &mut output,
+                )
+                .await
+            }
             _ => {
                 relay_read_or_control(
                     host,
@@ -984,6 +1034,7 @@ struct OpenedDownstream {
     chained: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn open_and_greet_downstream(
     fleet: &Fleet,
     config: &ConfigStore,
@@ -992,6 +1043,7 @@ async fn open_and_greet_downstream(
     options: &StreamServeOptions,
     auth_check: &RelayAuthCheck,
     revoke_kill_delay: Duration,
+    is_tunnel: bool,
 ) -> Result<OpenedDownstream, ErrorBody> {
     let pipe_cancel = CancellationToken::new();
     let opened_pipe = tokio::select! {
@@ -1031,7 +1083,7 @@ async fn open_and_greet_downstream(
 
     let greet_timeout = DOWNSTREAM_GREETING_TIMEOUT.min(options.downstream_read_timeout);
     let greet_res = match wait_downstream(
-        read_downstream_greeting(&mut stdout, &next_hop, target, chained, &stderr),
+        read_downstream_greeting(&mut stdout, &next_hop, target, chained, is_tunnel, &stderr),
         greet_timeout,
         options.shutdown.as_ref(),
         options.client_gone.as_ref(),
@@ -1089,6 +1141,7 @@ async fn read_downstream_greeting(
     next_hop: &str,
     target: &str,
     chained: bool,
+    is_tunnel: bool,
     stderr: &std::sync::Arc<StderrTail>,
 ) -> Result<(), ErrorBody> {
     let mut noise_lines = 0usize;
@@ -1130,32 +1183,59 @@ async fn read_downstream_greeting(
                 .with_hint("Update legion on whichever machine is older.")
                 .with_machine(next_hop));
             }
-            if chained {
-                let supports_relay = fields
+            let has_cap = |cap: &str| {
+                fields
                     .get("capabilities")
                     .and_then(Value::as_array)
-                    .is_some_and(|arr| {
-                        arr.iter()
-                            .filter_map(Value::as_str)
-                            .any(|c| c == CAP_STREAM_RELAY)
-                    });
-                if !supports_relay {
-                    return Err(ErrorBody::new(
-                        ErrorCode::Unsupported,
+                    .is_some_and(|arr| arr.iter().filter_map(Value::as_str).any(|c| c == cap))
+            };
+            if chained {
+                let required = if is_tunnel {
+                    CAP_STREAM_RELAY_TUNNEL
+                } else {
+                    CAP_STREAM_RELAY
+                };
+                if !has_cap(required) {
+                    let message = if is_tunnel {
+                        format!(
+                            "{next_hop} needs an update before it can relay sealed sessions to {target}."
+                        )
+                    } else {
                         format!(
                             "{next_hop} needs an update before it can pass files along from {target}."
-                        ),
-                    )
-                    .with_hint(format!(
-                        "Update legion on {next_hop} so it supports relayed streams."
-                    ))
-                    .with_machine(next_hop)
-                    .with_details(json!({
-                        "reason": "relay_too_old",
-                        "relay": next_hop,
-                        "target": target,
-                    })));
+                        )
+                    };
+                    let hint = if is_tunnel {
+                        format!(
+                            "Update legion on {next_hop} so it advertises `{CAP_STREAM_RELAY_TUNNEL}`."
+                        )
+                    } else {
+                        format!("Update legion on {next_hop} so it supports relayed streams.")
+                    };
+                    return Err(ErrorBody::new(ErrorCode::Unsupported, message)
+                        .with_hint(hint)
+                        .with_machine(next_hop)
+                        .with_details(json!({
+                            "reason": "relay_too_old",
+                            "relay": next_hop,
+                            "target": target,
+                        })));
                 }
+            } else if is_tunnel && !has_cap(CAP_STREAM_TUNNEL) {
+                return Err(ErrorBody::new(
+                    ErrorCode::Unsupported,
+                    format!(
+                        "{target} needs an update before it can accept sealed tunnel sessions."
+                    ),
+                )
+                .with_hint(format!(
+                    "Update legion on {target} so it advertises `{CAP_STREAM_TUNNEL}`."
+                ))
+                .with_machine(target)
+                .with_details(json!({
+                    "reason": "target_too_old",
+                    "target": target,
+                })));
             }
             return Ok(());
         }
@@ -1324,6 +1404,7 @@ async fn relay_read_or_control<W: Write>(
         options,
         auth_check,
         Duration::from_millis(80),
+        false,
     )
     .await
     {
@@ -1560,7 +1641,9 @@ async fn relay_read_or_control<W: Write>(
                 pump_bytes_to_eof(&mut stdout, host, target, options, auth_check, output).await
             }
         }
-        Op::Put { .. } | Op::Unpack { .. } | Op::Relay { .. } | Op::Lock { .. } => unreachable!(),
+        Op::Put { .. } | Op::Unpack { .. } | Op::Relay { .. } | Op::Tunnel | Op::Lock { .. } => {
+            unreachable!()
+        }
     };
 
     drop(stdout);
@@ -1873,6 +1956,7 @@ async fn relay_keep_open_gets<W: Write>(
         options,
         auth_check,
         Duration::from_millis(80),
+        false,
     )
     .await
     {
@@ -2466,6 +2550,7 @@ async fn relay_write_spawned<R: Read + Send + 'static, W: Write>(
         options,
         auth_check,
         DOWNSTREAM_WRITE_REVOKE_FALLBACK,
+        false,
     )
     .await
     {
@@ -2881,6 +2966,442 @@ async fn relay_write_spawned<R: Read + Send + 'static, W: Write>(
                 Err(error)
             }
         }
+    };
+
+    record_for_target(
+        host,
+        target,
+        Some(principal),
+        door,
+        device,
+        audit_tool,
+        recorded,
+        started,
+        &outcome,
+    );
+    outcome
+}
+
+/// Relays `op: "tunnel"` to `target` (over direct ssh, `command`, dual-boot `systems`, or chained
+/// `via` up to `MAX_HOPS`): waits for the downstream `{"tunnel":true}\n` ready line, forwards it,
+/// and then copies raw bytes in both directions without parsing anything and with no idle timeout,
+/// cutting both ends promptly on EOF, client disconnect, shutdown, or live revocation.
+#[allow(clippy::too_many_arguments)]
+async fn relay_tunnel_spawned<R: Read + Send + 'static, W: Write>(
+    host: &Host,
+    config: &ConfigStore,
+    fleet: &Fleet,
+    door: Door,
+    device: Option<&str>,
+    options: &StreamServeOptions,
+    auth_check: &RelayAuthCheck,
+    target: &str,
+    principal: String,
+    inner_map: Map<String, Value>,
+    next_hops: u32,
+    recorded: Value,
+    started: Instant,
+    mut input: BufReader<R>,
+    output: &mut BufWriter<W>,
+) -> Result<(), ErrorBody> {
+    let audit_tool = "stream.tunnel";
+    let opened = match open_and_greet_downstream(
+        fleet,
+        config,
+        host,
+        target,
+        options,
+        auth_check,
+        Duration::from_millis(80),
+        true,
+    )
+    .await
+    {
+        Ok(opened) => opened,
+        Err(error) => {
+            let error = machine_or(error, host.name());
+            let _ = reply_error(output, &error);
+            record_for_target(
+                host,
+                target,
+                Some(principal),
+                door,
+                device,
+                audit_tool,
+                recorded,
+                started,
+                &Err(error.clone()),
+            );
+            return Err(error);
+        }
+    };
+
+    let OpenedDownstream {
+        mut stdin,
+        mut stdout,
+        guard,
+        stderr,
+        next_hop,
+        chained,
+    } = opened;
+
+    let header_bytes = build_downstream_header(&inner_map, &principal, target, chained, next_hops);
+    let header_err = match wait_downstream(
+        async {
+            stdin.write_all(&header_bytes).await?;
+            stdin.flush().await
+        },
+        options.downstream_read_timeout,
+        options.shutdown.as_ref(),
+        options.client_gone.as_ref(),
+        Some(auth_check.revoke_token()),
+        None,
+        None,
+    )
+    .await
+    {
+        DownstreamWait::Ready(Ok(())) => None,
+        DownstreamWait::Ready(Err(err)) => Some(
+            ErrorBody::new(
+                ErrorCode::Unreachable,
+                format!("Could not send stream tunnel request to {next_hop}: {err}."),
+            )
+            .with_machine(&next_hop),
+        ),
+        DownstreamWait::Shutdown => Some(relay_shutdown_error(host.name())),
+        DownstreamWait::Revoked => Some(auth_check.denied_or_generic()),
+        DownstreamWait::ClientGone => Some(client_gone_error(host.name())),
+        DownstreamWait::TimedOut => Some(downstream_timeout_error(
+            target,
+            options.downstream_read_timeout,
+        )),
+    };
+    if let Some(error) = header_err {
+        drop(stdin);
+        drop(stdout);
+        guard.close(DOWNSTREAM_ABORT_GRACE).await;
+        let _ = reply_error(output, &error);
+        record_for_target(
+            host,
+            target,
+            Some(principal),
+            door,
+            device,
+            audit_tool,
+            recorded,
+            started,
+            &Err(error.clone()),
+        );
+        return Err(error);
+    }
+
+    let first_reply = read_downstream_reply_forwarding_busy(
+        &mut stdout,
+        host,
+        target,
+        options,
+        auth_check,
+        None,
+        None,
+        output,
+    )
+    .await;
+    if let Some(denied) = auth_check.denied_error() {
+        drop(stdin);
+        drop(stdout);
+        guard.close(DOWNSTREAM_ABORT_GRACE).await;
+        let _ = reply_error(output, &denied);
+        record_for_target(
+            host,
+            target,
+            Some(principal),
+            door,
+            device,
+            audit_tool,
+            recorded,
+            started,
+            &Err(denied.clone()),
+        );
+        return Err(denied);
+    }
+
+    let (ready_raw, ready_fields) = match first_reply {
+        Ok(ReplyLine::Json(raw, fields)) => (raw, fields),
+        Ok(ReplyLine::RemoteError(error)) => {
+            drop(stdin);
+            drop(stdout);
+            guard.close(DOWNSTREAM_CLOSE_GRACE).await;
+            let _ = reply_error(output, &error);
+            record_for_target(
+                host,
+                target,
+                Some(principal),
+                door,
+                device,
+                audit_tool,
+                recorded,
+                started,
+                &Err(error.clone()),
+            );
+            return Err(error);
+        }
+        Ok(ReplyLine::Eof) => {
+            drop(stdin);
+            drop(stdout);
+            guard.close(DOWNSTREAM_ABORT_GRACE).await;
+            let mut error = ErrorBody::new(
+                ErrorCode::Unreachable,
+                format!("The tunnel stream to {target} closed before answering."),
+            )
+            .with_machine(target);
+            let text = stderr.text();
+            if !text.is_empty() {
+                error = error.with_hint(format!("Remote stderr: {text}"));
+            }
+            let _ = reply_error(output, &error);
+            record_for_target(
+                host,
+                target,
+                Some(principal),
+                door,
+                device,
+                audit_tool,
+                recorded,
+                started,
+                &Err(error.clone()),
+            );
+            return Err(error);
+        }
+        Err(error) => {
+            drop(stdin);
+            drop(stdout);
+            guard.close(DOWNSTREAM_ABORT_GRACE).await;
+            let error = machine_or(error, host.name());
+            let _ = reply_error(output, &error);
+            record_for_target(
+                host,
+                target,
+                Some(principal),
+                door,
+                device,
+                audit_tool,
+                recorded,
+                started,
+                &Err(error.clone()),
+            );
+            return Err(error);
+        }
+    };
+
+    if ready_fields.get("tunnel") != Some(&Value::Bool(true)) {
+        drop(stdin);
+        drop(stdout);
+        guard.close(DOWNSTREAM_ABORT_GRACE).await;
+        let error = ErrorBody::new(
+            ErrorCode::Failed,
+            format!("{target} answered relayed tunnel with an unexpected reply."),
+        )
+        .with_machine(target);
+        let _ = reply_error(output, &error);
+        record_for_target(
+            host,
+            target,
+            Some(principal),
+            door,
+            device,
+            audit_tool,
+            recorded,
+            started,
+            &Err(error.clone()),
+        );
+        return Err(error);
+    }
+
+    if let Err(err) = output.write_all(&ready_raw).and_then(|()| output.flush()) {
+        drop(stdin);
+        drop(stdout);
+        guard.close(DOWNSTREAM_ABORT_GRACE).await;
+        let error = machine_or(gone(&err), host.name());
+        record_for_target(
+            host,
+            target,
+            Some(principal),
+            door,
+            device,
+            audit_tool,
+            recorded,
+            started,
+            &Err(error.clone()),
+        );
+        return Err(error);
+    }
+
+    let (chunk_tx, mut chunk_rx) = async_mpsc::channel::<Vec<u8>>(QUEUED_CHUNKS);
+    let stop_writing = CancellationToken::new();
+    let reader_stop = stop_writing.clone();
+    let reader_revoke = auth_check.revoke_token().clone();
+
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; OUTPUT_BUFFER];
+        while !reader_stop.is_cancelled() && !reader_revoke.is_cancelled() {
+            match input.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if reader_stop.is_cancelled()
+                        || reader_revoke.is_cancelled()
+                        || chunk_tx.blocking_send(buf[..n].to_vec()).is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let writer_stop = stop_writing.clone();
+    let writer_shutdown = options.shutdown.clone();
+    let writer_client_gone = options.client_gone.clone();
+    let writer_auth = auth_check.clone();
+    let writer_revoke = auth_check.revoke_token().clone();
+    let mut writer_task = tokio::spawn(async move {
+        let mut since_check = 0u64;
+        loop {
+            if writer_auth
+                .maybe_recheck_async(&mut since_check, Some(&writer_stop))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            let next = tokio::select! {
+                biased;
+                () = writer_stop.cancelled() => None,
+                () = async {
+                    match writer_shutdown.as_ref() {
+                        Some(tok) => tok.cancelled().await,
+                        None => std::future::pending().await,
+                    }
+                } => None,
+                () = writer_revoke.cancelled() => None,
+                () = async {
+                    match writer_client_gone.as_ref() {
+                        Some(tok) => tok.cancelled().await,
+                        None => std::future::pending().await,
+                    }
+                } => None,
+                chunk = chunk_rx.recv() => chunk,
+            };
+            match next {
+                Some(bytes) => {
+                    let chunk_len = bytes.len() as u64;
+                    let write_ok = tokio::select! {
+                        biased;
+                        () = writer_stop.cancelled() => false,
+                        () = async {
+                            match writer_shutdown.as_ref() {
+                                Some(tok) => tok.cancelled().await,
+                                None => std::future::pending().await,
+                            }
+                        } => false,
+                        () = writer_revoke.cancelled() => false,
+                        () = async {
+                            match writer_client_gone.as_ref() {
+                                Some(tok) => tok.cancelled().await,
+                                None => std::future::pending().await,
+                            }
+                        } => false,
+                        res = async {
+                            stdin.write_all(&bytes).await?;
+                            stdin.flush().await
+                        } => res.is_ok(),
+                    };
+                    if !write_ok {
+                        break;
+                    }
+                    since_check = since_check.saturating_add(chunk_len);
+                }
+                None => {
+                    if !writer_revoke.is_cancelled() && !writer_stop.is_cancelled() {
+                        let _ = tokio::time::timeout(DOWNSTREAM_ABORT_GRACE, stdin.flush()).await;
+                    }
+                    break;
+                }
+            }
+        }
+        drop(stdin);
+    });
+
+    // Pump downstream -> upstream with NO idle timeout: a live SSH session over the tunnel may sit
+    // idle for minutes while SSH keepalives and the revocation watchdog monitor liveness.
+    let mut buf = vec![0u8; OUTPUT_BUFFER];
+    let mut since_check = 0u64;
+    let outcome: Result<(), ErrorBody> = loop {
+        if let Err(err) = auth_check.maybe_recheck_async(&mut since_check, None).await {
+            break Err(err);
+        }
+        enum ReadEvent {
+            Data(io::Result<usize>),
+            Shutdown,
+            ClientGone,
+            Revoked,
+        }
+        let event = tokio::select! {
+            biased;
+            () = async {
+                match options.shutdown.as_ref() {
+                    Some(tok) => tok.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            } => ReadEvent::Shutdown,
+            () = auth_check.revoke_token().cancelled() => ReadEvent::Revoked,
+            () = async {
+                match options.client_gone.as_ref() {
+                    Some(tok) => tok.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            } => ReadEvent::ClientGone,
+            res = stdout.read(&mut buf) => ReadEvent::Data(res),
+        };
+        match event {
+            ReadEvent::Shutdown => break Err(relay_shutdown_error(host.name())),
+            ReadEvent::Revoked => break Err(auth_check.denied_or_generic()),
+            ReadEvent::ClientGone => break Err(client_gone_error(host.name())),
+            ReadEvent::Data(Ok(0)) => break Ok(()),
+            ReadEvent::Data(Ok(n)) => {
+                if let Err(err) = output.write_all(&buf[..n]).and_then(|()| output.flush()) {
+                    break Err(machine_or(gone(&err), host.name()));
+                }
+                since_check = since_check.saturating_add(n as u64);
+            }
+            ReadEvent::Data(Err(err)) => {
+                break Err(ErrorBody::new(
+                    ErrorCode::Failed,
+                    format!("Reading relayed tunnel bytes from {target} failed: {err}."),
+                )
+                .with_machine(target));
+            }
+        }
+    };
+
+    stop_writing.cancel();
+    if tokio::time::timeout(DOWNSTREAM_ABORT_GRACE, &mut writer_task)
+        .await
+        .is_err()
+    {
+        writer_task.abort();
+        let _ = writer_task.await;
+    }
+    drop(stdout);
+    let close_grace = if outcome.is_ok() {
+        DOWNSTREAM_CLOSE_GRACE
+    } else {
+        DOWNSTREAM_ABORT_GRACE
+    };
+    guard.close(close_grace).await;
+
+    let outcome = match (outcome, auth_check.denied_error()) {
+        (Err(_), Some(denied)) => Err(denied),
+        (other, _) => other,
     };
 
     record_for_target(

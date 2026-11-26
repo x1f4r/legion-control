@@ -199,6 +199,31 @@ async fn roles(ctx: &Ctx, _args: NoArgs) -> Result<DeviceRolesResult, ToolError>
     })
 }
 
+/// Returns this node's configured SSH port (`[devices] port` in `node.toml`, defaulting to
+/// [`DEFAULT_SSH_PORT`]), rejecting port `0`.
+pub fn self_ssh_port(node_file: &NodeFile) -> Result<u16, ErrorBody> {
+    let port = node_file.devices.port.unwrap_or(DEFAULT_SSH_PORT);
+    if port == 0 {
+        return Err(ErrorBody::new(
+            ErrorCode::InvalidArgs,
+            "port must be between 1 and 65535.",
+        ));
+    }
+    Ok(port)
+}
+
+/// Resolves this node's own advertised SSH host names / addresses using the exact same source as
+/// `device.endpoint`: `[devices] hosts` in `node.toml` when set, otherwise Tailscale self
+/// addresses or the system hostname.
+pub async fn resolve_self_ssh_hosts(
+    node_file: &NodeFile,
+    cancel: legion_core::CancellationToken,
+) -> Result<Vec<String>, ErrorBody> {
+    let host_arg = (!node_file.devices.hosts.is_empty())
+        .then(|| HostArg::Many(node_file.devices.hosts.clone()));
+    resolve_hosts(host_arg, cancel).await
+}
+
 async fn detect_endpoint(
     ctx: &Ctx,
     node_file: &NodeFile,
@@ -207,15 +232,16 @@ async fn detect_endpoint(
     user_override: Option<String>,
     use_host_key_cache: bool,
 ) -> Result<DetectedEndpoint, ErrorBody> {
-    let port = port_override
-        .or(node_file.devices.port)
-        .unwrap_or(DEFAULT_SSH_PORT);
-    if port == 0 {
-        return Err(ErrorBody::new(
-            ErrorCode::InvalidArgs,
-            "port must be between 1 and 65535.",
-        ));
-    }
+    let port = match port_override {
+        Some(0) => {
+            return Err(ErrorBody::new(
+                ErrorCode::InvalidArgs,
+                "port must be between 1 and 65535.",
+            ));
+        }
+        Some(p) => p,
+        None => self_ssh_port(node_file)?,
+    };
 
     let user = match user_override.or_else(|| node_file.devices.user.clone()) {
         Some(raw) => {
@@ -254,11 +280,10 @@ async fn detect_endpoint(
         }
     };
 
-    let host_arg = host_override.or_else(|| {
-        (!node_file.devices.hosts.is_empty())
-            .then(|| HostArg::Many(node_file.devices.hosts.clone()))
-    });
-    let hosts = resolve_hosts(host_arg, ctx.cancel_token().child_token()).await?;
+    let hosts = match host_override {
+        Some(arg) => resolve_hosts(Some(arg), ctx.cancel_token().child_token()).await?,
+        None => resolve_self_ssh_hosts(node_file, ctx.cancel_token().child_token()).await?,
+    };
     let resolved_host_keys = if use_host_key_cache {
         resolve_host_keys_cached(
             ctx.paths().config_dir(),

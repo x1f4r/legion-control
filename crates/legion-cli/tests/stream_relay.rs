@@ -99,6 +99,14 @@ fn main() -> ExitCode {
             "relayed_stalled_get_revoked_on_relay_stops_both_sides_like_direct",
             relayed_stalled_get_revoked_on_relay_stops_both_sides_like_direct,
         ),
+        (
+            "relayed_tunnel_over_command_systems_chained_via_hops_and_field_validation",
+            relayed_tunnel_over_command_systems_chained_via_hops_and_field_validation,
+        ),
+        (
+            "relayed_tunnel_idle_survives_short_timeout_revocation_and_teardown",
+            relayed_tunnel_idle_survives_short_timeout_revocation_and_teardown,
+        ),
     ];
 
     let mut passed = 0usize;
@@ -2944,4 +2952,325 @@ fn relayed_stalled_get_revoked_on_relay_stops_both_sides_like_direct() {
         big_bytes.len(),
         "source file on studio must remain untouched"
     );
+}
+
+fn spawn_loopback_echo_server() -> (u16, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_bg = Arc::clone(&stop);
+    std::thread::spawn(move || {
+        while !stop_bg.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut conn, _)) => {
+                    let _ = conn.set_nonblocking(false);
+                    let _ = conn.set_nodelay(true);
+                    std::thread::spawn(move || {
+                        let mut buf = [0u8; 8192];
+                        while let Ok(n) = conn.read(&mut buf) {
+                            if n == 0 {
+                                break;
+                            }
+                            if conn.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (port, stop)
+}
+
+fn relayed_tunnel_over_command_systems_chained_via_hops_and_field_validation() {
+    let (echo_port, stop_echo) = spawn_loopback_echo_server();
+    let tower = node("tower");
+    let mid = node("mid");
+    let studio = node("studio");
+    studio.write_config(
+        "node.toml",
+        &format!("name = \"studio\"\n\n[devices]\nport = {echo_port}\nhosts = [\"127.0.0.1\"]\n"),
+    );
+
+    let exe = toml_string(&self_exe());
+    let flag = toml_string(HELPER_FLAG);
+    let mode = toml_string("node");
+    let studio_lh = toml_string(&legion_home_of(&studio).to_string_lossy());
+    let studio_uh = toml_string(&studio.home().to_string_lossy());
+    let systems_entry = format!(
+        "[[machines.dual.systems]]\nname = \"linux\"\ncommand = [{exe}, {flag}, {mode}, {studio_lh}, {studio_uh}, \"rpc\"]\n"
+    );
+
+    tower.write_config(
+        "fleet.toml",
+        &format!(
+            "{}{}{}[machines.far]\nvia = \"mid\"\n",
+            fleet_entry_for_node("studio", &studio),
+            fleet_entry_for_node("mid", &mid),
+            systems_entry,
+        ),
+    );
+    mid.write_config("fleet.toml", &fleet_entry_for_node("far", &studio));
+
+    // Give `device` ONLY `meta.whoami` (no `fs.*`): non-`nobody` role may open/relay `tunnel`.
+    write_device_policy(&tower, "allow = [\"meta.whoami\"]\n");
+    write_device_policy(&mid, "allow = [\"meta.whoami\"]\n");
+    write_device_policy(&studio, "allow = [\"meta.whoami\"]\n");
+
+    // 1. Greeting advertises both `stream.tunnel` and `stream.relay.tunnel`; relayed tunnel works
+    //    over `command` (`studio`), dual-boot `systems` (`dual`), and chained `via` (`far`).
+    for (target, payload) in [
+        ("studio", b"hello-command-tunnel".as_slice()),
+        ("dual", b"hello-systems-tunnel".as_slice()),
+        ("far", b"hello-chained-via-tunnel".as_slice()),
+    ] {
+        let mut child = spawn_stream(&tower, Some("device"));
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let greeting = read_greeting(&mut stdout);
+        let caps = greeting["capabilities"].as_array().unwrap();
+        assert!(caps.iter().any(|c| c == "stream.tunnel"), "{greeting}");
+        assert!(
+            caps.iter().any(|c| c == "stream.relay.tunnel"),
+            "{greeting}"
+        );
+
+        write_json_line(
+            &mut stdin,
+            &json!({
+                "protocol": 1,
+                "op": "relay",
+                "on": target,
+                "request": { "protocol": 1, "op": "tunnel" }
+            }),
+        );
+        let ready = read_json_line(&mut stdout);
+        assert_eq!(ready, json!({ "tunnel": true }), "target={target}");
+        stdin.write_all(payload).unwrap();
+        stdin.flush().unwrap();
+        drop(stdin);
+        let mut echoed = vec![0u8; payload.len()];
+        stdout.read_exact(&mut echoed).unwrap();
+        assert_eq!(echoed, payload, "target={target}");
+        assert!(child.wait().unwrap().success(), "target={target}");
+    }
+
+    // Verify dual audit logs recorded `stream.tunnel`.
+    assert!(
+        audit_entries(&tower)
+            .iter()
+            .any(|e| e["tool"] == "stream.tunnel"
+                && e["target"] == "studio"
+                && e["outcome"] == "ok"),
+        "tower audit missing stream.tunnel"
+    );
+    assert!(
+        audit_entries(&studio)
+            .iter()
+            .any(|e| e["tool"] == "stream.tunnel" && e["outcome"] == "ok"),
+        "studio audit missing stream.tunnel"
+    );
+
+    // 2. Extra destination fields inside `tunnel` request are refused with `invalid_args`.
+    {
+        let mut child = spawn_stream(&tower, Some("device"));
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let _ = read_greeting(&mut stdout);
+        write_json_line(
+            &mut stdin,
+            &json!({
+                "protocol": 1,
+                "op": "relay",
+                "on": "studio",
+                "request": { "protocol": 1, "op": "tunnel", "host": "127.0.0.1", "port": 22 }
+            }),
+        );
+        drop(stdin);
+        let reply = read_json_line(&mut stdout);
+        assert_eq!(reply["error"]["code"], json!("invalid_args"), "{reply}");
+        let _ = child.wait().unwrap();
+    }
+
+    // 3. Exceeding `MAX_HOPS` (3) is refused cleanly.
+    {
+        let mut child = spawn_stream(&tower, Some("device"));
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let _ = read_greeting(&mut stdout);
+        write_json_line(
+            &mut stdin,
+            &json!({
+                "protocol": 1,
+                "op": "relay",
+                "on": "studio",
+                "hops": 3,
+                "request": { "protocol": 1, "op": "tunnel" }
+            }),
+        );
+        drop(stdin);
+        let reply = read_json_line(&mut stdout);
+        assert_eq!(reply["error"]["code"], json!("failed"), "{reply}");
+        assert_eq!(reply["error"]["machine"], json!("tower"), "{reply}");
+        let _ = child.wait().unwrap();
+    }
+
+    // 4. `nobody` role is denied on relay before contacting target.
+    let studio_audits_before = audit_entries(&studio).len();
+    tower.write_config(
+        "policy.toml",
+        "default = \"owner\"\n\n[principals.device]\nrole = \"nobody\"\n",
+    );
+    {
+        let mut child = spawn_stream(&tower, Some("device"));
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let _ = read_greeting(&mut stdout);
+        write_json_line(
+            &mut stdin,
+            &json!({
+                "protocol": 1,
+                "op": "relay",
+                "on": "studio",
+                "request": { "protocol": 1, "op": "tunnel" }
+            }),
+        );
+        drop(stdin);
+        let reply = read_json_line(&mut stdout);
+        assert_eq!(reply["error"]["code"], json!("denied"), "{reply}");
+        assert_eq!(reply["error"]["machine"], json!("tower"), "{reply}");
+        let _ = child.wait().unwrap();
+    }
+    assert_eq!(
+        audit_entries(&studio).len(),
+        studio_audits_before,
+        "denied relay tunnel must never contact target"
+    );
+
+    stop_echo.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn relayed_tunnel_idle_survives_short_timeout_revocation_and_teardown() {
+    let (echo_port, stop_echo) = spawn_loopback_echo_server();
+    let pairing_id = "55555555666666667777777788888888";
+    let tower = node("tower");
+    let studio = node("studio");
+    configure_gate_device(&tower, "tower", pairing_id, "allow = [\"meta.whoami\"]");
+    configure_gate_device(&studio, "studio", pairing_id, "allow = [\"meta.whoami\"]");
+    let studio_ak = studio.home().join(".ssh/authorized_keys");
+    studio.write_config(
+        "node.toml",
+        &format!(
+            "name = \"studio\"\n\n[devices]\nport = {echo_port}\nhosts = [\"127.0.0.1\"]\nauthorized_keys = {}\n",
+            toml_string(&studio_ak.to_string_lossy()),
+        ),
+    );
+    #[cfg(unix)]
+    let pid_file = tower.home().join("tunnel-target.pid");
+    #[cfg(unix)]
+    tower.write_config(
+        "fleet.toml",
+        &fleet_entry_for_node_with_pid("studio", &pid_file, &studio),
+    );
+    #[cfg(not(unix))]
+    tower.write_config("fleet.toml", &fleet_entry_for_node("studio", &studio));
+
+    // 1. With LEGION_TEST_RELAY_TIMEOUT_MS=250, an idle relayed tunnel stays open for 800 ms,
+    //    echoes bytes cleanly, and tears down both relay and target when stdin closes.
+    {
+        let mut child = spawn_stream_with_timeout(&tower, Some("device:handset"), Some(250));
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let _ = read_greeting(&mut stdout);
+        write_json_line(
+            &mut stdin,
+            &json!({
+                "protocol": 1,
+                "op": "relay",
+                "on": "studio",
+                "request": { "protocol": 1, "op": "tunnel" }
+            }),
+        );
+        let ready = read_json_line(&mut stdout);
+        assert_eq!(ready, json!({ "tunnel": true }), "{ready}");
+
+        std::thread::sleep(Duration::from_millis(800));
+        stdin.write_all(b"survived-idle").unwrap();
+        stdin.flush().unwrap();
+        let mut echoed = [0u8; 13];
+        stdout.read_exact(&mut echoed).unwrap();
+        assert_eq!(&echoed, b"survived-idle");
+
+        drop(stdin);
+        let status = wait_child_exit_within(&mut child, Duration::from_secs(4));
+        assert!(status.success(), "clean tunnel close must exit 0");
+        #[cfg(unix)]
+        wait_pid_dead_within(&pid_file, Duration::from_secs(3));
+    }
+
+    // 2. Removing the pairing from `tower`'s `devices.toml` while a relayed tunnel is completely
+    //    idle cuts the tunnel within the recheck window and reaps the target process cleanly.
+    {
+        let mut child = spawn_gate_stream(&tower, pairing_id);
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let _ = read_greeting(&mut stdout);
+        write_json_line(
+            &mut stdin,
+            &json!({
+                "protocol": 1,
+                "op": "relay",
+                "on": "studio",
+                "request": { "protocol": 1, "op": "tunnel" }
+            }),
+        );
+        let ready = read_json_line(&mut stdout);
+        assert_eq!(ready, json!({ "tunnel": true }), "{ready}");
+
+        // Verify live bytes work, then go completely idle and tombstone the pairing on `tower`.
+        stdin.write_all(b"ping").unwrap();
+        stdin.flush().unwrap();
+        let mut pong = [0u8; 4];
+        stdout.read_exact(&mut pong).unwrap();
+        assert_eq!(&pong, b"ping");
+
+        let revoked_at = Instant::now();
+        let rm_out = Command::new(LEGION_BIN)
+            .args(["device.remove", "name=handset"])
+            .env("LEGION_HOME", legion_home_of(&tower))
+            .env("HOME", tower.home())
+            .env("USERPROFILE", tower.home())
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_STATE_HOME")
+            .output()
+            .expect("run device.remove");
+        assert!(
+            rm_out.status.success(),
+            "device.remove failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&rm_out.stdout),
+            String::from_utf8_lossy(&rm_out.stderr)
+        );
+
+        let status = wait_child_exit_within(&mut child, Duration::from_secs(6));
+        assert!(
+            !status.success(),
+            "revoked live idle tunnel must exit non-zero (took {:?})",
+            revoked_at.elapsed()
+        );
+        #[cfg(unix)]
+        wait_pid_dead_within(&pid_file, Duration::from_secs(3));
+        drop(stdin);
+    }
+
+    stop_echo.store(true, std::sync::atomic::Ordering::Relaxed);
 }

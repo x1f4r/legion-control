@@ -97,20 +97,33 @@ pub const CAP_PROBE: &str = "probe";
 pub const CAP_RENAME: &str = "rename";
 /// Stream capability advertised in the opening greeting when this node supports `op: "relay"`.
 pub const CAP_STREAM_RELAY: &str = "stream.relay";
+/// Stream capability advertised in the opening greeting when this node supports `op: "tunnel"`.
+pub const CAP_STREAM_TUNNEL: &str = "stream.tunnel";
+/// Stream capability advertised in the opening greeting when this node supports relaying
+/// `op: "tunnel"` for end-to-end encrypted sessions.
+pub const CAP_STREAM_RELAY_TUNNEL: &str = "stream.relay.tunnel";
 
 /// Capabilities advertised in this node's stream greeting line.
 #[cfg(feature = "move-between-places")]
-pub const STREAM_CAPABILITIES: [&str; 6] = [
+pub const STREAM_CAPABILITIES: [&str; 8] = [
     CAP_IF_EXISTS,
     CAP_LOCK,
     CAP_MOVE,
     CAP_PROBE,
     CAP_RENAME,
     CAP_STREAM_RELAY,
+    CAP_STREAM_TUNNEL,
+    CAP_STREAM_RELAY_TUNNEL,
 ];
 /// Capabilities advertised in this node's stream greeting line.
 #[cfg(not(feature = "move-between-places"))]
-pub const STREAM_CAPABILITIES: [&str; 3] = [CAP_IF_EXISTS, CAP_RENAME, CAP_STREAM_RELAY];
+pub const STREAM_CAPABILITIES: [&str; 5] = [
+    CAP_IF_EXISTS,
+    CAP_RENAME,
+    CAP_STREAM_RELAY,
+    CAP_STREAM_TUNNEL,
+    CAP_STREAM_RELAY_TUNNEL,
+];
 
 /// How often an operation at work on something long says so, where a reply line is awaited.
 pub const HEARTBEAT: Duration = Duration::from_secs(10);
@@ -133,7 +146,7 @@ static STREAM_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// The operations this node knows, as `unsupported` names them.
 #[cfg(feature = "move-between-places")]
-pub(crate) const OPS: [&str; 12] = [
+pub(crate) const OPS: [&str; 13] = [
     "manifest",
     "stat",
     "get",
@@ -146,11 +159,12 @@ pub(crate) const OPS: [&str; 12] = [
     "rename",
     "lock",
     "relay",
+    "tunnel",
 ];
 /// The operations this node knows, as `unsupported` names them.
 #[cfg(not(feature = "move-between-places"))]
-pub(crate) const OPS: [&str; 9] = [
-    "manifest", "stat", "get", "put", "pack", "unpack", "delete", "rename", "relay",
+pub(crate) const OPS: [&str; 10] = [
+    "manifest", "stat", "get", "put", "pack", "unpack", "delete", "rename", "relay", "tunnel",
 ];
 
 /// The longest header read. A header carries the names a `pack` or `delete` acts on, which a
@@ -304,6 +318,10 @@ pub(crate) enum Op {
         #[serde(default)]
         hops: u32,
     },
+    /// Connects strictly to this node's own SSH server (`127.0.0.1` first, then this node's own
+    /// advertised addresses), writes `{"tunnel":true}\n`, and copies raw bytes bidirectionally so
+    /// a remote controller can run an end-to-end encrypted SSH session through a relay.
+    Tunnel,
     /// Create or remove a uniquely named empty marker file in a directory to prove whether two
     /// move endpoints refer to distinct directories (even across fleet aliases or network shares).
     #[serde(rename = "probe_write")]
@@ -373,6 +391,7 @@ impl Op {
             Op::Unpack { .. } => "unpack",
             Op::Delete { .. } => "delete",
             Op::Relay { .. } => "relay",
+            Op::Tunnel => "tunnel",
             Op::ProbeWrite { .. } => "probe_write",
             Op::ProbeRead { .. } => "probe_read",
             Op::Rename { .. } => "rename",
@@ -838,6 +857,20 @@ pub fn serve_with_options<R: Read + Send + 'static, W: Write>(
                 as_principal: header.as_principal,
                 op: inner_op,
             };
+            if matches!(local_header.op, Op::Tunnel) {
+                return crate::stream_tunnel::serve_tunnel(
+                    host,
+                    pinned,
+                    door,
+                    device,
+                    &options,
+                    local_header.as_principal,
+                    recorded,
+                    started,
+                    reader,
+                    output,
+                );
+            }
             if matches!(
                 local_header.op,
                 Op::Get {
@@ -895,6 +928,20 @@ pub fn serve_with_options<R: Read + Send + 'static, W: Write>(
             on,
             request,
             hops,
+            recorded,
+            started,
+            reader,
+            output,
+        );
+    }
+    if matches!(header.op, Op::Tunnel) {
+        return crate::stream_tunnel::serve_tunnel(
+            host,
+            pinned,
+            door,
+            device,
+            &options,
+            header.as_principal,
             recorded,
             started,
             reader,
@@ -1427,6 +1474,9 @@ fn parse_header_bytes(line: &[u8]) -> Result<(Header, Value), ErrorBody> {
         }
     }
     match fields.get("op").and_then(Value::as_str) {
+        Some("tunnel") => {
+            crate::stream_tunnel::validate_tunnel_fields(fields)?;
+        }
         Some(op) if OPS.contains(&op) => {}
         Some(op) => {
             return Err(unsupported(format!(
@@ -1446,7 +1496,7 @@ fn parse_header_bytes(line: &[u8]) -> Result<(Header, Value), ErrorBody> {
             ErrorCode::InvalidArgs,
             format!("The stream's header does not name an operation it can do: {error}."),
         )
-        .with_hint("op is one of manifest, stat, get, put, pack, unpack, delete and relay.")
+        .with_hint("op is one of manifest, stat, get, put, pack, unpack, delete, relay and tunnel.")
     })?;
     validate_op_enabled(&header.op)?;
     let mut recorded = value;
@@ -1919,7 +1969,7 @@ impl<R: Read> Read for RecheckingReader<R> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn record(
+pub(crate) fn record(
     host: &Host,
     principal: Option<String>,
     door: Door,
@@ -2086,6 +2136,10 @@ fn run<R: Read + Send + 'static, W: Write>(
         Op::Relay { .. } => Err(Failure::Reply(ErrorBody::new(
             ErrorCode::Internal,
             "Relay operations are dispatched before local execution.",
+        ))),
+        Op::Tunnel => Err(Failure::Reply(ErrorBody::new(
+            ErrorCode::Internal,
+            "Tunnel operations are dispatched before local execution.",
         ))),
         Op::ProbeWrite {
             action,
