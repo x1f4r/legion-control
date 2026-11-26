@@ -402,6 +402,7 @@ pub(super) async fn run_sandboxed(
     let deadline = options.timeout.map(|d| tokio::time::Instant::now() + d);
     let peak_rss = Arc::new(AtomicU64::new(0));
     let mut exit_code: Option<i32> = None;
+    let mut wait_done = false;
     let mut timed_out = false;
     let mut cancelled = false;
     let mut memory_watchdog_killed = false;
@@ -409,6 +410,7 @@ pub(super) async fn run_sandboxed(
 
     tokio::select! {
         res = &mut wait_task => {
+            wait_done = true;
             exit_code = res.ok().flatten();
         }
         () = wait_deadline(deadline) => {
@@ -451,7 +453,9 @@ pub(super) async fn run_sandboxed(
         .flatten();
     }
 
-    let _ = wait_task.await;
+    if !wait_done {
+        let _ = wait_task.await;
+    }
 
     let mut stdout_captured: Option<(CapturedOutput, Vec<u8>)> = None;
     let mut stderr_captured: Option<(CapturedOutput, Vec<u8>)> = None;

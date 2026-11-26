@@ -74,6 +74,7 @@ const APPCONTAINER_DISPLAY_NAME: &str = "Legion Decode Worker";
 const APPCONTAINER_DESCRIPTION: &str = "Sandboxed media decode worker for Legion";
 const LOW_INTEGRITY_SID_STR: &str = "S-1-16-4096";
 const SECURITY_MANDATORY_LOW_RID: u32 = 0x1000;
+const AC_FALLBACK_REASON_ENV: &str = "LEGION_WIN_AC_FALLBACK_REASON";
 
 /// Serializes inheritable stdio handle duplication across sandboxed `CreateProcess*` calls.
 static SANDBOX_SPAWN_LOCK: Mutex<()> = Mutex::new(());
@@ -526,22 +527,29 @@ fn create_low_il_restricted_token() -> Result<OwnedWinHandle> {
         },
     )?;
 
-    let tml = TOKEN_MANDATORY_LABEL {
-        Label: SID_AND_ATTRIBUTES {
-            Sid: low_sid,
-            Attributes: SE_GROUP_INTEGRITY as u32,
-        },
-    };
     // SAFETY: `low_sid` is valid until `LocalFree` below.
-    let sid_len = unsafe { GetLengthSid(low_sid) };
-    let info_len = size_of::<TOKEN_MANDATORY_LABEL>() as u32 + sid_len;
-    // SAFETY: `restricted.0` is an owned token handle with `TOKEN_ADJUST_DEFAULT` and `tml` is valid.
+    let sid_len = unsafe { GetLengthSid(low_sid) } as usize;
+    let label_len = size_of::<TOKEN_MANDATORY_LABEL>();
+    let total_len = label_len + sid_len;
+    let mut buf = vec![0usize; total_len.div_ceil(size_of::<usize>())];
+    // SAFETY: `buf` is pointer-aligned with room for `TOKEN_MANDATORY_LABEL` followed by `sid_len`
+    // bytes for the inline SID copy, so `SetTokenInformation` reads strictly within `buf`.
     let set_res = unsafe {
+        let base = buf.as_mut_ptr().cast::<u8>();
+        let sid_dst = base.add(label_len);
+        std::ptr::copy_nonoverlapping(low_sid.0.cast::<u8>(), sid_dst, sid_len);
+        let tml = TOKEN_MANDATORY_LABEL {
+            Label: SID_AND_ATTRIBUTES {
+                Sid: PSID(sid_dst.cast::<c_void>()),
+                Attributes: SE_GROUP_INTEGRITY as u32,
+            },
+        };
+        std::ptr::write(base.cast::<TOKEN_MANDATORY_LABEL>(), tml);
         SetTokenInformation(
             restricted.0,
             TokenIntegrityLevel,
-            (&raw const tml).cast::<c_void>(),
-            info_len,
+            base.cast::<c_void>(),
+            total_len as u32,
         )
     };
     // SAFETY: `low_sid` was allocated by `ConvertStringSidToSidW` and must be freed via `LocalFree`.
@@ -680,12 +688,19 @@ pub(crate) fn spawn_sandboxed(
     }
 
     // Windows-only fallback: Restricted Token + Low Integrity + Job Object.
+    let fallback_env_block = if let Some(ref ac) = ac_error {
+        let mut fallback_overrides = env_overrides.clone();
+        fallback_overrides.insert(OsString::from(AC_FALLBACK_REASON_ENV), OsString::from(ac));
+        build_unicode_env_block(env_clear, env_remove, &fallback_overrides)
+    } else {
+        env_block
+    };
     let fallback_cwd = cwd.map(Path::to_path_buf).unwrap_or_else(system_root_dir);
     match launch_with_restricted_token(
         app_wide.as_deref(),
         &cmdline_base,
         &fallback_cwd,
-        &env_block,
+        &fallback_env_block,
         stdin_child_base.0,
         stdout_child_base.0,
         stderr_child_base.0,
@@ -1001,16 +1016,28 @@ pub(super) fn verify_worker_sandbox() -> std::result::Result<SandboxReport, Sand
     // Check whether the Windows-only Low-Integrity Restricted Token + Job Object fallback is active.
     let integrity_rid = query_token_integrity_rid(token.0);
     if job_ok && integrity_rid.is_some_and(|rid| rid <= SECURITY_MANDATORY_LOW_RID) {
+        let ac_reason = std::env::var(AC_FALLBACK_REASON_ENV)
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let missing = match ac_reason {
+            Some(ref reason) => format!("AppContainer isolation ({reason})"),
+            None => {
+                "AppContainer isolation (fell back to Low-Integrity restricted token)".to_owned()
+            }
+        };
+        let detail = match ac_reason {
+            Some(ref reason) => format!(
+                "Windows decode worker running in Low-Integrity restricted token + Job Object fallback ({reason}; writes and child spawns blocked, user file reads and network still permitted)."
+            ),
+            None => "Windows decode worker running in Low-Integrity restricted token + Job Object fallback (writes and child spawns blocked; user file reads and network are still permitted).".to_owned(),
+        };
         return Ok(SandboxReport {
             available: true,
             complete: false,
             platform: "windows".to_owned(),
             mechanism: "restricted-token+job".to_owned(),
-            detail: "Windows decode worker running in Low-Integrity restricted token + Job Object fallback (writes and child spawns blocked; user file reads and network are still permitted)."
-                .to_owned(),
-            missing: Some(
-                "AppContainer isolation (fell back to Low-Integrity restricted token)".to_owned(),
-            ),
+            detail,
+            missing: Some(missing),
         });
     }
 
