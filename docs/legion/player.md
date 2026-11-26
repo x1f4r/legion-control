@@ -180,17 +180,83 @@ In the folder listing a song shows its cover where a picture shows its thumbnail
 - A machine that has neither tells the app so the usual way (per-machine capabilities); the app
   then shows the file name and the music tile, with no error.
 
-## After that: it keeps playing
+## Keeping the music playing
 
-Built once the above is in use, as its own piece of work:
+Music belongs to the app, not to the screen that opened it. There is one player across the whole
+app:
 
-- a small player bar above the tabs while browsing, so leaving the song's screen does not stop
-  the music;
-- on Android, playing on with the screen off or the app in the background, with the system's
-  media notification and lock-screen controls. The test that decides the mechanism: play a
-  folder of real songs, lock the screen, ten minutes later it is still playing and has moved to
-  the next track;
-- shuffle and repeat; picture-in-picture for video.
+- Leaving a song's screen keeps it playing. Opening another song stops the first and revokes its
+  stream before starting the new one. Starting a video pauses the music. Two songs never play at
+  once.
+- **The small player.** Whenever a song is loaded and the song's screen is not open, a 56 px bar
+  sits directly above the tab bar on a phone (or at the bottom of the main column on desktop): a
+  40 px square cover with 8 px corners (or the music tile), a single-line title over a single-line
+  artist (never "Unknown artist"), play or pause, next when another song follows, and a 2 px
+  position line along the top.
+- Tapping the bar returns to the song's screen, growing the cover from the bar in 220 ms (a clean
+  cut under reduced motion). Swiping the bar down dismisses it, stops playback and releases the
+  stream. Ten continuous minutes paused dismisses it the same way.
+- The bar is absent on the song's screen, in the video player, and over full-screen pictures.
+  Scrollable views add its height as bottom padding while it is shown so the last row, the
+  selection bar and the tab bar never sit under it.
+
+### Shuffle and repeat
+
+Two quiet toggles sit to the left and right of the transport on the song's screen, remembered on
+the device:
+
+- **Shuffle** shuffles the rest of the folder once, keeping the current song first, and holds that
+  order for Previous, Next and track end until turned off. Turning it off returns to the folder's
+  order around the current song.
+- **Repeat** cycles through off, repeat folder, and repeat one. Repeat folder wraps Previous, Next
+  and track end around the folder; repeat one replays the current song when it ends while explicit
+  Next still moves on if another song exists.
+
+### Android
+
+WebView halts background track advances when the screen turns off and does not register a reliable
+system `MediaSession` or media notification. On Android, Legion plays music in Media3 `ExoPlayer`
+inside a `mediaPlayback` `MediaSessionService`, keeping one shared state with the page:
+
+- **Fresh streams without the page awake.** The service talks to Rust over an owner-only (`0o600`,
+  256-bit token) Unix domain socket inside the app's private data directory. On every song start,
+  screen-off auto-advance, repeat, or lock-screen skip, Rust revokes the previous ticket, mints a
+  fresh short-lived loopback content URL, and reads `fs.tags` and `fs.thumb` so the lock screen
+  and notification stay current without waking the WebView.
+- **Lock screen and notification.** Shows cover, title, artist, play or pause, previous, next (only
+  when a next song exists), and a seekable position bar. Tapping the notification opens Legion on
+  the song's screen, even if the activity was swiped away from Recents while music kept playing.
+- **Notification permission.** Asked once, when music starts for the first time, with a single
+  sentence explaining why. Refusing still plays.
+- **Focus and headphones.** Unplugging headphones (`ACTION_AUDIO_BECOMING_NOISY`) pauses. Permanent
+  audio-focus loss pauses and stays paused; a transient duck lowers volume and restores it; a
+  transient loss such as a call pauses and resumes when the call ends if music was playing before.
+- **Wake locks.** Held only while music is actively playing (and briefly around the track-switch
+  ticket mint while advancing); released immediately on pause, stop, error, or dismiss.
+- **Revocation.** While playing, Rust checks device access on the node's two-second cadence in
+  addition to stream failures. If this device is revoked on the machine, playback stops promptly
+  within the revocation watchdog's window, revokes the ticket, drops the foreground service, and
+  shows a clear sentence naming the machine rather than playing buffered silence or looping.
+
+### iOS and iPadOS
+
+The same small player and single music state run on iOS and iPadOS. The app declares the `audio`
+background mode and attaches an origin-scoped (`tauri://localhost`, main frame only) Swift bridge
+that configures `AVAudioSession` with `.playback`, publishes title, artist, album, cover, duration
+and position to `MPNowPlayingInfoCenter`, wires `MPRemoteCommandCenter` (play, pause, toggle,
+previous, next when present, and scrubbing), pauses when headphones unplug
+(`.oldDeviceUnavailable`), and pauses and resumes across call interruptions.
+
+### Desktop and browser
+
+Desktop and browser share the same small player and single music state. `navigator.mediaSession`
+stays active while the small player is shown and clears when dismissed. Hiding or closing the
+desktop window (for example while transfers drain or for an update) pauses music in place so
+nothing keeps playing behind a hidden window.
+
+### Later
+
+Picture-in-picture for video remains for a later step.
 
 ## Tests
 
@@ -202,6 +268,21 @@ Built once the above is in use, as its own piece of work:
   scrub anywhere (bar-matched travel, slower rates, 12 px cancel); 10-second seek icons centred at
   device pixel ratios 1, 2 and 3; no disabled control anywhere; queue order follows the folder's
   sort; song ends, next starts; resume and "Start over"; keys.
+- Small player, single state, shuffle and repeat: leaving the song's screen keeps playing and shows
+  the 56 px bar directly above the tab bar on phones and at the bottom of the main column on
+  desktop with zero overlap against rows, the selection bar or tabs; absent on the song's screen,
+  video player and full-screen pictures; tapping returns to the song's screen; swiping down and ten
+  continuous paused minutes (under a controlled clock) dismiss and revoke the stream; opening a
+  second song revokes the first; starting a video pauses music; shuffle keeps the current song
+  first and preserves order until turned off; repeat cycles off, folder and one and persists across
+  reloads.
+- Android background playback: on the Android emulator, play a folder of six real one-minute tagged
+  songs with embedded covers, lock the screen (`KEYCODE_POWER`) and let it play for five full
+  minutes; verify the native 1-second position log has no gap larger than 2 seconds against wall
+  time, at least four songs play through in order, `MediaSession` metadata and the notification
+  match each song, `cmd media_session dispatch next` advances, zero wake locks are held while
+  paused, revoking the device on the node stops playback within the revocation watchdog's window
+  with a clear sentence, and focus/headphone events pause and resume as specified.
 - `immersive`: on the Android emulator, screenshots prove the bars are gone and nothing of the
   app surrounds the video, in both orientations, by button and by turning, and that back and
   close restore them. Desktop: the window's state before and after. Browser tests: the viewer
