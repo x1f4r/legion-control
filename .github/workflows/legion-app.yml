@@ -6,16 +6,22 @@ on:
       - 'apps/**'
       - 'crates/**'
       - '.github/workflows/legion-app.yml'
+      - 'scripts/build-desktop-preview.mjs'
+      - 'scripts/build-linux-app-bundles.sh'
       - 'scripts/ios-sim-check.sh'
       - 'scripts/ios-sim-resume.sh'
+      - 'scripts/legion-app-distro-test.sh'
       - 'rust-toolchain.toml'
   pull_request:
     paths:
       - 'apps/**'
       - 'crates/**'
       - '.github/workflows/legion-app.yml'
+      - 'scripts/build-desktop-preview.mjs'
+      - 'scripts/build-linux-app-bundles.sh'
       - 'scripts/ios-sim-check.sh'
       - 'scripts/ios-sim-resume.sh'
+      - 'scripts/legion-app-distro-test.sh'
       - 'rust-toolchain.toml'
   workflow_dispatch:
     inputs:
@@ -298,7 +304,9 @@ jobs:
             --os linux \
             --sequence "$LEGION_PREVIEW_SEQUENCE"
       - name: Install Rust
-        run: rustup toolchain install
+        run: |
+          rustup toolchain install
+          rustup target add x86_64-unknown-linux-musl
       - name: Install Linux Tauri bundle and headless display dependencies
         run: |
           sudo apt-get update -q
@@ -313,13 +321,16 @@ jobs:
             file \
             curl \
             build-essential \
+            musl-tools \
             xvfb \
             dbus-x11 \
             gstreamer1.0-plugins-base \
             gstreamer1.0-plugins-good
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ~/.cargo/bin/cargo-tauri
+          path: |
+            ~/.cargo/bin/cargo-tauri
+            ~/.cache/legion-app-u22/tauri-cli
           key: legion-app-tauri-cli-${{ runner.os }}-2.12.6-${{ hashFiles('rust-toolchain.toml') }}
           restore-keys: legion-app-tauri-cli-${{ runner.os }}-2.12.6-
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -338,24 +349,28 @@ jobs:
             cargo install tauri-cli --version =2.12.6 --locked
           fi
       - id: build
-        name: Build deb and AppImage bundles
+        name: Build deb and AppImage bundles (ubuntu:22.04 glibc baseline)
         working-directory: apps/legion-app
         env:
           APPIMAGE_EXTRACT_AND_RUN: '1'
         # The cached target directory can hold bundles from an earlier run under another name.
+        # Building inside ubuntu:22.04 pins the glibc floor to 2.35 so the shipped .deb and
+        # AppImage run on Debian 12 and Ubuntu 22.04 as well as newer releases.
         run: |
           set -euo pipefail
           rm -rf src-tauri/target/release/bundle
           export LEGION_BUILD_SEQUENCE="$(date -u +%Y%m%d%H%M)"
-          BASE_VER="$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' src-tauri/Cargo.toml)"
-          CFG="$(node ../../scripts/make-update-set.mjs tauri-config --os linux --version "$BASE_VER" --sequence "$LEGION_BUILD_SEQUENCE")"
-          cargo tauri build --bundles deb,appimage --config "$CFG" 2>&1 | tee "$RUNNER_TEMP/linux-build.log"
+          export LEGION_BUILD_REV="${{ github.sha }}"
+          bash ../../scripts/build-linux-app-bundles.sh \
+            --sequence "$LEGION_BUILD_SEQUENCE" \
+            --build-log "$RUNNER_TEMP/linux-build.log"
           mapfile -t DEBS < <(find src-tauri/target/release/bundle/deb -maxdepth 1 -type f -name '*.deb' | sort)
           mapfile -t IMAGES < <(find src-tauri/target/release/bundle/appimage -maxdepth 1 -type f -name '*.AppImage' | sort)
           test "${#DEBS[@]}" -eq 1
           test "${#IMAGES[@]}" -eq 1
           DEB_FILE="${DEBS[0]}"
           IMG_FILE="${IMAGES[0]}"
+          node ../../scripts/check-binary-paths.mjs src-tauri/target/release/legion-app
           node ../../scripts/make-update-set.mjs check-artifact \
             --file src-tauri/target/release/legion-app \
             --kind binary \
@@ -376,6 +391,14 @@ jobs:
             --build-log "$RUNNER_TEMP/linux-build.log"
           echo "deb_path=apps/legion-app/${DEB_FILE#./}" >> "$GITHUB_OUTPUT"
           echo "appimage_path=apps/legion-app/${IMG_FILE#./}" >> "$GITHUB_OUTPUT"
+      - name: Verify deb and AppImage across Debian and Ubuntu containers
+        run: |
+          set -euo pipefail
+          DEB="${{ steps.build.outputs.deb_path }}"
+          IMG="${{ steps.build.outputs.appimage_path }}"
+          for distro in debian:12 debian:13 ubuntu:22.04 ubuntu:24.04 ubuntu:26.04; do
+            bash scripts/legion-app-distro-test.sh "$distro" "$DEB" "$IMG"
+          done
       - name: Verify deb package metadata does not collide with node package
         run: |
           set -euo pipefail

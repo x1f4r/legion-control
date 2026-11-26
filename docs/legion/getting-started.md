@@ -38,28 +38,55 @@ sudo apt-get install ./legion_<ver>-1_amd64.deb
 
 The package installs `/usr/bin/legion`, the manual page (`man legion`), and an optional systemd user
 unit at `/usr/lib/systemd/user/legion-serve.service` (disabled by default; enable it with
-`systemctl --user enable --now legion-serve.service`). Package-managed installations refuse
-`meta.update` and `fleet.install` so `apt` remains the single owner of `/usr/bin/legion`; upgrade by
-installing the newer `.deb` with `sudo apt-get install ./legion_<ver>-1_amd64.deb`, and remove with
-`sudo apt-get remove legion` (your configuration under `~/.config/legion` is kept).
+`systemctl --user enable --now legion-serve.service`). `apt-get` pulls in `openssh-client` by
+default via `Recommends`. Package-managed installations refuse `meta.update` and `fleet.install` so
+`apt` remains the single owner of `/usr/bin/legion`; upgrade by installing the newer `.deb` with
+`sudo apt-get install ./legion_<ver>-1_amd64.deb`. To remove, disable the user unit first if you
+enabled it (`systemctl --user disable --now legion-serve.service`), then run
+`sudo apt-get remove legion` (your configuration under `~/.config/legion` and state under
+`~/.local/state/legion` are kept).
+
+To install the **desktop app** on Debian 12/13 or Ubuntu 22.04/24.04/26.04, install `legion-app`
+alongside the node package with `apt-get` (or run the portable `.AppImage`, which self-updates from
+the fleet):
+
+```sh
+sudo apt-get install ./legion-app_<ver>_amd64.deb
+# Remove with: sudo apt-get remove legion-app
+```
 
 ### Install on Arch
 
-Two `PKGBUILD` files live in `packaging/arch/`: `packaging/arch/PKGBUILD` (`legion`, built from
-source at a `legion-v<ver>` tag) and `packaging/arch/legion-bin/PKGBUILD` (`legion-bin`, wrapping
-the released static binary). From a checkout:
+Three `PKGBUILD` files live in `packaging/arch/`:
+
+- `packaging/arch/PKGBUILD` (`legion` — node built from source at a `legion-v<ver>` tag)
+- `packaging/arch/legion-bin/PKGBUILD` (`legion-bin` — node wrapping the released static binary,
+  verifying `SHA256SUMS.sig` against the pinned Ed25519 release key and checking the binary's
+  SHA-256 digest during `prepare()`)
+- `packaging/arch/legion-app/PKGBUILD` (`legion-app` — desktop app built from source)
+
+From a checkout:
 
 ```sh
-# From a published release tag (or inside packaging/arch/legion-bin for the static binary)
+# From a published release tag (or inside packaging/arch/legion-bin or packaging/arch/legion-app)
 cd packaging/arch
 makepkg -si
 
 # Or build directly from the local checkout before a tag exists
 bash packaging/arch/build-local.sh source target/packages
 sudo pacman -U target/packages/legion-*-x86_64.pkg.tar.zst
+
+# Optional: build and install the desktop app package from the local checkout
+bash packaging/arch/build-local.sh app target/packages
+sudo pacman -U target/packages/legion-app-*-x86_64.pkg.tar.zst
 ```
 
-Remove with `sudo pacman -R legion` (your configuration under `~/.config/legion` is kept). As with
+`openssh` is an optional dependency of `legion` — install it with `sudo pacman -S openssh` if it is
+not already present so Legion can reach remote machines. If you prefer not to build `legion-app`
+from source, the Linux `.AppImage` also runs on Arch once `webkit2gtk-4.1` and `gtk3` are
+installed. To remove `legion`, disable the user unit first if you enabled it
+(`systemctl --user disable --now legion-serve.service`), then run `sudo pacman -R legion` (your
+configuration under `~/.config/legion` and state under `~/.local/state/legion` are kept). As with
 `.deb`, package-managed installations refuse `meta.update` and `fleet.install` and direct you to
 `pacman`. See `packaging/README.md` for full build and packaging details.
 

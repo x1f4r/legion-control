@@ -146,6 +146,13 @@ class MainActivity : TauriActivity() {
           }
         }
       }
+      "haptic" -> {
+        val constant = ImmersiveState.hapticFeedbackConstant(msg.optString("kind", "")) ?: return
+        runOnUiThread {
+          val target = attachedWebView ?: window.decorView
+          target.performHapticFeedback(constant)
+        }
+      }
     }
   }
 
@@ -554,6 +561,17 @@ class MainActivity : TauriActivity() {
                 resolve(false);
               }
             });
+          },
+          haptic: function(kind){
+            if (kind !== 'tick' && kind !== 'tap') return;
+            try {
+              bridge.postMessage(JSON.stringify({
+                type: 'haptic',
+                kind: kind
+              }));
+            } catch (_) {
+              // Ignore if bridge is unavailable.
+            }
           }
         };
 

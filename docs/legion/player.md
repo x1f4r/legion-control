@@ -34,10 +34,11 @@ Showing and hiding:
 
 - While playing, the layer fades out 3 seconds after the last touch, key or pointer movement.
   On desktop the pointer hides with it.
-- It stays while paused, while loading, at the end, on an error, and while keyboard focus is
-  inside it.
+- It stays while paused, while loading, at the end, on an error, while scrubbing, and while
+  keyboard focus is inside it.
 - One tap anywhere on the picture toggles it, at once. A second tap within 300 ms on the left or
   right third seeks 10 seconds instead and puts the layer back as it was.
+- Pressing and holding for 2× leaves the layer's state alone: hidden stays hidden.
 - Hidden controls cannot be focused or pressed.
 
 The position bar: dragging shows the time under the finger and moves the picture only on
@@ -73,10 +74,65 @@ One operation, `immersive(on)`, that each platform implements. The viewer calls 
 
 Pictures use the same operation: a tap hides the viewer's bars, and with them the system's.
 
+### Touch
+
+One recogniser decides what a touch on the picture is, from the first pointer down on the picture
+(never on a control):
+
+| What happens | It is |
+| --- | --- |
+| a second pointer goes down | a pinch; anything else in progress is dropped |
+| the finger moves more than 12 px, mostly sideways (within 30 degrees of horizontal), and the layer is visible | a scrub |
+| the finger stays within 12 px for 350 ms, and the video is playing | a hold |
+| the finger lifts before 350 ms within 12 px | a tap (one tap toggles the layer; a second within 300 ms on the left or right third seeks 10 s) |
+| anything else (a vertical drag, a sideways drag with the layer hidden) | nothing, and it does not turn into a tap on release |
+
+Touches that begin within 24 px of the left or right edge, or in the system's bottom gesture area,
+belong to the system (back, home) and start nothing. The picture surface takes `touch-action: none`
+while the viewer is open so the page never zooms or scrolls under these gestures. Once a touch has
+become a pinch, scrub or hold, its release is never a tap. The mouse takes part where it makes
+sense: press and hold is the same hold; a sideways drag with the button down is the same scrub.
+
+**Zoom to fill.** Two states, nothing in between: *fit* (the whole picture) and *fill* (the
+picture covers the screen, cropped evenly on two sides). While pinching, the picture follows the
+fingers continuously between the two scales, with slight resistance beyond either end; on release
+it settles on the nearer one, or the one the fingers were moving toward if moving fast, in 180 ms.
+A chip at the top says "Zoomed to fill" or "Original" for 1.2 s. It exists only in full screen,
+and only when fill would differ from fit by more than 3 percent; otherwise the pinch does nothing
+and nothing is offered. In fill the picture runs under the display cutout while the controls keep
+their safe margins. The choice is remembered on the device and applied when a video enters full
+screen, but only if fill would hide at most 15 percent of the picture; a 4:3 film on a tall phone
+starts whole. Desktop and browser: `Z` toggles it in full screen, and More carries "Zoom to fill"
+or "Fit to screen" under the same conditions.
+
+**Hold for 2×.** While held, the video plays at 2×; on release it returns to the speed that was
+chosen before, not to 1×. A pill at the top centre shows "2×" with two small arrows for as long as
+it lasts and fades in 120 ms. The layer's state does not change: hidden stays hidden. Absent when
+paused or when the chosen speed is already 2×.
+
+**Scrub anywhere.** With the layer visible, a sideways drag on the picture takes hold of the
+position from where it is: the finger's travel moves the position by the same amount the bar would
+(the bar's full width is the whole duration), starting at the current position rather than jumping
+to the finger. While scrubbing, a large time is shown in the centre (such as "12:40") with the
+change under it (such as "+0:35"), the bar's thumb follows, the layer stays visible, and the
+centre transport buttons hide so the time is readable. As on the bar, the picture moves once, on
+release. Pulling the finger down or up from where the drag began slows the scrub to half beyond
+80 px ("Half speed"), a quarter beyond 160 px ("Quarter speed"), and a tenth beyond 240 px
+("Fine"); moving back toward the line restores it. A scrub that ends within 12 px of where it
+began changes nothing.
+
+**Touch answers.** One platform operation next to `immersive`: `haptic(kind)` with `tick` (a state
+changed: zoom settled, hold engaged, or a scrub rate changed) and `tap`. On Android it uses the
+view's own haptic feedback constants, which need no permission and respect the system setting; on
+iOS and iPadOS it uses the system's impact feedback. Everywhere else it is absent and callers do
+not care. The browser vibration API is not used.
+
 ### Keys (desktop and browser)
 
-Space or `K` play and pause; left and right 10 seconds; up and down volume; `M` mute; `F` full
-screen; `N` and `P` next and previous; `Esc` leaves full screen, then closes.
+Space or `K` play and pause (holding Space longer than 350 ms while playing plays at 2× until
+release without toggling play or pause); left and right 10 seconds; up and down volume; `M` mute;
+`F` full screen; `Z` toggles zoom to fill in full screen; `N` and `P` next and previous; `Esc`
+leaves full screen, then closes.
 
 ## Music
 
@@ -142,9 +198,13 @@ Built once the above is in use, as its own piece of work:
 ## Tests
 
 - Interface: the layer's timing with a clock under test control (hides after 3 s while playing;
-  stays while paused, loading, ended, on error, with focus inside); tap toggles; double tap
-  seeks and restores; one seek per drag; no disabled control anywhere; queue order follows the
-  folder's sort; song ends, next starts; resume and "Start over"; keys.
+  stays while paused, loading, ended, on error, while scrubbing, with focus inside); tap toggles;
+  double tap seeks and restores; one seek per drag; the touch recogniser (pinch, scrub, hold, tap,
+  edges, thresholds, second finger during scrub); zoom to fill (nearer state, velocity, 3 percent
+  and 15 percent rules, `Z` and More); hold for 2× (pointer and Space, restores chosen speed);
+  scrub anywhere (bar-matched travel, slower rates, 12 px cancel); 10-second seek icons centred at
+  device pixel ratios 1, 2 and 3; no disabled control anywhere; queue order follows the folder's
+  sort; song ends, next starts; resume and "Start over"; keys.
 - `immersive`: on the Android emulator, screenshots prove the bars are gone and nothing of the
   app surrounds the video, in both orientations, by button and by turning, and that back and
   close restore them. Desktop: the window's state before and after. Browser tests: the viewer
