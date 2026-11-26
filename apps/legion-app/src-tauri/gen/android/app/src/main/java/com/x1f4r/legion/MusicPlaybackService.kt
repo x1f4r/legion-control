@@ -654,8 +654,12 @@ class MusicPlaybackService : MediaSessionService() {
     cancelPausedDismiss()
 
     currentMetadata = buildMediaMetadata(track, null, null)
-    exoPlayer.stop()
-    exoPlayer.clearMediaItems()
+    // Keep the current timeline and foreground service intact while `mintTrack` fetches the next
+    // short-lived content URL: calling `stop()`/`clearMediaItems()` here drops Media3 out of
+    // foreground, which Android 12+ refuses to restart when advancing tracks with the screen off.
+    if (exoPlayer.playbackState != Player.STATE_ENDED && exoPlayer.playbackState != Player.STATE_IDLE) {
+      exoPlayer.pause()
+    }
     forwardingPlayer.notifyMetadataAndCommandsChanged()
     pushStateToRust(includeCover = false, includeTracks = true)
 
