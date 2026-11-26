@@ -8,6 +8,9 @@
 
 /* Begin PBXBuildFile section */
 		15776C236EB92456807B7C45 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 65A3973A902151193068B318 /* Assets.xcassets */; };
+		2A1F7C048E3B4A91B6D01101 /* AVFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 2A1F7C048E3B4A91B6D01102 /* AVFoundation.framework */; };
+		2A1F7C048E3B4A91B6D01103 /* MediaPlayer.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 2A1F7C048E3B4A91B6D01104 /* MediaPlayer.framework */; };
+		2A1F7C048E3B4A91B6D01105 /* AudioBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A1F7C048E3B4A91B6D01106 /* AudioBridge.swift */; };
 		2D44A12907B79200852101B4 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 958A052423B7877C7A5B87F7 /* QuartzCore.framework */; };
 		36CCC693A34D8B83E5BC72C4 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F50CEC27AD5200C0A08215A3 /* CoreGraphics.framework */; };
 		6B6A93DCF6FD2A3F69FCA55A /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = EC5208F1451927FF4FD2E07A /* LaunchScreen.storyboard */; };
@@ -25,6 +28,9 @@
 /* Begin PBXFileReference section */
 		02997A061EB4CEAB8BFAC771 /* assets */ = {isa = PBXFileReference; lastKnownFileType = folder; path = assets; sourceTree = SOURCE_ROOT; };
 		0B7E9E7AC836091D9C03DB32 /* main.rs */ = {isa = PBXFileReference; path = main.rs; sourceTree = "<group>"; };
+		2A1F7C048E3B4A91B6D01102 /* AVFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFoundation.framework; path = System/Library/Frameworks/AVFoundation.framework; sourceTree = SDKROOT; };
+		2A1F7C048E3B4A91B6D01104 /* MediaPlayer.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MediaPlayer.framework; path = System/Library/Frameworks/MediaPlayer.framework; sourceTree = SDKROOT; };
+		2A1F7C048E3B4A91B6D01106 /* AudioBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioBridge.swift; sourceTree = "<group>"; };
 		30944CCF2F11AB0BBF24BEAF /* commands.rs */ = {isa = PBXFileReference; path = commands.rs; sourceTree = "<group>"; };
 		3355B611B57412EB9143B45F /* store.rs */ = {isa = PBXFileReference; path = store.rs; sourceTree = "<group>"; };
 		528BE6012D09C5DE0AEDD674 /* backend.rs */ = {isa = PBXFileReference; path = backend.rs; sourceTree = "<group>"; };
@@ -53,7 +59,9 @@
 			buildActionMask = 2147483647;
 			files = (
 				A8D8F8F44B08FD72584FA24C /* libapp.a in Frameworks */,
+				2A1F7C048E3B4A91B6D01101 /* AVFoundation.framework in Frameworks */,
 				36CCC693A34D8B83E5BC72C4 /* CoreGraphics.framework in Frameworks */,
+				2A1F7C048E3B4A91B6D01103 /* MediaPlayer.framework in Frameworks */,
 				ACCA748BCEC032E9EA366D89 /* Metal.framework in Frameworks */,
 				F3E3F77BCF44298683FE8119 /* MetalKit.framework in Frameworks */,
 				2D44A12907B79200852101B4 /* QuartzCore.framework in Frameworks */,
@@ -113,8 +121,10 @@
 		AA049BC4431C0FAA39BC44AA /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
+				2A1F7C048E3B4A91B6D01102 /* AVFoundation.framework */,
 				F50CEC27AD5200C0A08215A3 /* CoreGraphics.framework */,
 				940B44E97834A92896E9CACA /* libapp.a */,
+				2A1F7C048E3B4A91B6D01104 /* MediaPlayer.framework */,
 				E7396AE922C706A88EC51BAC /* Metal.framework */,
 				5C4A949CBB9C67072A34C2CC /* MetalKit.framework */,
 				958A052423B7877C7A5B87F7 /* QuartzCore.framework */,
@@ -152,6 +162,7 @@
 		FFF97ECDE3A21354F1DA35F9 /* legion-app */ = {
 			isa = PBXGroup;
 			children = (
+				2A1F7C048E3B4A91B6D01106 /* AudioBridge.swift */,
 				C4E8A1905F2D49B1A72B9311 /* ImmersiveBridge.swift */,
 				DAB3B96B6F1929AE4D8E2909 /* main.mm */,
 				A90AF45C72F44ACAD71D6F40 /* bindings */,
@@ -254,6 +265,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				2A1F7C048E3B4A91B6D01105 /* AudioBridge.swift in Sources */,
 				C4E8A1905F2D49B1A72B9310 /* ImmersiveBridge.swift in Sources */,
 				B59BAEE49EBDE9A498CEAD51 /* main.mm in Sources */,
 			);

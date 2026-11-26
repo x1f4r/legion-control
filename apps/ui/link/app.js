@@ -2111,6 +2111,12 @@ export function createAppLink() {
     return handler && typeof handler.postMessage === 'function' ? handler : null;
   }
 
+  function iosAudioHandler() {
+    if (typeof window === 'undefined') return null;
+    const handler = window.webkit?.messageHandlers?.legionAudio;
+    return handler && typeof handler.postMessage === 'function' ? handler : null;
+  }
+
   function currentImmersiveCap() {
     return detectAppImmersiveCapability({
       hasAndroidBridge: Boolean(androidBridge()),
@@ -2430,6 +2436,60 @@ export function createAppLink() {
           audioStateListeners.delete(listener);
           if (audioStateListeners.size === 0) {
             teardownAudioStateSubscription();
+          }
+        };
+      },
+    };
+  }
+
+  // On iOS/iPadOS, wire AVAudioSession (.playback), MPNowPlayingInfoCenter, MPRemoteCommandCenter,
+  // and interruption/route-change callbacks through the origin-scoped `legionAudio` message handler.
+  if (iosPlatform && Boolean(iosAudioHandler())) {
+    const iosRemoteListeners = new Set();
+    const postIosAudio = (msg) => {
+      const handler = iosAudioHandler();
+      if (!handler) return;
+      try {
+        handler.postMessage(msg);
+      } catch {
+        // Ignore if WebView message handler is unavailable.
+      }
+    };
+    const installDispatch = () => {
+      if (typeof window === 'undefined') return;
+      window.__LEGION_IOS_AUDIO_DISPATCH__ = (cmd) => {
+        if (!cmd || typeof cmd !== 'object') return;
+        for (const fn of iosRemoteListeners) {
+          try {
+            fn(cmd);
+          } catch {
+            // Keep notifying remaining listeners.
+          }
+        }
+      };
+    };
+
+    link.iosAudio = {
+      activateSession() {
+        postIosAudio({ type: 'activate' });
+      },
+      updateNowPlaying(info = {}) {
+        postIosAudio({ type: 'now_playing', ...info });
+      },
+      updatePlaybackState(info = {}) {
+        postIosAudio({ type: 'playback_state', ...info });
+      },
+      clearNowPlaying() {
+        postIosAudio({ type: 'clear' });
+      },
+      onRemoteCommand(listener) {
+        if (typeof listener !== 'function') return () => {};
+        iosRemoteListeners.add(listener);
+        installDispatch();
+        return () => {
+          iosRemoteListeners.delete(listener);
+          if (iosRemoteListeners.size === 0 && typeof window !== 'undefined') {
+            delete window.__LEGION_IOS_AUDIO_DISPATCH__;
           }
         };
       },

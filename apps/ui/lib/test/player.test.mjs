@@ -1718,3 +1718,35 @@ test('createPausedDismissTimer dismisses after 10 continuous paused minutes and 
 
   timer.dispose();
 });
+
+test('iOS/iPadOS background audio declares UIBackgroundModes audio, links AVFoundation/MediaPlayer, and scopes AudioBridge to tauri://localhost', () => {
+  const appleDir = fileURLToPath(new URL('../../../legion-app/src-tauri/gen/apple/', import.meta.url));
+  const plist = fs.readFileSync(`${appleDir}legion-app_iOS/Info.plist`, 'utf8');
+  const projectYml = fs.readFileSync(`${appleDir}project.yml`, 'utf8');
+  const pbxproj = fs.readFileSync(`${appleDir}legion-app.xcodeproj/project.pbxproj`, 'utf8');
+  const mainMm = fs.readFileSync(`${appleDir}Sources/legion-app/main.mm`, 'utf8');
+  const audioSwift = fs.readFileSync(`${appleDir}Sources/legion-app/AudioBridge.swift`, 'utf8');
+
+  assert.match(plist, /<key>UIBackgroundModes<\/key>[\s\S]*?<string>audio<\/string>/);
+  assert.match(projectYml, /UIBackgroundModes:[\s\S]*?-\s+audio/);
+  assert.match(projectYml, /AVFoundation\.framework/);
+  assert.match(projectYml, /MediaPlayer\.framework/);
+
+  assert.match(pbxproj, /AudioBridge\.swift in Sources/);
+  assert.match(pbxproj, /AVFoundation\.framework in Frameworks/);
+  assert.match(pbxproj, /MediaPlayer\.framework in Frameworks/);
+
+  assert.match(mainMm, /legion_install_ios_audio_bridge\(\)/);
+  assert.match(mainMm, /legion_ios_audio_attach_webview/);
+  assert.match(mainMm, /legion_ios_audio_reset\(\)/);
+
+  assert.match(audioSwift, /AVAudioSession\.sharedInstance\(\)/);
+  assert.match(audioSwift, /\.setCategory\(\.playback/);
+  assert.match(audioSwift, /MPNowPlayingInfoCenter\.default\(\)/);
+  assert.match(audioSwift, /MPRemoteCommandCenter\.shared\(\)/);
+  assert.match(audioSwift, /interruptionNotification/);
+  assert.match(audioSwift, /routeChangeNotification/);
+  assert.match(audioSwift, /oldDeviceUnavailable/);
+  assert.match(audioSwift, /securityOrigin\.protocol == "tauri"/);
+  assert.match(audioSwift, /securityOrigin\.host == "localhost"/);
+});

@@ -2389,3 +2389,55 @@ test('createAppLink exposes nativeAudio only on Android, asks notification permi
     else delete globalThis.navigator;
   }
 });
+
+test('createAppLink exposes iosAudio when iOS legionAudio handler exists and routes Now Playing & remote commands', () => {
+  const prevWindow = globalThis.window;
+  const prevNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  const posted = [];
+
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15' },
+  });
+  globalThis.window = {
+    location: { origin: 'tauri://localhost' },
+    webkit: {
+      messageHandlers: {
+        legionAudio: {
+          postMessage(msg) {
+            posted.push(msg);
+          },
+        },
+      },
+    },
+    __TAURI__: { core: { invoke: () => Promise.resolve({}) } },
+  };
+
+  try {
+    const link = createAppLink();
+    assert.ok(link.iosAudio, 'iOS app link must expose iosAudio when handler is attached');
+    assert.equal(link.nativeAudio, undefined);
+
+    const received = [];
+    const unsub = link.iosAudio.onRemoteCommand((cmd) => received.push(cmd));
+    link.iosAudio.activateSession();
+    link.iosAudio.updateNowPlaying({ title: 'Track 1', artist: 'Clara', playing: true, canNext: true });
+    link.iosAudio.updatePlaybackState({ elapsed: 12, duration: 60, playing: true, rate: 1, canNext: true });
+    globalThis.window.__LEGION_IOS_AUDIO_DISPATCH__?.({ action: 'next' });
+    globalThis.window.__LEGION_IOS_AUDIO_DISPATCH__?.({ action: 'route_unavailable' });
+    link.iosAudio.clearNowPlaying();
+    unsub();
+
+    assert.deepEqual(
+      posted.map((m) => m.type),
+      ['activate', 'now_playing', 'playback_state', 'clear'],
+    );
+    assert.deepEqual(received, [{ action: 'next' }, { action: 'route_unavailable' }]);
+    assert.equal(globalThis.window.__LEGION_IOS_AUDIO_DISPATCH__, undefined);
+  } finally {
+    if (prevWindow === undefined) delete globalThis.window;
+    else globalThis.window = prevWindow;
+    if (prevNavigator) Object.defineProperty(globalThis, 'navigator', prevNavigator);
+    else delete globalThis.navigator;
+  }
+});
