@@ -84,6 +84,18 @@ function buildFiveThousandFixture(folder) {
   }
 }
 
+function buildMixedHeightFiveThousandFixture(folder) {
+  fs.mkdirSync(folder, { recursive: true });
+  for (let i = 1; i <= 5000; i += 1) {
+    const num = String(i).padStart(4, '0');
+    const name =
+      i % 2 === 1
+        ? `m${num}_Quarterly_Production_Cluster_Rollout_Archive_Snapshot_Approved.txt`
+        : `m${num}_note.txt`;
+    fs.writeFileSync(path.join(folder, name), `entry ${num}\n`);
+  }
+}
+
 async function maybeShot(page, name) {
   if (!SHOTS_DIR) return;
   fs.mkdirSync(SHOTS_DIR, { recursive: true });
@@ -323,12 +335,14 @@ browserTest(
   const towerUser = path.join(root, 'tower-user');
   const capturesDir = path.join(towerUser, 'Captures');
   const manyDir = path.join(towerUser, 'ManyFiles');
+  const mixedDir = path.join(towerUser, 'MixedHeights5000');
 
   fs.mkdirSync(path.join(towerHome, 'config'), { recursive: true });
   fs.mkdirSync(path.join(towerHome, 'state'), { recursive: true });
 
   const expectedCaptures = buildCapturesFixture(capturesDir);
   buildFiveThousandFixture(manyDir);
+  buildMixedHeightFiveThousandFixture(mixedDir);
 
   const policy = [
     'default = "owner"',
@@ -980,7 +994,10 @@ browserTest(
       };
     });
 
-    assert.ok(initialPerf.renderedDomRows >= 100, `Expected first render slice (>=100 rows), got ${initialPerf.renderedDomRows}`);
+    assert.ok(
+      initialPerf.renderedDomRows >= 12 && initialPerf.renderedDomRows <= 90,
+      `Expected virtualized bounded row count (12..90), got ${initialPerf.renderedDomRows}`,
+    );
     assert.ok(
       initialPerf.measuredReadyRows < initialPerf.renderedDomRows,
       `Only on-screen rows should be measured: ready=${initialPerf.measuredReadyRows}, rendered=${initialPerf.renderedDomRows}`,
@@ -1013,6 +1030,389 @@ browserTest(
     );
 
     await deskCtx.close();
+
+    // ── 4. 5,000 mixed-height rows on phone (390x844): scroll end & back with zero blank gaps,
+    //       zero jump on estimate correction above the viewport, and dynamic bottom inset toggle ─
+    tracker.setStep('phone 5,000 mixed-height virtual scroll + bottom inset');
+    const vCtx = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      colorScheme: 'dark',
+    });
+    const vPage = tracker.attach(await vCtx.newPage(), {
+      label: 'phone-virtual',
+      collectConsole: consoleErrors,
+      collectPage: pageErrors,
+    });
+
+    await connectPage(vPage, server.url, tokenOut.token, tracker);
+    await vPage.goto(`${server.url}/#/files/tower/${encodeURIComponent(mixedDir)}`, {
+      waitUntil: 'domcontentloaded',
+    });
+    await tracker.waitForLocator(
+      vPage.locator('.list a.row[aria-label^="m0001_"]').first(),
+      'MixedHeights5000 first row on phone',
+    );
+    await waitForVisibleFitted(vPage, '.list a.row .fn-slot', 'main.main', tracker);
+    await waitForLayoutSettled(vPage, 2);
+
+    // Confirm genuine mixed 1-line and 2-line heights on phone.
+    const mixedSample = await vPage.evaluate(() => {
+      const items = [...document.querySelectorAll('.list .vlist-item')];
+      const oneLine = [];
+      const twoLine = [];
+      for (const item of items) {
+        const slot = item.querySelector('.fn-slot');
+        if (!slot || slot.getAttribute('data-fn-ready') !== '1') continue;
+        const lines = slot.querySelectorAll('.fn-line').length;
+        const h = Math.round(item.getBoundingClientRect().height);
+        if (lines === 1) oneLine.push(h);
+        else if (lines === 2) twoLine.push(h);
+      }
+      return {
+        mountedCount: items.length,
+        oneLineCount: oneLine.length,
+        twoLineCount: twoLine.length,
+        avgOne: oneLine.length ? oneLine.reduce((a, b) => a + b, 0) / oneLine.length : 0,
+        avgTwo: twoLine.length ? twoLine.reduce((a, b) => a + b, 0) / twoLine.length : 0,
+      };
+    });
+    assert.ok(mixedSample.oneLineCount >= 2 && mixedSample.twoLineCount >= 2, `Expected both 1-line and 2-line rows, got ${JSON.stringify(mixedSample)}`);
+    assert.ok(
+      mixedSample.avgTwo >= mixedSample.avgOne + 10,
+      `Expected 2-line rows noticeably taller than 1-line rows: ${JSON.stringify(mixedSample)}`,
+    );
+    assert.ok(
+      mixedSample.mountedCount <= 80,
+      `Expected bounded DOM rows on phone, got ${mixedSample.mountedCount}`,
+    );
+
+    const checkNoBlankGap = async (label) => {
+      const snap = await vPage.evaluate(() => {
+        const scroller = document.querySelector('main.main');
+        const list = document.querySelector('.list');
+        if (!scroller || !list) return { ok: false, reason: 'missing scroller/list' };
+        const sr = scroller.getBoundingClientRect();
+        const lr = list.getBoundingClientRect();
+        const visTop = Math.max(sr.top, lr.top + 1);
+        const visBottom = Math.min(sr.bottom, lr.bottom - 1);
+        const rows = [...list.querySelectorAll('.vlist-item')];
+        if (rows.length === 0) return { ok: false, reason: 'zero mounted rows' };
+
+        let firstTop = Infinity;
+        let lastBottom = -Infinity;
+        let maxInternalGap = 0;
+        let prevBottom = null;
+        for (const el of rows) {
+          const r = el.getBoundingClientRect();
+          if (r.top < firstTop) firstTop = r.top;
+          if (r.bottom > lastBottom) lastBottom = r.bottom;
+          if (prevBottom !== null) {
+            const gap = r.top - prevBottom;
+            if (gap > maxInternalGap) maxInternalGap = gap;
+          }
+          prevBottom = r.bottom;
+        }
+        const topGap = visTop < visBottom ? Math.max(0, firstTop - visTop) : 0;
+        const bottomGap = visTop < visBottom ? Math.max(0, visBottom - lastBottom) : 0;
+        return {
+          ok: topGap <= 3 && bottomGap <= 3 && maxInternalGap <= 3,
+          mountedRows: rows.length,
+          topGap: Math.round(topGap * 10) / 10,
+          bottomGap: Math.round(bottomGap * 10) / 10,
+          maxInternalGap: Math.round(maxInternalGap * 10) / 10,
+          scrollTop: Math.round(scroller.scrollTop),
+          scrollHeight: Math.round(scroller.scrollHeight),
+          clientHeight: Math.round(scroller.clientHeight),
+        };
+      });
+      assert.ok(snap.ok, `Blank gap detected (${label}): ${JSON.stringify(snap)}`);
+      assert.ok(
+        snap.mountedRows <= 85,
+        `Mounted DOM rows exceeded bound (${label}): ${snap.mountedRows}`,
+      );
+      return snap;
+    };
+
+    // Scroll all the way to the end of the 5,000 mixed-height rows, asserting zero blank gaps on
+    // every scroll sample until `m5000_note.txt` is mounted and visible.
+    let downSamples = 0;
+    let reachedEnd = false;
+    for (let iter = 0; iter < 500; iter += 1) {
+      const state = await vPage.evaluate(() => {
+        const scroller = document.querySelector('main.main');
+        const pager = document.querySelector('.folder-pager');
+        const lastRow = document.querySelector('.list a.row[aria-label="m5000_note.txt"]');
+        const maxTop = scroller ? Math.max(0, scroller.scrollHeight - scroller.clientHeight) : 0;
+        return {
+          scrollTop: scroller ? scroller.scrollTop : 0,
+          maxTop,
+          clientHeight: scroller ? scroller.clientHeight : 0,
+          hasPager: Boolean(pager),
+          hasLastRow: Boolean(lastRow),
+        };
+      });
+
+      if (iter % 4 === 0 || state.hasLastRow) {
+        await checkNoBlankGap(`down step ${iter}`);
+        downSamples += 1;
+      }
+
+      if (!state.hasPager && state.hasLastRow && state.scrollTop >= state.maxTop - 4) {
+        reachedEnd = true;
+        break;
+      }
+
+      // Advance by ~2.5 viewports per step (large enough to load all 5,000 rows quickly while
+      // still testing continuous virtualization and page fetches).
+      await vPage.evaluate(() => {
+        const scroller = document.querySelector('main.main');
+        if (!scroller) return;
+        const maxTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+        const step = Math.max(900, scroller.clientHeight * 2.5);
+        scroller.scrollTop = Math.min(maxTop, scroller.scrollTop + step);
+      });
+      await waitForLayoutSettled(vPage, 2);
+
+      // If we hit the current bottom while more pages are still loading, wait for scrollHeight
+      // to grow or the pager to finish (bounded wait, no fixed sleep).
+      const atCurrentBottom = await vPage.evaluate(() => {
+        const scroller = document.querySelector('main.main');
+        const pager = document.querySelector('.folder-pager');
+        if (!scroller || !pager) return null;
+        const maxTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+        return scroller.scrollTop >= maxTop - 12 ? scroller.scrollHeight : null;
+      });
+      if (atCurrentBottom !== null) {
+        await tracker.waitForFn(
+          vPage,
+          (prevH) => {
+            const scroller = document.querySelector('main.main');
+            const pager = document.querySelector('.folder-pager');
+            return !pager || (scroller && scroller.scrollHeight > prevH + 20);
+          },
+          atCurrentBottom,
+          'next 500-row page to load during 5,000-row scroll',
+        );
+        await waitForLayoutSettled(vPage, 1);
+      }
+    }
+
+    assert.ok(reachedEnd, 'Should scroll all the way to m5000_note.txt with pager gone');
+    assert.ok(downSamples >= 10, `Expected at least 10 viewport samples on scroll down, got ${downSamples}`);
+    await waitForVisibleFitted(vPage, '.list a.row .fn-slot', 'main.main', tracker);
+    await checkNoBlankGap('at bottom (row 5000)');
+
+    // Toggle a dynamic bottom padding/inset mid-scroll & at the bottom (simulating a mini player
+    // bar appearing and disappearing) and assert no blank strip + last row remains reachable.
+    tracker.setStep('dynamic bottom inset toggle at bottom and mid-scroll');
+    await vPage.evaluate(() => {
+      const scroller = document.querySelector('main.main');
+      if (scroller) scroller.style.paddingBottom = '104px';
+    });
+    await waitForLayoutSettled(vPage, 2);
+    await checkNoBlankGap('bottom inset added at bottom');
+
+    await vPage.evaluate(() => {
+      const scroller = document.querySelector('main.main');
+      if (scroller) scroller.scrollTop = scroller.scrollHeight - scroller.clientHeight;
+    });
+    await waitForLayoutSettled(vPage, 2);
+    await checkNoBlankGap('scrolled to bottom with 104px inset');
+
+    const lastRowClearance = await vPage.evaluate(() => {
+      const scroller = document.querySelector('main.main');
+      const last = document.querySelector('.list a.row[aria-label="m5000_note.txt"]');
+      if (!scroller || !last) return null;
+      const sr = scroller.getBoundingClientRect();
+      const lr = last.getBoundingClientRect();
+      return {
+        clearancePx: Math.round(sr.bottom - lr.bottom),
+        visibleAboveTop: lr.top >= sr.top - 1,
+      };
+    });
+    assert.ok(
+      lastRowClearance && lastRowClearance.visibleAboveTop && lastRowClearance.clearancePx >= 100,
+      `Last row must clear the 104px bottom inset: ${JSON.stringify(lastRowClearance)}`,
+    );
+
+    // Remove the bottom inset while at the very bottom: browser clamps scrollTop, no blank strip.
+    await vPage.evaluate(() => {
+      const scroller = document.querySelector('main.main');
+      if (scroller) scroller.style.paddingBottom = '';
+    });
+    await waitForLayoutSettled(vPage, 2);
+    await checkNoBlankGap('bottom inset removed at bottom');
+
+    // Also toggle bottom inset AND viewport height mid-scroll (~halfway down the 5,000 rows).
+    await vPage.evaluate(() => {
+      const scroller = document.querySelector('main.main');
+      if (scroller) scroller.scrollTop = Math.round(scroller.scrollHeight * 0.5);
+    });
+    await waitForLayoutSettled(vPage, 2);
+    await waitForVisibleFitted(vPage, '.list a.row .fn-slot', 'main.main', tracker);
+    await checkNoBlankGap('mid-scroll before bottom inset toggle');
+
+    await vPage.evaluate(() => {
+      const scroller = document.querySelector('main.main');
+      if (scroller) scroller.style.paddingBottom = '96px';
+    });
+    await waitForLayoutSettled(vPage, 2);
+    await checkNoBlankGap('mid-scroll after adding 96px bottom inset');
+
+    await vPage.setViewportSize({ width: 390, height: 740 });
+    await waitForLayoutSettled(vPage, 2);
+    await checkNoBlankGap('mid-scroll after shrinking viewport height');
+
+    await vPage.setViewportSize({ width: 390, height: 844 });
+    await vPage.evaluate(() => {
+      const scroller = document.querySelector('main.main');
+      if (scroller) scroller.style.paddingBottom = '';
+    });
+    await waitForLayoutSettled(vPage, 2);
+    await checkNoBlankGap('mid-scroll after restoring viewport and removing inset');
+
+    // Test "scroll to the item I came back from" halfway down a 5,000-row virtualized folder:
+    // open a visible row, close viewer, confirm scroll position and row stay intact.
+    const midOpenedLabel = await vPage.evaluate(() => {
+      const scroller = document.querySelector('main.main');
+      if (!scroller) return null;
+      const sr = scroller.getBoundingClientRect();
+      const rows = [...document.querySelectorAll('.list a.row')];
+      const vis = rows.find((r) => {
+        const b = r.getBoundingClientRect();
+        return b.top >= sr.top + 80 && b.bottom <= sr.bottom - 80;
+      });
+      return vis ? vis.getAttribute('aria-label') : null;
+    });
+    assert.ok(midOpenedLabel, 'Expected a centered visible row at mid-scroll');
+    const scrollBeforeViewer = await vPage.evaluate(() => document.querySelector('main.main')?.scrollTop || 0);
+    await vPage.locator(`.list a.row[aria-label="${midOpenedLabel}"]`).click();
+    await tracker.waitForLocator(vPage.locator('.viewer'), 'viewer opened from mid-list row');
+    await vPage.locator('.viewer-top button[aria-label="Close"]').click();
+    await vPage.locator('.viewer').waitFor({ state: 'hidden' });
+    await waitForLayoutSettled(vPage, 2);
+    const afterViewer = await vPage.evaluate((label) => {
+      const scroller = document.querySelector('main.main');
+      const row = document.querySelector(`.list a.row[aria-label="${label}"]`);
+      if (!scroller || !row) return { found: false, scrollTop: scroller?.scrollTop || 0 };
+      const sr = scroller.getBoundingClientRect();
+      const rr = row.getBoundingClientRect();
+      return {
+        found: true,
+        scrollTop: scroller.scrollTop,
+        visible: rr.top >= sr.top - 2 && rr.bottom <= sr.bottom + 2,
+      };
+    }, midOpenedLabel);
+    assert.ok(
+      afterViewer.found && afterViewer.visible && Math.abs(afterViewer.scrollTop - scrollBeforeViewer) <= 4,
+      `Expected returned row "${midOpenedLabel}" to stay visible without jump: ${JSON.stringify(afterViewer)} (before=${scrollBeforeViewer})`,
+    );
+
+    // Resize width slightly (390 -> 376) to clear cached heights of unmounted rows above, then
+    // scroll BACK UP through unmeasured territory and assert ZERO jump when 1-line estimates
+    // above the viewport expand to 2-line measured rows, and ZERO blank gaps all the way to row 1.
+    tracker.setStep('reverse scroll through unmeasured mixed rows with zero jump');
+    await vPage.setViewportSize({ width: 376, height: 844 });
+    await waitForLayoutSettled(vPage, 2);
+    await waitForVisibleFitted(vPage, '.list a.row .fn-slot', 'main.main', tracker);
+
+    let maxAnchorDriftPx = 0;
+    let jumpChecks = 0;
+    let compensatedSteps = 0;
+    for (let step = 0; step < 12; step += 1) {
+      // Scroll upward into unmeasured rows and immediately capture the first unobstructed visible
+      // row's screen Y (below the sticky `.where` bar) BEFORE `FileNameList` finishes fitting the
+      // newly mounted rows above the viewport.
+      const before = await vPage.evaluate(() => {
+        const scroller = document.querySelector('main.main');
+        if (!scroller) return null;
+        scroller.scrollTop = Math.max(0, scroller.scrollTop - 420);
+        const sr = scroller.getBoundingClientRect();
+        const cs = window.getComputedStyle(scroller);
+        const padTop = parseFloat(cs.paddingTop) || 0;
+        const whereEl = scroller.querySelector('.where');
+        const stickyTop = whereEl ? whereEl.getBoundingClientRect().height : 0;
+        const visTop = sr.top + padTop + stickyTop;
+        const items = [...document.querySelectorAll('.list .vlist-item')];
+        const anchor = items.find((el) => {
+          const r = el.getBoundingClientRect();
+          return r.height > 0 && r.top >= visTop - 0.5 && r.bottom <= sr.bottom - 4;
+        });
+        if (!anchor) return null;
+        return {
+          key: anchor.dataset.vlistKey,
+          topBefore: anchor.getBoundingClientRect().top,
+          scrollTopBefore: scroller.scrollTop,
+        };
+      });
+      await waitForVisibleFitted(vPage, '.list a.row .fn-slot', 'main.main', tracker);
+      await waitForLayoutSettled(vPage, 2);
+      await checkNoBlankGap(`reverse jump-check step ${step}`);
+
+      if (before && before.key && before.scrollTopBefore > 10) {
+        const after = await vPage.evaluate((k) => {
+          const scroller = document.querySelector('main.main');
+          const el = document.querySelector(`.list .vlist-item[data-vlist-key="${CSS.escape(k)}"]`);
+          return {
+            topAfter: el ? el.getBoundingClientRect().top : null,
+            scrollTopAfter: scroller ? scroller.scrollTop : 0,
+          };
+        }, before.key);
+        if (after.topAfter !== null) {
+          const drift = Math.abs(after.topAfter - before.topBefore);
+          if (drift > maxAnchorDriftPx) maxAnchorDriftPx = drift;
+          if (after.scrollTopAfter > before.scrollTopBefore + 5) {
+            compensatedSteps += 1;
+          }
+          jumpChecks += 1;
+          assert.ok(
+            drift <= 2.5,
+            `Visible anchor "${before.key}" jumped by ${drift.toFixed(1)}px when estimates above viewport settled (step ${step}, scrollTop ${before.scrollTopBefore} -> ${after.scrollTopAfter})`,
+          );
+        }
+      }
+    }
+    assert.ok(jumpChecks >= 6, `Expected >= 6 reverse-scroll anchor jump checks, got ${jumpChecks}`);
+    assert.ok(
+      compensatedSteps >= 3,
+      `Expected scrollTop compensation to fire as unmeasured 2-line rows above viewport settled (compensatedSteps=${compensatedSteps})`,
+    );
+
+    // Finish scrolling all the way back to the very top (row 1) with zero blank gaps.
+    let reachedTop = false;
+    for (let iter = 0; iter < 400; iter += 1) {
+      const st = await vPage.evaluate(() => {
+        const scroller = document.querySelector('main.main');
+        const firstRow = document.querySelector('.list a.row[aria-label^="m0001_"]');
+        return {
+          scrollTop: scroller ? scroller.scrollTop : 0,
+          hasFirstRow: Boolean(firstRow),
+        };
+      });
+      if (iter % 4 === 0 || st.scrollTop <= 2) {
+        await checkNoBlankGap(`up step ${iter}`);
+      }
+      if (st.scrollTop <= 2 && st.hasFirstRow) {
+        reachedTop = true;
+        break;
+      }
+      await vPage.evaluate(() => {
+        const scroller = document.querySelector('main.main');
+        if (!scroller) return;
+        const step = Math.max(900, scroller.clientHeight * 2.5);
+        scroller.scrollTop = Math.max(0, scroller.scrollTop - step);
+      });
+      await waitForLayoutSettled(vPage, 2);
+    }
+    assert.ok(reachedTop, 'Should scroll cleanly back to row 1 (m0001_) at scrollTop 0');
+    await waitForVisibleFitted(vPage, '.list a.row .fn-slot', 'main.main', tracker);
+    await checkNoBlankGap('back at top (row 1)');
+
+    console.log(
+      `[virtual-list phone] 5,000 mixed-height rows: downSamples=${downSamples} jumpChecks=${jumpChecks} maxAnchorDrift=${maxAnchorDriftPx.toFixed(2)}px`,
+    );
+
+    await vCtx.close();
 
     assert.deepEqual(consoleErrors, [], `Unexpected console errors: ${consoleErrors.join('\n')}`);
     assert.deepEqual(pageErrors, [], `Unexpected page errors: ${pageErrors.join('\n')}`);

@@ -6,7 +6,10 @@ import {
   canOpenExternally,
   categoryFromName,
   changedPresetCutoff,
+  computeVirtualGridWindow,
+  computeVirtualWindow,
   createThumbQueue,
+  createVirtualListLayout,
   detectFileCapabilities,
   entryCategory,
   entryIconName,
@@ -906,4 +909,220 @@ test('createThumbQueue batches at most 32 paths and retries busy errors with exp
     'data:image/jpeg;base64,UEhPVE8=',
   );
   qOldAudio.dispose();
+});
+
+test('createVirtualListLayout handles mixed variable heights, estimate corrections without jump, and scroll-to-index', () => {
+  const layout = createVirtualListLayout({ estimatedHeight: 60 });
+  const keys = Array.from({ length: 5000 }, (_, i) => `/dir/item_${String(i).padStart(4, '0')}.txt`);
+  layout.syncItems(keys);
+
+  assert.equal(layout.getCount(), 5000);
+  assert.equal(layout.getTotalHeight(), 5000 * 60);
+  assert.equal(layout.getOffset(0), 0);
+  assert.equal(layout.getOffset(100), 6000);
+  assert.equal(layout.findIndexAtOffset(0), 0);
+  assert.equal(layout.findIndexAtOffset(6000), 100);
+  assert.equal(layout.findIndexAtOffset(6059), 100);
+  assert.equal(layout.findIndexAtOffset(6060), 101);
+
+  // Top window covers viewport + overscan and preserves exact total height.
+  const topWin = layout.computeWindow({ scrollOffset: 0, viewportHeight: 720, overscanPx: 600 });
+  assert.equal(topWin.start, 0);
+  assert.equal(topWin.topPad, 0);
+  assert.equal(topWin.end, Math.ceil((720 + 600) / 60));
+  assert.equal(
+    topWin.topPad + (layout.getOffset(topWin.end) - layout.getOffset(topWin.start)) + topWin.bottomPad,
+    layout.getTotalHeight(),
+  );
+
+  // Hysteresis keeps the mounted window unchanged while the viewport still has >= minBufferPx
+  // of mounted rows above and below, preventing redundant re-renders on small scroll steps.
+  const smallStep = layout.computeWindow({
+    scrollOffset: 120,
+    viewportHeight: 720,
+    overscanPx: 600,
+    minBufferPx: 280,
+    prevWindow: topWin,
+  });
+  assert.equal(smallStep.start, topWin.start);
+  assert.equal(smallStep.end, topWin.end);
+
+  // Scrolling past the hysteresis buffer shifts the window cleanly.
+  const scrolledWin = layout.computeWindow({
+    scrollOffset: 12_000, // row 200
+    viewportHeight: 720,
+    overscanPx: 600,
+    minBufferPx: 280,
+    prevWindow: topWin,
+  });
+  assert.equal(scrolledWin.start, 190);
+  assert.equal(scrolledWin.end, 222);
+
+  // Estimate correction ABOVE the viewport anchor returns exact positive scrollDelta so visible
+  // content does not jump when 1-line estimates wrap to 2-line rows.
+  const scrollOff = 12_000; // anchor is row 200 (offset 12,000)
+  const aboveUpdates = [
+    { index: 195, key: keys[195], height: 82 }, // +22
+    { index: 199, key: keys[199], height: 80 }, // +20 (partially/strictly above anchor 200)
+    { index: 205, key: keys[205], height: 84 }, // +24 (below anchor: must NOT shift scrollTop)
+  ];
+  const anchorBefore = layout.getOffset(200);
+  const resAbove = layout.applyMeasurements({
+    updates: aboveUpdates,
+    scrollOffset: scrollOff,
+  });
+  assert.equal(resAbove.changed, true);
+  assert.equal(resAbove.anchorIndex, 200);
+  assert.equal(resAbove.scrollDelta, 42);
+  assert.equal(layout.getOffset(200) - (scrollOff + resAbove.scrollDelta), anchorBefore - scrollOff);
+  assert.equal(layout.getTotalHeight(), 5000 * 60 + 22 + 20 + 24);
+
+  // Corrections strictly AT or BELOW the anchor produce zero scrollDelta.
+  const resBelow = layout.applyMeasurements({
+    updates: [
+      { index: 200, key: keys[200], height: 86 },
+      { index: 201, key: keys[201], height: 86 },
+    ],
+    scrollOffset: scrollOff + resAbove.scrollDelta,
+  });
+  assert.equal(resBelow.changed, true);
+  assert.equal(resBelow.scrollDelta, 0);
+
+  // At scrollOffset = 0, corrections never push scrollTop away from the top of the list.
+  const resAtTop = layout.applyMeasurements({
+    updates: [{ index: 0, key: keys[0], height: 84 }],
+    scrollOffset: 0,
+  });
+  assert.equal(resAtTop.scrollDelta, 0);
+
+  // Updating the live one-line estimatedHeight shifts unmeasured rows above the anchor and
+  // reports the exact combined scrollDelta to keep the anchor row pinned.
+  const midOff = layout.getOffset(200) + 10; // anchor becomes row 201
+  const old201 = layout.getOffset(201);
+  const resEst = layout.applyMeasurements({
+    estimatedHeight: 64, // +4 on all unmeasured rows
+    scrollOffset: midOff,
+  });
+  assert.equal(resEst.anchorIndex, 201);
+  // Rows 0..200 have 4 measured rows (0, 195, 199, 200), so 197 unmeasured rows grew by +4 = +788.
+  assert.equal(resEst.scrollDelta, 197 * 4);
+  assert.equal(layout.getOffset(201) - old201, 197 * 4);
+
+  // Append-only paging preserves measured heights and extends offsets incrementally.
+  const extendedKeys = [
+    ...keys,
+    ...Array.from({ length: 500 }, (_, i) => `/dir/item_${String(5000 + i).padStart(4, '0')}.txt`),
+  ];
+  const prevTotal = layout.getTotalHeight();
+  layout.syncItems(extendedKeys);
+  assert.equal(layout.getCount(), 5500);
+  assert.equal(layout.getHeight(195), 82);
+  assert.equal(layout.getTotalHeight(), prevTotal + 500 * 64);
+
+  // Dynamic viewport height + bottom inset (e.g. mini player bar appearing): window covers full
+  // viewport and computeScrollTargetForIndex keeps the target above the bottom inset.
+  const targetIdx = 4999;
+  const targetTop = layout.computeScrollTargetForIndex(targetIdx, {
+    listTop: 40,
+    viewportHeight: 844,
+    topInset: 44,
+    bottomInset: 96,
+    align: 'end',
+  });
+  const itemBottom = 40 + layout.getOffset(targetIdx) + layout.getHeight(targetIdx);
+  assert.equal(itemBottom - targetTop, 844 - 96);
+
+  // `onlyIfOffscreen` returns null when the item is already comfortably inside the unobstructed
+  // viewport, and returns a scroll target if hidden behind the bottom inset.
+  const idx300 = 300;
+  const top300 = 40 + layout.getOffset(idx300);
+  assert.equal(
+    layout.computeScrollTargetForIndex(idx300, {
+      listTop: 40,
+      viewportHeight: 844,
+      topInset: 44,
+      bottomInset: 96,
+      currentScrollTop: top300 - 200,
+      onlyIfOffscreen: true,
+    }),
+    null,
+  );
+  assert.notEqual(
+    layout.computeScrollTargetForIndex(idx300, {
+      listTop: 40,
+      viewportHeight: 844,
+      topInset: 44,
+      bottomInset: 96,
+      currentScrollTop: top300 - 760, // sits under the 96px bottom inset
+      onlyIfOffscreen: true,
+    }),
+    null,
+  );
+
+  // Resetting measurements (e.g. after width change) clears cached heights and adopts live estimate.
+  layout.resetMeasurements({ estimatedHeight: 58 });
+  assert.equal(layout.isMeasured(195), false);
+  assert.equal(layout.getEstimatedHeight(), 58);
+  assert.equal(layout.getTotalHeight(), 5500 * 58);
+});
+
+test('computeVirtualWindow and computeVirtualGridWindow bound rendered slices and preserve geometry', () => {
+  assert.deepEqual(
+    computeVirtualWindow({ total: 0, rowHeight: 56, scrollOffset: 0, viewportHeight: 720 }),
+    { start: 0, end: 0, topPad: 0, bottomPad: 0 },
+  );
+
+  const mid = computeVirtualWindow({
+    total: 5000,
+    rowHeight: 56,
+    scrollOffset: 140_000,
+    viewportHeight: 720,
+    overscan: 20,
+  });
+  assert.equal(mid.start, 2480);
+  assert.equal(mid.topPad + (mid.end - mid.start) * 56 + mid.bottomPad, 5000 * 56);
+
+  // Grid: 5,000 square cells in 4 columns, 124px cells + 3px gap.
+  const gridTop = computeVirtualGridWindow({
+    total: 5000,
+    columns: 4,
+    rowHeight: 124,
+    rowGap: 3,
+    scrollOffset: 0,
+    viewportHeight: 720,
+    overscanRows: 4,
+  });
+  assert.equal(gridTop.startIndex, 0);
+  assert.equal(gridTop.topPad, 0);
+  assert.equal(gridTop.endIndex % 4, 0);
+  assert.ok(gridTop.endIndex > 20 && gridTop.endIndex < 80);
+
+  const gridMid = computeVirtualGridWindow({
+    total: 5000,
+    columns: 4,
+    rowHeight: 124,
+    rowGap: 3,
+    scrollOffset: 50_000,
+    viewportHeight: 720,
+    overscanRows: 4,
+  });
+  assert.equal(gridMid.startIndex % 4, 0);
+  assert.equal(gridMid.endIndex % 4, 0);
+  assert.ok(gridMid.topPad > 0 && gridMid.bottomPad > 0);
+  // Top spacer + rowGap + mounted rows + rowGap + bottom spacer === totalHeight.
+  const mountedRows = gridMid.endRow - gridMid.startRow;
+  const mountedH = mountedRows * 124 + Math.max(0, mountedRows - 1) * 3;
+  assert.equal(gridMid.topPad + 3 + mountedH + 3 + gridMid.bottomPad, gridMid.totalHeight);
+
+  const gridEnd = computeVirtualGridWindow({
+    total: 5000,
+    columns: 4,
+    rowHeight: 124,
+    rowGap: 3,
+    scrollOffset: gridMid.totalHeight,
+    viewportHeight: 720,
+    overscanRows: 4,
+  });
+  assert.equal(gridEnd.endIndex, 5000);
+  assert.equal(gridEnd.bottomPad, 0);
 });

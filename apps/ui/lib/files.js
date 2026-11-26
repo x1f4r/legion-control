@@ -1103,3 +1103,454 @@ export function buildTransferDestination(destDir, sourcePath) {
   const name = baseFileName(sourcePath);
   return joinFilePath(destDir || '~', name);
 }
+
+const DEFAULT_VIRTUAL_ROW_HEIGHT = 56;
+
+/**
+ * Pure variable-height virtual list layout index.
+ *
+ * Tracks measured heights per stable item key, falls back to a live one-line estimated height for
+ * unmeasured items, maintains exact prefix offsets in a `Float64Array`, and computes scroll-top
+ * corrections when rows above the visible anchor change height so visible content never jumps.
+ */
+export function createVirtualListLayout({ estimatedHeight = DEFAULT_VIRTUAL_ROW_HEIGHT } = {}) {
+  let keys = [];
+  let keyToIndex = new Map();
+  const measured = new Map();
+  let estimate =
+    Number.isFinite(estimatedHeight) && estimatedHeight > 0
+      ? estimatedHeight
+      : DEFAULT_VIRTUAL_ROW_HEIGHT;
+  let offsets = new Float64Array(1);
+  let dirtyFrom = 0;
+
+  function ensureOffsets() {
+    const count = keys.length;
+    if (dirtyFrom > count) {
+      dirtyFrom = count;
+    }
+    if (offsets.length < count + 1) {
+      const next = new Float64Array(Math.max(count + 1, offsets.length * 2));
+      const copyLen = Math.min(dirtyFrom + 1, offsets.length);
+      if (copyLen > 0) {
+        next.set(offsets.subarray(0, copyLen));
+      }
+      offsets = next;
+    }
+    if (dirtyFrom === 0) {
+      offsets[0] = 0;
+    }
+    for (let i = dirtyFrom; i < count; i += 1) {
+      const h = measured.get(keys[i]);
+      offsets[i + 1] = offsets[i] + (h !== undefined ? h : estimate);
+    }
+    dirtyFrom = count;
+  }
+
+  function syncItems(nextKeys) {
+    const list = Array.isArray(nextKeys) ? nextKeys : [];
+    const prevCount = keys.length;
+    const nextCount = list.length;
+
+    // Fast path: append-only paging (existing prefix unchanged).
+    let appendOnly = prevCount > 0 && nextCount >= prevCount;
+    if (appendOnly) {
+      if (keys[0] !== list[0] || keys[prevCount - 1] !== list[prevCount - 1]) {
+        appendOnly = false;
+      } else {
+        for (let i = 1; i < prevCount - 1; i += 1) {
+          if (keys[i] !== list[i]) {
+            appendOnly = false;
+            break;
+          }
+        }
+      }
+    }
+
+    if (appendOnly) {
+      for (let i = prevCount; i < nextCount; i += 1) {
+        keyToIndex.set(list[i], i);
+      }
+      keys = list;
+      dirtyFrom = Math.min(dirtyFrom, prevCount);
+    } else {
+      keys = list;
+      keyToIndex = new Map();
+      for (let i = 0; i < nextCount; i += 1) {
+        keyToIndex.set(list[i], i);
+      }
+      dirtyFrom = 0;
+      // Keep measured cache bounded across directory/filter churn.
+      if (measured.size > Math.max(nextCount * 2, 10_000)) {
+        for (const k of measured.keys()) {
+          if (!keyToIndex.has(k)) measured.delete(k);
+        }
+      }
+    }
+  }
+
+  function getHeight(index) {
+    if (index < 0 || index >= keys.length) return estimate;
+    const h = measured.get(keys[index]);
+    return h !== undefined ? h : estimate;
+  }
+
+  function getOffset(index) {
+    ensureOffsets();
+    const count = keys.length;
+    if (count === 0 || index <= 0) return 0;
+    if (index >= count) return offsets[count];
+    return offsets[index];
+  }
+
+  function getTotalHeight() {
+    ensureOffsets();
+    return offsets[keys.length];
+  }
+
+  function findIndexAtOffset(y) {
+    ensureOffsets();
+    const count = keys.length;
+    if (count === 0 || !Number.isFinite(y) || y <= 0) return 0;
+    if (y >= offsets[count]) return count;
+    let lo = 0;
+    let hi = count - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (offsets[mid + 1] <= y) {
+        lo = mid + 1;
+      } else if (offsets[mid] > y) {
+        hi = mid - 1;
+      } else {
+        return mid;
+      }
+    }
+    return Math.max(0, Math.min(count - 1, lo));
+  }
+
+  // Returns the first item whose top edge is at or below `scrollOffset` (minus subpixel tolerance).
+  // Anchoring here ensures rows partially or fully above the viewport top absorb height deltas into
+  // scrollTop rather than pushing visible rows below them downward.
+  function findAnchorIndex(scrollOffset) {
+    const count = keys.length;
+    if (count === 0 || !Number.isFinite(scrollOffset) || scrollOffset <= 1) return 0;
+    ensureOffsets();
+    const target = scrollOffset - 0.5;
+    let lo = 0;
+    let hi = count - 1;
+    let ans = count - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (offsets[mid] >= target) {
+        ans = mid;
+        hi = mid - 1;
+      } else {
+        lo = mid + 1;
+      }
+    }
+    return ans;
+  }
+
+  function applyMeasurements({ updates = [], estimatedHeight: nextEstimate = null, scrollOffset = 0 } = {}) {
+    const count = keys.length;
+    const estimateChanged =
+      nextEstimate != null &&
+      Number.isFinite(nextEstimate) &&
+      nextEstimate > 0 &&
+      Math.abs(nextEstimate - estimate) >= 0.25;
+
+    if (!estimateChanged && (!Array.isArray(updates) || updates.length === 0)) {
+      return { changed: false, anchorIndex: 0, scrollDelta: 0, totalHeight: getTotalHeight() };
+    }
+
+    ensureOffsets();
+    const shouldAnchor = count > 0 && Number.isFinite(scrollOffset) && scrollOffset > 1;
+    const anchorIndex = shouldAnchor ? findAnchorIndex(scrollOffset) : 0;
+    const oldAnchorOffset = anchorIndex > 0 ? offsets[anchorIndex] : 0;
+
+    let changed = false;
+    let minDirty = count;
+
+    if (estimateChanged) {
+      estimate = nextEstimate;
+      changed = true;
+      minDirty = 0;
+    }
+
+    if (Array.isArray(updates)) {
+      for (let i = 0; i < updates.length; i += 1) {
+        const u = updates[i];
+        if (!u || !Number.isFinite(u.height) || u.height <= 0) continue;
+        const key = u.key !== undefined ? u.key : keys[u.index];
+        if (key === undefined) continue;
+        const idx =
+          typeof u.index === 'number' && keys[u.index] === key ? u.index : keyToIndex.get(key);
+        const prev = measured.get(key);
+        if (prev === undefined || Math.abs(u.height - prev) >= 0.25) {
+          measured.set(key, u.height);
+          changed = true;
+          if (idx !== undefined && idx >= 0 && idx < minDirty) {
+            minDirty = idx;
+          }
+        }
+      }
+    }
+
+    if (!changed) {
+      return { changed: false, anchorIndex, scrollDelta: 0, totalHeight: offsets[count] };
+    }
+
+    dirtyFrom = Math.min(dirtyFrom, minDirty);
+    ensureOffsets();
+
+    const newAnchorOffset = anchorIndex > 0 ? offsets[anchorIndex] : 0;
+    const scrollDelta = shouldAnchor && anchorIndex > 0 ? newAnchorOffset - oldAnchorOffset : 0;
+    return {
+      changed: true,
+      anchorIndex,
+      scrollDelta,
+      totalHeight: offsets[count],
+    };
+  }
+
+  function resetMeasurements({ estimatedHeight: nextEstimate = null } = {}) {
+    measured.clear();
+    if (nextEstimate != null && Number.isFinite(nextEstimate) && nextEstimate > 0) {
+      estimate = nextEstimate;
+    }
+    dirtyFrom = 0;
+  }
+
+  function computeWindow({
+    scrollOffset = 0,
+    viewportHeight = 720,
+    overscanPx = 600,
+    minBufferPx = 0,
+    prevWindow = null,
+  } = {}) {
+    ensureOffsets();
+    const count = keys.length;
+    if (count === 0) {
+      return {
+        start: 0,
+        end: 0,
+        topPad: 0,
+        bottomPad: 0,
+        totalHeight: 0,
+        visibleStart: 0,
+        visibleEnd: 0,
+      };
+    }
+
+    const vp = Number.isFinite(viewportHeight) && viewportHeight > 0 ? viewportHeight : 720;
+    const off = Number.isFinite(scrollOffset) ? scrollOffset : 0;
+    const os = Number.isFinite(overscanPx) && overscanPx > 0 ? overscanPx : 0;
+    const totalHeight = offsets[count];
+
+    const visTop = Math.max(0, Math.min(totalHeight, off));
+    const visBottom = Math.max(0, Math.min(totalHeight, off + vp));
+    const visibleStart = visTop >= totalHeight ? Math.max(0, count - 1) : findIndexAtOffset(visTop);
+    const visibleEnd =
+      visBottom <= 0
+        ? Math.min(count, 1)
+        : Math.min(count, findIndexAtOffset(Math.max(0, visBottom - 0.01)) + 1);
+
+    // Hysteresis: keep the existing mounted range when it still provides at least `minBufferPx`
+    // of mounted coverage above and below the live viewport, avoiding redundant DOM churn during
+    // smooth frame-by-frame scrolling.
+    if (
+      prevWindow &&
+      Number.isFinite(minBufferPx) &&
+      minBufferPx > 0 &&
+      prevWindow.start >= 0 &&
+      prevWindow.end <= count &&
+      prevWindow.end > prevWindow.start
+    ) {
+      const mountedTop = offsets[prevWindow.start];
+      const mountedBottom = offsets[prevWindow.end];
+      const hasTop = prevWindow.start === 0 || mountedTop <= visTop - minBufferPx;
+      const hasBottom = prevWindow.end === count || mountedBottom >= visBottom + minBufferPx;
+      const maxReasonableRows = Math.ceil((vp + os * 3) / Math.max(20, estimate)) + 20;
+      if (hasTop && hasBottom && prevWindow.end - prevWindow.start <= maxReasonableRows) {
+        return {
+          start: prevWindow.start,
+          end: prevWindow.end,
+          topPad: Math.round(mountedTop),
+          bottomPad: Math.round(Math.max(0, totalHeight - mountedBottom)),
+          totalHeight: Math.round(totalHeight),
+          visibleStart,
+          visibleEnd,
+        };
+      }
+    }
+
+    const winTop = Math.max(0, off - os);
+    const winBottom = Math.max(0, Math.min(totalHeight, off + vp + os));
+    let start = winTop <= 0 ? 0 : findIndexAtOffset(winTop);
+    let end =
+      winBottom <= 0
+        ? Math.min(count, 1)
+        : Math.min(count, findIndexAtOffset(Math.max(0, winBottom - 0.01)) + 1);
+
+    start = Math.min(start, visibleStart);
+    end = Math.max(end, visibleEnd);
+    start = Math.max(0, Math.min(count, start));
+    end = Math.max(start, Math.min(count, end));
+
+    return {
+      start,
+      end,
+      topPad: Math.round(offsets[start]),
+      bottomPad: Math.round(Math.max(0, totalHeight - offsets[end])),
+      totalHeight: Math.round(totalHeight),
+      visibleStart,
+      visibleEnd,
+    };
+  }
+
+  function computeScrollTargetForIndex(
+    index,
+    {
+      listTop = 0,
+      viewportHeight = 720,
+      topInset = 0,
+      bottomInset = 0,
+      currentScrollTop = null,
+      onlyIfOffscreen = false,
+      align = 'center',
+    } = {},
+  ) {
+    const count = keys.length;
+    if (count === 0 || index < 0 || index >= count) return null;
+    ensureOffsets();
+    const vp = Number.isFinite(viewportHeight) && viewportHeight > 0 ? viewportHeight : 720;
+    const tInset = Number.isFinite(topInset) && topInset > 0 ? topInset : 0;
+    const bInset = Number.isFinite(bottomInset) && bottomInset > 0 ? bottomInset : 0;
+    const itemTop = listTop + offsets[index];
+    const itemBottom = itemTop + getHeight(index);
+
+    if (onlyIfOffscreen && Number.isFinite(currentScrollTop)) {
+      const visTop = currentScrollTop + tInset;
+      const visBottom = currentScrollTop + Math.max(1, vp - bInset);
+      if (itemTop >= visTop - 1 && itemBottom <= visBottom + 1) {
+        return null;
+      }
+    }
+
+    const usable = Math.max(1, vp - tInset - bInset);
+    let target;
+    if (align === 'start') {
+      target = itemTop - tInset;
+    } else if (align === 'end') {
+      target = itemBottom - Math.max(1, vp - bInset);
+    } else {
+      target = itemTop - tInset - Math.max(0, (usable - (itemBottom - itemTop)) / 2);
+    }
+    return Math.max(0, Math.round(target));
+  }
+
+  return {
+    syncItems,
+    getCount: () => keys.length,
+    getEstimatedHeight: () => estimate,
+    getHeight,
+    isMeasured: (index) => index >= 0 && index < keys.length && measured.has(keys[index]),
+    indexOfKey: (key) => (keyToIndex.has(key) ? keyToIndex.get(key) : -1),
+    getOffset,
+    getTotalHeight,
+    findIndexAtOffset,
+    findAnchorIndex,
+    applyMeasurements,
+    resetMeasurements,
+    computeWindow,
+    computeScrollTargetForIndex,
+  };
+}
+
+/**
+ * Computes the visible `[start, end)` row slice and top/bottom spacer heights in pixels
+ * for a uniform-row-height virtualized list (convenience wrapper).
+ */
+export function computeVirtualWindow({
+  total,
+  rowHeight = DEFAULT_VIRTUAL_ROW_HEIGHT,
+  scrollOffset = 0,
+  viewportHeight = 720,
+  overscan = 20,
+}) {
+  if (!Number.isFinite(total) || total <= 0) {
+    return { start: 0, end: 0, topPad: 0, bottomPad: 0 };
+  }
+  const count = Math.floor(total);
+  const h = Number.isFinite(rowHeight) && rowHeight > 0 ? rowHeight : DEFAULT_VIRTUAL_ROW_HEIGHT;
+  const vp = Number.isFinite(viewportHeight) && viewportHeight > 0 ? viewportHeight : 720;
+  const off = Number.isFinite(scrollOffset) && scrollOffset > 0 ? scrollOffset : 0;
+  const pad = Number.isFinite(overscan) && overscan > 0 ? Math.floor(overscan) : 0;
+
+  const firstVisible = Math.floor(off / h);
+  const visibleCount = Math.ceil(vp / h) + 1;
+  const start = Math.max(0, Math.min(count, firstVisible - pad));
+  const end = Math.max(start, Math.min(count, firstVisible + visibleCount + pad));
+  return {
+    start,
+    end,
+    topPad: Math.round(start * h),
+    bottomPad: Math.round((count - end) * h),
+  };
+}
+
+/**
+ * Computes the visible cell range and full-span top/bottom spacer heights for a uniform square-cell
+ * multi-column virtual grid. Spacer heights subtract one `rowGap` when non-zero because CSS Grid
+ * inserts `rowGap` between the spacer track and the adjacent cell row.
+ */
+export function computeVirtualGridWindow({
+  total,
+  columns = 3,
+  rowHeight = 124,
+  rowGap = 3,
+  scrollOffset = 0,
+  viewportHeight = 720,
+  overscanRows = 4,
+}) {
+  if (!Number.isFinite(total) || total <= 0) {
+    return {
+      startRow: 0,
+      endRow: 0,
+      startIndex: 0,
+      endIndex: 0,
+      topPad: 0,
+      bottomPad: 0,
+      totalHeight: 0,
+    };
+  }
+  const count = Math.floor(total);
+  const cols = Number.isFinite(columns) && columns >= 1 ? Math.floor(columns) : 3;
+  const cellH = Number.isFinite(rowHeight) && rowHeight > 0 ? rowHeight : 124;
+  const gap = Number.isFinite(rowGap) && rowGap >= 0 ? rowGap : 0;
+  const pitch = cellH + gap;
+  const vp = Number.isFinite(viewportHeight) && viewportHeight > 0 ? viewportHeight : 720;
+  const off = Number.isFinite(scrollOffset) && scrollOffset > 0 ? scrollOffset : 0;
+  const pad = Number.isFinite(overscanRows) && overscanRows >= 0 ? Math.floor(overscanRows) : 0;
+
+  const totalRows = Math.ceil(count / cols);
+  const totalHeight = Math.round(totalRows * cellH + Math.max(0, totalRows - 1) * gap);
+  const firstVisibleRow = Math.min(totalRows, Math.floor(off / pitch));
+  const visibleRows = Math.ceil((vp + gap) / pitch) + 1;
+  const startRow = Math.max(0, Math.min(totalRows, firstVisibleRow - pad));
+  const endRow = Math.max(startRow, Math.min(totalRows, firstVisibleRow + visibleRows + pad));
+
+  const topPad = startRow > 0 ? Math.max(0, Math.round(startRow * pitch - gap)) : 0;
+  const trailingRows = totalRows - endRow;
+  const bottomPad = trailingRows > 0 ? Math.max(0, Math.round(trailingRows * pitch - gap)) : 0;
+
+  return {
+    startRow,
+    endRow,
+    startIndex: Math.min(count, startRow * cols),
+    endIndex: Math.min(count, endRow * cols),
+    topPad,
+    bottomPad,
+    totalHeight,
+  };
+}
