@@ -7,44 +7,12 @@
 //    clipping, and shape-matched focus rings hold on icon, dismiss, resume, and swipe controls.
 
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import http from 'node:http';
-import path from 'node:path';
-import test from 'node:test';
-import { fileURLToPath } from 'node:url';
-import { chromium } from 'playwright-core';
-
-const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
-const UI_ROOT = path.resolve(TEST_DIR, '..');
-
-const MOCK_TEST_CSP =
-  "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self' blob: data:; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
-
-const MIME_BY_EXT = {
-  '.html': 'text/html; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.svg': 'image/svg+xml',
-  '.png': 'image/png',
-  '.webmanifest': 'application/manifest+json; charset=utf-8',
-};
-
-function findBrowser() {
-  if (process.env.LEGION_CHROME && fs.existsSync(process.env.LEGION_CHROME)) {
-    return process.env.LEGION_CHROME;
-  }
-  const candidates = [
-    '/usr/bin/chromium',
-    '/usr/bin/chromium-browser',
-    '/usr/bin/google-chrome',
-    '/usr/bin/google-chrome-stable',
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-  ];
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) return candidate;
-  }
-  throw new Error('No Chromium or Chrome binary found; set LEGION_CHROME.');
-}
+import {
+  browserTest,
+  launchBrowser,
+  startStaticUiServer,
+  waitForLayoutSettled,
+} from './browser-helpers.mjs';
 
 function buildButtonFixtureHtml() {
   const icon = (name) => `<svg aria-hidden="true"><use href="#i-${name}"></use></svg>`;
@@ -53,6 +21,7 @@ function buildButtonFixtureHtml() {
 <head>
   <meta charset="utf-8" />
   <title>UI Craft Button Fixture</title>
+  <link rel="icon" href="data:," />
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body style="padding:24px;display:grid;gap:14px;align-content:start;">
@@ -125,39 +94,20 @@ function buildButtonFixtureHtml() {
 </html>`;
 }
 
-async function startStaticUiServer() {
+function startCraftServer() {
   const fixtureHtml = buildButtonFixtureHtml();
-  const server = http.createServer((req, res) => {
-    const urlPath = (req.url || '/').split('?')[0];
-    if (urlPath === '/__craft-fixture') {
+  return startStaticUiServer({
+    extraHandler(req, res) {
+      const urlPath = (req.url || '/').split('?')[0];
+      if (urlPath !== '/__craft-fixture') return false;
       res.writeHead(200, {
         'Content-Type': 'text/html; charset=utf-8',
         'Cache-Control': 'no-store',
       });
       res.end(fixtureHtml);
-      return;
-    }
-    const rel = urlPath === '/' ? 'index.html' : urlPath.replace(/^\/+/, '');
-    const full = path.resolve(UI_ROOT, rel);
-    if (!full.startsWith(UI_ROOT) || !fs.existsSync(full) || fs.statSync(full).isDirectory()) {
-      res.writeHead(404);
-      res.end('Not found');
-      return;
-    }
-    const ext = path.extname(full).toLowerCase();
-    res.writeHead(200, {
-      'Content-Type': MIME_BY_EXT[ext] || 'application/octet-stream',
-      'Content-Security-Policy': MOCK_TEST_CSP,
-      'Cache-Control': 'no-store',
-    });
-    fs.createReadStream(full).pipe(res);
+      return true;
+    },
   });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const { port } = server.address();
-  return {
-    url: `http://127.0.0.1:${port}`,
-    stop: () => new Promise((resolve) => server.close(resolve)),
-  };
 }
 
 function parseScaleFromMatrix(transform) {
@@ -168,33 +118,71 @@ function parseScaleFromMatrix(transform) {
   return parts[0];
 }
 
-test('UI craft: every rendered icon across views resolves to a symbol in icons.js', async () => {
-  const server = await startStaticUiServer();
-  const browser = await chromium.launch({ executablePath: findBrowser(), headless: true });
+async function readButtonStyleNextFrame(locator, timeoutMs = 2_000) {
+  return locator.evaluate(
+    (el, timeout) =>
+      new Promise((resolve) => {
+        let done = false;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          const cs = getComputedStyle(el);
+          const bf = getComputedStyle(el, '::before');
+          resolve({
+            transform: cs.transform,
+            bg: cs.backgroundColor,
+            transitionDuration: cs.transitionDuration,
+            touchAction: cs.touchAction,
+            beforeOpacity: bf.opacity,
+            beforeBg: bf.backgroundColor,
+            beforeWidth: bf.width,
+            beforeHeight: bf.height,
+          });
+        };
+        const timer = setTimeout(finish, timeout);
+        requestAnimationFrame(finish);
+      }),
+    timeoutMs,
+  );
+}
+
+browserTest('UI craft: every rendered icon across views resolves to a symbol in icons.js', async (_t, tracker) => {
+  const server = await startCraftServer();
+  const browser = await launchBrowser();
   const consoleErrors = [];
   const pageErrors = [];
   try {
     const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, colorScheme: 'dark' });
-    const page = await ctx.newPage();
-    page.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    const page = tracker.attach(await ctx.newPage(), {
+      label: 'icons',
+      collectConsole: consoleErrors,
+      collectPage: pageErrors,
     });
-    page.on('pageerror', (err) => pageErrors.push(String(err)));
 
     const routes = [
-      '/?mock#/machines',
-      '/?mock#/files',
-      '/?mock#/files/tower/home',
-      '/?mock#/activity',
-      '/?mock#/settings',
-      '/?mock=tech#/actions',
+      { url: '/?mock#/machines', hashPrefix: '#/machines' },
+      { url: '/?mock#/files', hashPrefix: '#/files' },
+      { url: '/?mock#/files/tower/home', hashPrefix: '#/files/tower' },
+      { url: '/?mock#/activity', hashPrefix: '#/activity' },
+      { url: '/?mock#/settings', hashPrefix: '#/settings' },
+      { url: '/?mock=tech#/actions', hashPrefix: '#/actions' },
     ];
 
     const seenIcons = new Set();
-    for (const route of routes) {
+    for (const { url: route, hashPrefix } of routes) {
+      tracker.setStep(`navigate to ${route}`);
       await page.goto(`${server.url}${route}`, { waitUntil: 'domcontentloaded' });
-      await page.locator('svg.sprite symbol').first().waitFor({ state: 'attached', timeout: 5000 });
-      await page.waitForTimeout(180);
+      await tracker.waitForLocator(page.locator('svg.sprite symbol').first(), `icon sprite on ${route}`, {
+        state: 'attached',
+      });
+      await tracker.waitForFn(
+        page,
+        (prefix) => location.hash.startsWith(prefix) && document.querySelectorAll('svg use').length > 0,
+        hashPrefix,
+        `rendered view icons on ${route}`,
+      );
+      await waitForLayoutSettled(page, 2);
 
       const check = await page.evaluate(() => {
         const symbols = new Set(
@@ -231,13 +219,16 @@ test('UI craft: every rendered icon across views resolves to a symbol in icons.j
   }
 });
 
-test('UI craft: every button kind shows immediate press feedback within one frame, obeys reduced motion, and unifies disabled state', async () => {
-  const server = await startStaticUiServer();
-  const browser = await chromium.launch({ executablePath: findBrowser(), headless: true });
+browserTest(
+  'UI craft: every button kind shows immediate press feedback within one frame, obeys reduced motion, and unifies disabled state',
+  async (_t, tracker) => {
+  const server = await startCraftServer();
+  const browser = await launchBrowser();
   try {
     const ctx = await browser.newContext({ viewport: { width: 1024, height: 900 }, colorScheme: 'dark' });
-    const page = await ctx.newPage();
+    const page = tracker.attach(await ctx.newPage(), { label: 'buttons' });
     await page.goto(`${server.url}/__craft-fixture`, { waitUntil: 'load' });
+    await waitForLayoutSettled(page, 2);
 
     const kinds = await page.evaluate(() =>
       Array.from(document.querySelectorAll('[data-kind]')).map((el) => ({
@@ -248,10 +239,11 @@ test('UI craft: every button kind shows immediate press feedback within one fram
     assert.ok(kinds.length >= 20, `Expected every button kind in fixture, got ${kinds.length}`);
 
     for (const theme of ['dark', 'light']) {
+      tracker.setStep(`button press feedback (${theme})`);
       await page.evaluate((t) => {
         document.documentElement.dataset.theme = t;
       }, theme);
-      await page.waitForTimeout(40);
+      await waitForLayoutSettled(page, 2);
 
       for (const { kind, usesBefore } of kinds) {
         const loc = page.locator(`[data-kind="${kind}"]`);
@@ -272,27 +264,13 @@ test('UI craft: every button kind shows immediate press feedback within one fram
 
         await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
         await page.mouse.down();
-        // Wait exactly one animation frame to confirm press response arrives without lag.
-        const pressed = await loc.evaluate(
-          (el) =>
-            new Promise((resolve) =>
-              requestAnimationFrame(() => {
-                const cs = getComputedStyle(el);
-                const bf = getComputedStyle(el, '::before');
-                resolve({
-                  transform: cs.transform,
-                  bg: cs.backgroundColor,
-                  transitionDuration: cs.transitionDuration,
-                  touchAction: cs.touchAction,
-                  beforeOpacity: bf.opacity,
-                  beforeBg: bf.backgroundColor,
-                  beforeWidth: bf.width,
-                  beforeHeight: bf.height,
-                });
-              }),
-            ),
-        );
-        await page.mouse.up();
+        let pressed;
+        try {
+          // Wait one animation frame (with safety timeout) to confirm press response arrives without lag.
+          pressed = await readButtonStyleNextFrame(loc);
+        } finally {
+          await page.mouse.up();
+        }
 
         const scale = parseScaleFromMatrix(pressed.transform);
         assert.ok(
@@ -354,17 +332,12 @@ test('UI craft: every button kind shows immediate press feedback within one fram
 
         await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
         await page.mouse.down();
-        const pressed = await loc.evaluate(
-          (el) =>
-            new Promise((resolve) =>
-              requestAnimationFrame(() => {
-                const cs = getComputedStyle(el);
-                const bf = getComputedStyle(el, '::before');
-                resolve({ transform: cs.transform, bg: cs.backgroundColor, beforeOpacity: bf.opacity });
-              }),
-            ),
-        );
-        await page.mouse.up();
+        let pressed;
+        try {
+          pressed = await readButtonStyleNextFrame(loc);
+        } finally {
+          await page.mouse.up();
+        }
         assert.equal(pressed.transform, 'none', `${kind} (${theme}): disabled control must not scale on press`);
         assert.equal(pressed.bg, before.bg, `${kind} (${theme}): disabled control must not change fill on press`);
         if (usesBefore) {
@@ -378,10 +351,12 @@ test('UI craft: every button kind shows immediate press feedback within one fram
     }
 
     // Reduced motion: colour step stays, scale does not.
+    tracker.setStep('reduced-motion press feedback');
     await page.emulateMedia({ reducedMotion: 'reduce' });
     await page.evaluate(() => {
       document.documentElement.dataset.theme = 'dark';
     });
+    await waitForLayoutSettled(page, 2);
     for (const kind of ['btn', 'btn-primary', 'btn-icon', 'chip-btn', 'tabs-btn', 'swipe-danger', 'update-note-dismiss']) {
       const loc = page.locator(`[data-kind="${kind}"]`);
       const usesBefore = (await loc.getAttribute('data-uses-before')) === '1';
@@ -393,19 +368,12 @@ test('UI craft: every button kind shows immediate press feedback within one fram
       }));
       await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
       await page.mouse.down();
-      const pressed = await loc.evaluate(
-        (el) =>
-          new Promise((resolve) =>
-            requestAnimationFrame(() =>
-              resolve({
-                transform: getComputedStyle(el).transform,
-                bg: getComputedStyle(el).backgroundColor,
-                beforeOpacity: getComputedStyle(el, '::before').opacity,
-              }),
-            ),
-          ),
-      );
-      await page.mouse.up();
+      let pressed;
+      try {
+        pressed = await readButtonStyleNextFrame(loc);
+      } finally {
+        await page.mouse.up();
+      }
       assert.equal(
         pressed.transform,
         'none',
@@ -426,22 +394,28 @@ test('UI craft: every button kind shows immediate press feedback within one fram
       }
     }
 
+    assert.deepEqual(tracker.consoleErrors, [], `Unexpected console errors: ${tracker.consoleErrors.join('; ')}`);
+    assert.deepEqual(tracker.pageErrors, [], `Unexpected page errors: ${tracker.pageErrors.join('; ')}`);
     await ctx.close();
   } finally {
     await browser.close();
     await server.stop();
   }
-});
+  },
+);
 
-test('UI craft: focus rings on .tabs and .filters fit fully inside their scroll containers and follow element shapes', async () => {
-  const server = await startStaticUiServer();
-  const browser = await chromium.launch({ executablePath: findBrowser(), headless: true });
+browserTest(
+  'UI craft: focus rings on .tabs and .filters fit fully inside their scroll containers and follow element shapes',
+  async (_t, tracker) => {
+  const server = await startCraftServer();
+  const browser = await launchBrowser();
   try {
     // 1. Live wide split view: .split-tools .tabs
     const wideCtx = await browser.newContext({ viewport: { width: 1280, height: 800 }, colorScheme: 'dark' });
-    const widePage = await wideCtx.newPage();
+    const widePage = tracker.attach(await wideCtx.newPage(), { label: 'wide-focus' });
     await widePage.goto(`${server.url}/?mock#/machines`, { waitUntil: 'domcontentloaded' });
-    await widePage.locator('.split-tools .tabs button').first().waitFor({ timeout: 5000 });
+    await tracker.waitForLocator(widePage.locator('.split-tools .tabs button').first(), 'split .tabs button');
+    await waitForLayoutSettled(widePage, 2);
 
     const wideTabsCheck = await widePage.evaluate(() => {
       const container = document.querySelector('.split-tools .tabs');
@@ -484,11 +458,12 @@ test('UI craft: focus rings on .tabs and .filters fit fully inside their scroll 
 
     // 2. Live phone view: .filters in Files search
     const phoneCtx = await browser.newContext({ viewport: { width: 390, height: 844 }, colorScheme: 'dark' });
-    const phonePage = await phoneCtx.newPage();
+    const phonePage = tracker.attach(await phoneCtx.newPage(), { label: 'phone-focus' });
     await phonePage.goto(`${server.url}/?mock#/files/tower/home`, { waitUntil: 'domcontentloaded' });
-    await phonePage.locator('input[type="search"]').first().waitFor({ timeout: 5000 });
+    await tracker.waitForLocator(phonePage.locator('input[type="search"]').first(), 'Files search input');
     await phonePage.locator('input[type="search"]').first().fill('a');
-    await phonePage.locator('.filters button').first().waitFor({ timeout: 5000 });
+    await tracker.waitForLocator(phonePage.locator('.filters button').first(), 'Files search filter button');
+    await waitForLayoutSettled(phonePage, 2);
 
     const filtersCheck = await phonePage.evaluate(() => {
       const container = document.querySelector('.filters');
@@ -526,6 +501,7 @@ test('UI craft: focus rings on .tabs and .filters fit fully inside their scroll 
 
     // 3. Shape-matched focus rings on fixture: .tabs, .filters, .player-resume-btn, .update-note-dismiss, .btn.icon, .swipe-action
     await phonePage.goto(`${server.url}/__craft-fixture`, { waitUntil: 'load' });
+    await waitForLayoutSettled(phonePage, 2);
     const shapeCheck = await phonePage.evaluate(() => {
       const inspect = (sel) => {
         const el = document.querySelector(sel);
@@ -574,9 +550,12 @@ test('UI craft: focus rings on .tabs and .filters fit fully inside their scroll 
     assert.ok(shapeCheck.swipeDanger.outlineWidth >= 2 && shapeCheck.swipeDanger.outlineOffset < 0, '.swipe-action focus ring must be a full inset >= 2px ring');
     assert.ok(shapeCheck.swipeAccent.outlineWidth >= 2 && shapeCheck.swipeAccent.outlineOffset < 0 && shapeCheck.swipeAccent.boxShadow !== 'none', '.swipe-action.accent focus ring must keep inset contrast band');
 
+    assert.deepEqual(tracker.consoleErrors, [], `Unexpected console errors: ${tracker.consoleErrors.join('; ')}`);
+    assert.deepEqual(tracker.pageErrors, [], `Unexpected page errors: ${tracker.pageErrors.join('; ')}`);
     await phoneCtx.close();
   } finally {
     await browser.close();
     await server.stop();
   }
-});
+  },
+);

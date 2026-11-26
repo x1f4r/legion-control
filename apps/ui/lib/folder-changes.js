@@ -188,6 +188,11 @@ export function createFolderChangesStore({
     }
   }
 
+  function getHome(machine) {
+    const m = String(machine || '');
+    return (m && homeByMachine.get(m)) || null;
+  }
+
   function emitEvent(event) {
     for (const sub of Array.from(listeners)) {
       if (sub.machine !== event.machine) continue;
@@ -503,6 +508,7 @@ export function createFolderChangesStore({
 
   return {
     registerHome,
+    getHome,
     canonicalize,
     changed,
     subscribe,

@@ -194,6 +194,15 @@ fn compare_natural_chunks(a: NaturalChunk<'_>, b: NaturalChunk<'_>) -> Ordering 
 }
 
 fn compare_text_case_insensitive(a: &str, b: &str) -> Ordering {
+    if a.is_ascii() && b.is_ascii() {
+        for (&ba, &bb) in a.as_bytes().iter().zip(b.as_bytes().iter()) {
+            let ord = ba.to_ascii_lowercase().cmp(&bb.to_ascii_lowercase());
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        return a.len().cmp(&b.len());
+    }
     let mut ca = a.chars().flat_map(char::to_lowercase);
     let mut cb = b.chars().flat_map(char::to_lowercase);
     loop {
@@ -514,6 +523,11 @@ impl OwnDirFilter {
     /// Whether `path` refers to Legion's own directories or a refused secret location.
     pub(crate) fn is_blocked(&self, path: &Path) -> bool {
         self.inner.is_blocked(path)
+    }
+
+    /// Whether this filter has no protected locations to skip and no fail-closed condition.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.inner.is_empty()
     }
 
     #[cfg(test)]

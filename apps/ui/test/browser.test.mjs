@@ -3,15 +3,25 @@
 // fleet reached through a local `command = [...]` pipe, verifying zero console/CSP errors.
 
 import assert from 'node:assert/strict';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import readline from 'node:readline';
-import test from 'node:test';
-import { fileURLToPath } from 'node:url';
 import zlib from 'node:zlib';
-import { chromium } from 'playwright-core';
+import {
+  browserTest,
+  launchBrowser,
+  LEGION_BIN,
+  playAndWaitForTime,
+  REPO_ROOT,
+  seekAndWait,
+  setTheme,
+  startLegionServer,
+  TEST_DIR,
+  waitForImageLoaded,
+  waitForLayoutSettled,
+  waitForMediaReady,
+} from './browser-helpers.mjs';
 import './files-browser.mjs';
 import './live-refresh-browser.mjs';
 import './long-names-browser.mjs';
@@ -20,29 +30,7 @@ import './player-browser.mjs';
 import './split-view-browser.mjs';
 import './ui-craft-browser.mjs';
 
-const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = path.resolve(TEST_DIR, '..', '..', '..');
-const LEGION_BIN =
-  process.env.LEGION_BIN ||
-  path.join(REPO_ROOT, 'target', 'release', process.platform === 'win32' ? 'legion.exe' : 'legion');
 const SHOTS_DIR = process.env.LEGION_UI_SHOTS_DIR || '';
-
-function findBrowser() {
-  if (process.env.LEGION_CHROME && fs.existsSync(process.env.LEGION_CHROME)) {
-    return process.env.LEGION_CHROME;
-  }
-  const candidates = [
-    '/usr/bin/chromium',
-    '/usr/bin/chromium-browser',
-    '/usr/bin/google-chrome',
-    '/usr/bin/google-chrome-stable',
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-  ];
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) return candidate;
-  }
-  throw new Error('No Chromium or Chrome binary found; set LEGION_CHROME.');
-}
 
 function makeWorkRoot() {
   const base =
@@ -61,57 +49,8 @@ function runLegion(args, legionHome, userHome) {
   return execFileSync(LEGION_BIN, args, { env, encoding: 'utf8' });
 }
 
-async function startServer(legionHome, userHome, options = {}) {
-  const { listen = '127.0.0.1:0', envExtra = {} } = options;
-  const env = {
-    ...process.env,
-    ...envExtra,
-    LEGION_HOME: legionHome,
-    HOME: userHome,
-    USERPROFILE: userHome,
-  };
-  delete env.XDG_CONFIG_HOME;
-  delete env.XDG_STATE_HOME;
-  const child = spawn(LEGION_BIN, ['serve', '--listen', listen], {
-    env,
-    stdio: ['ignore', 'ignore', 'pipe'],
-  });
-  let stderr = '';
-  const url = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new Error(`legion serve did not announce its port. stderr:\n${stderr}`));
-    }, 15_000);
-    const rl = readline.createInterface({ input: child.stderr });
-    rl.on('line', (line) => {
-      stderr += `${line}\n`;
-      const prefix = 'legion serve: listening on ';
-      if (line.startsWith(prefix)) {
-        clearTimeout(timer);
-        resolve(line.slice(prefix.length).trim());
-      }
-    });
-    child.once('exit', (code) => {
-      clearTimeout(timer);
-      reject(new Error(`legion serve exited early (${code}). stderr:\n${stderr}`));
-    });
-  });
-
-  async function stop() {
-    if (child.exitCode !== null) return;
-    child.kill('SIGTERM');
-    await new Promise((resolve) => {
-      const t = setTimeout(() => {
-        child.kill('SIGKILL');
-        resolve();
-      }, 8000);
-      child.once('exit', () => {
-        clearTimeout(t);
-        resolve();
-      });
-    });
-  }
-
-  return { url, stop, getStderr: () => stderr };
+function startServer(legionHome, userHome, options = {}) {
+  return startLegionServer(legionHome, userHome, options);
 }
 
 function setupFleet(root) {
@@ -184,17 +123,6 @@ function setupFleet(root) {
   return { towerHome, towerUser, piHome, piUser, token: tokenOut.token };
 }
 
-async function setTheme(page, theme) {
-  await page.evaluate((t) => {
-    const raw = localStorage.getItem('legion.settings.v1');
-    const obj = raw ? JSON.parse(raw) : {};
-    obj.theme = t;
-    localStorage.setItem('legion.settings.v1', JSON.stringify(obj));
-    document.documentElement.dataset.theme = t;
-  }, theme);
-  await page.waitForTimeout(80);
-}
-
 async function dispatchSwipe(page, selector, { startX, startY, endX, endY }) {
   await page.evaluate(
     ({ sel, sx, sy, ex, ey }) => {
@@ -215,7 +143,7 @@ async function dispatchSwipe(page, selector, { startX, startY, endX, endY }) {
     },
     { sel: selector, sx: startX, sy: startY, ex: endX, ey: endY },
   );
-  await page.waitForTimeout(120);
+  await waitForLayoutSettled(page, 2);
 }
 
 const CATALOG_TOOL_RE =
@@ -233,31 +161,32 @@ async function maybeShot(page, name) {
   await page.screenshot({ path: path.join(SHOTS_DIR, `${name}.png`) });
 }
 
-test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x720)', async () => {
-  assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
-  const root = makeWorkRoot();
-  const fleet = setupFleet(root);
-  const server = await startServer(fleet.towerHome, fleet.towerUser);
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu'],
-  });
+browserTest(
+  'real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x720)',
+  { timeout: 150_000 },
+  async (_t, tracker) => {
+    assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
+    const root = makeWorkRoot();
+    const fleet = setupFleet(root);
+    const server = await startServer(fleet.towerHome, fleet.towerUser);
+    tracker.setServerStderr(server.getStderr);
+    const browser = await launchBrowser();
 
-  const consoleErrors = [];
-  const pageErrors = [];
+    const consoleErrors = [];
+    const pageErrors = [];
 
-  try {
-    // ── Phone viewport (390x844) ───────────────────────────────────────────────────────────────
-    const phoneCtx = await browser.newContext({
-      viewport: { width: 390, height: 844 },
-      colorScheme: 'dark',
-    });
-    const page = await phoneCtx.newPage();
-    page.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
-    });
-    page.on('pageerror', (err) => pageErrors.push(String(err)));
+    try {
+      // ── Phone viewport (390x844) ───────────────────────────────────────────────────────────────
+      tracker.setStep('phone viewport real serve login and navigation');
+      const phoneCtx = await browser.newContext({
+        viewport: { width: 390, height: 844 },
+        colorScheme: 'dark',
+      });
+      const page = tracker.attach(await phoneCtx.newPage(), {
+        label: 'real-phone',
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
 
     await page.goto(server.url, { waitUntil: 'domcontentloaded' });
     await page.getByRole('heading', { name: /Connect this browser to tower/ }).waitFor();
@@ -379,10 +308,11 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
     await page.locator('.viewer-bar button', { hasText: 'Send to' }).click();
     const realSendSheet = page.locator('.sheet');
     await realSendSheet.waitFor();
-    await page.waitForFunction(
+    await tracker.waitForFn(
+      page,
       () => document.activeElement?.classList?.contains('sheet'),
       null,
-      { timeout: 3000 },
+      'real Send to sheet focus',
     );
     await realSendSheet.getByRole('button', { name: 'Copy to pi' }).waitFor();
     assert.equal(
@@ -547,15 +477,16 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
     await phoneCtx.close();
 
     // ── Wide desktop viewport (1100x720) ───────────────────────────────────────────────────────
+    tracker.setStep('wide desktop real serve login and navigation');
     const wideCtx = await browser.newContext({
       viewport: { width: 1100, height: 720 },
       colorScheme: 'dark',
     });
-    const wide = await wideCtx.newPage();
-    wide.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    const wide = tracker.attach(await wideCtx.newPage(), {
+      label: 'real-wide',
+      collectConsole: consoleErrors,
+      collectPage: pageErrors,
     });
-    wide.on('pageerror', (err) => pageErrors.push(String(err)));
 
     // One-time #token= URL fragment login removes the token from the address bar immediately.
     await wide.goto(`${server.url}/#token=${encodeURIComponent(fleet.token)}`, {
@@ -597,12 +528,13 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
       : [['phone', { width: 390, height: 844 }]];
 
     for (const [label, viewport] of mockViewports) {
+      tracker.setStep(`mock mode checks (${label})`);
       const ctx = await browser.newContext({ viewport, colorScheme: 'dark' });
-      const p = await ctx.newPage();
-      p.on('console', (msg) => {
-        if (msg.type() === 'error') consoleErrors.push(msg.text());
+      const p = tracker.attach(await ctx.newPage(), {
+        label: `mock-${label}`,
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
       });
-      p.on('pageerror', (err) => pageErrors.push(String(err)));
 
       // Default mock: 3 on, 2 off (laptop with "Last on 14 days ago" + Wake, nas with "Off" & no Wake).
       await p.goto(`${server.url}/?mock`, { waitUntil: 'domcontentloaded' });
@@ -766,13 +698,14 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
       // Mock pairing start screen.
       await p.goto(`${server.url}/?mock=pair`, { waitUntil: 'domcontentloaded' });
       await p.getByRole('heading', { name: 'Pair this device' }).waitFor();
-      await p.waitForFunction(
+      await tracker.waitForFn(
+        p,
         () => {
           const el = document.querySelector('label.field input');
           return el && el.value === 'Pixel 10';
         },
         null,
-        { timeout: 5000 },
+        'pair screen prefilled device name Pixel 10',
       );
       await maybeShot(p, `mock-${label}-dark-start-pair`);
 
@@ -820,139 +753,173 @@ test('real legion serve v2 UI end-to-end on phone (390x844) and desktop (1100x72
   }
 });
 
-test('fast start with an offline dual-boot machine paints immediately and keeps known-off machines calm on reload', async () => {
-  assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
-  const root = makeWorkRoot();
-  const fleet = setupFleet(root);
+browserTest(
+  'fast start with an offline dual-boot machine paints immediately and keeps known-off machines calm on reload',
+  { timeout: 120_000 },
+  async (_t, tracker) => {
+    assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
+    const root = makeWorkRoot();
+    const fleet = setupFleet(root);
 
-  const hangCmd = [process.execPath, '-e', 'setInterval(() => {}, 60000)'];
-  fs.appendFileSync(
-    path.join(fleet.towerHome, 'config', 'fleet.toml'),
-    [
-      '',
-      '[machines.dead]',
-      '[[machines.dead.systems]]',
-      'name = "linux"',
-      `command = ${JSON.stringify(hangCmd)}`,
-      '[[machines.dead.systems]]',
-      'name = "windows"',
-      `command = ${JSON.stringify(hangCmd)}`,
-      '',
-    ].join('\n'),
-  );
-
-  const server = await startServer(fleet.towerHome, fleet.towerUser);
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu'],
-  });
-
-  const consoleErrors = [];
-  const pageErrors = [];
-
-  try {
-    const ctx = await browser.newContext({
-      viewport: { width: 390, height: 844 },
-      colorScheme: 'dark',
-    });
-    const page = await ctx.newPage();
-    page.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
-    });
-    page.on('pageerror', (err) => pageErrors.push(String(err)));
-
-    await page.goto(server.url, { waitUntil: 'domcontentloaded' });
-    await page.getByLabel('Token', { exact: true }).fill(fleet.token);
-
-    const tClick = performance.now();
-    await page.getByRole('button', { name: 'Connect' }).click();
-
-    // This node paints immediately (under 2s).
-    await page.locator('a.machine', { hasText: 'tower' }).waitFor({ timeout: 2000 });
-    const tTower = Math.round(performance.now() - tClick);
-    assert.ok(tTower < 2000, `tower took ${tTower} ms to appear`);
-
-    // Never-seen dead machine appears briefly as Checking… while pi answers on its own.
-    await page.locator('.machine.asking', { hasText: 'dead' }).waitFor({ timeout: 2000 });
-    await page.locator('a.machine', { hasText: 'pi' }).waitFor({ timeout: 2000 });
-
-    // Full list settles to "2 are on, 1 is off" with dead calmly under Off.
-    const deadRow = page.locator('.machine.off', { hasText: 'dead' });
-    await deadRow.waitFor({ timeout: 10_000 });
-    await page.getByText('2 are on, 1 is off').waitFor({ timeout: 5000 });
-    const deadRowText = await deadRow.innerText();
-    assert.match(deadRowText, /Off/);
-    assert.ok(
-      !deadRowText.includes("None of dead's systems answered"),
-      `raw dual-boot error leaked into list row: ${deadRowText}`,
+    const hangCmd = [process.execPath, '-e', 'setInterval(() => {}, 60000)'];
+    fs.appendFileSync(
+      path.join(fleet.towerHome, 'config', 'fleet.toml'),
+      [
+        '',
+        '[machines.dead]',
+        '[[machines.dead.systems]]',
+        'name = "linux"',
+        `command = ${JSON.stringify(hangCmd)}`,
+        '[[machines.dead.systems]]',
+        'name = "windows"',
+        `command = ${JSON.stringify(hangCmd)}`,
+        '',
+      ].join('\n'),
     );
 
-    // Persistent cache stores non-secret machine metadata (no token).
-    const cachedRaw = await page.evaluate(() => localStorage.getItem('legion.cache.fleet'));
-    assert.ok(cachedRaw, 'expected legion.cache.fleet in localStorage');
-    assert.ok(!cachedRaw.includes(fleet.token), 'token must never be written to fleet cache');
-    const cached = JSON.parse(cachedRaw);
-    assert.equal(cached.value.node, 'tower');
-    assert.equal(cached.value.machines.length, 3);
+    const server = await startServer(fleet.towerHome, fleet.towerUser);
+    tracker.setServerStderr(server.getStderr);
+    const browser = await launchBrowser();
 
-    // Return visit keeps known-off `dead` calmly under Off (NEVER flips it back to Checking…).
-    const tReload0 = performance.now();
-    await page.reload({ waitUntil: 'domcontentloaded' });
-    await page.locator('.machine.off', { hasText: 'dead' }).waitFor({ timeout: 2000 });
-    assert.equal(
-      await page.locator('.machine.asking', { hasText: 'dead' }).count(),
-      0,
-      'Known-off machine must not flip back to asking/checking on reload',
-    );
-    const tReload = Math.round(performance.now() - tReload0);
-    assert.ok(tReload < 2000, `Cached return paint took ${tReload} ms`);
+    const consoleErrors = [];
+    const pageErrors = [];
 
-    // Forgetting this browser via Settings -> This browser clears the persistent fleet cache too.
-    await page.locator('header.top a[aria-label="Settings"]').click();
-    await page.locator('a.row', { hasText: 'This browser' }).click();
-    await page.getByRole('button', { name: 'Forget this browser' }).click();
-    const dialog = page.getByRole('dialog');
-    await dialog.waitFor();
-    await dialog.getByRole('button', { name: 'Forget this browser' }).click();
-    await page.getByRole('heading', { name: /Connect this browser to tower/ }).waitFor({ timeout: 5000 });
-    const afterForget = await page.evaluate(() => localStorage.getItem('legion.cache.fleet'));
-    assert.equal(afterForget, null, 'fleet cache should be cleared on forget');
+    try {
+      const ctx = await browser.newContext({
+        viewport: { width: 390, height: 844 },
+        colorScheme: 'dark',
+      });
+      const page = tracker.attach(await ctx.newPage(), {
+        label: 'fast-start',
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
 
-    await ctx.close();
-    assert.deepEqual(pageErrors, [], `Uncaught page errors: ${pageErrors.join('\n')}`);
-    assert.deepEqual(consoleErrors, [], `Console/CSP errors: ${consoleErrors.join('\n')}`);
-  } finally {
-    await browser.close();
-    await server.stop();
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
+      tracker.setStep('connect and verify progressive paint before dead dual-boot probe times out');
+      await page.goto(server.url, { waitUntil: 'domcontentloaded' });
+      await page.getByLabel('Token', { exact: true }).fill(fleet.token);
 
-test('fleet connections routes, identity-change acceptance, pairing sync notice, and role invite delivery', async () => {
-  assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
-  const root = makeWorkRoot();
-  const fleet = setupFleet(root);
-  const server = await startServer(fleet.towerHome, fleet.towerUser);
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu'],
-  });
+      await page.getByRole('button', { name: 'Connect' }).click();
 
-  const consoleErrors = [];
-  const pageErrors = [];
+      // This node paints immediately while the never-seen offline machine `dead` is still being probed.
+      await tracker.waitForLocator(page.locator('a.machine', { hasText: 'tower' }), 'tower machine card');
+      await tracker.waitForLocator(
+        page.locator('.machine.asking', { hasText: 'dead' }),
+        'dead machine shown as Checking while probing',
+      );
+      assert.equal(
+        await page.locator('.machine.off', { hasText: 'dead' }).count(),
+        0,
+        'tower must paint before the hung dual-boot probe settles dead to Off',
+      );
+      await tracker.waitForLocator(page.locator('a.machine', { hasText: 'pi' }), 'pi machine card');
 
-  try {
-    const ctx = await browser.newContext({
-      viewport: { width: 390, height: 844 },
-      colorScheme: 'dark',
-    });
-    const p = await ctx.newPage();
-    p.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
-    });
-    p.on('pageerror', (err) => pageErrors.push(String(err)));
+      // Full list settles to "2 are on, 1 is off" with dead calmly under Off.
+      tracker.setStep('wait for dead machine to settle to Off');
+      const deadRow = page.locator('.machine.off', { hasText: 'dead' });
+      await tracker.waitForLocator(deadRow, 'dead machine settled to Off', { timeout: 20_000 });
+      await tracker.waitForLocator(page.getByText('2 are on, 1 is off'), '2 are on, 1 is off summary');
+      const deadRowText = await deadRow.innerText();
+      assert.match(deadRowText, /Off/);
+      assert.ok(
+        !deadRowText.includes("None of dead's systems answered"),
+        `raw dual-boot error leaked into list row: ${deadRowText}`,
+      );
+
+      // Persistent cache stores non-secret machine metadata (no token).
+      const cachedRaw = await page.evaluate(() => localStorage.getItem('legion.cache.fleet'));
+      assert.ok(cachedRaw, 'expected legion.cache.fleet in localStorage');
+      assert.ok(!cachedRaw.includes(fleet.token), 'token must never be written to fleet cache');
+      const cached = JSON.parse(cachedRaw);
+      assert.equal(cached.value.node, 'tower');
+      assert.equal(cached.value.machines.length, 3);
+
+      // Return visit keeps known-off `dead` calmly under Off (NEVER flips it back to Checking…).
+      // Observe every DOM mutation from document start across reload rather than relying on a wall-clock race.
+      tracker.setStep('reload and verify dead never flashes Checking');
+      await page.addInitScript(() => {
+        window.__SAW_DEAD_ASKING__ = false;
+        const scan = () => {
+          for (const el of document.querySelectorAll('.machine.asking')) {
+            if (el.textContent?.includes('dead')) {
+              window.__SAW_DEAD_ASKING__ = true;
+            }
+          }
+        };
+        const obs = new MutationObserver(scan);
+        if (document.documentElement) {
+          obs.observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
+        } else {
+          document.addEventListener('DOMContentLoaded', () => {
+            scan();
+            obs.observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
+          });
+        }
+      });
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await tracker.waitForLocator(page.locator('.machine.off', { hasText: 'dead' }), 'cached dead row under Off after reload');
+      await waitForLayoutSettled(page, 2);
+      assert.equal(
+        await page.evaluate(() => Boolean(window.__SAW_DEAD_ASKING__)),
+        false,
+        'Known-off machine must never flip back to asking/checking on reload',
+      );
+      assert.equal(
+        await page.locator('.machine.asking', { hasText: 'dead' }).count(),
+        0,
+        'Known-off machine must not flip back to asking/checking on reload',
+      );
+
+      // Forgetting this browser via Settings -> This browser clears the persistent fleet cache too.
+      tracker.setStep('forget browser clears fleet cache');
+      await page.locator('header.top a[aria-label="Settings"]').click();
+      await page.locator('a.row', { hasText: 'This browser' }).click();
+      await page.getByRole('button', { name: 'Forget this browser' }).click();
+      const dialog = page.getByRole('dialog');
+      await dialog.waitFor();
+      await dialog.getByRole('button', { name: 'Forget this browser' }).click();
+      await tracker.waitForLocator(
+        page.getByRole('heading', { name: /Connect this browser to tower/ }),
+        'Connect screen after Forget this browser',
+      );
+      const afterForget = await page.evaluate(() => localStorage.getItem('legion.cache.fleet'));
+      assert.equal(afterForget, null, 'fleet cache should be cleared on forget');
+
+      await ctx.close();
+      assert.deepEqual(pageErrors, [], `Uncaught page errors: ${pageErrors.join('\n')}`);
+      assert.deepEqual(consoleErrors, [], `Console/CSP errors: ${consoleErrors.join('\n')}`);
+    } finally {
+      await browser.close();
+      await server.stop();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+browserTest(
+  'fleet connections routes, identity-change acceptance, pairing sync notice, and role invite delivery',
+  { timeout: 120_000 },
+  async (_t, tracker) => {
+    assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
+    const root = makeWorkRoot();
+    const fleet = setupFleet(root);
+    const server = await startServer(fleet.towerHome, fleet.towerUser);
+    tracker.setServerStderr(server.getStderr);
+    const browser = await launchBrowser();
+
+    const consoleErrors = [];
+    const pageErrors = [];
+
+    try {
+      const ctx = await browser.newContext({
+        viewport: { width: 390, height: 844 },
+        colorScheme: 'dark',
+      });
+      const p = tracker.attach(await ctx.newPage(), {
+        label: 'fleet-connections',
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
 
     // 1. Pairing from StartView shows plain fleet sync summary on Machines ONLY (not repeated on Connections).
     await p.goto(`${server.url}/?mock=pair`, { waitUntil: 'domcontentloaded' });
@@ -1235,280 +1202,320 @@ test('fleet connections routes, identity-change acceptance, pairing sync notice,
   }
 });
 
-test('content URLs isolate HTML and SVG from the interface origin and allow <video> seeking', async () => {
-  assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
-  const sampleVideo = path.join(TEST_DIR, 'fixtures', 'sample.webm');
-  assert.ok(fs.existsSync(sampleVideo), `Sample video fixture not found at ${sampleVideo}`);
+browserTest(
+  'content URLs isolate HTML and SVG from the interface origin and allow <video> seeking',
+  { timeout: 120_000 },
+  async (_t, tracker) => {
+    assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
+    const sampleVideo = path.join(TEST_DIR, 'fixtures', 'sample.webm');
+    assert.ok(fs.existsSync(sampleVideo), `Sample video fixture not found at ${sampleVideo}`);
 
-  const root = makeWorkRoot();
-  const fleet = setupFleet(root);
-  const docsDir = path.join(fleet.towerUser, 'docs');
+    const root = makeWorkRoot();
+    const fleet = setupFleet(root);
+    const docsDir = path.join(fleet.towerUser, 'docs');
 
-  // Craft adversarial HTML and SVG files that try to read localStorage (token), mutate storage,
-  // access window.parent, and postMessage back to the interface origin.
-  fs.writeFileSync(
-    path.join(docsDir, 'xss.html'),
-    [
-      '<!doctype html>',
-      '<html><body><script>',
-      'window.__xss = true;',
-      'try { localStorage.setItem("pwn_html", localStorage.getItem("legion.token") || "ran"); } catch (e) {}',
-      'try { window.parent.postMessage({ pwn: "html", token: localStorage.getItem("legion.token") }, "*"); } catch (e) {}',
-      'try { window.parent.__pwned_html = true; } catch (e) {}',
-      '</script><p>malicious html</p></body></html>',
-    ].join('\n'),
-  );
-  fs.writeFileSync(
-    path.join(docsDir, 'xss.svg'),
-    [
-      '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" onload="window.__xss=true;try{localStorage.setItem(\'pwn_svg\',\'1\')}catch(e){}try{window.parent.__pwned_svg=true}catch(e){}try{window.parent.postMessage({pwn:\'svg\'},\'*\')}catch(e){}">',
-      '<rect width="64" height="64" fill="#16a34a"/>',
-      '<script>window.__xss=true;try{localStorage.setItem("pwn_svg_script",localStorage.getItem("legion.token")||"ran")}catch(e){}try{window.parent.__pwned_svg=true}catch(e){}try{window.parent.postMessage({pwn:"svg-script"},"*")}catch(e){}</script>',
-      '</svg>',
-    ].join('\n'),
-  );
-  fs.writeFileSync(
-    path.join(docsDir, 'doc.pdf'),
-    '%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n%%EOF\n',
-  );
-  fs.copyFileSync(sampleVideo, path.join(docsDir, 'sample.webm'));
-
-  const server = await startServer(fleet.towerHome, fleet.towerUser);
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu'],
-  });
-
-  const uiConsoleErrors = [];
-  const uiPageErrors = [];
-
-  try {
-    const ctx = await browser.newContext({
-      viewport: { width: 1100, height: 720 },
-      colorScheme: 'dark',
-    });
-
-    // 1. Connect the real Legion interface page so localStorage holds the live bearer token.
-    const uiPage = await ctx.newPage();
-    uiPage.on('console', (msg) => {
-      if (msg.type() === 'error') uiConsoleErrors.push(msg.text());
-    });
-    uiPage.on('pageerror', (err) => uiPageErrors.push(String(err)));
-
-    await uiPage.goto(`${server.url}/#token=${encodeURIComponent(fleet.token)}`, {
-      waitUntil: 'domcontentloaded',
-    });
-    await uiPage.locator('.split-left .split-label-fact', { hasText: /^2$/ }).waitFor({ timeout: 15_000 });
-    const storedToken = await uiPage.evaluate(() => localStorage.getItem('legion.token'));
-    assert.equal(storedToken, fleet.token, 'expected live token in interface localStorage');
-
-    // Mint content URLs through the UI's own createHttpLink().contentUrl helper.
-    const urls = await uiPage.evaluate(async () => {
-      const { createHttpLink } = await import('/link/http.js');
-      const link = createHttpLink();
-      const [html, svg, pdf, video] = await Promise.all([
-        link.contentUrl({ path: '~/docs/xss.html' }),
-        link.contentUrl({ path: '~/docs/xss.svg' }),
-        link.contentUrl({ path: '~/docs/doc.pdf' }),
-        link.contentUrl({ path: '~/docs/sample.webm' }),
-      ]);
-      return { html, svg, pdf, video };
-    });
-    assert.match(urls.html.url, /^\/v1\/content\/[^/]+\/xss\.html$/);
-    assert.match(urls.svg.url, /^\/v1\/content\/[^/]+\/xss\.svg$/);
-    assert.match(urls.pdf.url, /^\/v1\/content\/[^/]+\/doc\.pdf$/);
-    assert.match(urls.video.url, /^\/v1\/content\/[^/]+\/sample\.webm$/);
-
-    // 2. Verify <video> seeking and <img> loading directly on the real Legion UI page
-    //    (proving the UI CSP's `img-src 'self'` and `media-src 'self'` allow them with zero errors).
-    const rangeStatuses = [];
-    uiPage.on('response', (res) => {
-      if (res.url().endsWith('/sample.webm')) {
-        rangeStatuses.push(res.status());
-      }
-    });
-
-    const mediaResult = await uiPage.evaluate(async ({ videoUrl, svgUrl }) => {
-      const img = document.createElement('img');
-      img.src = svgUrl;
-      document.body.appendChild(img);
-      await new Promise((resolve, reject) => {
-        img.addEventListener('load', resolve, { once: true });
-        img.addEventListener('error', () => reject(new Error('img failed to load')), { once: true });
-      });
-
-      const video = document.createElement('video');
-      video.muted = true;
-      video.preload = 'auto';
-      video.src = videoUrl;
-      document.body.appendChild(video);
-
-      await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error('timed out waiting for loadeddata')), 10_000);
-        video.addEventListener(
-          'loadeddata',
-          () => {
-            clearTimeout(timer);
-            resolve();
-          },
-          { once: true },
-        );
-        video.addEventListener(
-          'error',
-          () => {
-            clearTimeout(timer);
-            reject(new Error(`video error code=${video.error?.code}`));
-          },
-          { once: true },
-        );
-      });
-
-      const initialDuration = video.duration;
-      const initialWidth = video.videoWidth;
-      const initialHeight = video.videoHeight;
-
-      const seekDone = new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error('timed out waiting for seeked')), 10_000);
-        video.addEventListener(
-          'seeked',
-          () => {
-            clearTimeout(timer);
-            resolve();
-          },
-          { once: true },
-        );
-        video.addEventListener(
-          'error',
-          () => {
-            clearTimeout(timer);
-            reject(new Error(`video seek error code=${video.error?.code}`));
-          },
-          { once: true },
-        );
-      });
-      video.currentTime = 1.5;
-      await seekDone;
-
-      return {
-        imgLoaded: img.complete && img.naturalWidth > 0,
-        duration: initialDuration,
-        width: initialWidth,
-        height: initialHeight,
-        currentTime: video.currentTime,
-        hasError: video.error !== null,
-      };
-    }, { videoUrl: urls.video.url, svgUrl: urls.svg.url });
-
-    assert.equal(mediaResult.imgLoaded, true, 'expected SVG <img> to load under UI CSP');
-    assert.ok(mediaResult.duration > 2.0, `expected >2s video duration, got ${mediaResult.duration}`);
-    assert.equal(mediaResult.width, 64);
-    assert.equal(mediaResult.height, 64);
-    assert.ok(
-      mediaResult.currentTime >= 1.2 && mediaResult.currentTime <= 2.0,
-      `expected seeked currentTime near 1.5, got ${mediaResult.currentTime}`,
+    // Craft adversarial HTML and SVG files that try to read localStorage (token), mutate storage,
+    // access window.parent, and postMessage back to the interface origin.
+    fs.writeFileSync(
+      path.join(docsDir, 'xss.html'),
+      [
+        '<!doctype html>',
+        '<html><body><script>',
+        'window.__xss = true;',
+        'try { localStorage.setItem("pwn_html", localStorage.getItem("legion.token") || "ran"); } catch (e) {}',
+        'try { window.parent.postMessage({ pwn: "html", token: localStorage.getItem("legion.token") }, "*"); } catch (e) {}',
+        'try { window.parent.__pwned_html = true; } catch (e) {}',
+        '</script><p>malicious html</p></body></html>',
+      ].join('\n'),
     );
-    assert.equal(mediaResult.hasError, false);
-    assert.ok(
-      rangeStatuses.includes(206),
-      `expected at least one 206 Partial Content response for MP4 video, got ${JSON.stringify(rangeStatuses)}`,
+    fs.writeFileSync(
+      path.join(docsDir, 'xss.svg'),
+      [
+        '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" onload="window.__xss=true;try{localStorage.setItem(\'pwn_svg\',\'1\')}catch(e){}try{window.parent.__pwned_svg=true}catch(e){}try{window.parent.postMessage({pwn:\'svg\'},\'*\')}catch(e){}">',
+        '<rect width="64" height="64" fill="#16a34a"/>',
+        '<script>window.__xss=true;try{localStorage.setItem("pwn_svg_script",localStorage.getItem("legion.token")||"ran")}catch(e){}try{window.parent.__pwned_svg=true}catch(e){}try{window.parent.postMessage({pwn:"svg-script"},"*")}catch(e){}</script>',
+        '</svg>',
+      ].join('\n'),
     );
+    fs.writeFileSync(
+      path.join(docsDir, 'doc.pdf'),
+      '%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n%%EOF\n',
+    );
+    fs.copyFileSync(sampleVideo, path.join(docsDir, 'sample.webm'));
 
-    assert.deepEqual(uiPageErrors, [], `UI page errors during media test: ${uiPageErrors.join('\n')}`);
-    assert.deepEqual(uiConsoleErrors, [], `UI console/CSP errors during media test: ${uiConsoleErrors.join('\n')}`);
+    const server = await startServer(fleet.towerHome, fleet.towerUser);
+    tracker.setServerStderr(server.getStderr);
+    const browser = await launchBrowser();
 
-    // 3. Top-level navigation to .html and .svg content URLs: neither may run script or reach
-    //    the interface's origin, storage, or token; PDF is always forced to download as
-    //    application/octet-stream with the same sandbox + frame-ancestors 'none' CSP.
-    const expectedCsp = "sandbox; default-src 'none'; frame-ancestors 'none'";
-    for (const [kind, relUrl, expectedType] of [
-      ['html', urls.html.url, 'text/plain; charset=utf-8'],
-      ['svg', urls.svg.url, 'image/svg+xml'],
-    ]) {
-      const navPage = await ctx.newPage();
-      const resp = await navPage.goto(`${server.url}${relUrl}`, { waitUntil: 'load' });
-      assert.equal(resp.status(), 200, `${kind} navigation status`);
-      assert.equal(resp.headers()['content-type'], expectedType, `${kind} content-type`);
-      assert.equal(
-        resp.headers()['content-security-policy'],
-        expectedCsp,
-        `${kind} CSP must sandbox, forbid script, and forbid framing`,
-      );
-      assert.equal(resp.headers()['x-content-type-options'], 'nosniff');
-      await navPage.waitForTimeout(150);
+    const uiConsoleErrors = [];
+    const uiPageErrors = [];
 
-      const probe = await navPage.evaluate(() => {
-        let storageBlocked = false;
-        let leakedToken = null;
-        try {
-          leakedToken = localStorage.getItem('legion.token');
-        } catch {
-          storageBlocked = true;
+    try {
+      const ctx = await browser.newContext({
+        viewport: { width: 1100, height: 720 },
+        colorScheme: 'dark',
+      });
+
+      // 1. Connect the real Legion interface page so localStorage holds the live bearer token.
+      tracker.setStep('connect UI and mint content URLs');
+      const uiPage = tracker.attach(await ctx.newPage(), {
+        label: 'content-ui',
+        collectConsole: uiConsoleErrors,
+        collectPage: uiPageErrors,
+      });
+
+      await uiPage.goto(`${server.url}/#token=${encodeURIComponent(fleet.token)}`, {
+        waitUntil: 'domcontentloaded',
+      });
+      await uiPage.locator('.split-left .split-label-fact', { hasText: /^2$/ }).waitFor();
+      const storedToken = await uiPage.evaluate(() => localStorage.getItem('legion.token'));
+      assert.equal(storedToken, fleet.token, 'expected live token in interface localStorage');
+
+      // Mint content URLs through the UI's own createHttpLink().contentUrl helper.
+      const urls = await uiPage.evaluate(async () => {
+        const { createHttpLink } = await import('/link/http.js');
+        const link = createHttpLink();
+        const [html, svg, pdf, video] = await Promise.all([
+          link.contentUrl({ path: '~/docs/xss.html' }),
+          link.contentUrl({ path: '~/docs/xss.svg' }),
+          link.contentUrl({ path: '~/docs/doc.pdf' }),
+          link.contentUrl({ path: '~/docs/sample.webm' }),
+        ]);
+        return { html, svg, pdf, video };
+      });
+      assert.match(urls.html.url, /^\/v1\/content\/[^/]+\/xss\.html$/);
+      assert.match(urls.svg.url, /^\/v1\/content\/[^/]+\/xss\.svg$/);
+      assert.match(urls.pdf.url, /^\/v1\/content\/[^/]+\/doc\.pdf$/);
+      assert.match(urls.video.url, /^\/v1\/content\/[^/]+\/sample\.webm$/);
+
+      // 2. Verify <video> seeking and <img> loading directly on the real Legion UI page
+      //    (proving the UI CSP's `img-src 'self'` and `media-src 'self'` allow them with zero errors).
+      tracker.setStep('verify SVG img load and WebM video seek under UI CSP');
+      const rangeStatuses = [];
+      uiPage.on('response', (res) => {
+        if (res.url().endsWith('/sample.webm')) {
+          rangeStatuses.push(res.status());
         }
+      });
+
+      const mediaResult = await uiPage.evaluate(async ({ videoUrl, svgUrl }) => {
+        const img = document.createElement('img');
+        const imgLoaded = new Promise((resolve, reject) => {
+          const timer = setTimeout(
+            () => reject(new Error(`timed out waiting for SVG img load (complete=${img.complete}, w=${img.naturalWidth})`)),
+            15_000,
+          );
+          img.addEventListener(
+            'load',
+            () => {
+              clearTimeout(timer);
+              resolve();
+            },
+            { once: true },
+          );
+          img.addEventListener(
+            'error',
+            () => {
+              clearTimeout(timer);
+              reject(new Error('SVG img failed to load'));
+            },
+            { once: true },
+          );
+        });
+        img.src = svgUrl;
+        document.body.appendChild(img);
+        if (!(img.complete && img.naturalWidth > 0)) {
+          await imgLoaded;
+        }
+
+        const video = document.createElement('video');
+        video.muted = true;
+        video.preload = 'auto';
+        const videoReady = new Promise((resolve, reject) => {
+          const timer = setTimeout(
+            () => reject(new Error(`timed out waiting for loadeddata (readyState=${video.readyState}, networkState=${video.networkState})`)),
+            15_000,
+          );
+          const onReady = () => {
+            if (video.readyState >= 2) {
+              clearTimeout(timer);
+              video.removeEventListener('loadeddata', onReady);
+              video.removeEventListener('canplay', onReady);
+              resolve();
+            }
+          };
+          video.addEventListener('loadeddata', onReady);
+          video.addEventListener('canplay', onReady);
+          video.addEventListener(
+            'error',
+            () => {
+              clearTimeout(timer);
+              reject(new Error(`video error code=${video.error?.code}`));
+            },
+            { once: true },
+          );
+        });
+        video.src = videoUrl;
+        document.body.appendChild(video);
+        if (video.readyState < 2) {
+          await videoReady;
+        }
+
+        const initialDuration = video.duration;
+        const initialWidth = video.videoWidth;
+        const initialHeight = video.videoHeight;
+
+        const seekDone = new Promise((resolve, reject) => {
+          const timer = setTimeout(
+            () => reject(new Error(`timed out waiting for seeked (currentTime=${video.currentTime}, readyState=${video.readyState})`)),
+            15_000,
+          );
+          video.addEventListener(
+            'seeked',
+            () => {
+              clearTimeout(timer);
+              resolve();
+            },
+            { once: true },
+          );
+          video.addEventListener(
+            'error',
+            () => {
+              clearTimeout(timer);
+              reject(new Error(`video seek error code=${video.error?.code}`));
+            },
+            { once: true },
+          );
+        });
+        video.currentTime = 1.5;
+        await seekDone;
+
         return {
-          origin: window.origin,
-          xssFlag: Boolean(window.__xss),
-          storageBlocked,
-          leakedToken,
+          imgLoaded: img.complete && img.naturalWidth > 0,
+          duration: initialDuration,
+          width: initialWidth,
+          height: initialHeight,
+          currentTime: video.currentTime,
+          hasError: video.error !== null,
         };
-      });
-      assert.equal(probe.origin, 'null', `${kind} navigation must have opaque sandbox origin`);
-      assert.equal(probe.xssFlag, false, `${kind} navigation must not execute script`);
-      assert.equal(probe.storageBlocked, true, `${kind} navigation must be denied localStorage`);
-      assert.equal(probe.leakedToken, null, `${kind} navigation must never read token`);
-      await navPage.close();
-    }
+      }, { videoUrl: urls.video.url, svgUrl: urls.svg.url });
 
-    // PDF is never served inline: octet-stream + attachment + unconditional sandbox CSP.
-    const pdfHeaders = await uiPage.evaluate(async (pdfUrl) => {
-      const res = await fetch(pdfUrl);
-      return {
-        status: res.status,
-        contentType: res.headers.get('content-type'),
-        disposition: res.headers.get('content-disposition'),
-        csp: res.headers.get('content-security-policy'),
-        corp: res.headers.get('cross-origin-resource-policy'),
-      };
-    }, urls.pdf.url);
-    assert.equal(pdfHeaders.status, 200);
-    assert.equal(pdfHeaders.contentType, 'application/octet-stream');
-    assert.equal(pdfHeaders.disposition, 'attachment; filename="doc.pdf"');
-    assert.equal(pdfHeaders.csp, expectedCsp);
-    assert.equal(pdfHeaders.corp, 'same-origin');
+      assert.equal(mediaResult.imgLoaded, true, 'expected SVG <img> to load under UI CSP');
+      assert.ok(mediaResult.duration > 2.0, `expected >2s video duration, got ${mediaResult.duration}`);
+      assert.equal(mediaResult.width, 64);
+      assert.equal(mediaResult.height, 64);
+      assert.ok(
+        mediaResult.currentTime >= 1.2 && mediaResult.currentTime <= 2.0,
+        `expected seeked currentTime near 1.5, got ${mediaResult.currentTime}`,
+      );
+      assert.equal(mediaResult.hasError, false);
+      assert.ok(
+        rangeStatuses.includes(206),
+        `expected at least one 206 Partial Content response for WebM video, got ${JSON.stringify(rangeStatuses)}`,
+      );
 
-    // 4. Inside <iframe>, <object>, and <embed> on a same-origin host page (sharing the
-    //    interface's origin and token): frame-ancestors 'none' + sandbox CSP prevent framing
-    //    or script execution in every embedding vector.
-    const hostPage = await ctx.newPage();
-    await hostPage.route(`${server.url}/__test-iframe-host`, async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: 'text/html; charset=utf-8',
-        body: [
-          '<!doctype html><html><body>',
-          '<script>window.__messages = []; window.addEventListener("message", (e) => window.__messages.push(e.data));</script>',
-          `<iframe id="f-html" src="${urls.html.url}"></iframe>`,
-          `<iframe id="f-svg" src="${urls.svg.url}"></iframe>`,
-          `<object id="o-svg" data="${urls.svg.url}" type="image/svg+xml"></object>`,
-          `<embed id="e-svg" src="${urls.svg.url}" type="image/svg+xml">`,
-          '</body></html>',
-        ].join('\n'),
-      });
-    });
+      assert.deepEqual(uiPageErrors, [], `UI page errors during media test: ${uiPageErrors.join('\n')}`);
+      assert.deepEqual(uiConsoleErrors, [], `UI console/CSP errors during media test: ${uiConsoleErrors.join('\n')}`);
 
-    const embedResponses = new Map();
-    hostPage.on('response', (res) => {
-      if (res.url().includes('/v1/content/')) {
-        const key = new URL(res.url()).pathname;
-        embedResponses.set(key, (embedResponses.get(key) || 0) + 1);
+      // 3. Top-level navigation to .html and .svg content URLs: neither may run script or reach
+      //    the interface's origin, storage, or token; PDF is always forced to download as
+      //    application/octet-stream with the same sandbox + frame-ancestors 'none' CSP.
+      const expectedCsp = "sandbox; default-src 'none'; frame-ancestors 'none'";
+      for (const [kind, relUrl, expectedType] of [
+        ['html', urls.html.url, 'text/plain; charset=utf-8'],
+        ['svg', urls.svg.url, 'image/svg+xml'],
+      ]) {
+        tracker.setStep(`top-level sandbox check for ${kind}`);
+        const navPage = tracker.attach(await ctx.newPage(), { label: `nav-${kind}` });
+        const resp = await navPage.goto(`${server.url}${relUrl}`, { waitUntil: 'load' });
+        assert.equal(resp.status(), 200, `${kind} navigation status`);
+        assert.equal(resp.headers()['content-type'], expectedType, `${kind} content-type`);
+        assert.equal(
+          resp.headers()['content-security-policy'],
+          expectedCsp,
+          `${kind} CSP must sandbox, forbid script, and forbid framing`,
+        );
+        assert.equal(resp.headers()['x-content-type-options'], 'nosniff');
+
+        const probe = await navPage.evaluate(() => {
+          let storageBlocked = false;
+          let leakedToken = null;
+          try {
+            leakedToken = localStorage.getItem('legion.token');
+          } catch {
+            storageBlocked = true;
+          }
+          return {
+            origin: window.origin,
+            xssFlag: Boolean(window.__xss),
+            storageBlocked,
+            leakedToken,
+          };
+        });
+        assert.equal(probe.origin, 'null', `${kind} navigation must have opaque sandbox origin`);
+        assert.equal(probe.xssFlag, false, `${kind} navigation must not execute script`);
+        assert.equal(probe.storageBlocked, true, `${kind} navigation must be denied localStorage`);
+        assert.equal(probe.leakedToken, null, `${kind} navigation must never read token`);
+        await navPage.close();
       }
-    });
 
-    await hostPage.goto(`${server.url}/__test-iframe-host`, { waitUntil: 'load' });
-    await hostPage.waitForTimeout(250);
+      // PDF is never served inline: octet-stream + attachment + unconditional sandbox CSP.
+      tracker.setStep('verify PDF attachment headers');
+      const pdfHeaders = await uiPage.evaluate(async (pdfUrl) => {
+        const res = await fetch(pdfUrl);
+        return {
+          status: res.status,
+          contentType: res.headers.get('content-type'),
+          disposition: res.headers.get('content-disposition'),
+          csp: res.headers.get('content-security-policy'),
+          corp: res.headers.get('cross-origin-resource-policy'),
+        };
+      }, urls.pdf.url);
+      assert.equal(pdfHeaders.status, 200);
+      assert.equal(pdfHeaders.contentType, 'application/octet-stream');
+      assert.equal(pdfHeaders.disposition, 'attachment; filename="doc.pdf"');
+      assert.equal(pdfHeaders.csp, expectedCsp);
+      assert.equal(pdfHeaders.corp, 'same-origin');
 
-    assert.ok((embedResponses.get(urls.html.url) || 0) >= 1, 'HTML iframe must actually fetch from legion serve');
-    assert.ok((embedResponses.get(urls.svg.url) || 0) >= 1, 'SVG embeds must actually fetch from legion serve');
+      // 4. Inside <iframe>, <object>, and <embed> on a same-origin host page (sharing the
+      //    interface's origin and token): frame-ancestors 'none' + sandbox CSP prevent framing
+      //    or script execution in every embedding vector.
+      tracker.setStep('verify iframe/object/embed isolation');
+      const hostPage = tracker.attach(await ctx.newPage(), { label: 'embed-host' });
+      await hostPage.route(`${server.url}/__test-iframe-host`, async (route) => {
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/html; charset=utf-8',
+          body: [
+            '<!doctype html><html><body>',
+            '<script>window.__messages = []; window.addEventListener("message", (e) => window.__messages.push(e.data));</script>',
+            `<iframe id="f-html" src="${urls.html.url}"></iframe>`,
+            `<iframe id="f-svg" src="${urls.svg.url}"></iframe>`,
+            `<object id="o-svg" data="${urls.svg.url}" type="image/svg+xml"></object>`,
+            `<embed id="e-svg" src="${urls.svg.url}" type="image/svg+xml">`,
+            '</body></html>',
+          ].join('\n'),
+        });
+      });
+
+      const embedResponses = new Map();
+      hostPage.on('response', (res) => {
+        if (res.url().includes('/v1/content/')) {
+          const key = new URL(res.url()).pathname;
+          embedResponses.set(key, (embedResponses.get(key) || 0) + 1);
+        }
+      });
+
+      await hostPage.goto(`${server.url}/__test-iframe-host`, { waitUntil: 'load' });
+      await tracker.waitForCondition(
+        'iframe/object/embed fetches for HTML and SVG content URLs',
+        () => (embedResponses.get(urls.html.url) || 0) >= 1 && (embedResponses.get(urls.svg.url) || 0) >= 1,
+        { page: hostPage },
+      );
+      await waitForLayoutSettled(hostPage, 2);
+
+      assert.ok((embedResponses.get(urls.html.url) || 0) >= 1, 'HTML iframe must actually fetch from legion serve');
+      assert.ok((embedResponses.get(urls.svg.url) || 0) >= 1, 'SVG embeds must actually fetch from legion serve');
 
     const embedCheck = await hostPage.evaluate(() => {
       const checkIsolated = (id) => {
@@ -1558,8 +1565,11 @@ test('content URLs isolate HTML and SVG from the interface origin and allow <vid
   }
 });
 
-test('real Files tab opens pictures and plays/seeks video on local and remote nodes, with graceful older-node fallback', async () => {
-  assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
+browserTest(
+  'real Files tab opens pictures and plays/seeks video on local and remote nodes, with graceful older-node fallback',
+  { timeout: 120_000 },
+  async (_t, tracker) => {
+    assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
   const root = makeWorkRoot();
   const towerHome = path.join(root, 'tower-legion');
   const towerUser = path.join(root, 'tower-user');
@@ -1632,24 +1642,21 @@ test('real Files tab opens pictures and plays/seeks video on local and remote no
     runLegion(['token.add', 'name=ui', 'principal=ui', '--json'], towerHome, towerUser),
   );
   const server = await startServer(towerHome, towerUser);
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu'],
-  });
+  tracker.setServerStderr(server.getStderr);
+  const browser = await launchBrowser();
 
   try {
     const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, colorScheme: 'dark' });
-    const page = await ctx.newPage();
     const consoleErrors = [];
     const pageErrors = [];
+    const page = tracker.attach(await ctx.newPage(), {
+      label: 'real-files-media',
+      collectConsole: consoleErrors,
+      collectPage: pageErrors,
+    });
     const contentPostsByMachine = new Map();
     const contentGetStatuses = [];
 
-    page.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
-    });
-    page.on('pageerror', (err) => pageErrors.push(String(err)));
     page.on('request', (req) => {
       if (req.method() === 'POST' && new URL(req.url()).pathname === '/v1/content') {
         try {
@@ -1690,66 +1697,36 @@ test('real Files tab opens pictures and plays/seeks video on local and remote no
       await openMachineMedia(machine);
 
       // Picture opens through real /v1/content and decodes cleanly.
+      tracker.setStep(`${machine}: open icon.png`);
       await entryLocator('icon.png').click();
-      const img = page.locator('.viewer img.viewer-img');
-      await img.waitFor({ timeout: 10_000 });
-      await page.waitForFunction(
-        () => {
-          const el = document.querySelector('.viewer img.viewer-img');
-          return Boolean(el && el.complete && el.naturalWidth > 0);
-        },
-        null,
-        { timeout: 10_000 },
-      );
-      const imgInfo = await img.evaluate((el) => ({
-        src: el.getAttribute('src') || '',
-        w: el.naturalWidth,
-        h: el.naturalHeight,
-      }));
+      const img = page.locator('.viewer img.viewer-img[src]');
+      const imgInfo = await waitForImageLoaded(img, `${machine} icon.png`, { tracker });
       assert.ok(imgInfo.src.startsWith('/v1/content/'), `${machine}: expected /v1/content img src, got ${imgInfo.src}`);
-      assert.equal(imgInfo.w, 512, `${machine}: expected 512px PNG width`);
-      assert.equal(imgInfo.h, 512, `${machine}: expected 512px PNG height`);
+      assert.equal(imgInfo.width, 512, `${machine}: expected 512px PNG width`);
+      assert.equal(imgInfo.height, 512, `${machine}: expected 512px PNG height`);
       await page.locator('.viewer-top button[aria-label="Close"]').click();
       await page.locator('.viewer').waitFor({ state: 'hidden' });
 
       // Video opens through real /v1/content, decodes VP8 WebM, and seeks cleanly with 206 ranges.
+      tracker.setStep(`${machine}: open and seek sample.webm`);
       await entryLocator('sample.webm').click();
-      const video = page.locator('.viewer video.viewer-video');
-      await video.waitFor({ timeout: 10_000 });
-      const videoCheck = await video.evaluate(async (el) => {
+      const video = page.locator('.viewer video.viewer-video[src]');
+      await tracker.waitForLocator(video, `${machine} sample.webm video[src]`);
+      await waitForMediaReady(video, `${machine} sample.webm loadeddata`, {
+        tracker,
+        minReadyState: 2,
+        forceAutoPreload: true,
+      });
+      await video.evaluate(async (el) => {
         el.muted = true;
-        if (el.readyState < 2) {
-          el.preload = 'auto';
-          el.load();
-          await new Promise((resolve, reject) => {
-            const t = setTimeout(() => reject(new Error('timed out waiting for loadeddata')), 10_000);
-            el.addEventListener('loadeddata', () => { clearTimeout(t); resolve(); }, { once: true });
-            el.addEventListener('error', () => { clearTimeout(t); reject(new Error(`video error ${el.error?.code}`)); }, { once: true });
-          });
-        }
         try {
           await el.play();
           el.pause();
         } catch {
           // Headless autoplay policy may still allow seeking without play.
         }
-        const seeked = new Promise((resolve, reject) => {
-          const t = setTimeout(() => reject(new Error('timed out waiting for seeked')), 10_000);
-          el.addEventListener('seeked', () => { clearTimeout(t); resolve(); }, { once: true });
-          el.addEventListener('error', () => { clearTimeout(t); reject(new Error(`seek error ${el.error?.code}`)); }, { once: true });
-        });
-        el.currentTime = 1.5;
-        await seeked;
-        return {
-          src: el.getAttribute('src') || '',
-          readyState: el.readyState,
-          duration: el.duration,
-          width: el.videoWidth,
-          height: el.videoHeight,
-          currentTime: el.currentTime,
-          hasError: el.error !== null,
-        };
       });
+      const videoCheck = await seekAndWait(video, 1.5, `${machine} sample.webm seek to 1.5s`, { tracker });
       assert.ok(videoCheck.src.startsWith('/v1/content/'), `${machine}: expected /v1/content video src`);
       assert.ok(videoCheck.readyState >= 2, `${machine}: expected readyState >= 2, got ${videoCheck.readyState}`);
       assert.ok(videoCheck.duration > 2.0, `${machine}: expected duration > 2s, got ${videoCheck.duration}`);
@@ -1775,36 +1752,27 @@ test('real Files tab opens pictures and plays/seeks video on local and remote no
     // 2. Older node (legacy): POST /v1/content fails once (501 unsupported) and is remembered for
     //    the session; pictures fall back to the machine-made fs.thumb preview without Download,
     //    while video shows the plain unavailable message without retrying POST /v1/content.
+    tracker.setStep('legacy older-node fallback');
     await openMachineMedia('legacy');
     await entryLocator('icon.png').click();
-    const legacyImg = page.locator('.viewer img.viewer-img');
-    await legacyImg.waitFor({ timeout: 10_000 });
-    await page.waitForFunction(
-      () => {
-        const el = document.querySelector('.viewer img.viewer-img');
-        return Boolean(el && el.complete && el.naturalWidth > 0 && el.naturalHeight > 0);
-      },
-      null,
-      { timeout: 10_000 },
-    );
-    const legacyImgInfo = await legacyImg.evaluate((el) => ({
-      src: el.getAttribute('src') || '',
-      w: el.naturalWidth,
-      h: el.naturalHeight,
-    }));
+    const legacyImg = page.locator('.viewer img.viewer-img[src]');
+    const legacyImgInfo = await waitForImageLoaded(legacyImg, 'legacy fs.thumb fallback icon.png', { tracker });
     assert.ok(
       legacyImgInfo.src.startsWith('data:image/'),
       `legacy: expected data:image/ fs.thumb fallback preview, got ${legacyImgInfo.src.slice(0, 40)}`,
     );
-    assert.equal(legacyImgInfo.w, 512, 'legacy: expected 512px preview width');
-    assert.equal(legacyImgInfo.h, 512, 'legacy: expected 512px preview height');
+    assert.equal(legacyImgInfo.width, 512, 'legacy: expected 512px preview width');
+    assert.equal(legacyImgInfo.height, 512, 'legacy: expected 512px preview height');
     assert.equal(await page.locator('.viewer button', { hasText: 'Download' }).count(), 0);
     assert.equal(contentPostsByMachine.get('legacy') || 0, 1, 'expected exactly one POST /v1/content probe for legacy');
     await page.locator('.viewer-top button[aria-label="Close"]').click();
     await page.locator('.viewer').waitFor({ state: 'hidden' });
 
     await entryLocator('sample.webm').click();
-    await page.locator('.viewer .said', { hasText: "Video playback isn't available from legacy yet" }).waitFor({ timeout: 10_000 });
+    await tracker.waitForLocator(
+      page.locator('.viewer .said', { hasText: "Video playback isn't available from legacy yet" }),
+      'legacy unsupported video message',
+    );
     assert.equal(await page.locator('.viewer video.viewer-video').count(), 0);
     assert.equal(
       contentPostsByMachine.get('legacy') || 0,
@@ -1815,16 +1783,13 @@ test('real Files tab opens pictures and plays/seeks video on local and remote no
     await page.locator('.viewer').waitFor({ state: 'hidden' });
 
     // 3. Supported remote machine still opens pictures after legacy was remembered unsupported.
+    tracker.setStep('pi picture still works after legacy fallback');
     await openMachineMedia('pi');
     await entryLocator('icon.png').click();
-    await page.waitForFunction(
-      () => {
-        const el = document.querySelector('.viewer img.viewer-img');
-        return Boolean(el && el.complete && el.naturalWidth === 512);
-      },
-      null,
-      { timeout: 10_000 },
-    );
+    const piAfterLegacy = await waitForImageLoaded(page.locator('.viewer img.viewer-img[src]'), 'pi icon.png after legacy', {
+      tracker,
+    });
+    assert.equal(piAfterLegacy.width, 512);
     await page.locator('.viewer-top button[aria-label="Close"]').click();
     await page.locator('.viewer').waitFor({ state: 'hidden' });
 
@@ -2002,349 +1967,328 @@ function buildLongWebm(sampleBuf, repeatCount = 20, voidBytesPerGap = 1024 * 102
   return Buffer.concat([ebmlHeader, segHeader, seekHead, seekPad, info, tracks, ...bodyParts, cues]);
 }
 
-test('Files viewer recovers expired and door-restarted video playback, reports honest errors, and switches cleanly to a picture', async () => {
-  assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
-  const sampleWebm = fs.readFileSync(path.join(TEST_DIR, 'fixtures', 'sample.webm'));
-  const samplePng = fs.readFileSync(path.join(REPO_ROOT, 'apps', 'ui', 'icons', 'icon-512.png'));
-  const paddedWebm = buildLongWebm(sampleWebm, 20, 1024 * 1024);
+browserTest(
+  'Files viewer recovers expired and door-restarted video playback, reports honest errors, and switches cleanly to a picture',
+  { timeout: 180_000 },
+  async (_t, tracker) => {
+    assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
+    const sampleWebm = fs.readFileSync(path.join(TEST_DIR, 'fixtures', 'sample.webm'));
+    const samplePng = fs.readFileSync(path.join(REPO_ROOT, 'apps', 'ui', 'icons', 'icon-512.png'));
+    const paddedWebm = buildLongWebm(sampleWebm, 20, 1024 * 1024);
 
-  const root = makeWorkRoot();
-  const fleet = setupFleet(root);
-  const mediaDir = path.join(fleet.towerUser, 'media');
-  fs.mkdirSync(mediaDir, { recursive: true });
-  fs.writeFileSync(path.join(mediaDir, 'padded.webm'), paddedWebm);
-  fs.writeFileSync(path.join(mediaDir, 'sample.webm'), sampleWebm);
-  fs.writeFileSync(path.join(mediaDir, 'icon.png'), samplePng);
-  fs.writeFileSync(path.join(mediaDir, 'broken.webm'), Buffer.alloc(4096, 0x5a));
+    const root = makeWorkRoot();
+    const fleet = setupFleet(root);
+    const mediaDir = path.join(fleet.towerUser, 'media');
+    fs.mkdirSync(mediaDir, { recursive: true });
+    fs.writeFileSync(path.join(mediaDir, 'padded.webm'), paddedWebm);
+    fs.writeFileSync(path.join(mediaDir, 'sample.webm'), sampleWebm);
+    fs.writeFileSync(path.join(mediaDir, 'icon.png'), samplePng);
+    fs.writeFileSync(path.join(mediaDir, 'broken.webm'), Buffer.alloc(4096, 0x5a));
 
-  let server = await startServer(fleet.towerHome, fleet.towerUser, {
-    envExtra: {
-      LEGION_CONTENT_TICKET_SLIDING_MS: '1200',
-      LEGION_CONTENT_TICKET_ABSOLUTE_MS: '3000',
-    },
-  });
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu', '--autoplay-policy=no-user-gesture-required'],
-  });
-
-  try {
-    const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, colorScheme: 'dark' });
-    const page = await ctx.newPage();
-    const pageErrors = [];
-    page.on('pageerror', (err) => pageErrors.push(String(err)));
-
-    const contentPosts = [];
-    const contentGetStatuses = [];
-    page.on('request', (req) => {
-      if (req.method() === 'POST' && new URL(req.url()).pathname === '/v1/content') {
-        try {
-          contentPosts.push(JSON.parse(req.postData() || '{}'));
-        } catch {
-          contentPosts.push({});
-        }
-      }
+    let server = await startServer(fleet.towerHome, fleet.towerUser, {
+      envExtra: {
+        LEGION_CONTENT_TICKET_SLIDING_MS: '2500',
+        LEGION_CONTENT_TICKET_ABSOLUTE_MS: '5000',
+      },
     });
-    page.on('response', (res) => {
-      const p = new URL(res.url()).pathname;
-      if (res.request().method() === 'GET' && p.startsWith('/v1/content/')) {
-        contentGetStatuses.push({ path: p, status: res.status() });
-      }
-    });
+    tracker.setServerStderr(() => server?.getStderr?.());
+    const browser = await launchBrowser({ autoplay: true });
 
-    await page.goto(`${server.url}/#token=${encodeURIComponent(fleet.token)}`, {
-      waitUntil: 'domcontentloaded',
-    });
-    await page.getByText('2 are on').waitFor({ timeout: 15_000 });
-
-    const viewerHashFor = (fileName) =>
-      `#/files/tower/~/media?view=${encodeURIComponent(`~/media/${fileName}`)}`;
-    const paddedHash = `${server.url}/${viewerHashFor('padded.webm')}`;
-
-    // Helper: open padded.webm, play until >=0.4s, pause, and record recovery timestamps.
-    async function openPlayAndPause() {
-      await page.goto(paddedHash, { waitUntil: 'domcontentloaded' });
-      const video = page.locator('.viewer video.viewer-video');
-      await video.waitFor({ timeout: 10_000 });
-      const state = await video.evaluate(async (el) => {
-        el.muted = true;
-        await new Promise((resolve, reject) => {
-          if (el.readyState >= 2) return resolve();
-          const t = setTimeout(() => reject(new Error('timed out waiting for loadeddata')), 10_000);
-          el.addEventListener('loadeddata', () => { clearTimeout(t); resolve(); }, { once: true });
-          el.addEventListener('error', () => { clearTimeout(t); reject(new Error(`initial video error ${el.error?.code}`)); }, { once: true });
-        });
-        await el.play();
-        await new Promise((resolve, reject) => {
-          const t = setTimeout(() => reject(new Error(`video did not advance past 0.4s (at ${el.currentTime})`)), 10_000);
-          const check = () => {
-            if (el.currentTime >= 0.4) {
-              clearTimeout(t);
-              el.removeEventListener('timeupdate', check);
-              resolve();
-            }
-          };
-          el.addEventListener('timeupdate', check);
-          check();
-        });
-        el.pause();
-        window.__recoveryAudit = { timeAtError: null, timeAtSwap: null };
-        el.addEventListener(
-          'error',
-          () => {
-            window.__recoveryAudit.timeAtError = el.currentTime;
-          },
-          { once: true },
-        );
-        return {
-          src: el.getAttribute('src') || '',
-          pausedAt: el.currentTime,
-          bufferedEnd: el.buffered.length > 0 ? el.buffered.end(0) : 0,
-        };
+    try {
+      const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, colorScheme: 'dark' });
+      const pageErrors = [];
+      const page = tracker.attach(await ctx.newPage(), {
+        label: 'video-recovery',
+        collectPage: pageErrors,
       });
-      assert.ok(state.src.startsWith('/v1/content/'), `expected /v1/content src, got ${state.src}`);
-      assert.ok(state.pausedAt >= 0.4 && state.pausedAt < 5.0, `unexpected pausedAt: ${state.pausedAt}`);
-      assert.ok(state.bufferedEnd < 30, `expected partial buffering on 60s video, got ${state.bufferedEnd}s`);
-      return state;
-    }
 
-    // Helper: resume paused video (at 8x so it quickly reaches the unbuffered boundary and hits
-    // the 404 on the stale ticket), then verify silent single-shot recovery and continued playback
-    // from the exact position where playback stopped.
-    async function playAndAssertSilentRecovery(initialState, label) {
-      contentGetStatuses.length = 0;
-      const postsBefore = contentPosts.length;
+      const contentPosts = [];
+      const contentGetStatuses = [];
+      page.on('request', (req) => {
+        if (req.method() === 'POST' && new URL(req.url()).pathname === '/v1/content') {
+          try {
+            contentPosts.push(JSON.parse(req.postData() || '{}'));
+          } catch {
+            contentPosts.push({});
+          }
+        }
+      });
+      page.on('response', (res) => {
+        const p = new URL(res.url()).pathname;
+        if (res.request().method() === 'GET' && p.startsWith('/v1/content/')) {
+          contentGetStatuses.push({ path: p, status: res.status() });
+        }
+      });
+
+      tracker.setStep('connect for video recovery test');
+      await page.goto(`${server.url}/#token=${encodeURIComponent(fleet.token)}`, {
+        waitUntil: 'domcontentloaded',
+      });
+      await page.getByText('2 are on').waitFor();
+
+      const viewerHashFor = (fileName) =>
+        `#/files/tower/~/media?view=${encodeURIComponent(`~/media/${fileName}`)}`;
+      const paddedHash = `${server.url}/${viewerHashFor('padded.webm')}`;
+
+      // Helper: open a padded WebM file, wait for src + loadeddata, play until >=0.4s, pause, and
+      // optionally record recovery audit timestamps. Every wait is bounded with media diagnostics.
+      async function openPlayAndPause(targetHash = paddedHash, label = 'padded.webm', { audit = true } = {}) {
+        tracker.setStep(`${label}: open, play to 0.4s, and pause`);
+        await page.goto(targetHash, { waitUntil: 'domcontentloaded' });
+        const video = page.locator('.viewer video.viewer-video[src]');
+        await tracker.waitForLocator(video, `${label} video[src]`);
+        const state = await playAndWaitForTime(video, 0.4, `${label} initial playback to 0.4s`, {
+          tracker,
+          timeoutMs: 20_000,
+          pauseAfter: true,
+          recordRecoveryAudit: audit,
+        });
+        assert.ok(state.src.startsWith('/v1/content/'), `expected /v1/content src, got ${state.src}`);
+        assert.ok(state.pausedAt >= 0.4 && state.pausedAt < 5.0, `unexpected pausedAt: ${state.pausedAt}`);
+        assert.ok(state.bufferedEnd < 30, `expected partial buffering on 60s video, got ${state.bufferedEnd}s`);
+        return state;
+      }
+
+      // Helper: resume paused video (at 8x so it quickly reaches the unbuffered boundary and hits
+      // the 404 on the stale ticket), then verify silent single-shot recovery and continued playback
+      // from the exact position where playback stopped.
+      async function playAndAssertSilentRecovery(initialState, label) {
+        tracker.setStep(`${label}: resume and wait for silent recovery`);
+        contentGetStatuses.length = 0;
+        const postsBefore = contentPosts.length;
+        await page.locator('.viewer video.viewer-video').evaluate((el) => {
+          el.playbackRate = 8;
+          el.play().catch(() => {});
+        });
+
+        // Wait until src swaps to a fresh ticket and playback is actively continuing with no error.
+        await tracker.waitForFn(
+          page,
+          ({ oldSrc }) => {
+            const v = document.querySelector('.viewer video.viewer-video');
+            if (!v) return false;
+            const src = v.getAttribute('src') || '';
+            const swapped = src !== oldSrc && src.startsWith('/v1/content/');
+            if (swapped && window.__recoveryAudit && window.__recoveryAudit.timeAtSwap === null && v.currentTime > 0.5) {
+              window.__recoveryAudit.timeAtSwap = v.currentTime;
+            }
+            return swapped && !v.paused && v.error === null && v.readyState >= 2 && v.currentTime > 1.0;
+          },
+          { oldSrc: initialState.src },
+          `${label} src swap and active resumed playback`,
+          { timeout: 25_000 },
+        );
+
+        const tAfterSwap = await page.locator('.viewer video.viewer-video').evaluate((el) => el.currentTime);
+        await tracker.waitForFn(
+          page,
+          (minTime) => {
+            const v = document.querySelector('.viewer video.viewer-video');
+            return Boolean(v && !v.paused && v.error === null && v.currentTime >= minTime);
+          },
+          tAfterSwap + 0.5,
+          `${label} playback advancing past ${tAfterSwap + 0.5}s`,
+          { timeout: 15_000 },
+        );
+        const audit = await page.evaluate(() => window.__recoveryAudit);
+        assert.equal(await page.locator('.viewer .said').count(), 0, `${label}: recovery must show no error UI`);
+        assert.ok(
+          contentGetStatuses.some((r) => r.path === initialState.src && r.status === 404),
+          `${label}: expected player to hit 404 on stale ticket ${initialState.src}, saw ${JSON.stringify(contentGetStatuses)}`,
+        );
+        assert.equal(
+          contentPosts.length - postsBefore,
+          1,
+          `${label}: recovery must mint exactly one fresh address`,
+        );
+        if (audit?.timeAtError > 1.0 && audit?.timeAtSwap != null) {
+          assert.ok(
+            Math.abs(audit.timeAtSwap - audit.timeAtError) <= 1.5,
+            `${label}: expected playback to resume near ${audit.timeAtError}s, got ${audit.timeAtSwap}s`,
+          );
+        }
+        await page.locator('.viewer video.viewer-video').evaluate((el) => el.pause());
+      }
+
+      // ── Part A: Pause video, let short-lived ticket expire, press play -> silent recovery ─────
+      const expState = await openPlayAndPause(paddedHash, 'Part A (expired ticket)');
+      // Poll HEAD until the 5.0s absolute ticket lifetime expires (404) instead of a fixed sleep.
+      await tracker.waitForCondition(
+        'Part A initial ticket to expire (HEAD 404)',
+        async () => {
+          const status = await page.evaluate(async (url) => {
+            const res = await fetch(url, { method: 'HEAD' });
+            return res.status;
+          }, expState.src);
+          return status === 404;
+        },
+        { timeoutMs: 15_000, intervalMs: 250, page },
+      );
+      await playAndAssertSilentRecovery(expState, 'expired ticket');
+
+      // Close the viewer and restart server with normal 15-minute TTL on a fixed port for Part B.
+      tracker.setStep('restart server on fixed port for Part B');
+      await page.locator('.viewer-top button[aria-label="Close"]').click();
+      await page.locator('.viewer').waitFor({ state: 'hidden' });
+      const fixedPort = Number(new URL(server.url).port);
+      await server.stop();
+      server = await startServer(fleet.towerHome, fleet.towerUser, {
+        listen: `127.0.0.1:${fixedPort}`,
+      });
+
+      // ── Part B: Restart the door during a pause, press play -> silent recovery ────────────────
+      const restartState = await openPlayAndPause(paddedHash, 'Part B (door restart)');
+      tracker.setStep('Part B: restart door while paused');
+      await server.stop();
+      server = await startServer(fleet.towerHome, fleet.towerUser, {
+        listen: `127.0.0.1:${fixedPort}`,
+      });
+      await playAndAssertSilentRecovery(restartState, 'door restart');
+
+      // ── Part C1: Corrupt video reachable with HTTP 200 -> 1 recovery, no loop, honest decode msg
+      tracker.setStep('Part C1: corrupt video single-shot recovery and honest decode message');
+      const postsBeforeBroken = contentPosts.length;
+      const brokenHash = `${server.url}/${viewerHashFor('broken.webm')}`;
+      await page.goto(brokenHash, { waitUntil: 'domcontentloaded' });
+      await tracker.waitForLocator(
+        page.locator('.viewer .said', { hasText: "This browser can't play this kind of video" }),
+        'corrupt video honest decode error message',
+      );
+      await waitForLayoutSettled(page, 4);
+      assert.equal(
+        contentPosts.length - postsBeforeBroken,
+        2,
+        'corrupt video must mint initial address plus at most one fresh recovery address (never loop)',
+      );
+
+      // ── Part C2: Deleted/unreachable file -> honest "Couldn't reach this file" + Try again ───
+      const vanishedPath = path.join(mediaDir, 'vanished.webm');
+      fs.writeFileSync(vanishedPath, paddedWebm);
+      const vanishedHash = `${server.url}/${viewerHashFor('vanished.webm')}`;
+      await openPlayAndPause(vanishedHash, 'Part C2 (vanished.webm)', { audit: false });
+
+      // Remove the file and restart the door so both the old ticket and fresh mint fail.
+      tracker.setStep('Part C2: delete vanished.webm and restart door');
+      fs.unlinkSync(vanishedPath);
+      await server.stop();
+      server = await startServer(fleet.towerHome, fleet.towerUser, {
+        listen: `127.0.0.1:${fixedPort}`,
+      });
+
+      const postsBeforeVanished = contentPosts.length;
       await page.locator('.viewer video.viewer-video').evaluate((el) => {
         el.playbackRate = 8;
         el.play().catch(() => {});
       });
-
-      // Wait until src swaps to a fresh ticket and playback is actively continuing with no error.
-      await page.waitForFunction(
-        ({ oldSrc }) => {
-          const v = document.querySelector('.viewer video.viewer-video');
-          if (!v) return false;
-          const src = v.getAttribute('src') || '';
-          const swapped = src !== oldSrc && src.startsWith('/v1/content/');
-          if (swapped && window.__recoveryAudit && window.__recoveryAudit.timeAtSwap === null && v.currentTime > 0.5) {
-            window.__recoveryAudit.timeAtSwap = v.currentTime;
-          }
-          return swapped && !v.paused && v.error === null && v.readyState >= 2 && v.currentTime > 1.0;
-        },
-        { oldSrc: initialState.src },
-        { timeout: 15_000 },
-      );
-
-      const tAfterSwap = await page.locator('.viewer video.viewer-video').evaluate((el) => el.currentTime);
-      await page.waitForFunction(
-        (minTime) => {
-          const v = document.querySelector('.viewer video.viewer-video');
-          return Boolean(v && !v.paused && v.error === null && v.currentTime >= minTime);
-        },
-        tAfterSwap + 0.5,
-        { timeout: 10_000 },
-      );
-      const audit = await page.evaluate(() => window.__recoveryAudit);
-      assert.equal(await page.locator('.viewer .said').count(), 0, `${label}: recovery must show no error UI`);
-      assert.ok(
-        contentGetStatuses.some((r) => r.path === initialState.src && r.status === 404),
-        `${label}: expected player to hit 404 on stale ticket ${initialState.src}, saw ${JSON.stringify(contentGetStatuses)}`,
+      await tracker.waitForLocator(
+        page.locator('.viewer .said', { hasText: "Couldn't reach this file" }),
+        'Part C2 unreachable error message',
+        { timeout: 20_000 },
       );
       assert.equal(
-        contentPosts.length - postsBefore,
-        1,
-        `${label}: recovery must mint exactly one fresh address`,
+        await page.locator('.viewer .said', { hasText: "can't play this kind of video" }).count(),
+        0,
+        'unreachable/missing file must not blame video codec',
       );
-      if (audit?.timeAtError > 1.0 && audit?.timeAtSwap != null) {
-        assert.ok(
-          Math.abs(audit.timeAtSwap - audit.timeAtError) <= 1.5,
-          `${label}: expected playback to resume near ${audit.timeAtError}s, got ${audit.timeAtSwap}s`,
-        );
-      }
-      await page.locator('.viewer video.viewer-video').evaluate((el) => el.pause());
-    }
+      await page.locator('.viewer').getByRole('button', { name: 'Try again' }).waitFor();
+      assert.equal(
+        contentPosts.length - postsBeforeVanished,
+        1,
+        'unreachable file recovery must attempt at most one fresh address',
+      );
 
-    // ── Part A: Pause video, let short-lived ticket expire, press play -> silent recovery ─────
-    const openedAt = Date.now();
-    const expState = await openPlayAndPause();
-    // Wait past the 3.0s absolute ticket lifetime so expiry is deterministic even if Chromium
-    // holds a paused Range connection open.
-    const remainingMs = 3300 - (Date.now() - openedAt);
-    if (remainingMs > 0) await page.waitForTimeout(remainingMs);
-    const headStatus = await page.evaluate(async (url) => {
-      const res = await fetch(url, { method: 'HEAD' });
-      return res.status;
-    }, expState.src);
-    assert.equal(headStatus, 404, 'expected initial ticket to be expired (404) before pressing Play');
-    await playAndAssertSilentRecovery(expState, 'expired ticket');
+      // Restore file on disk and click Try again -> video loads cleanly.
+      tracker.setStep('Part C2: restore vanished.webm and click Try again');
+      fs.writeFileSync(vanishedPath, paddedWebm);
+      await page.locator('.viewer').getByRole('button', { name: 'Try again' }).click();
+      await tracker.waitForLocator(page.locator('.viewer video.viewer-video[src]'), 'restored vanished.webm video[src]');
+      await tracker.waitForFn(
+        page,
+        () => {
+          const v = document.querySelector('.viewer video.viewer-video');
+          return Boolean(v && v.readyState >= 1 && v.videoWidth === 64 && v.error === null);
+        },
+        null,
+        'restored vanished.webm metadata',
+      );
 
-    // Close the viewer and restart server with normal 15-minute TTL on a fixed port for Part B.
-    await page.locator('.viewer-top button[aria-label="Close"]').click();
-    await page.locator('.viewer').waitFor({ state: 'hidden' });
-    const fixedPort = Number(new URL(server.url).port);
-    await server.stop();
-    server = await startServer(fleet.towerHome, fleet.towerUser, {
-      listen: `127.0.0.1:${fixedPort}`,
-    });
+      // ── Part D: Switch mounted viewer from video to picture via hash change ──────────────────
+      tracker.setStep('Part D: switch mounted viewer from video to picture');
+      const videoHash = `${server.url}/${viewerHashFor('sample.webm')}`;
+      const picHash = viewerHashFor('icon.png');
+      await page.goto(videoHash, { waitUntil: 'domcontentloaded' });
+      await tracker.waitForLocator(page.locator('.viewer video.viewer-video[src]'), 'Part D sample.webm video[src]');
+      await tracker.waitForFn(
+        page,
+        () => {
+          const v = document.querySelector('.viewer video.viewer-video');
+          return Boolean(v && v.readyState >= 1 && v.videoWidth === 64);
+        },
+        null,
+        'Part D sample.webm metadata',
+      );
 
-    // ── Part B: Restart the door during a pause, press play -> silent recovery ────────────────
-    const restartState = await openPlayAndPause();
-    await server.stop();
-    server = await startServer(fleet.towerHome, fleet.towerUser, {
-      listen: `127.0.0.1:${fixedPort}`,
-    });
-    await playAndAssertSilentRecovery(restartState, 'door restart');
-
-    // ── Part C1: Corrupt video reachable with HTTP 200 -> 1 recovery, no loop, honest decode msg
-    const postsBeforeBroken = contentPosts.length;
-    const brokenHash = `${server.url}/${viewerHashFor('broken.webm')}`;
-    await page.goto(brokenHash, { waitUntil: 'domcontentloaded' });
-    await page.locator('.viewer .said', { hasText: "This browser can't play this kind of video" }).waitFor({ timeout: 10_000 });
-    await page.waitForTimeout(300);
-    assert.equal(
-      contentPosts.length - postsBeforeBroken,
-      2,
-      'corrupt video must mint initial address plus at most one fresh recovery address (never loop)',
-    );
-
-    // ── Part C2: Deleted/unreachable file -> honest "Couldn't reach this file" + Try again ───
-    const vanishedPath = path.join(mediaDir, 'vanished.webm');
-    fs.writeFileSync(vanishedPath, paddedWebm);
-    const vanishedHash = `${server.url}/${viewerHashFor('vanished.webm')}`;
-    await page.goto(vanishedHash, { waitUntil: 'domcontentloaded' });
-    await page.locator('.viewer video.viewer-video').waitFor({ timeout: 10_000 });
-    await page.locator('.viewer video.viewer-video').evaluate(async (el) => {
-      el.muted = true;
-      await new Promise((resolve) => {
-        if (el.readyState >= 2) return resolve();
-        el.addEventListener('loadeddata', resolve, { once: true });
-      });
-      await el.play();
-      await new Promise((resolve) => {
-        const check = () => {
-          if (el.currentTime >= 0.4) {
-            el.removeEventListener('timeupdate', check);
-            resolve();
-          }
-        };
-        el.addEventListener('timeupdate', check);
-        check();
-      });
-      el.pause();
-    });
-
-    // Remove the file and restart the door so both the old ticket and fresh mint fail.
-    fs.unlinkSync(vanishedPath);
-    await server.stop();
-    server = await startServer(fleet.towerHome, fleet.towerUser, {
-      listen: `127.0.0.1:${fixedPort}`,
-    });
-
-    const postsBeforeVanished = contentPosts.length;
-    await page.locator('.viewer video.viewer-video').evaluate((el) => {
-      el.playbackRate = 8;
-      el.play().catch(() => {});
-    });
-    await page.locator('.viewer .said', { hasText: "Couldn't reach this file" }).waitFor({ timeout: 15_000 });
-    assert.equal(
-      await page.locator('.viewer .said', { hasText: "can't play this kind of video" }).count(),
-      0,
-      'unreachable/missing file must not blame video codec',
-    );
-    await page.locator('.viewer').getByRole('button', { name: 'Try again' }).waitFor();
-    assert.equal(
-      contentPosts.length - postsBeforeVanished,
-      1,
-      'unreachable file recovery must attempt at most one fresh address',
-    );
-
-    // Restore file on disk and click Try again -> video loads cleanly.
-    fs.writeFileSync(vanishedPath, paddedWebm);
-    await page.locator('.viewer').getByRole('button', { name: 'Try again' }).click();
-    await page.locator('.viewer video.viewer-video').waitFor({ timeout: 10_000 });
-    await page.waitForFunction(
-      () => {
-        const v = document.querySelector('.viewer video.viewer-video');
-        return Boolean(v && v.readyState >= 1 && v.videoWidth === 64 && v.error === null);
-      },
-      null,
-      { timeout: 10_000 },
-    );
-
-    // ── Part D: Switch mounted viewer from video to picture via hash change ──────────────────
-    const videoHash = `${server.url}/${viewerHashFor('sample.webm')}`;
-    const picHash = viewerHashFor('icon.png');
-    await page.goto(videoHash, { waitUntil: 'domcontentloaded' });
-    await page.locator('.viewer video.viewer-video').waitFor({ timeout: 10_000 });
-    await page.waitForFunction(
-      () => {
-        const v = document.querySelector('.viewer video.viewer-video');
-        return Boolean(v && v.readyState >= 1 && v.videoWidth === 64);
-      },
-      null,
-      { timeout: 10_000 },
-    );
-
-    // Watch every <img> src rendered inside .viewer during the hash switch.
-    await page.evaluate(() => {
-      window.__seenImgSrcs = [];
-      const record = (node) => {
-        if (node && node.nodeType === 1) {
-          if (node.tagName === 'IMG' && node.getAttribute('src')) {
-            window.__seenImgSrcs.push(node.getAttribute('src'));
-          }
-          if (node.querySelectorAll) {
-            for (const img of node.querySelectorAll('img')) {
-              if (img.getAttribute('src')) window.__seenImgSrcs.push(img.getAttribute('src'));
+      // Watch every <img> src rendered inside .viewer during the hash switch.
+      await page.evaluate(() => {
+        window.__seenImgSrcs = [];
+        const record = (node) => {
+          if (node && node.nodeType === 1) {
+            if (node.tagName === 'IMG' && node.getAttribute('src')) {
+              window.__seenImgSrcs.push(node.getAttribute('src'));
+            }
+            if (node.querySelectorAll) {
+              for (const img of node.querySelectorAll('img')) {
+                if (img.getAttribute('src')) window.__seenImgSrcs.push(img.getAttribute('src'));
+              }
             }
           }
-        }
-      };
-      const viewer = document.querySelector('.viewer');
-      const obs = new MutationObserver((mutations) => {
-        for (const m of mutations) {
-          if (m.type === 'attributes' && m.target.tagName === 'IMG') {
-            record(m.target);
+        };
+        const viewer = document.querySelector('.viewer');
+        const obs = new MutationObserver((mutations) => {
+          for (const m of mutations) {
+            if (m.type === 'attributes' && m.target.tagName === 'IMG') {
+              record(m.target);
+            }
+            for (const n of m.addedNodes) record(n);
           }
-          for (const n of m.addedNodes) record(n);
-        }
+        });
+        if (viewer) obs.observe(viewer, { subtree: true, childList: true, attributes: true, attributeFilter: ['src'] });
+        window.__imgObs = obs;
       });
-      if (viewer) obs.observe(viewer, { subtree: true, childList: true, attributes: true, attributeFilter: ['src'] });
-      window.__imgObs = obs;
-    });
 
-    await page.evaluate((nextHash) => {
-      window.location.hash = nextHash;
-    }, picHash);
+      await page.evaluate((nextHash) => {
+        window.location.hash = nextHash;
+      }, picHash);
 
-    await page.waitForFunction(
-      () => {
-        const img = document.querySelector('.viewer img.viewer-img');
-        return Boolean(img && img.complete && img.naturalWidth === 512 && img.naturalHeight === 512);
-      },
-      null,
-      { timeout: 10_000 },
-    );
-    const seenImgSrcs = await page.evaluate(() => {
-      window.__imgObs?.disconnect();
-      return window.__seenImgSrcs || [];
-    });
-    assert.equal(await page.locator('.viewer .said').count(), 0, 'switching from video to picture must show no error');
-    assert.ok(
-      seenImgSrcs.every((s) => !s.endsWith('/sample.webm')),
-      `<img> must never receive the previous video address even for one frame: ${JSON.stringify(seenImgSrcs)}`,
-    );
+      await tracker.waitForFn(
+        page,
+        () => {
+          const img = document.querySelector('.viewer img.viewer-img');
+          return Boolean(img && img.complete && img.naturalWidth === 512 && img.naturalHeight === 512);
+        },
+        null,
+        'Part D icon.png decoded after switch from video',
+      );
+      const seenImgSrcs = await page.evaluate(() => {
+        window.__imgObs?.disconnect();
+        return window.__seenImgSrcs || [];
+      });
+      assert.equal(await page.locator('.viewer .said').count(), 0, 'switching from video to picture must show no error');
+      assert.ok(
+        seenImgSrcs.every((s) => !s.endsWith('/sample.webm')),
+        `<img> must never receive the previous video address even for one frame: ${JSON.stringify(seenImgSrcs)}`,
+      );
 
-    assert.deepEqual(pageErrors, [], `Unexpected page errors: ${pageErrors.join('\n')}`);
+      assert.deepEqual(pageErrors, [], `Unexpected page errors: ${pageErrors.join('\n')}`);
 
-    await ctx.close();
-  } finally {
-    await browser.close();
-    await server.stop();
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
+      await ctx.close();
+    } finally {
+      await browser.close();
+      await server.stop();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
 
 const PNG_CRC_TABLE = (() => {
   const table = new Uint32Array(256);
@@ -2457,41 +2401,9 @@ function makeTaggedFlac({ title, artist, album, coverPng, durationSecs = 4 } = {
   return Buffer.concat(out);
 }
 
-async function waitForLoadedThumb(locator, label) {
+async function waitForLoadedThumb(locator, label, tracker = null) {
   const img = locator.locator('img').first();
-  await img.waitFor({ timeout: 10_000 });
-  await img.evaluate(
-    (el) =>
-      new Promise((resolve, reject) => {
-        if (el.complete && el.naturalWidth > 0 && el.naturalHeight > 0) {
-          resolve();
-          return;
-        }
-        const timer = setTimeout(() => reject(new Error('Thumbnail image did not finish loading')), 10_000);
-        el.addEventListener(
-          'load',
-          () => {
-            clearTimeout(timer);
-            resolve();
-          },
-          { once: true },
-        );
-        el.addEventListener(
-          'error',
-          () => {
-            clearTimeout(timer);
-            reject(new Error('Thumbnail image failed to decode'));
-          },
-          { once: true },
-        );
-      }),
-  );
-  const info = await img.evaluate((el) => ({
-    src: el.getAttribute('src') || '',
-    complete: el.complete,
-    width: el.naturalWidth,
-    height: el.naturalHeight,
-  }));
+  const info = await waitForImageLoaded(img, `thumbnail ${label}`, { tracker });
   assert.ok(info.src.startsWith('data:image/'), `${label}: expected data:image/ thumbnail, got ${info.src.slice(0, 40)}`);
   assert.equal(info.complete, true, `${label}: expected thumbnail complete`);
   assert.ok(info.width > 0, `${label}: expected naturalWidth > 0, got ${info.width}`);
@@ -2499,342 +2411,501 @@ async function waitForLoadedThumb(locator, label) {
   return info;
 }
 
-test('real legion serve renders real fs.thumb thumbnails in grid, list, pinned strip, and search hits', async () => {
-  assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
-  const root = makeWorkRoot();
-  const fleet = setupFleet(root);
+browserTest(
+  'real legion serve renders real fs.thumb thumbnails in grid, list, pinned strip, and search hits',
+  { timeout: 120_000 },
+  async (_t, tracker) => {
+    assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
+    const root = makeWorkRoot();
+    const fleet = setupFleet(root);
 
-  const galleryDir = path.join(fleet.towerUser, 'gallery');
-  fs.mkdirSync(galleryDir, { recursive: true });
-  const pictures = [
-    { name: 'crimson-sunset.png', rgb: [210, 45, 60] },
-    { name: 'forest-pine.png', rgb: [34, 139, 68] },
-    { name: 'ocean-wave.png', rgb: [30, 110, 210] },
-  ];
-  for (const pic of pictures) {
-    fs.writeFileSync(path.join(galleryDir, pic.name), makeSolidPng(160, 120, ...pic.rgb));
-  }
-  fs.writeFileSync(path.join(galleryDir, 'notes.txt'), 'Caption notes for gallery.\n');
-
-  const crimsonPath = path.join(galleryDir, 'crimson-sunset.png');
-  runLegion(
-    ['fav.add', 'machine=tower', `path=${crimsonPath}`, 'pinned=true', '--json'],
-    fleet.towerHome,
-    fleet.towerUser,
-  );
-
-  // Confirm the real node returns the `{ results: [{ path, ok }] }` wire shape.
-  const cliThumb = JSON.parse(
-    runLegion(['fs.thumb', `paths=["${crimsonPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"]`, '--json'], fleet.towerHome, fleet.towerUser),
-  );
-  assert.ok(Array.isArray(cliThumb.results), 'Real node fs.thumb must return a results array');
-  assert.equal(cliThumb.results.length, 1);
-  assert.equal(cliThumb.results[0].path, crimsonPath);
-  assert.ok(cliThumb.results[0].ok?.mime?.startsWith('image/'));
-  assert.ok(cliThumb.results[0].ok?.content?.length > 0);
-  assert.equal(cliThumb.thumbnails, undefined);
-
-  const server = await startServer(fleet.towerHome, fleet.towerUser);
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu'],
-  });
-
-  const consoleErrors = [];
-  const pageErrors = [];
-
-  try {
-    const ctx = await browser.newContext({
-      viewport: { width: 390, height: 844 },
-      colorScheme: 'dark',
-    });
-    const page = await ctx.newPage();
-    page.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
-    });
-    page.on('pageerror', (err) => pageErrors.push(String(err)));
-
-    // 1. Connect and open Files home: pinned picture renders a real thumbnail.
-    await page.goto(`${server.url}/#token=${encodeURIComponent(fleet.token)}`, { waitUntil: 'domcontentloaded' });
-    await page.getByText('2 are on').waitFor({ timeout: 15_000 });
-    await page.locator('nav.nav a', { hasText: 'Files' }).click();
-    await page.locator('header.top h1', { hasText: 'Files' }).waitFor();
-
-    const pinnedTile = page.locator('.tiles a.tile', { hasText: 'crimson-sunset.png' });
-    await pinnedTile.waitFor({ timeout: 10_000 });
-    await waitForLoadedThumb(pinnedTile, 'pinned strip crimson-sunset.png');
-
-    // 2. Open tower -> gallery: defaults to grid view and renders real thumbnails for all 3 pictures.
-    await page.locator('a.row[href="#/files/tower/~"]').click();
-    await page.locator('header.top h1', { hasText: 'Home' }).waitFor();
-    await page.locator('.list a.row', { hasText: 'gallery' }).click();
-    await page.locator('header.top h1', { hasText: 'gallery' }).waitFor();
-
-    const gridSrcs = new Set();
+    const galleryDir = path.join(fleet.towerUser, 'gallery');
+    fs.mkdirSync(galleryDir, { recursive: true });
+    const pictures = [
+      { name: 'crimson-sunset.png', rgb: [210, 45, 60] },
+      { name: 'forest-pine.png', rgb: [34, 139, 68] },
+      { name: 'ocean-wave.png', rgb: [30, 110, 210] },
+    ];
     for (const pic of pictures) {
-      const cell = page.locator(`.grid a.cell[aria-label="${pic.name}"]`);
-      await cell.waitFor({ timeout: 10_000 });
-      const info = await waitForLoadedThumb(cell, `grid ${pic.name}`);
-      gridSrcs.add(info.src);
+      fs.writeFileSync(path.join(galleryDir, pic.name), makeSolidPng(160, 120, ...pic.rgb));
     }
-    assert.equal(gridSrcs.size, pictures.length, 'Different-coloured pictures should produce distinct thumbnails');
+    fs.writeFileSync(path.join(galleryDir, 'notes.txt'), 'Caption notes for gallery.\n');
 
-    // 3. Switch to list view: all 3 pictures render real thumbnails.
-    await page.locator('.dock button[aria-label="Show as list"]').click();
-    for (const pic of pictures) {
-      const row = page.locator('.list a.row', { hasText: pic.name });
-      await row.waitFor({ timeout: 10_000 });
-      await waitForLoadedThumb(row, `list ${pic.name}`);
-    }
+    const crimsonPath = path.join(galleryDir, 'crimson-sunset.png');
+    runLegion(
+      ['fav.add', 'machine=tower', `path=${crimsonPath}`, 'pinned=true', '--json'],
+      fleet.towerHome,
+      fleet.towerUser,
+    );
 
-    // 4. Clear cached thumbnails and reload Files home so search hits genuinely fetch via fs.thumb.
-    await page.evaluate(() => {
-      for (const k of Object.keys(localStorage)) {
-        if (k.startsWith('legion.thumb.')) localStorage.removeItem(k);
-      }
-    });
-    await page.goto(`${server.url}/#/files`, { waitUntil: 'domcontentloaded' });
-    await page.reload({ waitUntil: 'domcontentloaded' });
-    await page.locator('header.top h1', { hasText: 'Files' }).waitFor({ timeout: 10_000 });
+    // Confirm the real node returns the `{ results: [{ path, ok }] }` wire shape.
+    const cliThumb = JSON.parse(
+      runLegion(['fs.thumb', `paths=["${crimsonPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"]`, '--json'], fleet.towerHome, fleet.towerUser),
+    );
+    assert.ok(Array.isArray(cliThumb.results), 'Real node fs.thumb must return a results array');
+    assert.equal(cliThumb.results.length, 1);
+    assert.equal(cliThumb.results[0].path, crimsonPath);
+    assert.ok(cliThumb.results[0].ok?.mime?.startsWith('image/'));
+    assert.ok(cliThumb.results[0].ok?.content?.length > 0);
+    assert.equal(cliThumb.thumbnails, undefined);
 
-    const searchInput = page.locator('.dock input[aria-label="Search all machines"]');
-    await searchInput.waitFor({ timeout: 10_000 });
-    await searchInput.fill('ocean-wave');
-    await page.locator('header.top h1', { hasText: 'Search' }).waitFor({ timeout: 10_000 });
-    const searchRow = page.locator('.list a.row', { hasText: 'ocean-wave.png' }).first();
-    await searchRow.waitFor({ timeout: 10_000 });
-    await waitForLoadedThumb(searchRow, 'search hit ocean-wave.png');
+    const server = await startServer(fleet.towerHome, fleet.towerUser);
+    tracker.setServerStderr(server.getStderr);
+    const browser = await launchBrowser();
 
-    assert.deepEqual(consoleErrors, [], `Unexpected console/CSP errors: ${consoleErrors.join('\n')}`);
-    assert.deepEqual(pageErrors, [], `Unexpected page errors: ${pageErrors.join('\n')}`);
+    const consoleErrors = [];
+    const pageErrors = [];
 
-    await ctx.close();
-  } finally {
-    await browser.close();
-    await server.stop();
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test('delayed capability replies still render thumbnails in pinned strip, folder listing, and viewer', async () => {
-  assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
-  const root = makeWorkRoot();
-  const towerHome = path.join(root, 'tower-legion');
-  const towerUser = path.join(root, 'tower-user');
-  const piHome = path.join(root, 'pi-legion');
-  const piUser = path.join(root, 'pi-user');
-  const legacyHome = path.join(root, 'legacy-legion');
-  const legacyUser = path.join(root, 'legacy-user');
-
-  const samplePng = fs.readFileSync(path.join(REPO_ROOT, 'apps', 'ui', 'icons', 'icon-512.png'));
-
-  for (const [home, user] of [
-    [towerHome, towerUser],
-    [piHome, piUser],
-    [legacyHome, legacyUser],
-  ]) {
-    fs.mkdirSync(path.join(home, 'config'), { recursive: true });
-    fs.mkdirSync(path.join(home, 'state'), { recursive: true });
-    fs.mkdirSync(user, { recursive: true });
-  }
-
-  const piGallery = path.join(piUser, 'gallery');
-  fs.mkdirSync(piGallery, { recursive: true });
-  const piAmberPath = path.join(piGallery, 'pi-amber.png');
-  const piVioletPath = path.join(piGallery, 'pi-violet.png');
-  const piSongPath = path.join(piGallery, 'pi-song.flac');
-  const piSongCover = makeSolidPng(128, 128, 45, 175, 155);
-  fs.writeFileSync(piAmberPath, makeSolidPng(160, 120, 225, 165, 35));
-  fs.writeFileSync(piVioletPath, makeSolidPng(160, 120, 125, 70, 200));
-  fs.writeFileSync(
-    piSongPath,
-    makeTaggedFlac({ title: 'Pi Song', artist: 'Maren', album: 'Harbor', coverPng: piSongCover }),
-  );
-
-  const legacyMedia = path.join(legacyUser, 'media');
-  fs.mkdirSync(legacyMedia, { recursive: true });
-  const legacyIconPath = path.join(legacyMedia, 'icon.png');
-  fs.writeFileSync(legacyIconPath, samplePng);
-
-  const policy = [
-    'default = "owner"',
-    '',
-    '[principals.ui]',
-    'role = "operator"',
-    '',
-    '[roles.operator]',
-    'allow = ["effect:read", "effect:write"]',
-    '',
-  ].join('\n');
-
-  for (const [name, home] of [
-    ['tower', towerHome],
-    ['pi', piHome],
-    ['legacy', legacyHome],
-  ]) {
-    fs.writeFileSync(path.join(home, 'config', 'node.toml'), `name = "${name}"\nsystem = "linux"\nbusy = "none"\n`);
-    fs.writeFileSync(path.join(home, 'config', 'policy.toml'), policy);
-  }
-
-  const piCmd = [process.execPath, path.join(TEST_DIR, 'rpc-helper.mjs'), LEGION_BIN, piHome, piUser, 'rpc'];
-  const legacyCmd = [process.execPath, path.join(TEST_DIR, 'legacy-node-helper.mjs'), LEGION_BIN, legacyHome, legacyUser, 'rpc'];
-  fs.writeFileSync(
-    path.join(towerHome, 'config', 'fleet.toml'),
-    [
-      '[machines.tower]',
-      'ssh = "tower.example"',
-      '',
-      '[machines.pi]',
-      `command = ${JSON.stringify(piCmd)}`,
-      '',
-      '[machines.legacy]',
-      `command = ${JSON.stringify(legacyCmd)}`,
-      '',
-    ].join('\n'),
-  );
-
-  // Pin a picture and a song that live on `pi` so Files home renders both tiles via tower's
-  // fav.list while pi's own capabilities are still held back.
-  runLegion(['fav.add', 'machine=pi', `path=${piAmberPath}`, 'pinned=true', '--json'], towerHome, towerUser);
-  runLegion(['fav.add', 'machine=pi', `path=${piSongPath}`, 'pinned=true', '--json'], towerHome, towerUser);
-  const tokenOut = JSON.parse(runLegion(['token.add', 'name=ui', 'principal=ui', '--json'], towerHome, towerUser));
-
-  const server = await startServer(towerHome, towerUser);
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu'],
-  });
-
-  const consoleErrors = [];
-  const pageErrors = [];
-
-  try {
-    const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, colorScheme: 'dark' });
-    const page = await ctx.newPage();
-    const cdp = await ctx.newCDPSession(page);
-    await cdp.send('Emulation.setCPUThrottlingRate', { rate: 4 });
-
-    page.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
-    });
-    page.on('pageerror', (err) => pageErrors.push(String(err)));
-
-    function makeGate() {
-      let release;
-      let arrivedResolve;
-      const promise = new Promise((r) => {
-        release = r;
+    try {
+      const ctx = await browser.newContext({
+        viewport: { width: 390, height: 844 },
+        colorScheme: 'dark',
       });
-      const arrived = new Promise((r) => {
-        arrivedResolve = r;
+      const page = tracker.attach(await ctx.newPage(), {
+        label: 'real-thumbs',
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
       });
-      let held = true;
-      return {
-        isHeld: () => held,
-        waitArrived: () => arrived,
-        markArrived: () => arrivedResolve(),
-        waitRelease: () => promise,
-        release() {
-          held = false;
-          release();
-        },
-      };
+
+      // 1. Connect and open Files home: pinned picture renders a real thumbnail.
+      tracker.setStep('pinned strip thumbnail');
+      await page.goto(`${server.url}/#token=${encodeURIComponent(fleet.token)}`, { waitUntil: 'domcontentloaded' });
+      await page.getByText('2 are on').waitFor();
+      await page.locator('nav.nav a', { hasText: 'Files' }).click();
+      await page.locator('header.top h1', { hasText: 'Files' }).waitFor();
+
+      const pinnedTile = page.locator('.tiles a.tile', { hasText: 'crimson-sunset.png' });
+      await pinnedTile.waitFor();
+      await waitForLoadedThumb(pinnedTile, 'pinned strip crimson-sunset.png', tracker);
+
+      // 2. Open tower -> gallery: defaults to grid view and renders real thumbnails for all 3 pictures.
+      tracker.setStep('gallery grid thumbnails');
+      await page.locator('a.row[href="#/files/tower/~"]').click();
+      await page.locator('header.top h1', { hasText: 'Home' }).waitFor();
+      await page.locator('.list a.row', { hasText: 'gallery' }).click();
+      await page.locator('header.top h1', { hasText: 'gallery' }).waitFor();
+
+      const gridSrcs = new Set();
+      for (const pic of pictures) {
+        const cell = page.locator(`.grid a.cell[aria-label="${pic.name}"]`);
+        await cell.waitFor();
+        const info = await waitForLoadedThumb(cell, `grid ${pic.name}`, tracker);
+        gridSrcs.add(info.src);
+      }
+      assert.equal(gridSrcs.size, pictures.length, 'Different-coloured pictures should produce distinct thumbnails');
+
+      // 3. Switch to list view: all 3 pictures render real thumbnails.
+      tracker.setStep('gallery list thumbnails');
+      await page.locator('.dock button[aria-label="Show as list"]').click();
+      for (const pic of pictures) {
+        const row = page.locator('.list a.row', { hasText: pic.name });
+        await row.waitFor();
+        await waitForLoadedThumb(row, `list ${pic.name}`, tracker);
+      }
+
+      // 4. Clear cached thumbnails and reload Files home so search hits genuinely fetch via fs.thumb.
+      tracker.setStep('search hit thumbnail after cache clear');
+      await page.evaluate(() => {
+        for (const k of Object.keys(localStorage)) {
+          if (k.startsWith('legion.thumb.')) localStorage.removeItem(k);
+        }
+      });
+      await page.goto(`${server.url}/#/files`, { waitUntil: 'domcontentloaded' });
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await page.locator('header.top h1', { hasText: 'Files' }).waitFor();
+
+      const searchInput = page.locator('.dock input[aria-label="Search all machines"]');
+      await searchInput.waitFor();
+      await searchInput.fill('ocean-wave');
+      await page.locator('header.top h1', { hasText: 'Search' }).waitFor();
+      const searchRow = page.locator('.list a.row', { hasText: 'ocean-wave.png' }).first();
+      await searchRow.waitFor();
+      await waitForLoadedThumb(searchRow, 'search hit ocean-wave.png', tracker);
+
+      assert.deepEqual(consoleErrors, [], `Unexpected console/CSP errors: ${consoleErrors.join('\n')}`);
+      assert.deepEqual(pageErrors, [], `Unexpected page errors: ${pageErrors.join('\n')}`);
+
+      await ctx.close();
+    } finally {
+      await browser.close();
+      await server.stop();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+browserTest(
+  'delayed capability replies still render thumbnails in pinned strip, folder listing, and viewer',
+  { timeout: 120_000 },
+  async (_t, tracker) => {
+    assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
+    const root = makeWorkRoot();
+    const towerHome = path.join(root, 'tower-legion');
+    const towerUser = path.join(root, 'tower-user');
+    const piHome = path.join(root, 'pi-legion');
+    const piUser = path.join(root, 'pi-user');
+    const legacyHome = path.join(root, 'legacy-legion');
+    const legacyUser = path.join(root, 'legacy-user');
+
+    const samplePng = fs.readFileSync(path.join(REPO_ROOT, 'apps', 'ui', 'icons', 'icon-512.png'));
+
+    for (const [home, user] of [
+      [towerHome, towerUser],
+      [piHome, piUser],
+      [legacyHome, legacyUser],
+    ]) {
+      fs.mkdirSync(path.join(home, 'config'), { recursive: true });
+      fs.mkdirSync(path.join(home, 'state'), { recursive: true });
+      fs.mkdirSync(user, { recursive: true });
     }
 
-    let piCapsGate = makeGate();
-    let legacyCapsGate = makeGate();
+    const piGallery = path.join(piUser, 'gallery');
+    fs.mkdirSync(piGallery, { recursive: true });
+    const piAmberPath = path.join(piGallery, 'pi-amber.png');
+    const piVioletPath = path.join(piGallery, 'pi-violet.png');
+    const piSongPath = path.join(piGallery, 'pi-song.flac');
+    const piSongCover = makeSolidPng(128, 128, 45, 175, 155);
+    fs.writeFileSync(piAmberPath, makeSolidPng(160, 120, 225, 165, 35));
+    fs.writeFileSync(piVioletPath, makeSolidPng(160, 120, 125, 70, 200));
+    fs.writeFileSync(
+      piSongPath,
+      makeTaggedFlac({ title: 'Pi Song', artist: 'Maren', album: 'Harbor', coverPng: piSongCover }),
+    );
 
-    await page.route('**/v1/call', async (route) => {
-      let body = null;
-      try {
-        body = JSON.parse(route.request().postData() || '{}');
-      } catch {
-        body = null;
-      }
-      const isCapProbe = body && (body.tool === 'meta.whoami' || body.tool === 'meta.version');
-      if (isCapProbe && body.on === 'pi' && piCapsGate.isHeld()) {
-        piCapsGate.markArrived();
-        await piCapsGate.waitRelease();
-      } else if (isCapProbe && body.on === 'legacy' && legacyCapsGate.isHeld()) {
-        legacyCapsGate.markArrived();
-        await legacyCapsGate.waitRelease();
-      }
-      await route.continue();
-    });
+    const legacyMedia = path.join(legacyUser, 'media');
+    fs.mkdirSync(legacyMedia, { recursive: true });
+    const legacyIconPath = path.join(legacyMedia, 'icon.png');
+    fs.writeFileSync(legacyIconPath, samplePng);
 
-    // 1. Pinned strip renders while pi's capability reply is still held back.
-    await page.goto(`${server.url}/#token=${encodeURIComponent(tokenOut.token)}`, { waitUntil: 'domcontentloaded' });
-    await page.getByText('3 are on').waitFor({ timeout: 15_000 });
-    await page.locator('nav.nav a', { hasText: 'Files' }).click();
-    await page.locator('header.top h1', { hasText: 'Files' }).waitFor();
+    const policy = [
+      'default = "owner"',
+      '',
+      '[principals.ui]',
+      'role = "operator"',
+      '',
+      '[roles.operator]',
+      'allow = ["effect:read", "effect:write"]',
+      '',
+    ].join('\n');
 
-    const pinnedTile = page.locator('.tiles a.tile', { hasText: 'pi-amber.png' });
-    const pinnedSongTile = page.locator('.tiles a.tile', { hasText: 'pi-song.flac' });
-    await pinnedTile.waitFor({ timeout: 10_000 });
-    await pinnedSongTile.waitFor({ timeout: 10_000 });
-    await piCapsGate.waitArrived();
-    assert.equal(await pinnedTile.locator('img').count(), 0, 'Pinned tile should show icon while pi caps are held');
-    assert.equal(await pinnedSongTile.locator('img').count(), 0, 'Pinned song tile should show icon while pi caps are held');
-    piCapsGate.release();
-    await waitForLoadedThumb(pinnedTile, 'delayed-caps pinned pi-amber.png');
-    await waitForLoadedThumb(pinnedSongTile, 'delayed-caps pinned pi-song.flac');
-
-    // 2. Folder listing mounts while pi's capability reply is held back on a fresh reload.
-    piCapsGate = makeGate();
-    await page.goto(`${server.url}/#/files/pi/${encodeURIComponent(piGallery).replace(/%2F/g, '/')}`, {
-      waitUntil: 'domcontentloaded',
-    });
-    await page.reload({ waitUntil: 'domcontentloaded' });
-    await page.locator('header.top h1', { hasText: 'gallery' }).waitFor({ timeout: 10_000 });
-    await piCapsGate.waitArrived();
-    assert.equal(await page.locator('.grid a.cell img').count(), 0, 'Listing grid should wait until pi caps arrive');
-    assert.equal(await page.locator('.list a.row img').count(), 0, 'Listing song cover should wait until pi caps arrive');
-    piCapsGate.release();
-    for (const name of ['pi-amber.png', 'pi-violet.png']) {
-      const cell = page.locator(`.grid a.cell[aria-label="${name}"]`);
-      await cell.waitFor({ timeout: 10_000 });
-      await waitForLoadedThumb(cell, `delayed-caps listing ${name}`);
+    for (const [name, home] of [
+      ['tower', towerHome],
+      ['pi', piHome],
+      ['legacy', legacyHome],
+    ]) {
+      fs.writeFileSync(path.join(home, 'config', 'node.toml'), `name = "${name}"\nsystem = "linux"\nbusy = "none"\n`);
+      fs.writeFileSync(path.join(home, 'config', 'policy.toml'), policy);
     }
-    const songRow = page.locator('.list a.row', { hasText: 'pi-song.flac' });
-    await songRow.waitFor({ timeout: 10_000 });
-    await waitForLoadedThumb(songRow, 'delayed-caps listing pi-song.flac');
 
-    // 3. Viewer renders while legacy's capability reply is held back; releasing loads the fs.thumb preview.
-    legacyCapsGate = makeGate();
-    await page.goto(
-      `${server.url}/#/files/legacy/${encodeURIComponent(legacyMedia).replace(/%2F/g, '/')}?view=${encodeURIComponent(legacyIconPath)}`,
-      { waitUntil: 'domcontentloaded' },
-    );
-    await page.locator('.viewer').waitFor({ timeout: 10_000 });
-    await legacyCapsGate.waitArrived();
-    assert.equal(await page.locator('.viewer img.viewer-img').count(), 0, 'Viewer should wait until legacy caps arrive');
-    legacyCapsGate.release();
-    const viewerImg = page.locator('.viewer img.viewer-img');
-    await viewerImg.waitFor({ timeout: 10_000 });
-    await page.waitForFunction(
-      () => {
-        const el = document.querySelector('.viewer img.viewer-img');
-        return Boolean(el && el.complete && el.naturalWidth === 512 && el.naturalHeight === 512);
-      },
-      null,
-      { timeout: 10_000 },
-    );
-    const viewerSrc = await viewerImg.getAttribute('src');
-    assert.ok(
-      viewerSrc && viewerSrc.startsWith('data:image/'),
-      `Expected data:image/ fs.thumb preview after delayed caps, got ${String(viewerSrc).slice(0, 40)}`,
+    const piCmd = [process.execPath, path.join(TEST_DIR, 'rpc-helper.mjs'), LEGION_BIN, piHome, piUser, 'rpc'];
+    const legacyCmd = [process.execPath, path.join(TEST_DIR, 'legacy-node-helper.mjs'), LEGION_BIN, legacyHome, legacyUser, 'rpc'];
+    fs.writeFileSync(
+      path.join(towerHome, 'config', 'fleet.toml'),
+      [
+        '[machines.tower]',
+        'ssh = "tower.example"',
+        '',
+        '[machines.pi]',
+        `command = ${JSON.stringify(piCmd)}`,
+        '',
+        '[machines.legacy]',
+        `command = ${JSON.stringify(legacyCmd)}`,
+        '',
+      ].join('\n'),
     );
 
-    const unexpectedConsole = consoleErrors.filter((msg) => !msg.includes('status of 501'));
-    assert.deepEqual(unexpectedConsole, [], `Unexpected console/CSP errors: ${unexpectedConsole.join('\n')}`);
-    assert.deepEqual(pageErrors, [], `Unexpected page errors: ${pageErrors.join('\n')}`);
+    // Pin a picture and a song that live on `pi` so Files home renders both tiles via tower's
+    // fav.list while pi's own capabilities are still held back.
+    runLegion(['fav.add', 'machine=pi', `path=${piAmberPath}`, 'pinned=true', '--json'], towerHome, towerUser);
+    runLegion(['fav.add', 'machine=pi', `path=${piSongPath}`, 'pinned=true', '--json'], towerHome, towerUser);
+    const tokenOut = JSON.parse(runLegion(['token.add', 'name=ui', 'principal=ui', '--json'], towerHome, towerUser));
 
-    await ctx.close();
-  } finally {
-    await browser.close();
-    await server.stop();
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
+    const server = await startServer(towerHome, towerUser);
+    tracker.setServerStderr(server.getStderr);
+    const browser = await launchBrowser();
+
+    const consoleErrors = [];
+    const pageErrors = [];
+    let piCapsGate = tracker.makeBoundedGate('pi capabilities');
+    let legacyCapsGate = tracker.makeBoundedGate('legacy capabilities');
+    let page = null;
+
+    try {
+      const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, colorScheme: 'dark' });
+      page = tracker.attach(await ctx.newPage(), {
+        label: 'delayed-caps',
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
+      const cdp = await ctx.newCDPSession(page);
+      await cdp.send('Emulation.setCPUThrottlingRate', { rate: 4 });
+
+      await page.route('**/v1/call', async (route) => {
+        let body = null;
+        try {
+          body = JSON.parse(route.request().postData() || '{}');
+        } catch {
+          body = null;
+        }
+        const isCapProbe = body && (body.tool === 'meta.whoami' || body.tool === 'meta.version');
+        const activePiGate = piCapsGate;
+        const activeLegacyGate = legacyCapsGate;
+        if (isCapProbe && body.on === 'pi' && activePiGate.isHeld()) {
+          activePiGate.markArrived();
+          await activePiGate.waitRelease();
+        } else if (isCapProbe && body.on === 'legacy' && activeLegacyGate.isHeld()) {
+          activeLegacyGate.markArrived();
+          await activeLegacyGate.waitRelease();
+        }
+        try {
+          await route.continue();
+        } catch {
+          // Ignore teardown route race.
+        }
+      });
+
+      // 1. Pinned strip renders while pi's capability reply is still held back.
+      tracker.setStep('pinned strip with held pi capabilities');
+      await page.goto(`${server.url}/#token=${encodeURIComponent(tokenOut.token)}`, { waitUntil: 'domcontentloaded' });
+      await page.getByText('3 are on').waitFor();
+      await page.locator('nav.nav a', { hasText: 'Files' }).click();
+      await page.locator('header.top h1', { hasText: 'Files' }).waitFor();
+
+      const pinnedTile = page.locator('.tiles a.tile', { hasText: 'pi-amber.png' });
+      const pinnedSongTile = page.locator('.tiles a.tile', { hasText: 'pi-song.flac' });
+      await pinnedTile.waitFor();
+      await pinnedSongTile.waitFor();
+      await piCapsGate.waitArrived('pi capability probe on Files home');
+      assert.equal(await pinnedTile.locator('img').count(), 0, 'Pinned tile should show icon while pi caps are held');
+      assert.equal(await pinnedSongTile.locator('img').count(), 0, 'Pinned song tile should show icon while pi caps are held');
+      piCapsGate.release();
+      await waitForLoadedThumb(pinnedTile, 'delayed-caps pinned pi-amber.png', tracker);
+      await waitForLoadedThumb(pinnedSongTile, 'delayed-caps pinned pi-song.flac', tracker);
+
+      // 2. Folder listing mounts while pi's capability reply is held back on a fresh reload.
+      tracker.setStep('folder listing with held pi capabilities');
+      piCapsGate.release();
+      piCapsGate = tracker.makeBoundedGate('pi capabilities (reload)');
+      await page.goto(`${server.url}/#/files/pi/${encodeURIComponent(piGallery).replace(/%2F/g, '/')}`, {
+        waitUntil: 'domcontentloaded',
+      });
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await page.locator('header.top h1', { hasText: 'gallery' }).waitFor();
+      await piCapsGate.waitArrived('pi capability probe after gallery reload');
+      assert.equal(await page.locator('.grid a.cell img').count(), 0, 'Listing grid should wait until pi caps arrive');
+      assert.equal(await page.locator('.list a.row img').count(), 0, 'Listing song cover should wait until pi caps arrive');
+      piCapsGate.release();
+      for (const name of ['pi-amber.png', 'pi-violet.png']) {
+        const cell = page.locator(`.grid a.cell[aria-label="${name}"]`);
+        await cell.waitFor();
+        await waitForLoadedThumb(cell, `delayed-caps listing ${name}`, tracker);
+      }
+      const songRow = page.locator('.list a.row', { hasText: 'pi-song.flac' });
+      await songRow.waitFor();
+      await waitForLoadedThumb(songRow, 'delayed-caps listing pi-song.flac', tracker);
+
+      // 3. Viewer renders while legacy's capability reply is held back; releasing loads the fs.thumb preview.
+      tracker.setStep('viewer with held legacy capabilities');
+      legacyCapsGate.release();
+      legacyCapsGate = tracker.makeBoundedGate('legacy capabilities (viewer)');
+      await page.goto(
+        `${server.url}/#/files/legacy/${encodeURIComponent(legacyMedia).replace(/%2F/g, '/')}?view=${encodeURIComponent(legacyIconPath)}`,
+        { waitUntil: 'domcontentloaded' },
+      );
+      await page.locator('.viewer').waitFor();
+      await legacyCapsGate.waitArrived('legacy capability probe in viewer');
+      assert.equal(await page.locator('.viewer img.viewer-img').count(), 0, 'Viewer should wait until legacy caps arrive');
+      legacyCapsGate.release();
+      const viewerImg = page.locator('.viewer img.viewer-img[src]');
+      const viewerInfo = await waitForImageLoaded(viewerImg, 'legacy viewer fs.thumb preview after delayed caps', {
+        tracker,
+      });
+      assert.equal(viewerInfo.width, 512);
+      assert.equal(viewerInfo.height, 512);
+      assert.ok(
+        viewerInfo.src.startsWith('data:image/'),
+        `Expected data:image/ fs.thumb preview after delayed caps, got ${String(viewerInfo.src).slice(0, 40)}`,
+      );
+
+      const unexpectedConsole = consoleErrors.filter((msg) => !msg.includes('status of 501'));
+      assert.deepEqual(unexpectedConsole, [], `Unexpected console/CSP errors: ${unexpectedConsole.join('\n')}`);
+      assert.deepEqual(pageErrors, [], `Unexpected page errors: ${pageErrors.join('\n')}`);
+
+      await ctx.close();
+    } finally {
+      piCapsGate.release();
+      legacyCapsGate.release();
+      if (page) {
+        await page.unrouteAll({ behavior: 'ignoreErrors' }).catch(() => {});
+      }
+      await browser.close();
+      await server.stop();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+browserTest(
+  'HTTP door requests quietly retry once after a transient network-change error without showing an error',
+  { timeout: 120_000 },
+  async (_t, tracker) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-ui-netchange-'));
+    const legionHome = path.join(root, 'legion');
+    const userHome = path.join(root, 'home');
+    const galleryDir = path.join(userHome, 'gallery');
+    fs.mkdirSync(path.join(legionHome, 'config'), { recursive: true });
+    fs.mkdirSync(path.join(legionHome, 'state'), { recursive: true });
+    fs.mkdirSync(galleryDir, { recursive: true });
+    fs.writeFileSync(path.join(galleryDir, 'harbor.png'), makeSolidPng(160, 120, 60, 150, 210));
+    fs.writeFileSync(
+      path.join(legionHome, 'config', 'node.toml'),
+      'name = "tower"\nsystem = "linux"\nbusy = "none"\n',
+    );
+    fs.writeFileSync(
+      path.join(legionHome, 'config', 'policy.toml'),
+      [
+        'default = "owner"',
+        '',
+        '[principals.ui]',
+        'role = "operator"',
+        '',
+        '[roles.operator]',
+        'allow = ["effect:read", "effect:write"]',
+        '',
+      ].join('\n'),
+    );
+
+    const tokenOut = JSON.parse(runLegion(['token.add', 'name=ui', 'principal=ui', '--json'], legionHome, userHome));
+    const server = await startServer(legionHome, userHome);
+    tracker.setServerStderr(server.getStderr);
+    const browser = await launchBrowser();
+
+    const consoleErrors = [];
+    const pageErrors = [];
+    const counts = { health: 0, tools: 0, fsList: 0, content: 0, fsMkdir: 0 };
+    let page = null;
+
+    try {
+      const ctx = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
+      page = tracker.attach(await ctx.newPage(), {
+        label: 'http-net-change',
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
+
+      // Drop the first attempt of each door endpoint with a transport-level abort (the same
+      // TypeError('Failed to fetch') path Chromium takes on net::ERR_NETWORK_CHANGED).
+      await page.route('**/v1/**', async (route) => {
+        const req = route.request();
+        const pathname = new URL(req.url()).pathname;
+        if (pathname === '/v1/health') {
+          counts.health += 1;
+          if (counts.health === 1) {
+            await route.abort('connectionaborted');
+            return;
+          }
+        } else if (pathname === '/v1/tools') {
+          counts.tools += 1;
+          if (counts.tools === 1) {
+            await route.abort('connectionaborted');
+            return;
+          }
+        } else if (pathname === '/v1/content' && req.method() === 'POST') {
+          counts.content += 1;
+          if (counts.content === 1) {
+            await route.abort('connectionaborted');
+            return;
+          }
+        } else if (pathname === '/v1/call' && req.method() === 'POST') {
+          let body = null;
+          try {
+            body = JSON.parse(req.postData() || '{}');
+          } catch {
+            body = null;
+          }
+          if (body?.tool === 'fs.list' && String(body?.args?.path || '').includes('gallery')) {
+            counts.fsList += 1;
+            if (counts.fsList === 1) {
+              await route.abort('connectionaborted');
+              return;
+            }
+          } else if (body?.tool === 'fs.mkdir') {
+            counts.fsMkdir += 1;
+            await route.abort('connectionaborted');
+            return;
+          }
+        }
+        try {
+          await route.continue();
+        } catch {
+          // Ignore teardown route races.
+        }
+      });
+
+      // 1. Initial load recovers quietly from aborted /v1/health and /v1/tools.
+      tracker.setStep('initial load survives aborted health and tools');
+      await page.goto(`${server.url}/#token=${encodeURIComponent(tokenOut.token)}`, { waitUntil: 'domcontentloaded' });
+      await tracker.waitForLocator(page.locator('nav.nav a', { hasText: 'Files' }), 'Files nav link');
+      assert.equal(await page.locator('.err, .notice.error, .banner.error').count(), 0);
+
+      // 2. Folder listing recovers quietly from aborted fs.list and shows no error banner.
+      tracker.setStep('gallery folder listing survives aborted fs.list');
+      await page.goto(`${server.url}/#/files/tower/~/gallery`, {
+        waitUntil: 'domcontentloaded',
+      });
+      const harborCell = page
+        .locator('.grid a.cell[aria-label="harbor.png"]')
+        .or(page.locator('a.row', { hasText: 'harbor.png' }))
+        .first();
+      await tracker.waitForLocator(harborCell, 'harbor.png after fs.list retry');
+      assert.equal(counts.fsList, 2, `Expected exactly one retry for fs.list, saw ${counts.fsList}`);
+      assert.equal(await page.locator('.err, .notice.error, .banner.error').count(), 0);
+      const bodyText = await page.locator('body').innerText();
+      assert.equal(bodyText.includes("Can't reach"), false, `Unexpected unreachable text: ${bodyText}`);
+
+      // 3. Opening a picture recovers quietly from aborted POST /v1/content and renders the image.
+      tracker.setStep('opening harbor.png survives aborted /v1/content');
+      await harborCell.click();
+      const viewerImg = page.locator('.viewer img.viewer-img[src]');
+      const imgInfo = await waitForImageLoaded(viewerImg, 'harbor.png viewer image after /v1/content retry', {
+        tracker,
+      });
+      assert.equal(imgInfo.width, 160);
+      assert.equal(imgInfo.height, 120);
+      assert.equal(counts.content, 2, `Expected exactly one retry for /v1/content, saw ${counts.content}`);
+      assert.ok(counts.health >= 2, `Expected /v1/health retry, saw ${counts.health}`);
+      assert.ok(counts.tools >= 2, `Expected /v1/tools retry, saw ${counts.tools}`);
+      assert.equal(await page.locator('.err, .notice.error, .banner.error').count(), 0);
+
+      // 4. A mutating door call (fs.mkdir) is NOT retried when the network drops.
+      tracker.setStep('mutating fs.mkdir does not retry on aborted fetch');
+      const mkdirOutcome = await page.evaluate(async (targetPath) => {
+        const { createHttpLink } = await import('/link/http.js');
+        const link = createHttpLink();
+        try {
+          await link.call('fs.mkdir', { path: targetPath });
+          return { ok: true };
+        } catch (err) {
+          return { ok: false, code: err?.code || null };
+        }
+      }, path.join(galleryDir, 'never-created'));
+      assert.deepEqual(mkdirOutcome, { ok: false, code: 'unreachable' });
+      assert.equal(counts.fsMkdir, 1, `Mutating fs.mkdir must not retry, saw ${counts.fsMkdir}`);
+
+      const unexpectedConsole = consoleErrors.filter(
+        (msg) => !msg.includes('ERR_CONNECTION_ABORTED') && !msg.includes('Failed to load resource'),
+      );
+      assert.deepEqual(unexpectedConsole, [], `Unexpected console errors: ${unexpectedConsole.join('\n')}`);
+      assert.deepEqual(pageErrors, [], `Unexpected page errors: ${pageErrors.join('\n')}`);
+
+      await ctx.close();
+    } finally {
+      if (page) {
+        await page.unrouteAll({ behavior: 'ignoreErrors' }).catch(() => {});
+      }
+      await browser.close();
+      await server.stop();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  },
+);

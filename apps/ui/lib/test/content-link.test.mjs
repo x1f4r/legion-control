@@ -439,3 +439,188 @@ test('createMockLink contentUrl serves built-in samples and enforces auth, reach
     status: 401,
   });
 });
+
+test('createHttpLink quietly retries idempotent door requests once on transient network errors', async () => {
+  const prevWindow = globalThis.window;
+  globalThis.window = { location: { origin: 'http://127.0.0.1:4433' } };
+  const attempts = new Map();
+  const bump = (key) => {
+    const next = (attempts.get(key) || 0) + 1;
+    attempts.set(key, next);
+    return next;
+  };
+  const jsonHeaders = { get: () => 'application/json' };
+
+  const restore = withMockEnv(async (url, init) => {
+    if (url === '/v1/health') {
+      if (bump('health') === 1) throw new TypeError('Failed to fetch');
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { ok: true, node: 'tower', version: '0.2.0', content: true };
+        },
+      };
+    }
+    if (url === '/v1/tools?all=1') {
+      if (bump('tools') === 1) throw new TypeError('Failed to fetch');
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            tools: [
+              { name: 'meta.whoami', effect: 'read' },
+              { name: 'fs.list', effect: 'read' },
+              { name: 'custom.inspect', effect: 'read' },
+              { name: 'custom.mutate', effect: 'write' },
+              { name: 'exec.run', effect: 'exec' },
+              { name: 'fs.remove', effect: 'destroy' },
+            ],
+          };
+        },
+      };
+    }
+    if (url === '/v1/content') {
+      if (bump('content') === 1) throw new TypeError('Failed to fetch');
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { url: '/v1/content/tok/pic.png', expires_in: 900 };
+        },
+      };
+    }
+    if (url === '/v1/call') {
+      const req = JSON.parse(init.body);
+      const count = bump(`call:${req.tool}`);
+      if (count === 1) {
+        throw new TypeError('Failed to fetch');
+      }
+      if (req.tool === 'meta.whoami') {
+        return {
+          ok: true,
+          status: 200,
+          headers: jsonHeaders,
+          async json() {
+            return { node: 'tower', principal: 'ui', role: 'operator' };
+          },
+        };
+      }
+      if (req.tool === 'meta.version') {
+        return {
+          ok: true,
+          status: 200,
+          headers: jsonHeaders,
+          async json() {
+            return { version: '0.2.0', protocol: 1 };
+          },
+        };
+      }
+      if (req.tool === 'fs.list') {
+        return {
+          ok: true,
+          status: 200,
+          headers: jsonHeaders,
+          async json() {
+            return { entries: [{ name: 'notes.txt', kind: 'file' }] };
+          },
+        };
+      }
+      if (req.tool === 'custom.inspect') {
+        return {
+          ok: true,
+          status: 200,
+          headers: jsonHeaders,
+          async json() {
+            return { ok: true };
+          },
+        };
+      }
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  });
+
+  try {
+    const link = createHttpLink({ retryDelayMs: 0 });
+
+    // Startup state() retries /v1/health, meta.whoami, and meta.version once each.
+    const st = await link.state();
+    assert.equal(st.ready, true);
+    assert.equal(link.supportsContent, true);
+    assert.equal(attempts.get('health'), 2);
+    assert.equal(attempts.get('call:meta.whoami'), 2);
+    assert.equal(attempts.get('call:meta.version'), 2);
+
+    // /v1/tools retries once and caches declared read/write effects.
+    const tools = await link.tools();
+    assert.equal(tools.length, 6);
+    assert.equal(attempts.get('tools'), 2);
+
+    // Read-only built-in and declared read extension tools retry once quietly.
+    const listing = await link.call('fs.list', { path: '~' });
+    assert.equal(listing.entries.length, 1);
+    assert.equal(attempts.get('call:fs.list'), 2);
+
+    const inspected = await link.call('custom.inspect', {});
+    assert.deepEqual(inspected, { ok: true });
+    assert.equal(attempts.get('call:custom.inspect'), 2);
+
+    // /v1/content retries once quietly.
+    const minted = await link.contentUrl({ path: '/home/me/pic.png' });
+    assert.equal(minted.url, '/v1/content/tok/pic.png');
+    assert.equal(attempts.get('content'), 2);
+
+    // Mutating tools MUST NOT retry on a dropped fetch (server may already be executing them).
+    for (const mutTool of ['exec.run', 'fs.remove', 'fs.write', 'custom.mutate']) {
+      await assert.rejects(() => link.call(mutTool, {}), { code: 'unreachable' });
+      assert.equal(attempts.get(`call:${mutTool}`), 1, `${mutTool} must not retry automatically`);
+    }
+  } finally {
+    restore();
+    if (prevWindow === undefined) delete globalThis.window;
+    else globalThis.window = prevWindow;
+  }
+});
+
+test('createHttpLink stops after one retry on persistent failure and never retries aborted calls', async () => {
+  let persistentCalls = 0;
+  const restorePersistent = withMockEnv(async () => {
+    persistentCalls += 1;
+    throw new TypeError('Failed to fetch');
+  });
+  try {
+    const link = createHttpLink({ retryDelayMs: 0 });
+    await assert.rejects(() => link.call('fs.list', { path: '~' }), { code: 'unreachable' });
+    assert.equal(persistentCalls, 2, 'Read call must try initial + 1 retry only');
+
+    persistentCalls = 0;
+    await assert.rejects(() => link.contentUrl({ path: '/home/me/a.txt' }), { code: 'unreachable' });
+    assert.equal(persistentCalls, 2, 'contentUrl must try initial + 1 retry only');
+
+    persistentCalls = 0;
+    await assert.rejects(() => link.tools(), { code: 'unreachable' });
+    assert.equal(persistentCalls, 2, 'tools must try initial + 1 retry only');
+  } finally {
+    restorePersistent();
+  }
+
+  // Caller abort during retry wait cancels immediately without making a second fetch.
+  let abortWaitCalls = 0;
+  const ac = new AbortController();
+  const restoreAbortWait = withMockEnv(async () => {
+    abortWaitCalls += 1;
+    setTimeout(() => ac.abort(), 5);
+    throw new TypeError('Failed to fetch');
+  });
+  try {
+    const link = createHttpLink({ retryDelayMs: 5_000 });
+    await assert.rejects(
+      () => link.call('fs.list', { path: '~' }, { signal: ac.signal }),
+      { code: 'cancelled' },
+    );
+    assert.equal(abortWaitCalls, 1, 'Aborting during retry delay must not issue a second fetch');
+  } finally {
+    restoreAbortWait();
+  }
+});

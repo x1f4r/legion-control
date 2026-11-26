@@ -1414,6 +1414,9 @@ export function createMockFilesState({
       );
     if (!hasActive()) return;
     pumpTimer = setInterval(() => {
+      if (typeof window !== 'undefined' && window.__LEGION_MOCK_PAUSE_TRANSFER_PUMP__) {
+        return;
+      }
       let changed = false;
 
       // Advance at most 2 concurrent device transfers; promote queued ones.
@@ -1804,8 +1807,15 @@ export function createMockFilesState({
             },
           });
         }
-        if (isSlowCover && paths.some((p) => categoryFromName(p) === 'audio')) {
-          return new Promise((resolve) => setTimeout(() => resolve({ results }), 280));
+        if (paths.some((p) => categoryFromName(p) === 'audio')) {
+          if (typeof window !== 'undefined' && typeof window.__LEGION_MOCK_COVER_GATE__ === 'function') {
+            return Promise.resolve(
+              window.__LEGION_MOCK_COVER_GATE__({ machine: machineName, paths, size: reqSize }),
+            ).then(() => ({ results }));
+          }
+          if (isSlowCover) {
+            return new Promise((resolve) => setTimeout(() => resolve({ results }), 280));
+          }
         }
         return { results };
       }
@@ -2241,7 +2251,12 @@ export function createMockFilesState({
           if (signal?.aborted) {
             throw { code: 'cancelled', message: 'Loading was stopped.', hint: null, machine: machine || null };
           }
-          if (isSlowContent) {
+          if (typeof window !== 'undefined' && typeof window.__LEGION_MOCK_CONTENT_GATE__ === 'function') {
+            await window.__LEGION_MOCK_CONTENT_GATE__({ machine, path, signal });
+            if (signal?.aborted) {
+              throw { code: 'cancelled', message: 'Loading was stopped.', hint: null, machine: machine || null };
+            }
+          } else if (isSlowContent) {
             await new Promise((resolve, reject) => {
               const tid = setTimeout(resolve, 400);
               signal?.addEventListener?.(
@@ -2416,7 +2431,9 @@ export function createMockFilesState({
         },
 
         async upload({ machine, dir, files }) {
-          if (isSlowUpload) {
+          if (typeof window !== 'undefined' && typeof window.__LEGION_MOCK_UPLOAD_GATE__ === 'function') {
+            await window.__LEGION_MOCK_UPLOAD_GATE__({ machine, dir, files });
+          } else if (isSlowUpload) {
             await new Promise((resolve) => setTimeout(resolve, 450));
           }
           const target = machine || activeNodeRef();

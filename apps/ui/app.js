@@ -2491,8 +2491,10 @@ function App() {
         `;
       }
       if (!wide && route.view === 'folder') {
+        const homePath = folderChanges.getHome(route.machine);
         const title = folderDisplayName(filesMeta.resolvedPath || route.path, {
           technical: Boolean(settings.technical),
+          homePath,
         });
         return html`
           <header class="top sub">
@@ -2507,7 +2509,7 @@ function App() {
         const sub = filesSearchSummary.searching
           ? 'Searching…'
           : route.machine
-            ? `${filesSearchSummary.count} found in ${folderDisplayName(route.path)}`
+            ? `${filesSearchSummary.count} found in ${folderDisplayName(route.path, { homePath: folderChanges.getHome(route.machine) })}`
             : filesSearchSummary.machineCount > 0
               ? `${filesSearchSummary.count} found on ${filesSearchSummary.machineCount} ${filesSearchSummary.machineCount === 1 ? 'machine' : 'machines'}`
               : 'Search across your machines';
