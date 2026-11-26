@@ -43,15 +43,19 @@ impl TransportHandle for LocalPipeHandle {
         wait_limit: Duration,
     ) -> Pin<Box<dyn Future<Output = (Option<i32>, String)> + Send + '_>> {
         Box::pin(async move {
-            let exit_code = match self.child.try_wait() {
-                Ok(Some(status)) => status.code(),
-                _ => match tokio::time::timeout(wait_limit, self.child.wait()).await {
-                    Ok(Ok(status)) => status.code(),
-                    _ => None,
+            let deadline = tokio::time::Instant::now() + wait_limit;
+            let (exited, exit_code) = match self.child.try_wait() {
+                Ok(Some(status)) => (true, status.code()),
+                _ if wait_limit.is_zero() => (false, None),
+                _ => match tokio::time::timeout_at(deadline, self.child.wait()).await {
+                    Ok(Ok(status)) => (true, status.code()),
+                    _ => (false, None),
                 },
             };
-            if let Some(mut task) = self.stderr_task.take()
-                && tokio::time::timeout(wait_limit, &mut task).await.is_err()
+            if exited
+                && !wait_limit.is_zero()
+                && let Some(mut task) = self.stderr_task.take()
+                && tokio::time::timeout_at(deadline, &mut task).await.is_err()
             {
                 task.abort();
             }

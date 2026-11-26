@@ -121,7 +121,8 @@ impl TransportHandle for SshPipeHandle {
         wait_limit: Duration,
     ) -> Pin<Box<dyn Future<Output = (Option<i32>, String)> + Send + '_>> {
         Box::pin(async move {
-            if let Some(mut task) = self.rx_task.take()
+            if !wait_limit.is_zero()
+                && let Some(mut task) = self.rx_task.take()
                 && tokio::time::timeout(wait_limit, &mut task).await.is_err()
             {
                 task.abort();
@@ -136,19 +137,20 @@ impl TransportHandle for SshPipeHandle {
 
     fn close(mut self: Box<Self>, grace: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         Box::pin(async move {
+            let deadline = tokio::time::Instant::now() + grace;
             if let Some(mut tx) = self.tx_task.take()
-                && tokio::time::timeout(grace, &mut tx).await.is_err()
+                && tokio::time::timeout_at(deadline, &mut tx).await.is_err()
             {
                 tx.abort();
             }
             if let Some(mut rx) = self.rx_task.take()
-                && tokio::time::timeout(grace, &mut rx).await.is_err()
+                && tokio::time::timeout_at(deadline, &mut rx).await.is_err()
             {
                 rx.abort();
             }
             if let Some(session) = self.session.take() {
-                let _ = tokio::time::timeout(
-                    grace,
+                let _ = tokio::time::timeout_at(
+                    deadline,
                     session.disconnect(Disconnect::ByApplication, "", "en"),
                 )
                 .await;
