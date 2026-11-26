@@ -2513,7 +2513,7 @@ test('createAppLink exposes nativePip only on Android bridge and routes config, 
 
   Object.defineProperty(globalThis, 'navigator', {
     configurable: true,
-    value: { userAgent: 'Mozilla/5.0 (Linux; Android 15; Pixel) AppleWebKit/537.36' },
+    value: { userAgent: 'Mozilla/5.0 (Linux; Android 15; Phone) AppleWebKit/537.36' },
   });
   globalThis.window = {
     addEventListener(name, fn) {
