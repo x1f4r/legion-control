@@ -87,9 +87,15 @@ const SINGLE_SYSTEM_TIMEOUT: Duration = Duration::from_secs(10);
 /// Shorter per-system connect timeout when probing a multi-system machine.
 const MULTI_SYSTEM_TIMEOUT: Duration = Duration::from_secs(4);
 
-/// Brief head start given to the last-responding system of a multi-system machine before probing
-/// its sibling systems in parallel, avoiding redundant SSH spawns in the common case.
-const REMEMBERED_SYSTEM_HEAD_START: Duration = Duration::from_millis(250);
+/// Head start given to the last-responding system of a multi-system machine before probing its
+/// sibling systems in parallel.
+///
+/// 1.5 s covers healthy connection handshakes (SSH + remote `legion rpc` startup + `hello` over
+/// Tailscale/WAN, Windows OpenSSH, or busy hosts) so reconnections do not spawn redundant probes
+/// against offline siblings, while still leaving 2.5 s of [`MULTI_SYSTEM_TIMEOUT`] for sibling
+/// fallback when a remembered system silently blackholes. Fast failures on the remembered system
+/// fall through immediately without waiting out the head start.
+const REMEMBERED_SYSTEM_HEAD_START: Duration = Duration::from_millis(1500);
 
 /// Reported on a machine entry when the peer answered under a different node name than its fleet
 /// name.
@@ -1992,23 +1998,13 @@ impl Fleet {
         timeout_override: Option<Duration>,
         cancel: CancellationToken,
     ) -> Result<(Session, ResolvedSystem, Option<RemoteOs>), ErrorBody> {
-        let ordered = self.order_systems(machine, systems);
-        if ordered.len() == 1
-            && let Some(sys) = ordered.into_iter().next()
+        if systems.len() == 1
+            && let Some(sys) = systems.first().cloned()
         {
             let timeout = timeout_override.unwrap_or(SINGLE_SYSTEM_TIMEOUT);
             return match self.open_one_system(machine, &sys, timeout, cancel).await {
                 Ok((session, worked_os)) => {
-                    let hello = &session.info().hello;
-                    self.inner
-                        .state
-                        .record_node(machine, reported_from_hello(hello));
-                    if sys.explicit {
-                        self.inner.state.record_system(machine, &sys.name);
-                    }
-                    if let Some(os) = worked_os {
-                        self.inner.state.record_os(machine, &sys.name, os);
-                    }
+                    self.record_connection_state(machine, &session, &sys, worked_os);
                     Ok((session, sys, worked_os))
                 }
                 Err(OpenError::Unsupported(err))
@@ -2020,10 +2016,10 @@ impl Fleet {
         }
 
         // Probe a multi-system machine concurrently so an offline or secondary dual-boot target
-        // does not pay one timeout per configured system. When a system answered previously, give
-        // it a brief head start so healthy reconnections never spawn redundant sibling probes.
-        let has_remembered = self.inner.state.last_system(machine).is_some();
-        let ordered = self.order_systems(machine, systems);
+        // does not pay one timeout per configured system. When a configured system answered
+        // previously, give it a head start long enough for a healthy handshake so reconnections
+        // never spawn redundant sibling probes, while falling through immediately on fast failure.
+        let (ordered, has_remembered) = self.order_systems(machine, systems);
         let per_system_timeout = match timeout_override {
             Some(total) => total.min(MULTI_SYSTEM_TIMEOUT),
             None => MULTI_SYSTEM_TIMEOUT,
@@ -2046,22 +2042,13 @@ impl Fleet {
                 (index, preferred, res)
             });
 
-            let head_start = REMEMBERED_SYSTEM_HEAD_START.min(per_system_timeout / 4);
+            let head_start = REMEMBERED_SYSTEM_HEAD_START.min(per_system_timeout / 2);
             if let Ok(Some(joined)) = tokio::time::timeout(head_start, set.join_next()).await
                 && let Ok((idx, sys, res)) = joined
             {
                 match res {
                     Ok((session, worked_os)) => {
-                        let hello = &session.info().hello;
-                        self.inner
-                            .state
-                            .record_node(machine, reported_from_hello(hello));
-                        if sys.explicit {
-                            self.inner.state.record_system(machine, &sys.name);
-                        }
-                        if let Some(os) = worked_os {
-                            self.inner.state.record_os(machine, &sys.name, os);
-                        }
+                        self.record_connection_state(machine, &session, &sys, worked_os);
                         return Ok((session, sys, worked_os));
                     }
                     Err(OpenError::Unsupported(err)) | Err(OpenError::Cancelled(err)) => {
@@ -2096,16 +2083,7 @@ impl Fleet {
             match res {
                 Ok((session, worked_os)) => {
                     probe_cancel.cancel();
-                    let hello = &session.info().hello;
-                    self.inner
-                        .state
-                        .record_node(machine, reported_from_hello(hello));
-                    if sys.explicit {
-                        self.inner.state.record_system(machine, &sys.name);
-                    }
-                    if let Some(os) = worked_os {
-                        self.inner.state.record_os(machine, &sys.name, os);
-                    }
+                    self.record_connection_state(machine, &session, &sys, worked_os);
                     drain_probe_tasks(set);
                     return Ok((session, sys, worked_os));
                 }
@@ -2253,20 +2231,41 @@ impl Fleet {
         }
     }
 
-    fn order_systems(&self, machine: &str, systems: &[ResolvedSystem]) -> Vec<ResolvedSystem> {
+    fn record_connection_state(
+        &self,
+        machine: &str,
+        session: &Session,
+        sys: &ResolvedSystem,
+        worked_os: Option<RemoteOs>,
+    ) {
+        let hello = &session.info().hello;
+        self.inner.state.record_connection(
+            machine,
+            reported_from_hello(hello),
+            sys.explicit.then_some(sys.name.as_str()),
+            worked_os.map(|os| (sys.name.as_str(), os)),
+        );
+    }
+
+    fn order_systems(
+        &self,
+        machine: &str,
+        systems: &[ResolvedSystem],
+    ) -> (Vec<ResolvedSystem>, bool) {
         let Some(last) = self.inner.state.last_system(machine) else {
-            return systems.to_vec();
+            return (systems.to_vec(), false);
+        };
+        let Some(preferred) = systems.iter().find(|s| s.name == last) else {
+            return (systems.to_vec(), false);
         };
         let mut ordered = Vec::with_capacity(systems.len());
-        if let Some(preferred) = systems.iter().find(|s| s.name == last) {
-            ordered.push(preferred.clone());
-        }
+        ordered.push(preferred.clone());
         for sys in systems {
             if sys.name != last {
                 ordered.push(sys.clone());
             }
         }
-        ordered
+        (ordered, true)
     }
 
     fn slot(&self, machine: &str) -> Arc<MachineSlot> {
@@ -4301,6 +4300,200 @@ mod tests {
         );
 
         fleet.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remembered_system_head_start_avoids_sibling_retry_and_handles_fast_fail_blackhole_and_stale_cache()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::create_dir_all(paths.state_dir()).unwrap();
+        std::fs::write(paths.config_file("node.toml"), "name = \"tower\"\n").unwrap();
+
+        let make_reply_script = |system: &str, os: &str, delay_secs: Option<&str>| {
+            let reply = serde_json::to_string(&Response::ok(
+                Some(Id::Number(1)),
+                serde_json::to_value(HelloResult {
+                    node: "dual".to_owned(),
+                    node_explicit: Some(true),
+                    node_id: None,
+                    version: "0.1.0".to_owned(),
+                    build: None,
+                    protocol: PROTOCOL,
+                    os: os.to_owned(),
+                    arch: "x86_64".to_owned(),
+                    systems: Vec::new(),
+                    system: Some(system.to_owned()),
+                    boot_id: None,
+                })
+                .unwrap(),
+            ))
+            .unwrap();
+            let sleep_part = delay_secs
+                .map(|d| format!("sleep {d}; "))
+                .unwrap_or_default();
+            format!(
+                "read -r _line; {sleep_part}printf '%s\\n' '{}'; exec cat >/dev/null",
+                reply.replace('\'', "'\\''")
+            )
+        };
+        let write_dual_fleet = |linux_script: &str, windows_script: &str| {
+            let fleet_toml = format!(
+                "[machines.dual]\n\
+                 [[machines.dual.systems]]\n\
+                 name = \"linux\"\n\
+                 command = [\"/bin/sh\", \"-c\", {}]\n\
+                 [[machines.dual.systems]]\n\
+                 name = \"windows\"\n\
+                 command = [\"/bin/sh\", \"-c\", {}]\n",
+                serde_json::to_string(linux_script).unwrap(),
+                serde_json::to_string(windows_script).unwrap(),
+            );
+            std::fs::write(paths.config_file("fleet.toml"), fleet_toml).unwrap();
+        };
+
+        let store = ConfigStore::new(paths.config_dir());
+        let linux_log = paths.state_dir().join("linux-attempts.log");
+        let linux_fail = format!(
+            "printf 'attempt\\n' >> '{}'; exit 1",
+            linux_log.to_string_lossy().replace('\'', "'\\''")
+        );
+        let windows_slow = make_reply_script("windows", "windows", Some("0.4"));
+        write_dual_fleet(&linux_fail, &windows_slow);
+
+        // 1. First probe discovers "windows" and persists it; a fresh Fleet then reconnects while
+        //    "windows" takes 400 ms to answer hello and must not spawn "linux" a second time.
+        let fleet1 = Fleet::new(&paths);
+        let ping1 = fleet1
+            .ping(
+                &store,
+                "tower",
+                "dual",
+                Duration::from_secs(4),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(ping1.reachable, "{ping1:?}");
+        assert_eq!(ping1.system.as_deref(), Some("windows"));
+        fleet1.close().await;
+        assert_eq!(
+            std::fs::read_to_string(&linux_log)
+                .unwrap_or_default()
+                .lines()
+                .count(),
+            1
+        );
+
+        let fleet2 = Fleet::new(&paths);
+        let ping2 = fleet2
+            .ping(
+                &store,
+                "tower",
+                "dual",
+                Duration::from_secs(4),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(ping2.reachable, "{ping2:?}");
+        assert_eq!(ping2.system.as_deref(), Some("windows"));
+        fleet2.close().await;
+        assert_eq!(
+            std::fs::read_to_string(&linux_log)
+                .unwrap_or_default()
+                .lines()
+                .count(),
+            1,
+            "sibling system was retried while remembered system answered within head start"
+        );
+
+        // 2. When the remembered system fails fast, fallback probes the sibling immediately without
+        //    waiting out the head start, and updates the remembered winner.
+        let linux_fast = make_reply_script("linux", "linux", None);
+        write_dual_fleet(&linux_fast, "exit 1");
+        let fleet3 = Fleet::new(&paths);
+        let t_fast_fail = Instant::now();
+        let ping3 = fleet3
+            .ping(
+                &store,
+                "tower",
+                "dual",
+                Duration::from_secs(4),
+                CancellationToken::new(),
+            )
+            .await;
+        let fast_fail_elapsed = t_fast_fail.elapsed();
+        assert!(ping3.reachable, "{ping3:?}");
+        assert_eq!(ping3.system.as_deref(), Some("linux"));
+        assert!(
+            fast_fail_elapsed < Duration::from_millis(1200),
+            "fast failure on remembered system waited for head start: {fast_fail_elapsed:?}"
+        );
+        fleet3.close().await;
+        assert_eq!(
+            StateStore::new(paths.state_dir())
+                .last_system("dual")
+                .as_deref(),
+            Some("linux")
+        );
+
+        // 3. When the remembered system silently blackholes, fallback still starts after the head
+        //    start and succeeds within one timeout, updating the remembered winner.
+        let windows_fast = make_reply_script("windows", "windows", None);
+        write_dual_fleet("exec sleep 30", &windows_fast);
+        let fleet4 = Fleet::new(&paths);
+        let t_blackhole = Instant::now();
+        let ping4 = fleet4
+            .ping(
+                &store,
+                "tower",
+                "dual",
+                Duration::from_secs(4),
+                CancellationToken::new(),
+            )
+            .await;
+        let blackhole_elapsed = t_blackhole.elapsed();
+        assert!(ping4.reachable, "{ping4:?}");
+        assert_eq!(ping4.system.as_deref(), Some("windows"));
+        assert!(
+            blackhole_elapsed >= Duration::from_millis(1300),
+            "blackholed remembered system did not receive full head start: {blackhole_elapsed:?}"
+        );
+        fleet4.close().await;
+        assert_eq!(
+            StateStore::new(paths.state_dir())
+                .last_system("dual")
+                .as_deref(),
+            Some("windows")
+        );
+
+        // 4. A stale cached system name that no longer exists in fleet.toml must not grant a bogus
+        //    head start to the first configured system.
+        std::fs::write(
+            paths.state_dir().join("fleet-cache.json"),
+            r#"{"last_system":{"dual":"removed"}}"#,
+        )
+        .unwrap();
+        let fleet5 = Fleet::new(&paths);
+        let t_stale = Instant::now();
+        let ping5 = fleet5
+            .ping(
+                &store,
+                "tower",
+                "dual",
+                Duration::from_secs(4),
+                CancellationToken::new(),
+            )
+            .await;
+        let stale_elapsed = t_stale.elapsed();
+        assert!(ping5.reachable, "{ping5:?}");
+        assert_eq!(ping5.system.as_deref(), Some("windows"));
+        assert!(
+            stale_elapsed < Duration::from_millis(1200),
+            "stale cached system name delayed parallel fallback: {stale_elapsed:?}"
+        );
+        fleet5.close().await;
     }
 
     #[tokio::test]

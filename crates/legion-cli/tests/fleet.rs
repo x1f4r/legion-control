@@ -83,6 +83,10 @@ fn main() -> ExitCode {
             two_system_machine_falls_back_and_remembers_winner,
         ),
         (
+            "remembered_system_waits_past_normal_handshake_latency_without_retrying_sibling",
+            remembered_system_waits_past_normal_handshake_latency_without_retrying_sibling,
+        ),
+        (
             "hop_limit_stops_deliberate_loop_and_allows_valid_multi_hop",
             hop_limit_stops_deliberate_loop_and_allows_valid_multi_hop,
         ),
@@ -174,6 +178,21 @@ fn run_helper(args: &[String]) -> ExitCode {
             if let Some(log) = rest.get(3) {
                 append_line(Path::new(log), "spawn");
             }
+            let status = spawn_legion_rpc(legion, legion_home, user_home, false)
+                .wait()
+                .unwrap();
+            exit_from_status(status)
+        }
+        // run-delayed <delay_ms> <legion_bin> <legion_home> <user_home> [spawn_log]
+        "run-delayed" => {
+            let delay_ms: u64 = rest[0].parse().unwrap();
+            let legion = &rest[1];
+            let legion_home = &rest[2];
+            let user_home = &rest[3];
+            if let Some(log) = rest.get(4) {
+                append_line(Path::new(log), "spawn");
+            }
+            std::thread::sleep(Duration::from_millis(delay_ms));
             let status = spawn_legion_rpc(legion, legion_home, user_home, false)
                 .wait()
                 .unwrap();
@@ -846,6 +865,22 @@ fn run_argv(target: &Home, spawn_log: Option<&Path>) -> Vec<String> {
         this_test_exe(),
         HELPER_FLAG.to_owned(),
         "run".to_owned(),
+        LEGION_BIN.to_owned(),
+        legion_home_of(target).to_string_lossy().into_owned(),
+        target.home().to_string_lossy().into_owned(),
+    ];
+    if let Some(log) = spawn_log {
+        argv.push(log.to_string_lossy().into_owned());
+    }
+    argv
+}
+
+fn run_delayed_argv(target: &Home, delay_ms: u64, spawn_log: Option<&Path>) -> Vec<String> {
+    let mut argv = vec![
+        this_test_exe(),
+        HELPER_FLAG.to_owned(),
+        "run-delayed".to_owned(),
+        delay_ms.to_string(),
         LEGION_BIN.to_owned(),
         legion_home_of(target).to_string_lossy().into_owned(),
         target.home().to_string_lossy().into_owned(),
@@ -1862,6 +1897,55 @@ fn two_system_machine_falls_back_and_remembers_winner() {
         count_lines(&first_log),
         1,
         "first system should not have been retried"
+    );
+    assert_eq!(count_lines(&second_log), 2);
+}
+
+fn remembered_system_waits_past_normal_handshake_latency_without_retrying_sibling() {
+    let laptop = Home::new();
+    let tower = Home::new();
+    let first_log = laptop.state().join("sys1.log");
+    let second_log = laptop.state().join("sys2.log");
+    fs::create_dir_all(laptop.state()).unwrap();
+
+    laptop.write_config("node.toml", "name = \"laptop\"\n");
+    tower.write_config("node.toml", "name = \"tower\"\n");
+
+    let fail_argv = helper_argv(
+        "fail",
+        &[
+            first_log.to_string_lossy().into_owned(),
+            "first system offline".to_owned(),
+        ],
+    );
+    // Inject 400 ms of connector startup latency (representative of WAN/Windows SSH or a busy
+    // host): exceeds the old 250 ms head start deterministically, but stays well inside the
+    // remembered-system head start so the offline sibling must not be probed again.
+    let delayed_ok_argv = run_delayed_argv(&tower, 400, Some(&second_log));
+    laptop.write_config(
+        "fleet.toml",
+        &format!(
+            "[[machines.tower.systems]]\nname = \"first\"\ncommand = {}\n\n[[machines.tower.systems]]\nname = \"second\"\ncommand = {}\n",
+            toml_argv(&fail_argv),
+            toml_argv(&delayed_ok_argv),
+        ),
+    );
+
+    let ping1 = laptop.run(&["fleet.ping", "machines=[\"tower\"]"]);
+    assert_eq!(ping1.code, 0, "{}", ping1.stdout);
+    let r1 = &ping1.json()["results"][0];
+    assert_eq!(r1["reachable"], json!(true), "{r1}");
+    assert_eq!(r1["system"], json!("second"));
+    assert_eq!(count_lines(&first_log), 1);
+    assert_eq!(count_lines(&second_log), 1);
+
+    let call2 = laptop.run(&["meta.version", "--on", "tower"]);
+    assert_eq!(call2.code, 0, "{}", call2.stdout);
+    assert_eq!(call2.json()["node"], json!("tower"));
+    assert_eq!(
+        count_lines(&first_log),
+        1,
+        "first system should not have been retried while remembered system completed handshake"
     );
     assert_eq!(count_lines(&second_log), 2);
 }
