@@ -35,6 +35,7 @@ import {
   ZOOM_CHIP_DURATION_MS,
   ZOOM_SETTLE_MS,
 } from '../lib/player.js';
+import { FileNameSingle } from './file-name.js';
 
 function safeStorage() {
   try {
@@ -1689,7 +1690,9 @@ export function VideoPlayer({
           >
             <${Icon} name=${fullscreenSource === 'button' ? 'back' : 'down'} />
           </button>
-          <span class="name">${name}</span>
+          <span class="name" role="heading" aria-level="2" aria-label=${name} title=${name}>
+            <${FileNameSingle} name=${name} lines=${1} titleOnHover=${false} />
+          </span>
           <button
             type="button"
             class="btn icon"
@@ -2079,7 +2082,9 @@ export function MusicPlayer({
 
         <div class="music-meta-panel">
           <div class="music-headings">
-            <h1 class="music-title">${display.title}</h1>
+            <h1 class="music-title" aria-label=${display.title} title=${display.title}>
+              <${FileNameSingle} name=${display.title} lines=${2} titleOnHover=${false} />
+            </h1>
             ${display.subtitle ? html`<p class="music-subtitle">${display.subtitle}</p>` : null}
           </div>
 

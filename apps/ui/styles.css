@@ -1125,6 +1125,62 @@ button.row:active {
   font-weight: 550;
 }
 
+.row .title.fn-title {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+/* Fitted file/folder names: exact measured lines, secondary colour for shared leads, search hit mark. */
+.fn-slot {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+.fn-line {
+  display: block;
+  white-space: pre;
+  unicode-bidi: plaintext;
+}
+
+.fn-pending {
+  display: block;
+  white-space: nowrap;
+  unicode-bidi: plaintext;
+}
+
+.fn-dim {
+  color: var(--dim);
+}
+
+.fn-match {
+  background: color-mix(in srgb, var(--accent) 24%, transparent);
+  color: inherit;
+  border-radius: 3px;
+  padding: 0 1px;
+}
+
+:root[data-theme="light"] .fn-match {
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) .fn-match {
+    background: color-mix(in srgb, var(--accent) 20%, transparent);
+  }
+}
+
+.sheet-name-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 12px;
+}
+
 .row .title:has(> .chip) {
   display: flex;
   align-items: center;
@@ -1483,7 +1539,7 @@ button.row:active {
   font-weight: 600;
 }
 
-.tile span {
+.tile > span:not(.thumb) {
   color: var(--dim);
   font-size: var(--text-sub);
   line-height: 1.35;
@@ -2559,9 +2615,19 @@ button.row:active {
 .grid .cell .cell-name {
   display: block;
   width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  min-width: 0;
+  line-height: 1.3;
+  font-weight: 550;
+  color: var(--text);
+}
+
+.grid .cell .cell-name .fn-dim {
+  color: var(--dim);
+  font-weight: 400;
+}
+
+.grid .cell .cell-name .fn-line {
+  text-align: center;
 }
 
 .grid .cell .len {
@@ -2905,8 +2971,6 @@ button.row:active {
   min-width: 0;
   font-weight: 600;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .viewer-top .name small {
@@ -3628,11 +3692,11 @@ button.row:active {
   font: 650 22px/1.2 var(--sans);
   letter-spacing: -0.015em;
   color: #fff;
-  overflow-wrap: anywhere;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
+  min-width: 0;
+}
+
+.music-title .fn-line {
+  text-align: center;
 }
 
 .music-subtitle {
@@ -4348,12 +4412,11 @@ button.row:active {
 
 .tile strong {
   font-weight: 600;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  min-width: 0;
+  line-height: 1.3;
 }
 
-.tile span {
+.tile > span:not(.thumb) {
   font-size: var(--text-sub);
   color: var(--dim);
 }
@@ -4489,9 +4552,6 @@ button.row:active {
   min-width: 0;
   margin: 0;
   font: 600 20px/1.2 var(--sans);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .files-wide-tools {
