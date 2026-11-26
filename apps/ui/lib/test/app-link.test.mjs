@@ -951,13 +951,16 @@ test('createAppLink onAppResume listens to native tauri://resumed and deduplicat
   try {
     const link = createAppLink();
     const events = [];
+    const suspends = [];
     const unsub = link.onAppResume((ev) => events.push(ev.source));
+    const unsubSuspend = link.onAppSuspend((ev) => suspends.push(ev.source));
     // Allow async listen() promises to settle.
     await new Promise((r) => setTimeout(r, 0));
 
     assert.ok(handlers.has('tauri://resumed'));
     assert.ok(handlers.has('tauri://suspended'));
     assert.ok(handlers.has('tauri://focus'));
+    assert.equal(link.isAppSuspended(), false);
 
     // Focus alone without prior suspend (e.g. startup or desktop focus) never triggers resume.
     handlers.get('tauri://focus')({});
@@ -969,16 +972,24 @@ test('createAppLink onAppResume listens to native tauri://resumed and deduplicat
 
     // Standard iOS/Android sequence: suspended -> resumed -> focus fires once only.
     handlers.get('tauri://suspended')({});
+    assert.equal(link.isAppSuspended(), true);
+    assert.deepEqual(suspends, ['tauri://suspended']);
     handlers.get('tauri://resumed')({});
+    assert.equal(link.isAppSuspended(), false);
     handlers.get('tauri://focus')({});
     assert.deepEqual(events, ['tauri://resumed', 'tauri://resumed']);
 
     // Short iOS inactive -> active without sceneDidEnterBackground: suspended -> focus fires once.
     handlers.get('tauri://suspended')({});
+    assert.equal(link.isAppSuspended(), true);
     handlers.get('tauri://focus')({});
+    assert.equal(link.isAppSuspended(), false);
     assert.deepEqual(events, ['tauri://resumed', 'tauri://resumed', 'tauri://focus']);
+    assert.deepEqual(suspends, ['tauri://suspended', 'tauri://suspended']);
 
     unsub();
+    assert.equal(unlistenCount, 0);
+    unsubSuspend();
     assert.equal(unlistenCount, 3);
     assert.equal(handlers.size, 0);
   } finally {

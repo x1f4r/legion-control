@@ -143,6 +143,7 @@ export function createAppLink() {
   let hasLocalPipe = false;
   let localPipeNode = null;
   const appResumeListeners = new Set();
+  const appSuspendListeners = new Set();
   let nativeResumeUnlistens = null;
   let nativeResumeReady = null;
   let nativeResumeToken = null;
@@ -150,6 +151,16 @@ export function createAppLink() {
 
   function notifyAppResume(source) {
     for (const listener of appResumeListeners) {
+      try {
+        listener({ source });
+      } catch {
+        // Keep notifying remaining listeners.
+      }
+    }
+  }
+
+  function notifyAppSuspend(source) {
+    for (const listener of appSuspendListeners) {
       try {
         listener({ source });
       } catch {
@@ -170,6 +181,7 @@ export function createAppLink() {
     };
     const onSuspended = () => {
       sawNativeSuspend = true;
+      notifyAppSuspend('tauri://suspended');
     };
     const onFocus = () => {
       if (!sawNativeSuspend) return;
@@ -182,7 +194,10 @@ export function createAppLink() {
       Promise.resolve(ev.listen('tauri://focus', onFocus)).catch(() => null),
     ]).then((unlistens) => {
       const active = unlistens.filter((fn) => typeof fn === 'function');
-      if (nativeResumeToken !== token || appResumeListeners.size === 0) {
+      if (
+        nativeResumeToken !== token ||
+        (appResumeListeners.size === 0 && appSuspendListeners.size === 0)
+      ) {
         for (const fn of active) {
           try {
             const res = fn();
@@ -223,10 +238,26 @@ export function createAppLink() {
     ensureNativeResumeSubscription().catch(() => {});
     return () => {
       appResumeListeners.delete(listener);
-      if (appResumeListeners.size === 0) {
+      if (appResumeListeners.size === 0 && appSuspendListeners.size === 0) {
         teardownNativeResumeSubscription();
       }
     };
+  }
+
+  function onAppSuspend(listener) {
+    if (typeof listener !== 'function') return () => {};
+    appSuspendListeners.add(listener);
+    ensureNativeResumeSubscription().catch(() => {});
+    return () => {
+      appSuspendListeners.delete(listener);
+      if (appResumeListeners.size === 0 && appSuspendListeners.size === 0) {
+        teardownNativeResumeSubscription();
+      }
+    };
+  }
+
+  function isAppSuspended() {
+    return sawNativeSuspend;
   }
 
   function machineKey(machine) {
@@ -2286,6 +2317,8 @@ export function createAppLink() {
     repairStore,
     invalidateSessions,
     onAppResume,
+    onAppSuspend,
+    isAppSuspended,
     scanInvite,
     updateState,
     watchUpdates,

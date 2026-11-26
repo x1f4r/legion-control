@@ -563,7 +563,7 @@ export function ActivityView({
   useEffect(() => {
     if (!hasRunningTransferJob) return undefined;
     const timer = window.setInterval(() => {
-      if (document.visibilityState === 'visible') load(targetNames);
+      if (document.visibilityState === 'visible' && !link.isAppSuspended?.()) load(targetNames);
     }, 1000);
     return () => window.clearInterval(timer);
   }, [hasRunningTransferJob, targetKey]);

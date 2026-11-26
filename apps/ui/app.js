@@ -1560,7 +1560,7 @@ function App() {
     if (!linkState?.ready || typeof link.checkUpdates !== 'function') return;
 
     const periodicTimer = window.setInterval(() => {
-      if (document.visibilityState === 'visible') {
+      if (document.visibilityState === 'visible' && !link.isAppSuspended?.()) {
         checkUpdatesQuietly();
       }
     }, PERIODIC_CHECK_INTERVAL_MS);
@@ -1580,7 +1580,7 @@ function App() {
       return;
     }
     const retryTimer = window.setTimeout(() => {
-      if (document.visibilityState === 'visible') {
+      if (document.visibilityState === 'visible' && !link.isAppSuspended?.()) {
         checkUpdatesQuietly();
       }
     }, ERROR_RETRY_INTERVAL_MS);
@@ -1681,7 +1681,11 @@ function App() {
   useEffect(() => {
     if (!linkState?.ready || !nodeInfo) return;
 
+    const isForegroundVisible = () =>
+      document.visibilityState === 'visible' && !link.isAppSuspended?.();
+
     const resumeController = createForegroundResumeController({
+      getVisibilityState: () => (isForegroundVisible() ? 'visible' : 'hidden'),
       invalidateSessions:
         typeof link.invalidateSessions === 'function' ? () => link.invalidateSessions() : null,
       onResumingChange: (active) => {
@@ -1737,9 +1741,16 @@ function App() {
           })
         : () => {};
 
+    const unsubNativeSuspend =
+      typeof link.onAppSuspend === 'function'
+        ? link.onAppSuspend(() => {
+            resumeController.handleVisibilityChange().catch(() => {});
+          })
+        : () => {};
+
     const onFocus = () => {
       if (
-        document.visibilityState === 'visible' &&
+        isForegroundVisible() &&
         !resumeController.isHidden() &&
         !resumeController.isResuming() &&
         settings.refreshSeconds > 0
@@ -1751,7 +1762,7 @@ function App() {
     const timer =
       settings.refreshSeconds > 0
         ? window.setInterval(() => {
-            if (document.visibilityState === 'visible' && !resumeController.isResuming()) {
+            if (isForegroundVisible() && !resumeController.isResuming()) {
               refreshFleet(nodeInfo, { background: true });
             }
           }, settings.refreshSeconds * 1000)
@@ -1763,6 +1774,7 @@ function App() {
       if (timer !== null) window.clearInterval(timer);
       resumingRef.current = false;
       unsubNativeResume();
+      unsubNativeSuspend();
       window.removeEventListener('focus', onFocus);
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
