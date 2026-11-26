@@ -143,6 +143,37 @@ test('legion-app.yml covers every platform with timeouts, credential-free checko
   // artifact uploads must reference exact paths from build outputs rather than installer globs.
   assert.match(appJobs.get('android').join('\n'), /rm -rf src-tauri\/gen\/android\/app\/build\/outputs\/apk/);
   assert.match(appJobs.get('linux-desktop').join('\n'), /rm -rf src-tauri\/target\/release\/bundle/);
+  assert.match(
+    appJobs.get('linux-desktop').join('\n'),
+    /scripts\/build-linux-app-bundles\.sh/,
+    'legion-app.yml:linux-desktop must build Linux bundles against the ubuntu:22.04 glibc baseline',
+  );
+  assert.match(
+    appJobs.get('linux-desktop').join('\n'),
+    /rustup target add x86_64-unknown-linux-musl/,
+    'legion-app.yml:linux-desktop must install the x86_64-unknown-linux-musl target for static Linux preview node builds',
+  );
+  assert.match(
+    appJobs.get('linux-desktop').join('\n'),
+    /\bmusl-tools\b/,
+    'legion-app.yml:linux-desktop must install musl-tools for static Linux preview node builds',
+  );
+  assert.match(
+    appJobs.get('linux-desktop').join('\n'),
+    /scripts\/legion-app-distro-test\.sh/,
+    'legion-app.yml:linux-desktop must install-verify the built .deb and AppImage across Debian and Ubuntu containers',
+  );
+  const previewScript = read('scripts/build-desktop-preview.mjs');
+  assert.match(
+    previewScript,
+    /build-linux-app-bundles\.sh[\s\S]*--preview-key/,
+    'scripts/build-desktop-preview.mjs must route Linux desktop app preview builds through scripts/build-linux-app-bundles.sh',
+  );
+  assert.match(
+    previewScript,
+    /x86_64-unknown-linux-musl/,
+    'scripts/build-desktop-preview.mjs must build the static x86_64-unknown-linux-musl Linux node binary',
+  );
   assert.match(appJobs.get('ios').join('\n'), /rm -rf src-tauri\/gen\/apple\/build/);
   assert.match(appJobs.get('macos-desktop').join('\n'), /rm -rf src-tauri\/target\/release\/bundle/);
   assert.match(

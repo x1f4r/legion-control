@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Build the Arch source or -bin package from the local checkout using makepkg.
+# Build the Arch node (source or -bin) or desktop app package from the local checkout using makepkg.
 #
 # Usage:
 #   packaging/arch/build-local.sh source <out dir>
 #   packaging/arch/build-local.sh bin <path to static legion binary> <out dir>
+#   packaging/arch/build-local.sh app <out dir>
 #
 # Pre-populates the source archive or files that the PKGBUILD expects so makepkg runs
 # offline against the current working tree without needing a published GitHub release tag.
@@ -19,6 +20,7 @@ usage() {
 Usage:
   packaging/arch/build-local.sh source <out dir>
   packaging/arch/build-local.sh bin <static legion binary> <out dir>
+  packaging/arch/build-local.sh app <out dir>
 EOF
   exit 2
 }
@@ -45,6 +47,11 @@ case "$MODE" in
     [[ -f "$STATIC_BIN" && -s "$STATIC_BIN" ]] || die "Binary does not exist or is empty: $STATIC_BIN"
     PKGBUILD_SRC="${SCRIPT_DIR}/legion-bin/PKGBUILD"
     ;;
+  app)
+    [[ "$#" -eq 1 ]] || usage
+    OUT_DIR="$1"
+    PKGBUILD_SRC="${SCRIPT_DIR}/legion-app/PKGBUILD"
+    ;;
   *)
     usage
     ;;
@@ -63,11 +70,11 @@ trap cleanup EXIT
 
 cp "$PKGBUILD_SRC" "${WORK}/PKGBUILD"
 
-if [[ "$MODE" == "source" ]]; then
-  # Every path that `cargo build --release -p legion-cli` and `package()` read from the repo root:
-  # `apps/ui` is embedded at compile time by `crates/legion-doors/build.rs`, and `contract` holds
-  # the compiled-in release public key. Verify all required paths before archiving so a missing
-  # directory or renamed asset fails immediately with a clear error.
+if [[ "$MODE" == "source" || "$MODE" == "app" ]]; then
+  # Every path that `cargo build` and `package()` read from the repo root:
+  # `apps/ui` is embedded at compile time, and `contract` holds the compiled-in release public key.
+  # Verify all required paths before archiving so a missing directory or renamed asset fails
+  # immediately with a clear error.
   REQUIRED_PATHS=(
     Cargo.toml
     Cargo.lock
@@ -82,6 +89,23 @@ if [[ "$MODE" == "source" ]]; then
     apps/ui/index.html
     contract/release-public-key.pem
   )
+  TAR_EXCLUDES=()
+  ARCHIVE_PREFIX="legion"
+  if [[ "$MODE" == "app" ]]; then
+    REQUIRED_PATHS+=(apps/legion-app)
+    REQUIRED_FILES+=(
+      apps/legion-app/src-tauri/Cargo.toml
+      apps/legion-app/src-tauri/Cargo.lock
+      apps/legion-app/src-tauri/icons/32x32.png
+      apps/legion-app/src-tauri/icons/128x128.png
+      apps/legion-app/src-tauri/icons/128x128@2x.png
+    )
+    TAR_EXCLUDES+=(
+      --exclude=apps/legion-app/src-tauri/target
+      --exclude=apps/legion-app/src-tauri/gen
+    )
+    ARCHIVE_PREFIX="legion-app"
+  fi
   for rel in "${REQUIRED_PATHS[@]}"; do
     [[ -e "${REPO_ROOT}/${rel}" ]] || die "Required source path is missing from checkout: ${rel}"
   done
@@ -102,13 +126,13 @@ if [[ "$MODE" == "source" ]]; then
     fi
   fi
 
-  ARCHIVE="${WORK}/legion-${PKGVER}.tar.gz"
+  ARCHIVE="${WORK}/${ARCHIVE_PREFIX}-${PKGVER}.tar.gz"
   PREFIX="legion-control-legion-v${PKGVER}/"
   # Archive the workspace files needed to build and package legion, including uncommitted edits,
   # while skipping target/ and other build artifacts. When building from a clean commit SHA, write
   # the same PAX `comment=<sha>` header that GitHub's tag archives carry so PKGBUILD extracts it
   # identically to a published release tag.
-  TAR_ARGS=(-C "$REPO_ROOT" --transform "s,^,${PREFIX},")
+  TAR_ARGS=(-C "$REPO_ROOT" "${TAR_EXCLUDES[@]}" --transform "s,^,${PREFIX},")
   if [[ "$BUILD_REV" =~ ^[0-9a-fA-F]{40}$ ]]; then
     TAR_ARGS+=(--format=posix --pax-option="comment=${BUILD_REV,,}")
     MAKEPKG_ENV=(-u LEGION_BUILD_REV PKGDEST="$OUT_DIR_ABS")
@@ -122,17 +146,48 @@ if [[ "$MODE" == "source" ]]; then
   sed -i "s/^sha256sums=.*/sha256sums=('${HASH}')/" "${WORK}/PKGBUILD"
 else
   CARCH="$(uname -m)"
+  command -v openssl >/dev/null 2>&1 || die "openssl is required to sign the local test SHA256SUMS for legion-bin."
+  ASSET_NAME="legion-${PKGVER}-${CARCH}-unknown-linux-musl"
   cp "${REPO_ROOT}/packaging/systemd/legion-serve.service" "${WORK}/legion-serve.service-${PKGVER}"
   cp "${REPO_ROOT}/packaging/man/legion.1" "${WORK}/legion.1-${PKGVER}"
   cp "${REPO_ROOT}/LICENSE" "${WORK}/LICENSE-${PKGVER}"
-  cp "$STATIC_BIN" "${WORK}/legion-${PKGVER}-${CARCH}-unknown-linux-musl"
+  cp "$STATIC_BIN" "${WORK}/${ASSET_NAME}"
 
+  # Exercise legion-bin's real Ed25519 + SHA256SUMS verify() hook with an ephemeral keypair in
+  # the temporary build directory (never modifying the repository's pinned release public key).
   H_UNIT="$(sha256sum "${WORK}/legion-serve.service-${PKGVER}" | awk '{print $1}')"
   H_MAN="$(sha256sum "${WORK}/legion.1-${PKGVER}" | awk '{print $1}')"
   H_LIC="$(sha256sum "${WORK}/LICENSE-${PKGVER}" | awk '{print $1}')"
-  H_BIN="$(sha256sum "${WORK}/legion-${PKGVER}-${CARCH}-unknown-linux-musl" | awk '{print $1}')"
-  sed -i "s/^sha256sums=.*/sha256sums=('${H_UNIT}' '${H_MAN}' '${H_LIC}')/" "${WORK}/PKGBUILD"
-  sed -i "s/^sha256sums_${CARCH}=.*/sha256sums_${CARCH}=('${H_BIN}')/" "${WORK}/PKGBUILD"
+  H_BIN="$(sha256sum "${WORK}/${ASSET_NAME}" | awk '{print $1}')"
+  printf '%s  %s\n' "$H_BIN" "$ASSET_NAME" > "${WORK}/SHA256SUMS-${PKGVER}"
+
+  openssl genpkey -algorithm ED25519 -out "${WORK}/local-sign.pem" >/dev/null 2>&1
+  openssl pkey -in "${WORK}/local-sign.pem" -pubout -out "${WORK}/local-pub.pem" >/dev/null 2>&1
+  openssl pkeyutl -sign -inkey "${WORK}/local-sign.pem" -rawin \
+    -in "${WORK}/SHA256SUMS-${PKGVER}" -out "${WORK}/SHA256SUMS.sig.bin"
+  base64 -w 0 "${WORK}/SHA256SUMS.sig.bin" > "${WORK}/SHA256SUMS.sig-${PKGVER}"
+  printf '\n' >> "${WORK}/SHA256SUMS.sig-${PKGVER}"
+  rm -f "${WORK}/local-sign.pem" "${WORK}/SHA256SUMS.sig.bin"
+
+  H_SUMS="$(sha256sum "${WORK}/SHA256SUMS-${PKGVER}" | awk '{print $1}')"
+  H_SIG="$(sha256sum "${WORK}/SHA256SUMS.sig-${PKGVER}" | awk '{print $1}')"
+  LOCAL_PUB_BODY="$(awk '!/^-----/' "${WORK}/local-pub.pem" | tr -d '\n')"
+  rm -f "${WORK}/local-pub.pem"
+
+  sed -i "s/^sha256sums=.*/sha256sums=('${H_UNIT}' '${H_MAN}' '${H_LIC}' '${H_SUMS}' '${H_SIG}' '${H_BIN}')/" "${WORK}/PKGBUILD"
+  awk -v body="$LOCAL_PUB_BODY" '
+    /^_release_pubkey=/ {
+      print "_release_pubkey='\''-----BEGIN PUBLIC KEY-----"
+      print body
+      print "-----END PUBLIC KEY-----'\''"
+      in_key = 1
+      next
+    }
+    in_key && /-----END PUBLIC KEY-----/ { in_key = 0; next }
+    in_key { next }
+    { print }
+  ' "${WORK}/PKGBUILD" > "${WORK}/PKGBUILD.tmp"
+  mv "${WORK}/PKGBUILD.tmp" "${WORK}/PKGBUILD"
   MAKEPKG_ENV=(PKGDEST="$OUT_DIR_ABS")
 fi
 

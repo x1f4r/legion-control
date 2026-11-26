@@ -7,6 +7,7 @@ import { execFileSync } from 'node:child_process';
 import test from 'node:test';
 import {
   formatPreviewInfo,
+  inspectElfLinkage,
   inspectMachoArchs,
   normalizeCommit,
   readTomlSectionVersion,
@@ -123,6 +124,56 @@ test('inspectMachoArchs detects thin arm64, thin x86_64, and universal Mach-O bi
   assert.throws(() => inspectMachoArchs(Buffer.from('\x7fELFnotmacho')), /Unrecognized Mach-O/);
 });
 
+test('inspectElfLinkage distinguishes static x86_64 ELF binaries from dynamically linked ones', () => {
+  const makeElf64 = ({ machine = 62, interp = null } = {}) => {
+    const phoff = 64;
+    const phentsize = 56;
+    const interpBytes = interp ? Buffer.from(`${interp}\0`, 'utf8') : null;
+    const phnum = interpBytes ? 2 : 1;
+    const interpOffset = phoff + phnum * phentsize;
+    const total = interpOffset + (interpBytes ? interpBytes.length : 0);
+    const buf = Buffer.alloc(total);
+    buf[0] = 0x7f;
+    buf[1] = 0x45;
+    buf[2] = 0x4c;
+    buf[3] = 0x46;
+    buf[4] = 2; // ELF64
+    buf[5] = 1; // little-endian
+    buf.writeUInt16LE(machine, 18);
+    buf.writeBigUInt64LE(BigInt(phoff), 32);
+    buf.writeUInt16LE(phentsize, 54);
+    buf.writeUInt16LE(phnum, 56);
+    // Program header 0: PT_LOAD (1)
+    buf.writeUInt32LE(1, phoff);
+    if (interpBytes) {
+      // Program header 1: PT_INTERP (3)
+      const ph1 = phoff + phentsize;
+      buf.writeUInt32LE(3, ph1);
+      buf.writeBigUInt64LE(BigInt(interpOffset), ph1 + 8);
+      buf.writeBigUInt64LE(BigInt(interpBytes.length), ph1 + 32);
+      interpBytes.copy(buf, interpOffset);
+    }
+    return buf;
+  };
+
+  assert.deepEqual(inspectElfLinkage(makeElf64()), {
+    machine: 'x86_64',
+    isStatic: true,
+    interp: null,
+  });
+  assert.deepEqual(inspectElfLinkage(makeElf64({ interp: '/lib64/ld-linux-x86-64.so.2' })), {
+    machine: 'x86_64',
+    isStatic: false,
+    interp: '/lib64/ld-linux-x86-64.so.2',
+  });
+  assert.deepEqual(inspectElfLinkage(makeElf64({ machine: 183 })), {
+    machine: 'aarch64',
+    isStatic: true,
+    interp: null,
+  });
+  assert.throws(() => inspectElfLinkage(Buffer.from('not-an-elf')), /not a valid ELF/);
+});
+
 test('formatPreviewInfo includes commit, sequence, fingerprint, macOS arm64 status, and never leaks key paths', () => {
   const kp = makeEd25519Keypair();
   const macText = formatPreviewInfo({
@@ -159,9 +210,13 @@ test('formatPreviewInfo includes commit, sequence, fingerprint, macOS arm64 stat
     appVersion: '0.1.0',
     nodeVersion: '0.1.0',
     fingerprint: kp.fingerprint,
+    linuxNodeTarget: 'x86_64-unknown-linux-musl (static)',
+    linuxAppBaseline: 'ubuntu:22.04 (glibc 2.35)',
     files: [{ name: 'legion-linux-x86_64', size: 1024, sha256: 'c'.repeat(64) }],
   });
   assert.match(linuxText, /^artifact: legion-linux-preview$/m);
+  assert.match(linuxText, /^linux_node_target: x86_64-unknown-linux-musl \(static\)$/m);
+  assert.match(linuxText, /^linux_app_baseline: ubuntu:22\.04 \(glibc 2\.35\)$/m);
   assert.doesNotMatch(linuxText, /macos_app_arch/);
 });
 

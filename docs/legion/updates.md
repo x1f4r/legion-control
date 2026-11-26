@@ -305,9 +305,10 @@ alongside the normal release-keyed CI bundles:
   `legion-macos-aarch64` (macOS arm64 node binary), and `PREVIEW-INFO.txt`.
 - `legion-windows-preview`: `Legion_<ver>+seq<seq>_x64-setup.exe` (per-user NSIS installer),
   `legion-windows-x86_64.exe` (Windows x64 node binary), and `PREVIEW-INFO.txt`.
-- `legion-linux-preview`: `legion-app_<ver>+<seq>_amd64.AppImage`,
-  `legion-app_<ver>+<seq>_amd64.deb`, `legion-linux-x86_64` (Linux x64 node binary), and
-  `PREVIEW-INFO.txt`.
+- `legion-linux-preview`: `legion-app_<ver>+<seq>_amd64.AppImage` and
+  `legion-app_<ver>+<seq>_amd64.deb` (built inside `ubuntu:22.04` via
+  `scripts/build-linux-app-bundles.sh` for the glibc 2.35 baseline), `legion-linux-x86_64`
+  (static `x86_64-unknown-linux-musl` node binary), and `PREVIEW-INFO.txt`.
 
 Every `PREVIEW-INFO.txt` records the commit SHA, 12-digit sequence, compiled preview key fingerprint
 (`SHA256:...`), file SHA-256 digests, and (for macOS) verified `arm64` architecture status.
