@@ -22,7 +22,7 @@ use crate::package::{PackageManager, detect_package_manager};
 use super::Check;
 
 /// Timeout for probing the user's login shell `PATH` or `loginctl`.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Per-machine timeout when `meta.doctor` checks fleet reachability.
 const FLEET_PING_TIMEOUT_S: f64 = 5.0;
@@ -786,14 +786,23 @@ async fn query_login_shell_path(ctx: &Ctx) -> Option<String> {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "/bin/sh".to_owned());
-    let shell_name = Path::new(&shell)
+    query_login_shell_path_with_shell(ctx.cancel_token().child_token(), &shell)
+        .await
+        .or_else(|| std::env::var("PATH").ok())
+}
+
+async fn query_login_shell_path_with_shell(
+    cancel: legion_core::CancellationToken,
+    shell: &str,
+) -> Option<String> {
+    let shell_name = Path::new(shell)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("sh");
 
     let (program, args): (&str, Vec<String>) = match shell_name {
         "fish" => (
-            &shell,
+            shell,
             vec![
                 "-l".to_owned(),
                 "-c".to_owned(),
@@ -809,7 +818,7 @@ async fn query_login_shell_path(ctx: &Ctx) -> Option<String> {
             ],
         ),
         _ => (
-            &shell,
+            shell,
             vec![
                 "-l".to_owned(),
                 "-c".to_owned(),
@@ -822,14 +831,14 @@ async fn query_login_shell_path(ctx: &Ctx) -> Option<String> {
     let options = RunOptions::new(spec)
         .c_locale()
         .timeout(PROBE_TIMEOUT)
-        .cancel(ctx.cancel_token().child_token());
+        .cancel(cancel);
     if let Ok(output) = run(options).await
         && output.success()
         && let Some(extracted) = extract_login_path(&output.stdout.text)
     {
         return Some(extracted.to_owned());
     }
-    std::env::var("PATH").ok()
+    None
 }
 
 /// Parses `loginctl show-user --property=Linger` output (`Linger=yes`, `Linger=no`, `yes`, `no`).
@@ -1662,6 +1671,34 @@ deny = [\"effect:power\", \"effect:admin\"]
                 .hint
                 .as_deref()
                 .is_some_and(|h| h.contains("fleet.sync"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn query_login_shell_path_waits_for_slow_login_shell_past_two_seconds() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_shell = dir.path().join("slow-sh");
+        std::fs::write(
+            &fake_shell,
+            format!(
+                "#!/bin/sh\nsleep 2.3\nprintf '{PATH_MARKER}/fake/slow-login/bin{PATH_MARKER}'\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let got = query_login_shell_path_with_shell(
+            legion_core::CancellationToken::new(),
+            &fake_shell.to_string_lossy(),
+        )
+        .await;
+        assert_eq!(
+            got.as_deref(),
+            Some("/fake/slow-login/bin"),
+            "login shell taking >2s (e.g. profile init) must not time out and fall back"
         );
     }
 }
