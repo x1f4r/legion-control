@@ -13,6 +13,14 @@ on:
         description: Run only the macOS pipe and stream_relay tests
         type: boolean
         default: false
+      macos_worker_sandbox_only:
+        description: Run only the macOS decode worker and ffmpeg sandbox tests
+        type: boolean
+        default: false
+      windows_worker_sandbox_only:
+        description: Run only the Windows decode worker and ffmpeg sandbox tests
+        type: boolean
+        default: false
       repeat_count:
         description: Number of times to run targeted tests (1-15)
         type: number
@@ -30,7 +38,7 @@ concurrency:
 jobs:
   scripts:
     name: Scripts and UI (${{ matrix.os }})
-    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only) }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only && !inputs.macos_worker_sandbox_only && !inputs.windows_worker_sandbox_only) }}
     strategy:
       fail-fast: false
       matrix:
@@ -87,9 +95,66 @@ jobs:
             cargo test -p legion-cli --test stream_relay --locked
           done
 
+  macos-worker-sandbox:
+    name: macOS worker sandbox
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.macos_worker_sandbox_only }}
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+      - name: Run macOS decode worker and ffmpeg sandbox tests
+        run: |
+          set -euo pipefail
+          which ffmpeg || true
+          cargo test -p legion-os --lib sandbox:: --locked -- --nocapture
+          cargo test -p legion-tools --lib meta::doctor::tests::worker_sandbox --locked -- --nocapture
+          cargo test -p legion-tools --test thumb_worker --locked -- --nocapture
+
+  windows-worker-sandbox:
+    name: Windows worker sandbox
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.windows_worker_sandbox_only }}
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+      - name: Run Windows decode worker and ffmpeg sandbox tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v ffmpeg || true
+          cargo test -p legion-os --lib sandbox:: --locked -- --nocapture
+          cargo test -p legion-tools --lib meta::doctor::tests::worker_sandbox --locked -- --nocapture
+          cargo test -p legion-tools --test thumb_worker --locked -- --nocapture
+
   rust:
     name: Rust (${{ matrix.os }})
-    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.macos_pipe_relay_only }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.macos_pipe_relay_only && !inputs.macos_worker_sandbox_only && !inputs.windows_worker_sandbox_only) }}
     strategy:
       fail-fast: false
       matrix:
@@ -256,7 +321,7 @@ jobs:
 
   private-data:
     name: Private data
-    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only) }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only && !inputs.macos_worker_sandbox_only && !inputs.windows_worker_sandbox_only) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -275,7 +340,7 @@ jobs:
 
   shellcheck:
     name: ShellCheck
-    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only) }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only && !inputs.macos_worker_sandbox_only && !inputs.windows_worker_sandbox_only) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -289,7 +354,7 @@ jobs:
 
   powershell:
     name: PSScriptAnalyzer
-    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only) }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only && !inputs.macos_worker_sandbox_only && !inputs.windows_worker_sandbox_only) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -308,7 +373,7 @@ jobs:
 
   ui-browser:
     name: UI browser
-    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only) }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only && !inputs.macos_worker_sandbox_only && !inputs.windows_worker_sandbox_only) }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -338,7 +403,7 @@ jobs:
 
   rust-move-between-places:
     name: Rust move-between-places (ubuntu-latest)
-    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only) }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only && !inputs.macos_worker_sandbox_only && !inputs.windows_worker_sandbox_only) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -364,7 +429,7 @@ jobs:
 
   audit:
     name: Dependency audit
-    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only) }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only && !inputs.macos_worker_sandbox_only && !inputs.windows_worker_sandbox_only) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

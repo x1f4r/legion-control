@@ -45,7 +45,17 @@ impl Drop for TimeoutGuard {
 
 fn main() -> ExitCode {
     legion_core::record_current_exe();
-    if let Some(code) = legion_tools::fs::try_thumb_worker_cli(std::env::args_os().skip(1)) {
+    let raw_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if raw_args.first().is_some_and(|a| a == "--sandbox-selftest") {
+        return run_sandbox_selftest(&raw_args[1..]);
+    }
+    if raw_args
+        .first()
+        .is_some_and(|a| a == "--dev-override-selftest")
+    {
+        return run_dev_override_selftest();
+    }
+    if let Some(code) = legion_tools::fs::try_thumb_worker_cli(raw_args) {
         return code;
     }
     legion_tools::fs::enable_thumb_worker_self();
@@ -56,6 +66,9 @@ fn main() -> ExitCode {
         .expect("build tokio runtime");
 
     runtime.block_on(async {
+        test_worker_sandbox_blocks_files_network_and_process_spawn().await;
+        test_worker_sandbox_unavailable_and_dev_override().await;
+        test_ffmpeg_sandbox_blocks_network_and_unauthorized_files().await;
         test_measured_baseline_and_honest_12mp_never_false_killed().await;
         test_honest_corpus_all_formats_extremes_sizes_and_fits().await;
         test_lying_headers_and_sibling_survival().await;
@@ -3446,4 +3459,832 @@ async fn test_property_hostile_bounds_through_real_worker() {
         elapsed < OVERALL_HANG_GUARD,
         "hang guard tripped: real-worker hostile property test ran for {elapsed:?} (limit {OVERALL_HANG_GUARD:?})"
     );
+}
+
+// ── OS Sandbox Proof Tests (Linux seccomp+Landlock, macOS Seatbelt, Windows AppContainer+Job) ──
+
+struct SimulateSandboxGuard;
+
+impl Drop for SimulateSandboxGuard {
+    fn drop(&mut self) {
+        legion_tools::fs::set_simulate_sandbox_unavailable_for_test(None);
+    }
+}
+
+/// Self-test child entrypoint invoked exclusively by `tests/thumb_worker.rs` (zero test code in
+/// the production `legion` binary).
+fn run_sandbox_selftest(args: &[std::ffi::OsString]) -> ExitCode {
+    let mode = args.first().and_then(|s| s.to_str()).unwrap_or("");
+    let action = args.get(1).and_then(|s| s.to_str()).unwrap_or("");
+    let target = args.get(2).map(|s| s.to_string_lossy().into_owned());
+
+    if mode == "worker" {
+        if let Err(err) = legion_tools::fs::enter_worker_sandbox_for_test() {
+            eprintln!("SANDBOX_UNAVAILABLE: {err}");
+            return ExitCode::from(2);
+        }
+    } else if mode != "ffmpeg-box" {
+        eprintln!("unknown selftest mode: {mode}");
+        return ExitCode::from(2);
+    }
+
+    match action {
+        "open_file" => {
+            let path = target.expect("target path");
+            match fs::read(&path) {
+                Ok(bytes) => {
+                    println!("ESCAPED: read {} bytes from {path}", bytes.len());
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("REFUSED: open_file({path}): {err}");
+                    ExitCode::from(42)
+                }
+            }
+        }
+        "write_file" => {
+            let path = target.expect("target path");
+            match fs::write(&path, b"sandbox-escape") {
+                Ok(()) => {
+                    println!("ESCAPED: wrote {path}");
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("REFUSED: write_file({path}): {err}");
+                    ExitCode::from(42)
+                }
+            }
+        }
+        "tcp_bind" => match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => {
+                println!("ESCAPED: bound {:?}", listener.local_addr());
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("REFUSED: tcp_bind: {err}");
+                ExitCode::from(42)
+            }
+        },
+        "tcp_connect" => {
+            let addr = target.expect("target addr");
+            match std::net::TcpStream::connect(&addr) {
+                Ok(_) => {
+                    println!("ESCAPED: connected to {addr}");
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("REFUSED: tcp_connect({addr}): {err}");
+                    ExitCode::from(42)
+                }
+            }
+        }
+        "spawn_proc" => {
+            #[cfg(unix)]
+            let res = std::process::Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .status();
+            #[cfg(windows)]
+            let res = std::process::Command::new("cmd.exe")
+                .args(["/C", "exit 0"])
+                .status();
+            match res {
+                Ok(status) => {
+                    println!("ESCAPED: spawned child status={status}");
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("REFUSED: spawn_proc: {err}");
+                    ExitCode::from(42)
+                }
+            }
+        }
+        "read_stdin" => {
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            match std::io::stdin().read_to_end(&mut buf) {
+                Ok(n) => {
+                    println!("OK:{n}");
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("FAILED: read_stdin: {err}");
+                    ExitCode::from(43)
+                }
+            }
+        }
+        "read_allowed" => {
+            let path = target.expect("allowed path");
+            match fs::read(&path) {
+                Ok(bytes) => {
+                    println!("OK:{}", bytes.len());
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("FAILED: read_allowed({path}): {err}");
+                    ExitCode::from(43)
+                }
+            }
+        }
+        other => {
+            eprintln!("unknown selftest action: {other}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn minimal_selftest_env() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    #[cfg(windows)]
+    {
+        let mut vars = Vec::new();
+        for key in ["SYSTEMROOT", "WINDIR", "COMSPEC"] {
+            if let Some(val) = std::env::var_os(key) {
+                vars.push((std::ffi::OsString::from(key), val));
+            }
+        }
+        vars
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+async fn run_selftest_child(
+    policy: legion_os::sandbox::SandboxPolicy,
+    mode: &str,
+    action: &str,
+    target: Option<&str>,
+    stdin_file: Option<fs::File>,
+) -> legion_os::run::RunOutput {
+    let exe = std::env::current_exe().expect("current exe");
+    let mut args = vec![
+        std::ffi::OsString::from("--sandbox-selftest"),
+        std::ffi::OsString::from(mode),
+        std::ffi::OsString::from(action),
+    ];
+    if let Some(t) = target {
+        args.push(std::ffi::OsString::from(t));
+    }
+    let mut opts = legion_os::run::RunOptions::new(legion_os::shell::CommandSpec::Argv {
+        program: exe.into_os_string(),
+        args,
+    })
+    .env_clear(true)
+    .envs(minimal_selftest_env())
+    .sandbox(policy)
+    .timeout(Duration::from_secs(10))
+    .kill_grace(Duration::ZERO);
+    if let Some(file) = stdin_file {
+        opts = opts.stdin_file(file);
+    }
+    legion_os::run::run(opts)
+        .await
+        .expect("spawn sandbox selftest child")
+}
+
+fn assert_sandbox_blocked(label: &str, out: &legion_os::run::RunOutput) {
+    assert!(
+        !out.stdout.text.contains("ESCAPED"),
+        "SANDBOX ESCAPE for {label}: stdout={:?} stderr={:?} exit={:?} signal={:?}",
+        out.stdout.text,
+        out.stderr.text,
+        out.exit_code,
+        out.signal,
+    );
+    assert!(
+        !out.stderr.text.contains("SANDBOX_UNAVAILABLE"),
+        "sandbox was unavailable for {label}: stderr={:?}",
+        out.stderr.text,
+    );
+    assert!(
+        !out.success(),
+        "sandboxed worker must NOT succeed on {label}: exit={:?} signal={:?} stdout={:?} stderr={:?}",
+        out.exit_code,
+        out.signal,
+        out.stdout.text,
+        out.stderr.text,
+    );
+    #[cfg(target_os = "linux")]
+    {
+        // Linux seccomp-BPF uses SECCOMP_RET_KILL_PROCESS (SIGSYS = 31) for the worker and
+        // Landlock/seccomp EPERM/EACCES (exit 42) for ffmpeg-box.
+        assert!(
+            out.signal == Some(31) || out.exit_code == Some(42),
+            "expected SIGSYS(31) or refused exit(42) on Linux for {label}, got exit={:?} signal={:?} stderr={:?}",
+            out.exit_code,
+            out.signal,
+            out.stderr.text,
+        );
+    }
+}
+
+async fn test_worker_sandbox_blocks_files_network_and_process_spawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    // 1. Live `meta.doctor` reports the decode worker sandbox as healthy on this host.
+    let node = Node::new(
+        Paths::under(dir.path()).with_home(&home),
+        legion_tools::registry(),
+    );
+    let doctor = node
+        .call(Call::new(Door::Cli, "meta.doctor", json!({"quick": true})))
+        .await
+        .unwrap();
+    let checks = doctor["checks"].as_array().expect("doctor checks array");
+    let sandbox_check = checks
+        .iter()
+        .find(|c| c["name"] == json!("decode worker sandbox"))
+        .unwrap_or_else(|| panic!("meta.doctor missing decode worker sandbox check: {doctor}"));
+    assert_eq!(
+        sandbox_check["ok"],
+        json!(true),
+        "decode worker sandbox must be healthy on this host: {sandbox_check}"
+    );
+    eprintln!("SANDBOX_DOCTOR: {}", sandbox_check["detail"]);
+
+    // 2. Direct `__thumb-worker --probe-sandbox` under `SandboxPolicy::Worker`.
+    let exe = std::env::current_exe().expect("current exe");
+    let probe_out = legion_os::run::run(
+        legion_os::run::RunOptions::new(legion_os::shell::CommandSpec::Argv {
+            program: exe.into_os_string(),
+            args: vec![
+                std::ffi::OsString::from(legion_tools::fs::THUMB_WORKER_MODE),
+                std::ffi::OsString::from("--probe-sandbox"),
+            ],
+        })
+        .env_clear(true)
+        .envs(minimal_selftest_env())
+        .sandbox(legion_os::sandbox::SandboxPolicy::Worker)
+        .timeout(Duration::from_secs(10))
+        .kill_grace(Duration::ZERO),
+    )
+    .await
+    .expect("run --probe-sandbox");
+    assert!(
+        probe_out.success(),
+        "--probe-sandbox failed: exit={:?} signal={:?} stdout={:?} stderr={:?}",
+        probe_out.exit_code,
+        probe_out.signal,
+        probe_out.stdout.text,
+        probe_out.stderr.text,
+    );
+    let report: legion_os::sandbox::SandboxReport =
+        serde_json::from_str(probe_out.stdout.text.trim()).expect("parse SandboxReport JSON");
+    eprintln!(
+        "SANDBOX_PROBE: platform={} mechanism={} available={} complete={} detail={}",
+        report.platform, report.mechanism, report.available, report.complete, report.detail
+    );
+    assert!(report.available, "sandbox must be available: {report:?}");
+
+    // 3. Prepare real targets that an unsandboxed worker WOULD succeed on:
+    //    - a secret file inside the user's real home/temp directory,
+    //    - `/etc/passwd` on Unix,
+    //    - a live local TCP listener on 127.0.0.1.
+    let home_secret = home.join("sandbox_secret.txt");
+    fs::write(&home_secret, b"TOP_SECRET_USER_DATA").unwrap();
+    let real_home_secret = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|h| {
+            let p = std::path::PathBuf::from(h)
+                .join(format!(".legion-sandbox-proof-{}.tmp", std::process::id()));
+            let _ = fs::write(&p, b"REAL_HOME_SECRET");
+            p
+        });
+    let write_target = home.join("sandbox_write_escape.txt");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let listen_addr = listener.local_addr().unwrap().to_string();
+
+    let policy = legion_os::sandbox::SandboxPolicy::Worker;
+
+    // Reading already-inherited stdin MUST still succeed inside the sandbox.
+    let stdin_sample = home.join("stdin_sample.bin");
+    fs::write(&stdin_sample, b"hello-sandbox").unwrap();
+    let stdin_ok = run_selftest_child(
+        policy.clone(),
+        "worker",
+        "read_stdin",
+        None,
+        Some(fs::File::open(&stdin_sample).unwrap()),
+    )
+    .await;
+    assert!(
+        stdin_ok.success() && stdin_ok.stdout.text.trim() == "OK:13",
+        "sandboxed worker must still read inherited stdin and write stdout: exit={:?} signal={:?} stdout={:?} stderr={:?}",
+        stdin_ok.exit_code,
+        stdin_ok.signal,
+        stdin_ok.stdout.text,
+        stdin_ok.stderr.text,
+    );
+
+    // Every write and child spawn MUST be blocked on every platform (including Windows fallback).
+    let out_write = run_selftest_child(
+        policy.clone(),
+        "worker",
+        "write_file",
+        Some(&write_target.to_string_lossy()),
+        None,
+    )
+    .await;
+    assert_sandbox_blocked("worker write_file", &out_write);
+    assert!(
+        !write_target.exists(),
+        "sandboxed worker must not create {}",
+        write_target.display()
+    );
+
+    let out_spawn = run_selftest_child(policy.clone(), "worker", "spawn_proc", None, None).await;
+    assert_sandbox_blocked("worker spawn_proc", &out_spawn);
+
+    // Full isolation checks: reading user files, reading /etc/passwd, binding/connecting TCP.
+    // On Linux and macOS `report.complete` MUST be true; on Windows AppContainer `report.complete`
+    // is true and all four must fail too.
+    #[cfg(not(windows))]
+    assert!(
+        report.complete,
+        "Unix sandbox must provide complete isolation: {report:?}"
+    );
+
+    if report.complete {
+        let out_home = run_selftest_child(
+            policy.clone(),
+            "worker",
+            "open_file",
+            Some(&home_secret.to_string_lossy()),
+            None,
+        )
+        .await;
+        assert_sandbox_blocked("worker open_file(temp home secret)", &out_home);
+
+        if let Some(ref real_secret) = real_home_secret
+            && real_secret.is_file()
+        {
+            let out_real = run_selftest_child(
+                policy.clone(),
+                "worker",
+                "open_file",
+                Some(&real_secret.to_string_lossy()),
+                None,
+            )
+            .await;
+            assert_sandbox_blocked("worker open_file($HOME secret)", &out_real);
+        }
+
+        #[cfg(unix)]
+        {
+            let out_passwd = run_selftest_child(
+                policy.clone(),
+                "worker",
+                "open_file",
+                Some("/etc/passwd"),
+                None,
+            )
+            .await;
+            assert_sandbox_blocked("worker open_file(/etc/passwd)", &out_passwd);
+        }
+
+        let out_bind = run_selftest_child(policy.clone(), "worker", "tcp_bind", None, None).await;
+        assert_sandbox_blocked("worker tcp_bind", &out_bind);
+
+        let out_connect = run_selftest_child(
+            policy.clone(),
+            "worker",
+            "tcp_connect",
+            Some(&listen_addr),
+            None,
+        )
+        .await;
+        assert_sandbox_blocked("worker tcp_connect", &out_connect);
+
+        #[cfg(target_os = "linux")]
+        {
+            // Confirm Linux worker died immediately with SIGSYS (never continuing after syscall).
+            for (name, out) in [
+                ("open_file", &out_home),
+                ("tcp_bind", &out_bind),
+                ("tcp_connect", &out_connect),
+                ("spawn_proc", &out_spawn),
+            ] {
+                assert_eq!(
+                    out.signal,
+                    Some(31),
+                    "Linux seccomp must kill worker immediately with SIGSYS(31) on {name}, got exit={:?} signal={:?}",
+                    out.exit_code,
+                    out.signal
+                );
+            }
+        }
+    }
+
+    if let Some(real_secret) = real_home_secret {
+        let _ = fs::remove_file(real_secret);
+    }
+    drop(listener);
+    eprintln!(
+        "SANDBOX_PROOF PASSED: platform={} mechanism={} complete={}",
+        report.platform, report.mechanism, report.complete
+    );
+}
+
+async fn test_worker_sandbox_unavailable_and_dev_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    let img_path = home.join("sample.png");
+    {
+        let img = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_pixel(128, 96, Rgb([40, 140, 220]));
+        let mut out = Vec::new();
+        PngEncoder::new(&mut out)
+            .write_image(&img, 128, 96, ExtendedColorType::Rgb8)
+            .unwrap();
+        fs::write(&img_path, out).unwrap();
+    }
+    let cover_path = home.join("cover.jpg");
+    fs::write(&cover_path, encode_solid_jpeg(160, 160, [20, 180, 90])).unwrap();
+    let mp3_path = home.join("track.mp3");
+    let small_cover = audio_fixtures::encode_solid_jpeg(128, 128, [220, 60, 40]);
+    fs::write(
+        &mp3_path,
+        audio_fixtures::build_mp3_id3v23(&[("image/jpeg", 3, &small_cover)], true, false),
+    )
+    .unwrap();
+
+    let node = Node::new(
+        Paths::under(dir.path()).with_home(&home),
+        legion_tools::registry(),
+    );
+
+    // 1. Simulate sandbox unavailability -> MUST fail closed with ErrorCode::Unsupported,
+    //    details.reason == "sandbox_unavailable", details.missing == "seccomp-bpf",
+    //    NEVER masked as not_found for audio, and NEVER cached in bad_cache!
+    {
+        let _guard = SimulateSandboxGuard;
+        legion_tools::fs::set_simulate_sandbox_unavailable_for_test(Some("seccomp-bpf"));
+
+        let thumb_res = node
+            .call(Call::new(
+                Door::Cli,
+                "fs.thumb",
+                json!({
+                    "paths": [img_path.to_string_lossy(), mp3_path.to_string_lossy()],
+                    "size": 256
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            thumb_res.get("details").is_none(),
+            "normal sandboxed reply must not carry dev_override details: {thumb_res}"
+        );
+        for (idx, item) in thumb_res["results"].as_array().unwrap().iter().enumerate() {
+            assert_eq!(
+                item["error"]["code"],
+                json!("unsupported"),
+                "item {idx} must return unsupported when sandbox unavailable: {item}"
+            );
+            assert_eq!(
+                item["error"]["details"]["reason"],
+                json!("sandbox_unavailable"),
+                "item {idx} must report sandbox_unavailable: {item}"
+            );
+            assert_eq!(
+                item["error"]["details"]["missing"],
+                json!("seccomp-bpf"),
+                "item {idx} must report missing capability: {item}"
+            );
+        }
+
+        let tags_res = node
+            .call(Call::new(
+                Door::Cli,
+                "fs.tags",
+                json!({"paths": [mp3_path.to_string_lossy()]}),
+            ))
+            .await
+            .unwrap();
+        assert!(tags_res.get("details").is_none());
+        let tag_item = &tags_res["results"][0];
+        assert_eq!(
+            tag_item["error"]["code"],
+            json!("unsupported"),
+            "{tag_item}"
+        );
+        assert_eq!(
+            tag_item["error"]["details"]["reason"],
+            json!("sandbox_unavailable"),
+            "{tag_item}"
+        );
+    }
+
+    // 2. Immediately after restoring sandbox availability, the exact same files MUST decode
+    //    cleanly (proving sandbox_unavailable was NOT cached in bad_cache).
+    let recovered_thumb = node
+        .call(Call::new(
+            Door::Cli,
+            "fs.thumb",
+            json!({
+                "paths": [img_path.to_string_lossy(), mp3_path.to_string_lossy()],
+                "size": 256
+            }),
+        ))
+        .await
+        .unwrap();
+    for item in recovered_thumb["results"].as_array().unwrap() {
+        assert!(
+            item.get("ok").is_some(),
+            "file must decode cleanly once sandbox is available (not poisoned in bad_cache): {item}"
+        );
+    }
+    let recovered_tags = node
+        .call(Call::new(
+            Door::Cli,
+            "fs.tags",
+            json!({"paths": [mp3_path.to_string_lossy()]}),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        recovered_tags["results"][0].get("ok").is_some(),
+        "tags must decode cleanly once sandbox is available: {recovered_tags}"
+    );
+
+    // 3. In debug builds, `LEGION_ALLOW_UNSANDBOXED_DECODE=1` allows decoding without a sandbox
+    //    and MUST mark EVERY `fs.thumb` and `fs.tags` reply with `details`.
+    if cfg!(debug_assertions) {
+        let exe = std::env::current_exe().expect("current exe");
+        let out = legion_os::run::run(
+            legion_os::run::RunOptions::new(legion_os::shell::CommandSpec::Argv {
+                program: exe.into_os_string(),
+                args: vec![std::ffi::OsString::from("--dev-override-selftest")],
+            })
+            .env(legion_os::sandbox::DEV_UNSANDBOXED_ENV, "1")
+            .timeout(Duration::from_secs(30)),
+        )
+        .await
+        .expect("run --dev-override-selftest");
+        assert!(
+            out.success(),
+            "--dev-override-selftest failed: exit={:?} stdout={:?} stderr={:?}",
+            out.exit_code,
+            out.stdout.text,
+            out.stderr.text,
+        );
+    }
+}
+
+fn run_dev_override_selftest() -> ExitCode {
+    legion_tools::fs::enable_thumb_worker_self();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        let img_path = home.join("dev.png");
+        let img = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_pixel(96, 96, Rgb([10, 200, 120]));
+        let mut png = Vec::new();
+        PngEncoder::new(&mut png)
+            .write_image(&img, 96, 96, ExtendedColorType::Rgb8)
+            .unwrap();
+        fs::write(&img_path, png).unwrap();
+
+        let mp3_path = home.join("dev.mp3");
+        let cover = audio_fixtures::encode_solid_jpeg(96, 96, [80, 120, 240]);
+        fs::write(
+            &mp3_path,
+            audio_fixtures::build_mp3_id3v23(&[("image/jpeg", 3, &cover)], true, false),
+        )
+        .unwrap();
+
+        let node = Node::new(
+            Paths::under(dir.path()).with_home(&home),
+            legion_tools::registry(),
+        );
+
+        let _guard = SimulateSandboxGuard;
+        legion_tools::fs::set_simulate_sandbox_unavailable_for_test(Some("seccomp-bpf"));
+
+        let thumb = node
+            .call(Call::new(
+                Door::Cli,
+                "fs.thumb",
+                json!({"paths": [img_path.to_string_lossy()], "size": 128}),
+            ))
+            .await
+            .unwrap();
+        assert!(thumb["results"][0].get("ok").is_some(), "{thumb}");
+        assert_eq!(
+            thumb["details"],
+            json!({"sandbox": "disabled", "reason": "dev_override"}),
+            "fs.thumb must report dev_override in top-level details: {thumb}"
+        );
+
+        let tags = node
+            .call(Call::new(
+                Door::Cli,
+                "fs.tags",
+                json!({"paths": [mp3_path.to_string_lossy()]}),
+            ))
+            .await
+            .unwrap();
+        assert!(tags["results"][0].get("ok").is_some(), "{tags}");
+        assert_eq!(
+            tags["details"],
+            json!({"sandbox": "disabled", "reason": "dev_override"}),
+            "fs.tags must report dev_override in top-level details: {tags}"
+        );
+
+        let doctor = node
+            .call(Call::new(Door::Cli, "meta.doctor", json!({"quick": true})))
+            .await
+            .unwrap();
+        let check = doctor["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == json!("decode worker sandbox"))
+            .unwrap();
+        assert_eq!(check["warning"], json!(true), "{check}");
+        assert!(
+            check["detail"]
+                .as_str()
+                .unwrap()
+                .contains("LEGION_ALLOW_UNSANDBOXED_DECODE"),
+            "{check}"
+        );
+    });
+    ExitCode::SUCCESS
+}
+
+async fn test_ffmpeg_sandbox_blocks_network_and_unauthorized_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let allowed_dir = dir.path().join("media");
+    let secret_dir = dir.path().join("secrets");
+    let work_dir = dir.path().join("ffmpeg_tmp");
+    fs::create_dir_all(&allowed_dir).unwrap();
+    fs::create_dir_all(&secret_dir).unwrap();
+    fs::create_dir_all(&work_dir).unwrap();
+
+    let allowed_video = allowed_dir.join("clip.mp4");
+    fs::write(&allowed_video, b"ALLOWED_VIDEO_BYTES").unwrap();
+    let sibling_secret = allowed_dir.join("sibling_secret.txt");
+    fs::write(&sibling_secret, b"SIBLING_SECRET_MUST_NOT_BE_READ").unwrap();
+    let other_secret = secret_dir.join("private.key");
+    fs::write(&other_secret, b"PRIVATE_KEY_MUST_NOT_BE_READ").unwrap();
+    let escape_write = secret_dir.join("escaped_write.txt");
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let listen_addr = listener.local_addr().unwrap().to_string();
+
+    let exe = std::env::current_exe().expect("current exe");
+    #[cfg(not(windows))]
+    let policy = legion_os::sandbox::SandboxPolicy::Ffmpeg {
+        ffmpeg_bin: exe.clone(),
+        input_file: Some(allowed_video.clone()),
+        temp_dir: work_dir.clone(),
+    };
+    #[cfg(windows)]
+    let policy = legion_os::sandbox::SandboxPolicy::Ffmpeg {
+        ffmpeg_bin: exe.clone(),
+        input_file: None,
+        temp_dir: work_dir.clone(),
+    };
+
+    // Allowed input succeeds (by path on Unix, by inherited stdin handle on Windows AppContainer).
+    #[cfg(not(windows))]
+    {
+        let ok_read = run_selftest_child(
+            policy.clone(),
+            "ffmpeg-box",
+            "read_allowed",
+            Some(&allowed_video.to_string_lossy()),
+            None,
+        )
+        .await;
+        assert!(
+            ok_read.success() && ok_read.stdout.text.trim() == "OK:19",
+            "ffmpeg sandbox must allow reading the single input file: exit={:?} stdout={:?} stderr={:?}",
+            ok_read.exit_code,
+            ok_read.stdout.text,
+            ok_read.stderr.text,
+        );
+    }
+    #[cfg(windows)]
+    {
+        let ok_read = run_selftest_child(
+            policy.clone(),
+            "ffmpeg-box",
+            "read_stdin",
+            None,
+            Some(fs::File::open(&allowed_video).unwrap()),
+        )
+        .await;
+        assert!(
+            ok_read.success() && ok_read.stdout.text.trim() == "OK:19",
+            "Windows ffmpeg AppContainer sandbox must allow reading inherited stdin video handle: exit={:?} stdout={:?} stderr={:?}",
+            ok_read.exit_code,
+            ok_read.stdout.text,
+            ok_read.stderr.text,
+        );
+    }
+
+    // Write outside temp_dir MUST fail on every platform.
+    let out_write = run_selftest_child(
+        policy.clone(),
+        "ffmpeg-box",
+        "write_file",
+        Some(&escape_write.to_string_lossy()),
+        None,
+    )
+    .await;
+    assert_sandbox_blocked("ffmpeg-box write outside temp_dir", &out_write);
+    assert!(!escape_write.exists());
+
+    // Spawning a shell child MUST fail on every platform (Landlock blocks /bin/sh exec on Linux,
+    // Seatbelt denies process-fork on macOS, Job ActiveProcessLimit=1 blocks spawn on Windows).
+    let out_spawn =
+        run_selftest_child(policy.clone(), "ffmpeg-box", "spawn_proc", None, None).await;
+    assert_sandbox_blocked("ffmpeg-box spawn_proc", &out_spawn);
+
+    // Check whether full isolation holds (always true on Linux + macOS; true on Windows when
+    // AppContainer launched).
+    let out_bind = run_selftest_child(policy.clone(), "ffmpeg-box", "tcp_bind", None, None).await;
+    let out_connect = run_selftest_child(
+        policy.clone(),
+        "ffmpeg-box",
+        "tcp_connect",
+        Some(&listen_addr),
+        None,
+    )
+    .await;
+    let out_sibling = run_selftest_child(
+        policy.clone(),
+        "ffmpeg-box",
+        "open_file",
+        Some(&sibling_secret.to_string_lossy()),
+        None,
+    )
+    .await;
+    let out_other = run_selftest_child(
+        policy.clone(),
+        "ffmpeg-box",
+        "open_file",
+        Some(&other_secret.to_string_lossy()),
+        None,
+    )
+    .await;
+
+    #[cfg(not(windows))]
+    {
+        assert_sandbox_blocked("ffmpeg-box tcp_bind", &out_bind);
+        assert_sandbox_blocked("ffmpeg-box tcp_connect", &out_connect);
+        assert_sandbox_blocked("ffmpeg-box sibling file read", &out_sibling);
+        assert_sandbox_blocked("ffmpeg-box unauthorized dir read", &out_other);
+        let out_passwd = run_selftest_child(
+            policy.clone(),
+            "ffmpeg-box",
+            "open_file",
+            Some("/etc/passwd"),
+            None,
+        )
+        .await;
+        assert_sandbox_blocked("ffmpeg-box /etc/passwd read", &out_passwd);
+    }
+
+    #[cfg(windows)]
+    {
+        // Probe whether AppContainer succeeded on this Windows host.
+        let probe_out = legion_os::run::run(
+            legion_os::run::RunOptions::new(legion_os::shell::CommandSpec::Argv {
+                program: exe.into_os_string(),
+                args: vec![
+                    std::ffi::OsString::from(legion_tools::fs::THUMB_WORKER_MODE),
+                    std::ffi::OsString::from("--probe-sandbox"),
+                ],
+            })
+            .env_clear(true)
+            .envs(minimal_selftest_env())
+            .sandbox(legion_os::sandbox::SandboxPolicy::Worker)
+            .timeout(Duration::from_secs(10))
+            .kill_grace(Duration::ZERO),
+        )
+        .await
+        .expect("probe sandbox");
+        let report: legion_os::sandbox::SandboxReport =
+            serde_json::from_str(probe_out.stdout.text.trim()).expect("parse report");
+        if report.complete {
+            assert_sandbox_blocked("Windows ffmpeg-box AppContainer tcp_bind", &out_bind);
+            assert_sandbox_blocked("Windows ffmpeg-box AppContainer tcp_connect", &out_connect);
+            assert_sandbox_blocked("Windows ffmpeg-box AppContainer sibling read", &out_sibling);
+            assert_sandbox_blocked("Windows ffmpeg-box AppContainer secret read", &out_other);
+        }
+    }
+
+    drop(listener);
+    eprintln!("FFMPEG_SANDBOX_PROOF PASSED");
 }
