@@ -64,32 +64,39 @@ impl StateStore {
         self.load().last_os.get(&key).copied()
     }
 
-    pub(crate) fn record_system(&self, machine: &str, system: &str) {
+    pub(crate) fn record_connection(
+        &self,
+        machine: &str,
+        node: ReportedNode,
+        system: Option<&str>,
+        os: Option<(&str, RemoteOs)>,
+    ) {
         let _guard = self
             .lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut data = self.load();
-        if data.last_system.get(machine).map(String::as_str) == Some(system) {
-            return;
+        let mut changed = false;
+        if data.last_node.get(machine) != Some(&node) {
+            data.last_node.insert(machine.to_owned(), node);
+            changed = true;
         }
-        data.last_system
-            .insert(machine.to_owned(), system.to_owned());
-        self.save(&data);
-    }
-
-    pub(crate) fn record_os(&self, machine: &str, system: &str, os: RemoteOs) {
-        let _guard = self
-            .lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let key = os_key(machine, system);
-        let mut data = self.load();
-        if data.last_os.get(&key) == Some(&os) {
-            return;
+        if let Some(sys) = system
+            && data.last_system.get(machine).map(String::as_str) != Some(sys)
+        {
+            data.last_system.insert(machine.to_owned(), sys.to_owned());
+            changed = true;
         }
-        data.last_os.insert(key, os);
-        self.save(&data);
+        if let Some((sys, remote_os)) = os {
+            let key = os_key(machine, sys);
+            if data.last_os.get(&key) != Some(&remote_os) {
+                data.last_os.insert(key, remote_os);
+                changed = true;
+            }
+        }
+        if changed {
+            self.save(&data);
+        }
     }
 
     pub(crate) fn last_node(&self, machine: &str) -> Option<ReportedNode> {
@@ -158,11 +165,21 @@ mod tests {
         assert_eq!(store.last_system("tower"), None);
         assert_eq!(store.last_os("tower", "linux"), None);
 
-        store.record_system("tower", "windows");
-        store.record_os("tower", "windows", RemoteOs::Windows);
+        let tower_node = ReportedNode {
+            node: "tower".to_owned(),
+            explicit: Some(true),
+            node_id: Some("fedcba9876543210fedcba9876543210".to_owned()),
+        };
+        store.record_connection(
+            "tower",
+            tower_node.clone(),
+            Some("windows"),
+            Some(("windows", RemoteOs::Windows)),
+        );
 
-        // Fresh store against the same state dir sees the persisted values.
+        // Fresh store against the same state dir sees all persisted values from one atomic write.
         let reloaded = StateStore::new(dir.path());
+        assert_eq!(reloaded.last_node("tower"), Some(tower_node));
         assert_eq!(reloaded.last_system("tower").as_deref(), Some("windows"));
         assert_eq!(
             reloaded.last_os("tower", "windows"),
