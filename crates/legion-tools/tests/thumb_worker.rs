@@ -3526,23 +3526,55 @@ fn run_sandbox_selftest(args: &[std::ffi::OsString]) -> ExitCode {
         }
         "tcp_bind" => match std::net::TcpListener::bind("127.0.0.1:0") {
             Ok(listener) => {
-                println!("ESCAPED: bound {:?}", listener.local_addr());
-                ExitCode::SUCCESS
+                #[cfg(windows)]
+                {
+                    // On Windows, zero-capability AppContainer permits reserving a local loopback
+                    // socket via `bind()`, while Windows Filtering Platform (WFP) blocks all
+                    // actual traffic (`ALE_AUTH_CONNECT` / `ALE_AUTH_RECV_ACCEPT`). Verify that
+                    // even connecting to the bound socket fails under AppContainer isolation.
+                    let local_addr = listener.local_addr().expect("local_addr");
+                    match std::net::TcpStream::connect_timeout(&local_addr, Duration::from_secs(1))
+                    {
+                        Ok(_) => {
+                            println!("ESCAPED: bound and connected to {local_addr}");
+                            ExitCode::SUCCESS
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "REFUSED: tcp_bind({local_addr}) blocked at connect: {err} (os_error={:?})",
+                                err.raw_os_error()
+                            );
+                            ExitCode::from(42)
+                        }
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    println!("ESCAPED: bound {:?}", listener.local_addr());
+                    ExitCode::SUCCESS
+                }
             }
             Err(err) => {
-                eprintln!("REFUSED: tcp_bind: {err}");
+                eprintln!(
+                    "REFUSED: tcp_bind: {err} (os_error={:?})",
+                    err.raw_os_error()
+                );
                 ExitCode::from(42)
             }
         },
         "tcp_connect" => {
             let addr = target.expect("target addr");
-            match std::net::TcpStream::connect(&addr) {
+            let sock_addr: std::net::SocketAddr = addr.parse().expect("valid socket addr");
+            match std::net::TcpStream::connect_timeout(&sock_addr, Duration::from_secs(2)) {
                 Ok(_) => {
                     println!("ESCAPED: connected to {addr}");
                     ExitCode::SUCCESS
                 }
                 Err(err) => {
-                    eprintln!("REFUSED: tcp_connect({addr}): {err}");
+                    eprintln!(
+                        "REFUSED: tcp_connect({addr}): {err} (os_error={:?})",
+                        err.raw_os_error()
+                    );
                     ExitCode::from(42)
                 }
             }
@@ -3854,6 +3886,12 @@ async fn test_worker_sandbox_blocks_files_network_and_process_spawn() {
         }
 
         let out_bind = run_selftest_child(policy.clone(), "worker", "tcp_bind", None, None).await;
+        eprintln!(
+            "SANDBOX_NET_BIND: exit={:?} signal={:?} stderr={}",
+            out_bind.exit_code,
+            out_bind.signal,
+            out_bind.stderr.text.trim()
+        );
         assert_sandbox_blocked("worker tcp_bind", &out_bind);
 
         let out_connect = run_selftest_child(
@@ -3864,6 +3902,12 @@ async fn test_worker_sandbox_blocks_files_network_and_process_spawn() {
             None,
         )
         .await;
+        eprintln!(
+            "SANDBOX_NET_CONNECT: exit={:?} signal={:?} stderr={}",
+            out_connect.exit_code,
+            out_connect.signal,
+            out_connect.stderr.text.trim()
+        );
         assert_sandbox_blocked("worker tcp_connect", &out_connect);
 
         #[cfg(target_os = "linux")]
@@ -3925,10 +3969,10 @@ async fn test_worker_sandbox_unavailable_and_dev_override() {
         legion_tools::registry(),
     );
 
-    // 1. Simulate sandbox unavailability -> MUST fail closed with ErrorCode::Unsupported,
-    //    details.reason == "sandbox_unavailable", details.missing == "seccomp-bpf",
-    //    NEVER masked as not_found for audio, and NEVER cached in bad_cache!
-    {
+    // 1. Simulate sandbox unavailability (hook compiled in debug builds only) -> MUST fail closed
+    //    with ErrorCode::Unsupported, details.reason == "sandbox_unavailable", details.missing ==
+    //    "seccomp-bpf", NEVER masked as not_found for audio, and NEVER cached in bad_cache!
+    if cfg!(debug_assertions) {
         let _guard = SimulateSandboxGuard;
         legion_tools::fs::set_simulate_sandbox_unavailable_for_test(Some("seccomp-bpf"));
 
