@@ -489,7 +489,7 @@ textarea {
   height: 22px;
   stroke: currentColor;
   fill: none;
-  stroke-width: 1.6;
+  stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -1631,7 +1631,7 @@ button.row:active {
   height: 22px;
   stroke: currentColor;
   fill: none;
-  stroke-width: 1.8;
+  stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -2196,7 +2196,7 @@ button.row:active {
   height: 22px;
   stroke: currentColor;
   fill: none;
-  stroke-width: 1.7;
+  stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -2342,7 +2342,7 @@ button.row:active {
   height: 28px;
   stroke: currentColor;
   fill: none;
-  stroke-width: 1.6;
+  stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -2419,7 +2419,7 @@ button.row:active {
   height: 30px;
   stroke: var(--accent);
   fill: none;
-  stroke-width: 1.6;
+  stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -2468,7 +2468,7 @@ button.row:active {
   height: 22px;
   stroke: currentColor;
   fill: none;
-  stroke-width: 1.7;
+  stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -3339,7 +3339,7 @@ button.row:active {
   height: 34%;
   stroke: currentColor;
   fill: none;
-  stroke-width: 1.5;
+  stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -3426,9 +3426,6 @@ button.row:active {
 .btn.icon.music-play-btn svg {
   width: 28px;
   height: 28px;
-  fill: currentColor;
-  stroke: currentColor;
-  stroke-width: 2.4;
 }
 
 .music-vol-row {
@@ -3533,7 +3530,7 @@ button.row:active {
   height: 44px;
   stroke: currentColor;
   fill: none;
-  stroke-width: 1.6;
+  stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -3632,7 +3629,7 @@ button.row:active {
   height: 30px;
   stroke: currentColor;
   fill: none;
-  stroke-width: 1.6;
+  stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -3812,7 +3809,7 @@ button.row:active {
   height: 20px;
   stroke: currentColor;
   fill: none;
-  stroke-width: 1.7;
+  stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
