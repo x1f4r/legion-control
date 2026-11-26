@@ -1270,12 +1270,13 @@ export function FolderBrowser({
         coalescedRef.current?.trigger({ highlightNew: false });
       }
     };
-    const unsubVis = subscribeForegroundVisibility(link, ({ visible }) => {
-      if (visible) checkStaleOnVisible();
-    });
+    const unsubResume =
+      typeof link?.onAppResume === 'function' ? link.onAppResume(checkStaleOnVisible) : () => {};
+    document.addEventListener('visibilitychange', checkStaleOnVisible);
     window.addEventListener('focus', checkStaleOnVisible);
     return () => {
-      unsubVis();
+      unsubResume();
+      document.removeEventListener('visibilitychange', checkStaleOnVisible);
       window.removeEventListener('focus', checkStaleOnVisible);
     };
   }, [folderChanges, machine, path, reachable, link]);
