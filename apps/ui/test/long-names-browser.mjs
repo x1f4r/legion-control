@@ -15,6 +15,7 @@ import readline from 'node:readline';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
+import { findDigitRuns, isNaturalBreak, toGraphemes } from '../lib/file-name.js';
 
 const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(TEST_DIR, '..', '..', '..');
@@ -195,13 +196,102 @@ async function connectPage(page, url, token) {
   await page.locator('nav.nav a', { hasText: 'Files' }).waitFor({ timeout: 10_000 });
 }
 
+function extractDigitRunStrings(text) {
+  const g = toGraphemes(text);
+  const runs = findDigitRuns(g);
+  const seen = new Set();
+  const out = [];
+  for (let i = 0; i < runs.length; i += 1) {
+    const r = runs[i];
+    if (!r || seen.has(r)) continue;
+    seen.add(r);
+    out.push({ start: r.start, end: r.end, text: g.slice(r.start, r.end).join('') });
+  }
+  return { g, runs, list: out };
+}
+
+function assertFontIndependentLayout(row, { maxLines, label }) {
+  assert.ok(row.lineCount >= 1 && row.lineCount <= maxLines, `${label}: line count ${row.lineCount} out of 1..${maxLines}`);
+  assert.ok(!row.drawn.endsWith('…'), `${label}: trailing ellipsis in "${row.drawn}"`);
+  assert.equal(row.lineOverflows, false, `${label}: horizontal text overflow in "${row.drawn}"`);
+  assert.equal(
+    row.dimText + row.strongText,
+    row.drawn,
+    `${label}: quiet + strong spans must reconstruct drawn text ("${row.dimText}" + "${row.strongText}" !== "${row.drawn}")`,
+  );
+
+  const origRuns = new Set(extractDigitRunStrings(row.ariaLabel).list.map((r) => r.text));
+  const { g: drawnG, runs: drawnRuns, list: drawnRunList } = extractDigitRunStrings(row.drawn);
+
+  // Every line after the first must begin at a natural break (or right after an ellipsis) and
+  // never split a digit run across lines.
+  let offset = 0;
+  for (let i = 0; i < row.lineTexts.length - 1; i += 1) {
+    offset += toGraphemes(row.lineTexts[i]).length;
+    assert.ok(
+      !(drawnRuns[offset - 1] !== null && drawnRuns[offset - 1] === drawnRuns[offset]),
+      `${label}: digit run split across lines: ${JSON.stringify(row.lineTexts)}`,
+    );
+    assert.ok(
+      drawnG[offset - 1] === '…' || isNaturalBreak(drawnG, offset),
+      `${label}: line ${i + 2} did not start at a natural break: ${JSON.stringify(row.lineTexts)}`,
+    );
+  }
+
+  // No digit run may be split by an ellipsis.
+  if (row.drawn.includes('…')) {
+    assert.ok(
+      !/[0-9][.:\-,]…|…[.:\-,][0-9]/.test(row.drawn),
+      `${label}: ellipsis landed inside a digit run joiner in "${row.drawn}"`,
+    );
+    for (const run of drawnRunList) {
+      const touchesEllipsis =
+        (run.start > 0 && drawnG[run.start - 1] === '…') ||
+        (run.end < drawnG.length && drawnG[run.end] === '…');
+      if (touchesEllipsis) {
+        assert.ok(
+          origRuns.has(run.text),
+          `${label}: ellipsis split digit run -> fragment "${run.text}" in "${row.drawn}" (original runs: ${JSON.stringify([...origRuns])})`,
+        );
+      }
+    }
+  }
+
+  // Emphasis must never change inside a digit run.
+  if (row.dimText.length > 0 && row.strongText.length > 0) {
+    const dimBoundary = toGraphemes(row.dimText).length;
+    assert.ok(
+      !(drawnRuns[dimBoundary - 1] !== null && drawnRuns[dimBoundary - 1] === drawnRuns[dimBoundary]),
+      `${label}: emphasis changed inside a digit run (dim="${row.dimText}", strong="${row.strongText}")`,
+    );
+  }
+}
+
+function assertSeparatorEmphasis(row, { expectedDim, expectedStrong, expectedDimSep, strongPrefix, strongSuffix, label }) {
+  assert.ok(
+    row.dimText.endsWith(expectedDimSep) || row.dimText.endsWith('…'),
+    `${label}: quiet prefix must end at separator "${expectedDimSep}", got dim="${row.dimText}"`,
+  );
+  assert.ok(
+    row.strongText.startsWith(strongPrefix),
+    `${label}: strong part must start with "${strongPrefix}", got strong="${row.strongText}"`,
+  );
+  assert.ok(
+    row.strongText.endsWith(strongSuffix),
+    `${label}: strong part must end with "${strongSuffix}", got strong="${row.strongText}"`,
+  );
+  if (!row.drawn.includes('…')) {
+    assert.equal(row.dimText, expectedDim, `${label}: expected exact quiet lead "${expectedDim}", got "${row.dimText}"`);
+    assert.equal(row.strongText, expectedStrong, `${label}: expected exact strong part "${expectedStrong}", got "${row.strongText}"`);
+  }
+}
+
 async function collectAllScrolledRows(page, scrollSelector, rowSelector, slotSelector) {
   const seen = new Map();
   let lastTop = -1;
 
-    for (let step = 0; step < 30; step += 1) {
-    await waitForVisibleFitted(page, slotSelector, scrollSelector);
-    const snap = await page.evaluate(
+  const readVisibleSnapshot = () =>
+    page.evaluate(
       ({ rSel, sSel, cSel }) => {
         const rows = [...document.querySelectorAll(rSel)];
         const boxEl = cSel ? document.querySelector(cSel) : null;
@@ -216,7 +306,18 @@ async function collectAllScrolledRows(page, scrollSelector, rowSelector, slotSel
           const lines = [...slot.querySelectorAll('.fn-line')];
           const lineTexts = lines.map((l) => l.textContent || '');
           const drawn = lineTexts.join('');
-          const dimTexts = [...slot.querySelectorAll('.fn-dim')].map((d) => d.textContent || '');
+          let dimText = '';
+          let strongText = '';
+          for (const line of lines) {
+            for (const node of line.childNodes) {
+              const txt = node.textContent || '';
+              if (node.nodeType === Node.ELEMENT_NODE && node.classList.contains('fn-dim')) {
+                dimText += txt;
+              } else {
+                strongText += txt;
+              }
+            }
+          }
           const lineOverflows = lines.some((l) => l.scrollWidth > slot.clientWidth + 2);
           out.push({
             href: row.getAttribute('href') || '',
@@ -225,7 +326,8 @@ async function collectAllScrolledRows(page, scrollSelector, rowSelector, slotSel
             drawn,
             lineTexts,
             lineCount: lines.length,
-            dimText: dimTexts.join(''),
+            dimText,
+            strongText,
             lineOverflows,
             rowHeight: Math.round(row.getBoundingClientRect().height),
           });
@@ -235,7 +337,9 @@ async function collectAllScrolledRows(page, scrollSelector, rowSelector, slotSel
       { rSel: rowSelector, sSel: slotSelector, cSel: scrollSelector },
     );
 
-    for (const item of snap) {
+  for (let step = 0; step < 30; step += 1) {
+    await waitForVisibleFitted(page, slotSelector, scrollSelector);
+    for (const item of await readVisibleSnapshot()) {
       seen.set(item.ariaLabel, item);
     }
 
@@ -249,37 +353,9 @@ async function collectAllScrolledRows(page, scrollSelector, rowSelector, slotSel
 
     if (Math.abs(pos.top - lastTop) < 2 || pos.top >= pos.max - 2) {
       await waitForVisibleFitted(page, slotSelector, scrollSelector);
-      const finalSnap = await page.evaluate(
-        ({ rSel, sSel, cSel }) => {
-          const rows = [...document.querySelectorAll(rSel)];
-          const boxEl = cSel ? document.querySelector(cSel) : null;
-          const bounds = boxEl ? boxEl.getBoundingClientRect() : { top: 0, bottom: window.innerHeight };
-          const out = [];
-          for (const row of rows) {
-            const slot = row.querySelector(sSel);
-            if (!slot) continue;
-            const r = slot.getBoundingClientRect();
-            if (r.height === 0 || r.bottom <= bounds.top + 1 || r.top >= bounds.bottom - 1) continue;
-            if (slot.getAttribute('data-fn-ready') !== '1') continue;
-            const lines = [...slot.querySelectorAll('.fn-line')];
-            const lineTexts = lines.map((l) => l.textContent || '');
-            out.push({
-              href: row.getAttribute('href') || '',
-              ariaLabel: row.getAttribute('aria-label') || '',
-              titleAttr: row.getAttribute('title') || '',
-              drawn: lineTexts.join(''),
-              lineTexts,
-              lineCount: lines.length,
-              dimText: [...slot.querySelectorAll('.fn-dim')].map((d) => d.textContent || '').join(''),
-              lineOverflows: lines.some((l) => l.scrollWidth > slot.clientWidth + 2),
-              rowHeight: Math.round(row.getBoundingClientRect().height),
-            });
-          }
-          return out;
-        },
-        { rSel: rowSelector, sSel: slotSelector, cSel: scrollSelector },
-      );
-      for (const item of finalSnap) seen.set(item.ariaLabel, item);
+      for (const item of await readVisibleSnapshot()) {
+        seen.set(item.ariaLabel, item);
+      }
       break;
     }
     lastTop = pos.top;
@@ -379,18 +455,34 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
       [...document.querySelectorAll('.tiles a.tile')].map((tile) => {
         const slot = tile.querySelector('.fn-slot');
         const lines = [...(slot?.querySelectorAll('.fn-line') || [])];
+        const lineTexts = lines.map((l) => l.textContent || '');
+        let dimText = '';
+        let strongText = '';
+        for (const line of lines) {
+          for (const node of line.childNodes) {
+            const txt = node.textContent || '';
+            if (node.nodeType === Node.ELEMENT_NODE && node.classList.contains('fn-dim')) {
+              dimText += txt;
+            } else {
+              strongText += txt;
+            }
+          }
+        }
         return {
           ariaLabel: tile.getAttribute('aria-label') || '',
-          drawn: lines.map((l) => l.textContent || '').join(''),
+          drawn: lineTexts.join(''),
+          lineTexts,
           lineCount: lines.length,
+          dimText,
+          strongText,
+          lineOverflows: lines.some((l) => l.scrollWidth > (slot?.clientWidth || 0) + 2),
         };
       }),
     );
     assert.equal(pinnedSnap.length, 2, 'Expected 2 pinned long-name tiles');
     assert.notEqual(pinnedSnap[0].drawn, pinnedSnap[1].drawn, 'Pinned tiles must draw distinct names');
-    assert.ok(pinnedSnap.every((p) => p.lineCount <= 2), 'Pinned tiles must wrap up to 2 lines');
     for (const p of pinnedSnap) {
-      assert.ok(!p.drawn.includes('…11-25') && !p.drawn.includes('2026-11-…'), `Pinned tile broke date digit run: "${p.drawn}"`);
+      assertFontIndependentLayout(p, { maxLines: 2, label: `phone pinned "${p.ariaLabel}"` });
     }
     assert.deepEqual(
       pinnedSnap.map((p) => p.ariaLabel).sort(),
@@ -476,54 +568,61 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
     );
     for (const r of phoneListRows) {
       assert.ok(expectedCaptures.includes(r.ariaLabel), `Unexpected accessible name: ${r.ariaLabel}`);
-      assert.ok(!r.drawn.endsWith('…'), `Trailing ellipsis on phone list: "${r.drawn}"`);
-      assert.ok(r.lineCount >= 1 && r.lineCount <= 2, `Row lines ${r.lineCount} out of range for ${r.ariaLabel}`);
-      assert.equal(r.lineOverflows, false, `Horizontal text overflow in row "${r.drawn}"`);
+      assertFontIndependentLayout(r, { maxLines: 2, label: `phone list "${r.ariaLabel}"` });
     }
 
-    // Verify shared-lead dimming & break placement on IMG_, Screen Recording, Quarterly report, and checklist rows.
+    // Verify separator-aligned emphasis (joined across lines, independent of wrap point) on all four groups.
     const imgRow = phoneListRows.find((r) => r.ariaLabel === 'IMG_20261125_140311.jpg');
     assert.ok(imgRow, 'IMG_20261125_140311.jpg row missing');
-    assert.equal(imgRow.dimText, 'IMG_20261125_', `Expected IMG_ shared lead dim, got "${imgRow.dimText}"`);
-    assert.equal(imgRow.lineCount, 1, '1-line IMG_ name must stay on 1 line');
+    assertSeparatorEmphasis(imgRow, {
+      expectedDim: 'IMG_20261125_',
+      expectedStrong: '140311.jpg',
+      expectedDimSep: '_',
+      strongPrefix: '140311',
+      strongSuffix: '140311.jpg',
+      label: 'phone list IMG_',
+    });
 
     const rec03Row = phoneListRows.find((r) => r.ariaLabel === 'Screen Recording 2026-11-25 at 14.03.19.mov');
     assert.ok(rec03Row, 'Screen Recording 2026-11-25 at 14.03.19.mov row missing');
-    assert.equal(
-      rec03Row.dimText,
-      'Screen Recording 2026-11-25 at ',
-      `Expected whole time strong on Screen Recording, got dim="${rec03Row.dimText}"`,
-    );
-    assert.deepEqual(
-      rec03Row.lineTexts,
-      ['Screen Recording 2026-11-25 at ', '14.03.19.mov'],
-      `Expected Screen Recording to break before whole time, got ${JSON.stringify(rec03Row.lineTexts)}`,
+    assertSeparatorEmphasis(rec03Row, {
+      expectedDim: 'Screen Recording 2026-11-25 at ',
+      expectedStrong: '14.03.19.mov',
+      expectedDimSep: ' ',
+      strongPrefix: '14.03.19',
+      strongSuffix: '14.03.19.mov',
+      label: 'phone list Screen Recording',
+    });
+    assert.ok(
+      rec03Row.lineTexts.some((l) => l.includes('14.03.19')),
+      `Expected whole time 14.03.19 on one line, got ${JSON.stringify(rec03Row.lineTexts)}`,
     );
 
     const repQ1Row = phoneListRows.find(
       (r) => r.ariaLabel === 'Quarterly_Architecture_Review_Q1_2026_Final_Approved.pdf',
     );
     assert.ok(repQ1Row, 'Quarterly_Architecture_Review_Q1_2026_Final_Approved.pdf row missing');
-    assert.equal(
-      repQ1Row.dimText,
-      'Quarterly_Architecture_Review_',
-      `Expected Q1 kept strong on report, got dim="${repQ1Row.dimText}"`,
-    );
-    assert.deepEqual(
-      repQ1Row.lineTexts,
-      ['Quarterly_Architecture_Review_', 'Q1_2026_Final_Approved.pdf'],
-      `Expected report second line to start with Q1, got ${JSON.stringify(repQ1Row.lineTexts)}`,
-    );
+    assertSeparatorEmphasis(repQ1Row, {
+      expectedDim: 'Quarterly_Architecture_Review_',
+      expectedStrong: 'Q1_2026_Final_Approved.pdf',
+      expectedDimSep: '_',
+      strongPrefix: 'Q1',
+      strongSuffix: 'Approved.pdf',
+      label: 'phone list Quarterly report',
+    });
 
     const depRev1Row = phoneListRows.find(
       (r) => r.ariaLabel === 'deployment-checklist-europe-west-primary-cluster-rollout-plan-rev1',
     );
     assert.ok(depRev1Row, 'deployment-checklist rev1 row missing');
-    assert.equal(
-      depRev1Row.dimText,
-      'deployment-checklist-europe-west-primary-cluster-rollout-plan-',
-      `Expected whole rev1 strong on checklist, got dim="${depRev1Row.dimText}"`,
-    );
+    assertSeparatorEmphasis(depRev1Row, {
+      expectedDim: 'deployment-checklist-europe-west-primary-cluster-rollout-plan-',
+      expectedStrong: 'rev1',
+      expectedDimSep: '-',
+      strongPrefix: 'rev1',
+      strongSuffix: 'rev1',
+      label: 'phone list checklist',
+    });
 
     // Verify zero page-level horizontal overflow on phone.
     const phoneOverflow = await phone.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
@@ -576,16 +675,32 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
       const nameEl = document.querySelector('.viewer-top .name');
       const slot = nameEl?.querySelector('.fn-slot');
       const lines = [...(slot?.querySelectorAll('.fn-line') || [])];
+      const lineTexts = lines.map((l) => l.textContent || '');
+      let dimText = '';
+      let strongText = '';
+      for (const line of lines) {
+        for (const node of line.childNodes) {
+          const txt = node.textContent || '';
+          if (node.nodeType === Node.ELEMENT_NODE && node.classList.contains('fn-dim')) {
+            dimText += txt;
+          } else {
+            strongText += txt;
+          }
+        }
+      }
       return {
         ariaLabel: nameEl?.getAttribute('aria-label') || '',
-        drawn: lines.map((l) => l.textContent || '').join(''),
+        drawn: lineTexts.join(''),
+        lineTexts,
         lineCount: lines.length,
+        dimText,
+        strongText,
+        lineOverflows: lines.some((l) => l.scrollWidth > (slot?.clientWidth || 0) + 2),
         overflow: document.documentElement.scrollWidth - window.innerWidth,
       };
     });
     assert.equal(viewerTitleInfo.ariaLabel, reportName);
-    assert.equal(viewerTitleInfo.lineCount, 1);
-    assert.ok(!viewerTitleInfo.drawn.endsWith('…'), `Viewer title must not end-truncate: "${viewerTitleInfo.drawn}"`);
+    assertFontIndependentLayout(viewerTitleInfo, { maxLines: 1, label: 'phone viewer title' });
     assert.ok(viewerTitleInfo.drawn.endsWith('Approved.pdf'), `Viewer title must keep ending: "${viewerTitleInfo.drawn}"`);
     assert.ok(viewerTitleInfo.overflow <= 1, `Viewer overflow: ${viewerTitleInfo.overflow}px`);
     await maybeShot(phone, 'after-phone-viewer-dark');
@@ -643,9 +758,7 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
       'Every grid cell visible text must be unique on phone',
     );
     for (const c of phoneGridCells) {
-      assert.ok(c.lineCount >= 1 && c.lineCount <= 3, `Grid cell lines ${c.lineCount} > 3 for ${c.ariaLabel}`);
-      assert.ok(!c.drawn.endsWith('…'), `Trailing ellipsis in grid cell: "${c.drawn}"`);
-      assert.equal(c.lineOverflows, false, `Grid cell horizontal overflow: "${c.drawn}"`);
+      assertFontIndependentLayout(c, { maxLines: 3, label: `phone grid "${c.ariaLabel}"` });
     }
 
     // Search results on phone: match highlight active, ZERO dimming (.fn-dim count == 0).
@@ -716,14 +829,39 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
     // Check pinned strip in left split pane.
     await waitForVisibleFitted(desk, '.split-left .tiles a.tile .fn-slot');
     const leftPinned = await desk.evaluate(() =>
-      [...document.querySelectorAll('.split-left .tiles a.tile')].map((t) => ({
-        title: t.getAttribute('title') || '',
-        ariaLabel: t.getAttribute('aria-label') || '',
-        drawn: [...t.querySelectorAll('.fn-line')].map((l) => l.textContent || '').join(''),
-      })),
+      [...document.querySelectorAll('.split-left .tiles a.tile')].map((t) => {
+        const slot = t.querySelector('.fn-slot');
+        const lines = [...(slot?.querySelectorAll('.fn-line') || [])];
+        const lineTexts = lines.map((l) => l.textContent || '');
+        let dimText = '';
+        let strongText = '';
+        for (const line of lines) {
+          for (const node of line.childNodes) {
+            const txt = node.textContent || '';
+            if (node.nodeType === Node.ELEMENT_NODE && node.classList.contains('fn-dim')) {
+              dimText += txt;
+            } else {
+              strongText += txt;
+            }
+          }
+        }
+        return {
+          title: t.getAttribute('title') || '',
+          ariaLabel: t.getAttribute('aria-label') || '',
+          drawn: lineTexts.join(''),
+          lineTexts,
+          lineCount: lines.length,
+          dimText,
+          strongText,
+          lineOverflows: lines.some((l) => l.scrollWidth > (slot?.clientWidth || 0) + 2),
+        };
+      }),
     );
     assert.equal(leftPinned.length, 2);
     assert.notEqual(leftPinned[0].drawn, leftPinned[1].drawn);
+    for (const p of leftPinned) {
+      assertFontIndependentLayout(p, { maxLines: 2, label: `desktop pinned "${p.ariaLabel}"` });
+    }
     assert.deepEqual(
       leftPinned.map((p) => p.title).sort(),
       ['Screen Recording 2026-11-25 at 14.01.12.mov', 'Screen Recording 2026-11-25 at 14.02.04.mov'],
@@ -751,6 +889,7 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
     assert.equal(new Set(deskGridCells.map((c) => c.drawn)).size, 52, 'Desktop grid cells must all differ');
     for (const c of deskGridCells) {
       assert.equal(c.titleAttr, c.ariaLabel, 'Desktop grid hover title must equal full name');
+      assertFontIndependentLayout(c, { maxLines: 3, label: `desktop grid "${c.ariaLabel}"` });
     }
 
     // Switch desktop to List view (dark + light), scroll to Screen Recordings to match before shot.
@@ -786,18 +925,30 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
     assert.equal(new Set(deskListRows.map((r) => r.drawn)).size, expectedCaptures.length);
     for (const r of deskListRows) {
       assert.equal(r.titleAttr, r.ariaLabel, 'Desktop list row hover title must equal full name');
-      assert.equal(r.lineOverflows, false, `Desktop row overflow: "${r.drawn}"`);
+      assertFontIndependentLayout(r, { maxLines: 2, label: `desktop list "${r.ariaLabel}"` });
     }
     const deskRec03 = deskListRows.find((r) => r.ariaLabel === 'Screen Recording 2026-11-25 at 14.03.19.mov');
     assert.ok(deskRec03);
-    assert.equal(deskRec03.lineCount, 1);
-    assert.equal(deskRec03.dimText, 'Screen Recording 2026-11-25 at ');
+    assertSeparatorEmphasis(deskRec03, {
+      expectedDim: 'Screen Recording 2026-11-25 at ',
+      expectedStrong: '14.03.19.mov',
+      expectedDimSep: ' ',
+      strongPrefix: '14.03.19',
+      strongSuffix: '14.03.19.mov',
+      label: 'desktop list Screen Recording',
+    });
     const deskRepQ1 = deskListRows.find(
       (r) => r.ariaLabel === 'Quarterly_Architecture_Review_Q1_2026_Final_Approved.pdf',
     );
     assert.ok(deskRepQ1);
-    assert.equal(deskRepQ1.lineCount, 1);
-    assert.equal(deskRepQ1.dimText, 'Quarterly_Architecture_Review_');
+    assertSeparatorEmphasis(deskRepQ1, {
+      expectedDim: 'Quarterly_Architecture_Review_',
+      expectedStrong: 'Q1_2026_Final_Approved.pdf',
+      expectedDimSep: '_',
+      strongPrefix: 'Q1',
+      strongSuffix: 'Approved.pdf',
+      label: 'desktop list Quarterly report',
+    });
 
     // Verify zero CSS text-overflow:ellipsis or -webkit-line-clamp on any file name slot.
     const cssLeak = await desk.evaluate(() => {
