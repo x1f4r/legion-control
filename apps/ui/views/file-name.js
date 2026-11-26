@@ -270,7 +270,7 @@ export function FileNameList({
 
     for (const id of visibleIds) {
       const item = items.get(id);
-      if (!item || !item.el) continue;
+      if (!item || !item.el || !item.el.isConnected) continue;
       const rawWidth = item.el.getBoundingClientRect().width;
       if (!(rawWidth > 1)) continue;
       // Leave a 1px safety cushion so subpixel rounding between canvas and DOM never triggers an
@@ -410,7 +410,7 @@ export function FileNameList({
           let changed = false;
           for (const entry of entries) {
             const id = elToIdRef.current.get(entry.target);
-            if (!id) continue;
+            if (!id || !itemsRef.current.has(id)) continue;
             if (entry.isIntersecting) {
               if (!visibleIdsRef.current.has(id)) {
                 visibleIdsRef.current.add(id);
@@ -500,8 +500,9 @@ export function FileNameList({
       },
       unregister(id) {
         const existing = itemsRef.current.get(id);
-        if (existing?.el && ioRef.current) {
-          ioRef.current.unobserve(existing.el);
+        if (existing?.el) {
+          if (ioRef.current) ioRef.current.unobserve(existing.el);
+          elToIdRef.current.delete(existing.el);
         }
         itemsRef.current.delete(id);
         visibleIdsRef.current.delete(id);

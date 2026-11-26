@@ -993,6 +993,152 @@ test('createThumbQueue pauses queued flushes and retry backoff while hidden and 
   q.dispose();
 });
 
+test('createThumbQueue dequeue, prune, and shouldKeep drop unmounted rows without leaking entries or timers', async () => {
+  const timers = new Map();
+  let nextTimerId = 1;
+  const schedule = (fn, ms) => {
+    const id = nextTimerId++;
+    timers.set(id, { fn, ms });
+    return id;
+  };
+  const cancel = (id) => {
+    timers.delete(id);
+  };
+  const runAllTimers = async () => {
+    while (timers.size > 0) {
+      const [id, item] = timers.entries().next().value;
+      timers.delete(id);
+      await item.fn();
+    }
+  };
+
+  let visible = true;
+  const requestedBatches = [];
+  const mounted = new Set([
+    '/home/me/Photos/a.jpg',
+    '/home/me/Photos/b.jpg',
+    '/home/me/Photos/c.jpg',
+    '/home/me/Photos/d.jpg',
+  ]);
+  let busyPaths = new Set();
+  const link = {
+    async call(tool, args) {
+      assert.equal(tool, 'fs.thumb');
+      requestedBatches.push([...args.paths]);
+      return {
+        results: args.paths.map((p) =>
+          busyPaths.has(p)
+            ? { path: p, error: { code: 'busy', message: 'busy' } }
+            : { path: p, ok: { mime: 'image/jpeg', content: 'UEhPVE8=', width: 128, height: 128 } },
+        ),
+      };
+    },
+  };
+
+  const cache = createThumbCache();
+  const q = createThumbQueue({
+    machine: 'nas',
+    link,
+    thumbCache: cache,
+    isVisible: () => visible,
+    shouldKeep: (p) => mounted.has(p),
+    schedule,
+    cancel,
+  });
+
+  // 1. Dequeueing while queued & debounced cancels the flush timer and leaves 0 pending entries.
+  q.enqueue({ path: '/home/me/Photos/a.jpg', mtime: '1' });
+  assert.equal(q.pendingCount(), 1);
+  assert.equal(timers.size, 1);
+  q.dequeue('/home/me/Photos/a.jpg');
+  assert.equal(q.pendingCount(), 0);
+  assert.equal(timers.size, 0);
+
+  // 2. Enqueueing while hidden then dequeueing an unmounted row drops it before return; the
+  //    still-mounted row fetches on return.
+  visible = false;
+  q.enqueue({ path: '/home/me/Photos/a.jpg', mtime: '1' });
+  q.enqueue({ path: '/home/me/Photos/b.jpg', mtime: '1' });
+  assert.equal(q.pendingCount(), 2);
+  assert.equal(timers.size, 0);
+  mounted.delete('/home/me/Photos/a.jpg');
+  q.dequeue('/home/me/Photos/a.jpg');
+  assert.equal(q.pendingCount(), 1);
+  visible = true;
+  q.onVisibilityChange();
+  await runAllTimers();
+  assert.deepEqual(requestedBatches, [['/home/me/Photos/b.jpg']]);
+  assert.equal(q.pendingCount(), 0);
+
+  // 3. Dequeueing one busy-retrying path cancels its retry timer while keeping its sibling's timer.
+  busyPaths = new Set(['/home/me/Photos/c.jpg', '/home/me/Photos/d.jpg']);
+  q.enqueue({ path: '/home/me/Photos/c.jpg', mtime: '1' });
+  q.enqueue({ path: '/home/me/Photos/d.jpg', mtime: '1' });
+  // Run only the flush timer so both c.jpg and d.jpg enter retry backoff.
+  const [flushId, flushItem] = timers.entries().next().value;
+  timers.delete(flushId);
+  await flushItem.fn();
+  assert.equal(q.pendingCount(), 2);
+  assert.equal(timers.size, 2);
+  mounted.delete('/home/me/Photos/c.jpg');
+  q.dequeue('/home/me/Photos/c.jpg');
+  assert.equal(q.pendingCount(), 1);
+  assert.equal(timers.size, 1, 'cancelling c.jpg must clear its retry timer without cancelling d.jpg');
+  busyPaths = new Set();
+  await runAllTimers();
+  assert.deepEqual(requestedBatches.at(-1), ['/home/me/Photos/d.jpg']);
+  assert.equal(q.pendingCount(), 0);
+
+  // 4. prune() drops out-of-view paths while hidden without touching in-view ones.
+  visible = false;
+  mounted.add('/home/me/Photos/e.jpg');
+  mounted.add('/home/me/Photos/f.jpg');
+  q.enqueue({ path: '/home/me/Photos/e.jpg', mtime: '1' });
+  q.enqueue({ path: '/home/me/Photos/f.jpg', mtime: '1' });
+  q.prune(new Set(['/home/me/Photos/f.jpg']));
+  assert.equal(q.pendingCount(), 1);
+  visible = true;
+  q.onVisibilityChange();
+  await runAllTimers();
+  assert.deepEqual(requestedBatches.at(-1), ['/home/me/Photos/f.jpg']);
+  assert.equal(q.pendingCount(), 0);
+
+  // 5. shouldKeep returning false prevents an in-flight busy error from re-queueing an unmounted row.
+  mounted.add('/home/me/Photos/g.jpg');
+  let resolveInFlight = null;
+  const qInFlight = createThumbQueue({
+    machine: 'nas',
+    link: {
+      call() {
+        return new Promise((resolve) => {
+          resolveInFlight = resolve;
+        });
+      },
+    },
+    thumbCache: createThumbCache(),
+    isVisible: () => true,
+    shouldKeep: (p) => mounted.has(p),
+    schedule,
+    cancel,
+  });
+  qInFlight.enqueue({ path: '/home/me/Photos/g.jpg', mtime: '1' });
+  const [gFlushId, gFlushItem] = timers.entries().next().value;
+  timers.delete(gFlushId);
+  const flushPromise = gFlushItem.fn();
+  // Row unmounts while fs.thumb is in flight.
+  mounted.delete('/home/me/Photos/g.jpg');
+  qInFlight.dequeue('/home/me/Photos/g.jpg');
+  resolveInFlight({
+    results: [{ path: '/home/me/Photos/g.jpg', error: { code: 'busy', message: 'busy' } }],
+  });
+  await flushPromise;
+  assert.equal(qInFlight.pendingCount(), 0);
+  assert.equal(timers.size, 0, 'unmounted in-flight busy row must not schedule retry timer');
+
+  qInFlight.dispose();
+  q.dispose();
+});
+
 test('createVirtualListLayout handles mixed variable heights, estimate corrections without jump, and scroll-to-index', () => {
   const layout = createVirtualListLayout({ estimatedHeight: 60 });
   const keys = Array.from({ length: 5000 }, (_, i) => `/dir/item_${String(i).padStart(4, '0')}.txt`);
