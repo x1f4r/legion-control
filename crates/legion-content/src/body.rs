@@ -12,9 +12,10 @@ use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
 use tokio::io::{AsyncBufRead, AsyncRead, BufReader};
 
-/// Chunk size buffered per read so arbitrarily large files stream in constant memory without
-/// zero-filling a fresh scratch buffer on every poll.
-const CHUNK_SIZE: usize = 64 * 1024;
+/// Chunk size buffered per read (64 KiB) so arbitrarily large files stream in constant memory
+/// without zero-filling a fresh scratch buffer on every poll, and so HTTP content transports can
+/// slice socket writes to the same unit when enforcing post-revocation bounds.
+pub const CHUNK_SIZE: usize = 64 * 1024;
 
 /// Default byte interval between in-flight revocation and TTL checks (2 MiB).
 pub const LIVENESS_CHECK_BYTES: u64 = 2 * 1024 * 1024;

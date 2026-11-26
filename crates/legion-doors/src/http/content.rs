@@ -453,22 +453,31 @@ pub(crate) async fn create(State(shared): State<Arc<Shared>>, request: Request) 
     response
 }
 
-/// RAII guard that activates per-connection write-stall, minimum-rate, and send-buffer limits
-/// while a content response body is streaming, and stops the independent revocation watcher when
-/// the response ends.
+/// RAII guard that activates per-connection write-stall, minimum-rate, send-buffer, and
+/// socket-level liveness checks while a content response body is streaming, and stops the
+/// independent revocation watcher and upstream content request when the response ends.
 struct ActiveContentStreamGuard {
     conn_active: Option<Arc<AtomicUsize>>,
+    live_check_slot: Option<Arc<Mutex<Option<super::SocketLiveCheck>>>>,
     stop_watcher: CancellationToken,
+    stream_cancel: CancellationToken,
 }
 
 impl ActiveContentStreamGuard {
-    fn new(flag: Option<Arc<AtomicUsize>>, stop_watcher: CancellationToken) -> Self {
+    fn new(
+        flag: Option<Arc<AtomicUsize>>,
+        live_check_slot: Option<Arc<Mutex<Option<super::SocketLiveCheck>>>>,
+        stop_watcher: CancellationToken,
+        stream_cancel: CancellationToken,
+    ) -> Self {
         if let Some(ref counter) = flag {
             counter.fetch_add(1, Ordering::Release);
         }
         Self {
             conn_active: flag,
+            live_check_slot,
             stop_watcher,
+            stream_cancel,
         }
     }
 }
@@ -476,6 +485,10 @@ impl ActiveContentStreamGuard {
 impl Drop for ActiveContentStreamGuard {
     fn drop(&mut self) {
         self.stop_watcher.cancel();
+        self.stream_cancel.cancel();
+        if let Some(ref slot) = self.live_check_slot {
+            *slot.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        }
         if let Some(ref counter) = self.conn_active {
             counter.fetch_sub(1, Ordering::Release);
         }
@@ -499,14 +512,16 @@ pub(crate) async fn serve(State(shared): State<Arc<Shared>>, request: Request) -
         );
     };
 
+    let conn_ctrl = request.extensions().get::<ConnectionControl>().cloned();
+    let stop_watcher = CancellationToken::new();
+    let stream_cancel = shared.link.shutdown.child_token();
+
     let open_slot: OpenAuditSlot = Arc::new(Mutex::new(None));
     let source = Arc::new(DoorContentSource {
         shared: Arc::clone(&shared),
         open_slot: Arc::clone(&open_slot),
+        stream_cancel: stream_cancel.clone(),
     });
-
-    let conn_ctrl = request.extensions().get::<ConnectionControl>().cloned();
-    let stop_watcher = CancellationToken::new();
 
     let hooks = StreamHooks {
         limiter: Some(shared.content_limiter.clone()),
@@ -514,7 +529,9 @@ pub(crate) async fn serve(State(shared): State<Arc<Shared>>, request: Request) -
         stream_failed: None,
         active_guard: Some(Box::new(ActiveContentStreamGuard::new(
             conn_ctrl.as_ref().map(|c| Arc::clone(&c.active)),
+            conn_ctrl.as_ref().map(|c| Arc::clone(&c.live_check)),
             stop_watcher.clone(),
+            stream_cancel.clone(),
         ))),
     };
 
@@ -547,10 +564,22 @@ pub(crate) async fn serve(State(shared): State<Arc<Shared>>, request: Request) -
             && response.status().is_success()
             && !response.body().is_end_stream()
         {
+            let socket_shared = Arc::clone(&shared);
+            let socket_source = Arc::clone(&source);
+            let socket_ticket = ticket.clone();
+            *ctrl
+                .live_check
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(move || {
+                check_stream_liveness(&socket_shared, &socket_source, &socket_ticket)
+                    == LivenessOutcome::Live
+            }));
+
             let watch_shared = Arc::clone(&shared);
             let watch_source = Arc::clone(&source);
             let watch_ticket = ticket.clone();
             let watch_ctrl = ctrl.clone();
+            let watch_stream_cancel = stream_cancel.clone();
             let watch_interval = shared
                 .content_liveness_interval
                 .max(Duration::from_millis(50));
@@ -559,6 +588,7 @@ pub(crate) async fn serve(State(shared): State<Arc<Shared>>, request: Request) -
                     tokio::select! {
                         biased;
                         () = watch_ctrl.abort.cancelled() => {
+                            watch_stream_cancel.cancel();
                             revoke_and_flush_after_abort(
                                 &watch_shared,
                                 &watch_source,
@@ -577,10 +607,11 @@ pub(crate) async fn serve(State(shared): State<Arc<Shared>>, request: Request) -
                             ) {
                                 LivenessOutcome::Live => {}
                                 LivenessOutcome::HolderRevoked => {
-                                    // Abort the TCP connection first so zero further bytes can be
-                                    // handed to the socket while the revoked holder's audit
-                                    // summaries flush to disk.
+                                    // Abort the TCP connection and upstream content request first
+                                    // so zero further bytes can be handed to the socket while the
+                                    // revoked holder's audit summaries flush to disk.
                                     watch_ctrl.abort.cancel();
+                                    watch_stream_cancel.cancel();
                                     let removed = watch_shared
                                         .content_tickets
                                         .revoke_holder_hashes(&watch_ticket.holder);
@@ -595,6 +626,7 @@ pub(crate) async fn serve(State(shared): State<Arc<Shared>>, request: Request) -
                                     // permission: end only this ticket and leave the holder's
                                     // other tickets intact.
                                     watch_ctrl.abort.cancel();
+                                    watch_stream_cancel.cancel();
                                     watch_shared
                                         .content_tickets
                                         .revoke_hash(&watch_ticket.key_hash);
@@ -630,6 +662,7 @@ pub(crate) async fn serve(State(shared): State<Arc<Shared>>, request: Request) -
         })
     } else {
         stop_watcher.cancel();
+        stream_cancel.cancel();
         response.map(Body::new)
     }
 }
@@ -744,6 +777,7 @@ type OpenAuditSlot = Arc<Mutex<Option<(Ticket, Arc<AtomicU64>)>>>;
 struct DoorContentSource {
     shared: Arc<Shared>,
     open_slot: OpenAuditSlot,
+    stream_cancel: CancellationToken,
 }
 
 impl ContentSource for DoorContentSource {
@@ -784,7 +818,7 @@ impl ContentSource for DoorContentSource {
                 holder: Some(ticket.holder.clone()),
                 door: Door::Http,
                 audit: false,
-                cancel: self.shared.link.shutdown.child_token(),
+                cancel: self.stream_cancel.child_token(),
             };
             match self
                 .shared

@@ -222,9 +222,22 @@ impl ContentStreamLimits {
 /// bounding kernel-buffered bytes on revocation without hurting loopback or LAN throughput.
 pub(crate) const CONTENT_SOCKET_SNDBUF: usize = 128 * 1024;
 
+/// Maximum bytes handed to the OS TCP socket in one write call while a content stream is active
+/// (64 KiB, matching [`legion_content::CHUNK_SIZE`]).
+///
+/// Slicing writes at the socket boundary ensures revocation is checked before every 64 KiB slice
+/// and bounds single-syscall overshoot above [`CONTENT_SOCKET_SNDBUF`] regardless of upstream read
+/// buffer or HTTP write-queue sizes (in particular on Windows AFD, where one `WSASend` started
+/// while a socket is writable can be accepted in full even when larger than `SO_SNDBUF`).
+pub(crate) const CONTENT_WRITE_SLICE: usize = legion_content::CHUNK_SIZE;
+
+/// Live revocation predicate consulted by [`MonitoredTcpStream`] before flushing buffered slices
+/// after socket backpressure. Returns `true` while the stream remains authorised.
+pub(crate) type SocketLiveCheck = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// Request extension injected per TCP connection so streaming content bodies can enable socket
-/// send-buffer bounding, write-stall / minimum-rate enforcement, and immediate RST abort on
-/// revocation.
+/// send-buffer bounding, write-stall / minimum-rate enforcement, socket-level liveness checks,
+/// and immediate RST abort on revocation.
 #[derive(Clone)]
 pub(crate) struct ConnectionControl {
     pub(crate) active: Arc<AtomicUsize>,
@@ -232,6 +245,9 @@ pub(crate) struct ConnectionControl {
     /// Set by `MonitoredTcpStream` whenever a content write blocks on a full socket (`Poll::Pending`),
     /// so the content body immediately re-checks revocation on resume before writing another frame.
     pub(crate) backpressured: Arc<AtomicBool>,
+    /// Live revocation predicate installed while a content response is streaming on this socket so
+    /// buffered slices are dropped rather than flushed if access was revoked while backpressured.
+    pub(crate) live_check: Arc<std::sync::Mutex<Option<SocketLiveCheck>>>,
 }
 
 /// The HTTP door over one node.
@@ -389,7 +405,10 @@ impl HttpDoor {
             let stream = tokio::select! {
                 () = &mut shutdown => break,
                 accepted = listener.accept() => match accepted {
-                    Ok((stream, _)) => stream,
+                    Ok((stream, _)) => {
+                        let _ = stream.set_nodelay(true);
+                        stream
+                    }
                     Err(error) => {
                         // Out of file descriptors, most likely; waiting lets some close.
                         log(&format!("accepting a connection failed: {error}"));
@@ -401,11 +420,13 @@ impl HttpDoor {
             let active_streams = Arc::new(AtomicUsize::new(0));
             let conn_abort = CancellationToken::new();
             let backpressured = Arc::new(AtomicBool::new(false));
+            let live_check = Arc::new(std::sync::Mutex::new(None));
             let monitored = MonitoredTcpStream::new(
                 stream,
                 Arc::clone(&active_streams),
                 conn_abort.clone(),
                 Arc::clone(&backpressured),
+                Arc::clone(&live_check),
                 Arc::clone(&self.content_socket_bytes),
                 Arc::clone(&self.content_socket_sndbuf),
                 content_limits.write_idle_timeout,
@@ -418,6 +439,7 @@ impl HttpDoor {
                     active: active_streams,
                     abort: conn_abort.clone(),
                     backpressured,
+                    live_check,
                 },
             };
             let closing = closing.clone();
@@ -426,7 +448,8 @@ impl HttpDoor {
                 let mut builder = hyper::server::conn::http1::Builder::new();
                 builder
                     .timer(TokioTimer::new())
-                    .header_read_timeout(HEADER_TIMEOUT);
+                    .header_read_timeout(HEADER_TIMEOUT)
+                    .max_buf_size(CONTENT_WRITE_SLICE);
                 let connection = builder.serve_connection(TokioIo::new(monitored), service);
                 tokio::pin!(connection);
                 tokio::select! {
@@ -538,8 +561,9 @@ impl hyper::service::Service<axum::http::Request<hyper::body::Incoming>> for Inj
     }
 }
 
-/// Wraps a [`TcpStream`] to enforce a write-idle timeout and minimum sustained progress rate while
-/// a content response is actively streaming on the connection.
+/// Wraps a [`TcpStream`] to enforce a write-idle timeout, minimum sustained progress rate,
+/// [`CONTENT_SOCKET_SNDBUF`] bounding, and [`CONTENT_WRITE_SLICE`] write slicing with per-slice
+/// revocation checks while a content response is actively streaming on the connection.
 ///
 /// Only time spent blocked on a full client socket counts toward the minimum-rate window, so a
 /// slow upstream source never causes a fast client to be disconnected. When no content stream is
@@ -550,6 +574,8 @@ struct MonitoredTcpStream {
     active: Arc<AtomicUsize>,
     abort: CancellationToken,
     backpressured: Arc<AtomicBool>,
+    live_check: Arc<std::sync::Mutex<Option<SocketLiveCheck>>>,
+    need_live_check: bool,
     socket_bytes: Arc<AtomicU64>,
     effective_sndbuf: Arc<AtomicUsize>,
     sndbuf_applied: bool,
@@ -580,6 +606,41 @@ impl Drop for MonitoredTcpStream {
     }
 }
 
+/// Writes at most `max_bytes` from `bufs` to `inner` in a single OS write/vectored-write call.
+fn poll_write_vectored_capped(
+    inner: &mut TcpStream,
+    cx: &mut Context<'_>,
+    bufs: &[io::IoSlice<'_>],
+    max_bytes: usize,
+) -> Poll<io::Result<usize>> {
+    const STACK_IOVS: usize = 16;
+    let mut capped = [io::IoSlice::new(&[]); STACK_IOVS];
+    let mut count = 0usize;
+    let mut remaining = max_bytes;
+
+    for slice in bufs {
+        let bytes: &[u8] = slice;
+        if bytes.is_empty() {
+            continue;
+        }
+        if count == STACK_IOVS || remaining == 0 {
+            break;
+        }
+        let take = bytes.len().min(remaining);
+        capped[count] = io::IoSlice::new(&bytes[..take]);
+        count += 1;
+        remaining -= take;
+    }
+
+    if count == 0 {
+        return Pin::new(inner).poll_write(cx, &[]);
+    }
+    if count == 1 {
+        return Pin::new(inner).poll_write(cx, &capped[0]);
+    }
+    Pin::new(inner).poll_write_vectored(cx, &capped[..count])
+}
+
 impl MonitoredTcpStream {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -587,6 +648,7 @@ impl MonitoredTcpStream {
         active: Arc<AtomicUsize>,
         abort: CancellationToken,
         backpressured: Arc<AtomicBool>,
+        live_check: Arc<std::sync::Mutex<Option<SocketLiveCheck>>>,
         socket_bytes: Arc<AtomicU64>,
         effective_sndbuf: Arc<AtomicUsize>,
         write_idle_timeout: Duration,
@@ -598,6 +660,8 @@ impl MonitoredTcpStream {
             active,
             abort,
             backpressured,
+            live_check,
+            need_live_check: false,
             socket_bytes,
             effective_sndbuf,
             sndbuf_applied: false,
@@ -615,6 +679,7 @@ impl MonitoredTcpStream {
 
     fn reset_monitoring(&mut self) {
         self.monitoring_active = false;
+        self.need_live_check = false;
         self.blocked_since = None;
         self.blocked_accum = Duration::ZERO;
         self.rate_window_bytes = 0;
@@ -625,7 +690,7 @@ impl MonitoredTcpStream {
     fn monitor_write(
         &mut self,
         cx: &mut Context<'_>,
-        write_op: impl FnOnce(&mut TcpStream, &mut Context<'_>) -> Poll<io::Result<usize>>,
+        write_op: impl FnOnce(&mut TcpStream, &mut Context<'_>, bool) -> Poll<io::Result<usize>>,
     ) -> Poll<io::Result<usize>> {
         if self.abort.is_cancelled() {
             return Poll::Ready(Err(io::Error::new(
@@ -637,7 +702,7 @@ impl MonitoredTcpStream {
             if self.monitoring_active {
                 self.reset_monitoring();
             }
-            return write_op(&mut self.inner, cx);
+            return write_op(&mut self.inner, cx, false);
         }
         if !self.sndbuf_applied {
             let sock = socket2::SockRef::from(&self.inner);
@@ -649,8 +714,27 @@ impl MonitoredTcpStream {
         }
         self.monitoring_active = true;
 
+        if self.need_live_check {
+            let check = self
+                .live_check
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(check) = check
+                && !check()
+            {
+                self.abort.cancel();
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "content stream was revoked",
+                )));
+            }
+            self.need_live_check = false;
+            self.backpressured.store(false, Ordering::Release);
+        }
+
         let now = Instant::now();
-        match write_op(&mut self.inner, cx) {
+        match write_op(&mut self.inner, cx, true) {
             Poll::Ready(Ok(n)) => {
                 self.socket_bytes.fetch_add(n as u64, Ordering::Relaxed);
                 if let Some(since) = self.blocked_since.take() {
@@ -677,6 +761,7 @@ impl MonitoredTcpStream {
             }
             Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
             Poll::Pending => {
+                self.need_live_check = true;
                 self.backpressured.store(true, Ordering::Release);
                 let since = *self.blocked_since.get_or_insert(now);
                 let write_idle_timeout = self.write_idle_timeout;
@@ -752,8 +837,14 @@ impl AsyncWrite for MonitoredTcpStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.get_mut()
-            .monitor_write(cx, |inner, cx| Pin::new(inner).poll_write(cx, buf))
+        self.get_mut().monitor_write(cx, |inner, cx, active| {
+            let slice = if active {
+                &buf[..buf.len().min(CONTENT_WRITE_SLICE)]
+            } else {
+                buf
+            };
+            Pin::new(inner).poll_write(cx, slice)
+        })
     }
 
     fn poll_write_vectored(
@@ -761,8 +852,12 @@ impl AsyncWrite for MonitoredTcpStream {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        self.get_mut().monitor_write(cx, |inner, cx| {
-            Pin::new(inner).poll_write_vectored(cx, bufs)
+        self.get_mut().monitor_write(cx, |inner, cx, active| {
+            if active {
+                poll_write_vectored_capped(inner, cx, bufs, CONTENT_WRITE_SLICE)
+            } else {
+                Pin::new(inner).poll_write_vectored(cx, bufs)
+            }
         })
     }
 
@@ -771,6 +866,12 @@ impl AsyncWrite for MonitoredTcpStream {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.abort.is_cancelled() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "content stream was revoked",
+            )));
+        }
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
@@ -1500,6 +1601,7 @@ mod tests {
             Arc::clone(&active),
             CancellationToken::new(),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(std::sync::Mutex::new(None)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicUsize::new(0)),
             Duration::from_secs(5),
@@ -1567,6 +1669,7 @@ mod tests {
             active,
             CancellationToken::new(),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(std::sync::Mutex::new(None)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicUsize::new(0)),
             Duration::from_secs(5),
@@ -1584,7 +1687,7 @@ mod tests {
             }
         });
 
-        let payload = vec![b'X'; 64 * 1024];
+        let payload = vec![b'X'; CONTENT_WRITE_SLICE];
         let mut err = None;
         for _ in 0..512 {
             match monitored.write_all(&payload).await {
@@ -1598,6 +1701,142 @@ mod tests {
         let err = err.expect("trickling client must be disconnected by minimum-rate rule");
         assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
         trickle.abort();
+    }
+
+    #[tokio::test]
+    async fn monitored_tcp_stream_slices_large_writes_and_drops_remaining_bytes_on_revoke() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 1. Even when a caller passes a multi-chunk buffer or many vectored slices (like hyper's
+        //    write queue or a large upstream window), each OS write is capped to CONTENT_WRITE_SLICE
+        //    and aborting immediately drops all remaining bytes without flushing.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, server) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let mut client = client.unwrap();
+        let (server, _) = server.unwrap();
+
+        let abort = CancellationToken::new();
+        let socket_bytes = Arc::new(AtomicU64::new(0));
+        let mut monitored = MonitoredTcpStream::new(
+            server,
+            Arc::new(AtomicUsize::new(1)),
+            abort.clone(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(std::sync::Mutex::new(None)),
+            Arc::clone(&socket_bytes),
+            Arc::new(AtomicUsize::new(0)),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            1,
+        );
+
+        let drain = tokio::spawn(async move {
+            let mut total = 0usize;
+            let mut buf = [0u8; 16 * 1024];
+            loop {
+                match client.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => total += n,
+                }
+            }
+            total
+        });
+
+        let big = vec![b'A'; 8 * CONTENT_WRITE_SLICE];
+        let n_plain = monitored.write(&big).await.unwrap();
+        assert!(
+            n_plain > 0 && n_plain <= CONTENT_WRITE_SLICE,
+            "single poll_write handed {n_plain} bytes (> CONTENT_WRITE_SLICE={CONTENT_WRITE_SLICE})"
+        );
+
+        let chunks: Vec<Vec<u8>> = (0..8).map(|_| vec![b'B'; CONTENT_WRITE_SLICE]).collect();
+        let iovs: Vec<io::IoSlice<'_>> = chunks.iter().map(|c| io::IoSlice::new(c)).collect();
+        let n_vec = monitored.write_vectored(&iovs).await.unwrap();
+        assert!(
+            n_vec > 0 && n_vec <= CONTENT_WRITE_SLICE,
+            "single poll_write_vectored handed {n_vec} bytes (> CONTENT_WRITE_SLICE={CONTENT_WRITE_SLICE})"
+        );
+
+        let written_before_abort = socket_bytes.load(Ordering::Acquire);
+        abort.cancel();
+        let err_plain = monitored.write(&big).await.unwrap_err();
+        assert_eq!(err_plain.kind(), io::ErrorKind::ConnectionReset);
+        let err_vec = monitored.write_vectored(&iovs).await.unwrap_err();
+        assert_eq!(err_vec.kind(), io::ErrorKind::ConnectionReset);
+        let err_flush = monitored.flush().await.unwrap_err();
+        assert_eq!(err_flush.kind(), io::ErrorKind::ConnectionReset);
+        assert_eq!(
+            socket_bytes.load(Ordering::Acquire),
+            written_before_abort,
+            "aborted MonitoredTcpStream must hand zero further bytes to socket"
+        );
+        drop(monitored);
+        let _ = drain.await;
+
+        // 2. When a stalled socket resumes from backpressure after revocation, `live_check` fires
+        //    before handing another slice to the socket, sets `abort`, and writes zero extra bytes.
+        let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        let (client2, server2) = tokio::join!(TcpStream::connect(addr2), listener2.accept());
+        let mut client2 = client2.unwrap();
+        let (server2, _) = server2.unwrap();
+
+        let live = Arc::new(AtomicBool::new(true));
+        let live_flag = Arc::clone(&live);
+        let live_slot: Arc<std::sync::Mutex<Option<SocketLiveCheck>>> =
+            Arc::new(std::sync::Mutex::new(Some(Arc::new(move || {
+                live_flag.load(Ordering::Acquire)
+            }))));
+        let abort2 = CancellationToken::new();
+        let bytes2 = Arc::new(AtomicU64::new(0));
+        let mut monitored2 = MonitoredTcpStream::new(
+            server2,
+            Arc::new(AtomicUsize::new(1)),
+            abort2.clone(),
+            Arc::new(AtomicBool::new(false)),
+            live_slot,
+            Arc::clone(&bytes2),
+            Arc::new(AtomicUsize::new(0)),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            1,
+        );
+
+        let slice = vec![b'C'; CONTENT_WRITE_SLICE];
+        // Fill loopback send+recv buffers until `poll_write` hits `Poll::Pending`.
+        let mut hit_pending = false;
+        for _ in 0..256 {
+            if tokio::time::timeout(Duration::from_millis(50), monitored2.write(&slice))
+                .await
+                .is_err()
+            {
+                hit_pending = true;
+                break;
+            }
+        }
+        assert!(
+            hit_pending,
+            "expected stalled loopback socket to backpressure"
+        );
+
+        let written_before_revoke = bytes2.load(Ordering::Acquire);
+        live.store(false, Ordering::Release);
+        // Drain a small piece on the client so the server socket becomes writable again.
+        let mut drained = vec![0u8; 16 * 1024];
+        client2.read_exact(&mut drained).await.unwrap();
+
+        let err = monitored2.write(&slice).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset, "{err}");
+        assert!(
+            abort2.is_cancelled(),
+            "revoked live_check must cancel abort"
+        );
+        assert_eq!(
+            bytes2.load(Ordering::Acquire),
+            written_before_revoke,
+            "resuming from backpressure after revocation must write zero extra bytes"
+        );
     }
 
     #[tokio::test]
@@ -1704,16 +1943,16 @@ allow = [\"effect:read\"]
                 .any(|e| e["tool"] == "content.read" && e["principal"] == principal)
         };
 
-        // Wait until the initial loopback burst fills OS buffers and settles (no new socket writes
-        // for 50ms) so `written_at_revoke` never counts bytes still in flight from the pre-revoke
-        // startup burst.
-        async fn wait_for_buffer_settle(socket_bytes: &AtomicU64) {
+        // Wait until this connection's initial loopback burst fills OS buffers and settles (at
+        // least one write past `baseline`, then no new socket writes for 50ms) so
+        // `written_at_revoke` never counts bytes still in flight from the pre-revoke startup burst.
+        async fn wait_for_buffer_settle(socket_bytes: &AtomicU64, baseline: u64) {
             let deadline = Instant::now() + Duration::from_millis(600);
             let mut prev = socket_bytes.load(Ordering::Acquire);
             while Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 let cur = socket_bytes.load(Ordering::Acquire);
-                if cur == prev && cur > 0 {
+                if cur == prev && cur > baseline {
                     return;
                 }
                 prev = cur;
@@ -1721,6 +1960,7 @@ allow = [\"effect:read\"]
         }
 
         // 1. Slow 20 KB/s reader.
+        let slow_baseline = socket_bytes.load(Ordering::Acquire);
         let slow_url = mint(port, &slow_tok, &big_file).await;
         let mut slow_conn = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let get = format!(
@@ -1730,14 +1970,13 @@ allow = [\"effect:read\"]
         read_headers(&mut slow_conn).await;
         let mut chunk = [0u8; 4096];
         slow_conn.read_exact(&mut chunk).await.unwrap();
-        wait_for_buffer_settle(&socket_bytes).await;
+        wait_for_buffer_settle(&socket_bytes, slow_baseline).await;
 
         let effective_sndbuf = socket_sndbuf.load(Ordering::Acquire);
         assert!(
             effective_sndbuf > 0,
             "expected getsockopt(SO_SNDBUF) to be recorded when content stream started"
         );
-        const ONE_CHUNK: usize = 64 * 1024;
         // Time bound: the 1 s liveness watcher cuts within 2 s in production; allow the 50 ms test
         // polling step plus loaded-runner scheduling margin.
         let max_cut_elapsed = Duration::from_millis(2500);
@@ -1824,20 +2063,22 @@ allow = [\"effect:read\"]
         );
 
         // 3. Physical ceiling between revocation and cutoff: effective SO_SNDBUF + client's
-        //    effective SO_RCVBUF + bytes the client actually read after revocation + one 64 KiB
-        //    write chunk.
+        //    effective SO_RCVBUF + bytes the client actually read after revocation + one
+        //    CONTENT_WRITE_SLICE.
         let written_after_revoke = written_after_1s.saturating_sub(written_at_revoke);
         let slow_ceiling =
-            (effective_sndbuf + slow_client_rcvbuf + client_read_before_cut + ONE_CHUNK) as u64;
+            (effective_sndbuf + slow_client_rcvbuf + client_read_before_cut + CONTENT_WRITE_SLICE)
+                as u64;
         let slow_total_client_read = chunk.len() + client_read_before_cut + tail.len();
         eprintln!(
-            "slow reader ({}): requested_sndbuf={} effective_sndbuf={} client_rcvbuf={} (revoke={} cut={}) client_read_before_cut={} written_after_revoke={} ceiling={} after_cut_1s={} cut={:?} client_drained={}",
+            "slow reader ({}): requested_sndbuf={} effective_sndbuf={} client_rcvbuf={} (revoke={} cut={}) write_slice={} client_read_before_cut={} written_after_revoke={} ceiling={} after_cut_1s={} cut={:?} client_drained={}",
             std::env::consts::OS,
             CONTENT_SOCKET_SNDBUF,
             effective_sndbuf,
             slow_client_rcvbuf,
             slow_rcvbuf_at_revoke,
             slow_rcvbuf_at_cut,
+            CONTENT_WRITE_SLICE,
             client_read_before_cut,
             written_after_revoke,
             slow_ceiling,
@@ -1847,7 +2088,7 @@ allow = [\"effect:read\"]
         );
         assert!(
             written_after_revoke <= slow_ceiling,
-            "server handed too many bytes to socket after revocation for slow reader: {written_after_revoke} > {slow_ceiling} (effective_sndbuf={effective_sndbuf}, client_rcvbuf={slow_client_rcvbuf}, client_read_before_cut={client_read_before_cut}, chunk={ONE_CHUNK}, cut={server_cut_elapsed:?})"
+            "server handed too many bytes to socket after revocation for slow reader: {written_after_revoke} > {slow_ceiling} (effective_sndbuf={effective_sndbuf}, client_rcvbuf={slow_client_rcvbuf}, client_read_before_cut={client_read_before_cut}, write_slice={CONTENT_WRITE_SLICE}, cut={server_cut_elapsed:?})"
         );
         assert!(
             slow_total_client_read < big_len,
@@ -1855,6 +2096,7 @@ allow = [\"effect:read\"]
         );
 
         // 2. Completely stalled reader (never reads again after initial 16 KiB).
+        let stalled_baseline = socket_bytes.load(Ordering::Acquire);
         let stalled_url = mint(port, &stalled_tok, &big_file).await;
         let mut stalled_conn = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let get = format!(
@@ -1864,7 +2106,7 @@ allow = [\"effect:read\"]
         read_headers(&mut stalled_conn).await;
         let mut initial = [0u8; 16 * 1024];
         stalled_conn.read_exact(&mut initial).await.unwrap();
-        wait_for_buffer_settle(&socket_bytes).await;
+        wait_for_buffer_settle(&socket_bytes, stalled_baseline).await;
         let stalled_effective_sndbuf = socket_sndbuf.load(Ordering::Acquire);
         assert!(
             stalled_effective_sndbuf > 0,
@@ -1930,18 +2172,20 @@ allow = [\"effect:read\"]
         );
 
         // 3. Physical ceiling for a stalled reader collapses strictly to effective SO_SNDBUF +
-        //    client effective SO_RCVBUF + one 64 KiB write chunk (no client-read term).
+        //    client effective SO_RCVBUF + one CONTENT_WRITE_SLICE (no client-read term).
         let stalled_written_after_revoke =
             stalled_written_after_1s.saturating_sub(stalled_written_at_revoke);
-        let stalled_ceiling = (stalled_effective_sndbuf + stalled_client_rcvbuf + ONE_CHUNK) as u64;
+        let stalled_ceiling =
+            (stalled_effective_sndbuf + stalled_client_rcvbuf + CONTENT_WRITE_SLICE) as u64;
         eprintln!(
-            "stalled reader ({}): requested_sndbuf={} effective_sndbuf={} client_rcvbuf={} (revoke={} cut={}) written_after_revoke={} ceiling={} after_cut_1s={} cut={:?} client_drained={}",
+            "stalled reader ({}): requested_sndbuf={} effective_sndbuf={} client_rcvbuf={} (revoke={} cut={}) write_slice={} written_after_revoke={} ceiling={} after_cut_1s={} cut={:?} client_drained={}",
             std::env::consts::OS,
             CONTENT_SOCKET_SNDBUF,
             stalled_effective_sndbuf,
             stalled_client_rcvbuf,
             stalled_rcvbuf_at_revoke,
             stalled_rcvbuf_at_cut,
+            CONTENT_WRITE_SLICE,
             stalled_written_after_revoke,
             stalled_ceiling,
             stalled_bytes_after_cut,
@@ -1950,12 +2194,225 @@ allow = [\"effect:read\"]
         );
         assert!(
             stalled_written_after_revoke <= stalled_ceiling,
-            "server handed too many bytes to socket after revocation for stalled reader: {stalled_written_after_revoke} > {stalled_ceiling} (effective_sndbuf={stalled_effective_sndbuf}, client_rcvbuf={stalled_client_rcvbuf}, chunk={ONE_CHUNK}, cut={stalled_cut_elapsed:?})"
+            "server handed too many bytes to socket after revocation for stalled reader: {stalled_written_after_revoke} > {stalled_ceiling} (effective_sndbuf={stalled_effective_sndbuf}, client_rcvbuf={stalled_client_rcvbuf}, write_slice={CONTENT_WRITE_SLICE}, cut={stalled_cut_elapsed:?})"
         );
         assert!(
             initial.len() + stalled_tail.len() < big_len,
             "stalled reader must not receive the full 16 MiB file after revocation (received {} / {big_len} bytes)",
             initial.len() + stalled_tail.len()
+        );
+
+        shutdown.cancel();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn revoked_large_window_content_stream_writes_bounded_bytes_independent_of_source_buffer()
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        struct LargeWindowRouter {
+            payload: Arc<Vec<u8>>,
+            last_cancel: Arc<std::sync::Mutex<Option<CancellationToken>>>,
+        }
+
+        impl Router for LargeWindowRouter {
+            fn call<'a>(
+                &'a self,
+                node: &'a Node,
+                call: legion_core::Call,
+                on: Option<legion_core::proto::Target>,
+            ) -> legion_core::BoxFuture<'a, legion_core::RouteOutcome> {
+                Box::pin(async move { legion_core::Local.call(node, call, on).await })
+            }
+
+            fn open_content<'a>(
+                &'a self,
+                _node: &'a Node,
+                req: legion_core::ContentRequest,
+            ) -> legion_core::BoxFuture<
+                'a,
+                Result<legion_core::OpenedContent, legion_core::ContentError>,
+            > {
+                let payload = Arc::clone(&self.payload);
+                let last_cancel = Arc::clone(&self.last_cancel);
+                Box::pin(async move {
+                    *last_cancel
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(req.cancel.clone());
+                    let total = payload.len() as u64;
+                    let start = usize::try_from(req.offset).unwrap_or(payload.len());
+                    let avail = payload.len().saturating_sub(start);
+                    let len = req
+                        .length
+                        .map_or(avail, |n| usize::try_from(n).unwrap_or(avail).min(avail));
+                    let slice = payload[start..start + len].to_vec();
+                    Ok(legion_core::OpenedContent {
+                        size: total,
+                        offset: req.offset,
+                        length: len as u64,
+                        mtime_secs: 1_700_000_000,
+                        mtime_nanos: 0,
+                        file_id: Some(42),
+                        reader: Box::new(io::Cursor::new(slice)),
+                    })
+                })
+            }
+
+            fn effects<'a>(
+                &'a self,
+                node: &'a Node,
+                tool: &'a str,
+                on: Option<&'a legion_core::proto::Target>,
+                cancel: CancellationToken,
+            ) -> legion_core::BoxFuture<'a, Result<legion_core::MachineEffects, ErrorBody>>
+            {
+                Box::pin(async move { legion_core::Local.effects(node, tool, on, cancel).await })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("legion");
+        std::fs::create_dir_all(home.join("config")).unwrap();
+        std::fs::create_dir_all(home.join("state")).unwrap();
+
+        let paths = legion_core::Paths::under(&home);
+        std::fs::write(paths.config_file("node.toml"), "name = \"tower\"\n").unwrap();
+        std::fs::write(
+            paths.config_file("policy.toml"),
+            "\
+[principals.remote]
+role = \"observer\"
+
+[roles.observer]
+allow = [\"effect:read\"]
+",
+        )
+        .unwrap();
+
+        let node = Node::new(paths.clone(), legion_tools::registry());
+        let token = node
+            .call(legion_core::Call::new(
+                legion_core::Door::Cli,
+                "token.add",
+                serde_json::json!({ "name": "remote-tok", "principal": "remote" }),
+            ))
+            .await
+            .unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // Simulate a full 4 MiB pre-buffered remote window sitting in memory ready to flush.
+        let window_len = 4 * 1024 * 1024usize;
+        let last_cancel = Arc::new(std::sync::Mutex::new(None));
+        let router = Arc::new(LargeWindowRouter {
+            payload: Arc::new(vec![b'R'; window_len]),
+            last_cancel: Arc::clone(&last_cancel),
+        });
+
+        let door = HttpDoor::new(node.clone(), router).unwrap();
+        let socket_bytes = door.content_socket_bytes();
+        let socket_sndbuf = door.content_socket_sndbuf();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
+        let server_task = tokio::spawn(async move {
+            let _ = door.serve(listener, stop.cancelled()).await;
+        });
+
+        let body = serde_json::json!({ "path": "/remote/movie.bin", "on": "far" }).to_string();
+        let mut mint_sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mint_req = format!(
+            "POST /v1/content HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        mint_sock.write_all(mint_req.as_bytes()).await.unwrap();
+        let mut mint_resp = Vec::new();
+        mint_sock.read_to_end(&mut mint_resp).await.unwrap();
+        let mint_text = String::from_utf8(mint_resp).unwrap();
+        let (_, json_body) = mint_text.split_once("\r\n\r\n").unwrap();
+        let url = serde_json::from_str::<serde_json::Value>(json_body).unwrap()["url"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let baseline = socket_bytes.load(Ordering::Acquire);
+        let mut conn = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let get =
+            format!("GET {url} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+        conn.write_all(get.as_bytes()).await.unwrap();
+        let mut head_buf = Vec::new();
+        let mut b = [0u8; 1];
+        while !head_buf.ends_with(b"\r\n\r\n") {
+            conn.read_exact(&mut b).await.unwrap();
+            head_buf.push(b[0]);
+        }
+        let head = String::from_utf8_lossy(&head_buf);
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+        let mut initial = [0u8; 16 * 1024];
+        conn.read_exact(&mut initial).await.unwrap();
+
+        let settle_deadline = Instant::now() + Duration::from_millis(600);
+        let mut prev = socket_bytes.load(Ordering::Acquire);
+        while Instant::now() < settle_deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let cur = socket_bytes.load(Ordering::Acquire);
+            if cur == prev && cur > baseline {
+                break;
+            }
+            prev = cur;
+        }
+
+        let effective_sndbuf = socket_sndbuf.load(Ordering::Acquire);
+        assert!(effective_sndbuf > 0);
+        let written_at_revoke = socket_bytes.load(Ordering::Acquire);
+        let rcvbuf_at_revoke = socket2::SockRef::from(&conn).recv_buffer_size().unwrap();
+
+        node.call(legion_core::Call::new(
+            legion_core::Door::Cli,
+            "token.remove",
+            serde_json::json!({ "name": "remote-tok" }),
+        ))
+        .await
+        .unwrap();
+
+        let mut tail = Vec::new();
+        let drain_res =
+            tokio::time::timeout(Duration::from_secs(4), conn.read_to_end(&mut tail)).await;
+        assert!(
+            drain_res.is_ok(),
+            "revoked 4 MiB buffered stream must close promptly"
+        );
+        let rcvbuf_at_cut = socket2::SockRef::from(&conn).recv_buffer_size().unwrap();
+        let client_rcvbuf = rcvbuf_at_revoke.max(rcvbuf_at_cut);
+
+        let written_at_cut = socket_bytes.load(Ordering::Acquire);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let written_after_1s = socket_bytes.load(Ordering::Acquire);
+        assert_eq!(written_after_1s.saturating_sub(written_at_cut), 0);
+
+        let written_after_revoke = written_after_1s.saturating_sub(written_at_revoke);
+        let ceiling = (effective_sndbuf + client_rcvbuf + CONTENT_WRITE_SLICE) as u64;
+        assert!(
+            written_after_revoke <= ceiling,
+            "4 MiB pre-buffered source exceeded socket revocation bound: {written_after_revoke} > {ceiling} (effective_sndbuf={effective_sndbuf}, client_rcvbuf={client_rcvbuf}, write_slice={CONTENT_WRITE_SLICE})"
+        );
+        assert!(
+            initial.len() + tail.len() < window_len,
+            "remaining bytes in 4 MiB source buffer must be dropped rather than flushed ({} / {window_len})",
+            initial.len() + tail.len()
+        );
+        let upstream_cancel = last_cancel
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("router open_content must have received a cancel token");
+        assert!(
+            upstream_cancel.is_cancelled(),
+            "revoking an active content stream must cancel ContentRequest.cancel"
         );
 
         shutdown.cancel();
@@ -2067,6 +2524,7 @@ paths = [{projects_toml}]
         assert_eq!(initial_body, photo_bytes);
 
         // Start streaming big.bin, read headers and 4 KiB, then let loopback buffers fill.
+        let big_baseline = socket_bytes.load(Ordering::Acquire);
         let mut big_conn = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let get_big = format!(
             "GET {big_url} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
@@ -2087,7 +2545,7 @@ paths = [{projects_toml}]
         while Instant::now() < settle_deadline {
             tokio::time::sleep(Duration::from_millis(50)).await;
             let cur = socket_bytes.load(Ordering::Acquire);
-            if cur == prev_bytes && cur > 0 {
+            if cur == prev_bytes && cur > big_baseline {
                 break;
             }
             prev_bytes = cur;

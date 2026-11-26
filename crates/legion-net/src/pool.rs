@@ -5129,7 +5129,10 @@ printf 'closed\n' > "{exited}"
         std::fs::write(paths.config_file("node.toml"), "name = \"tower\"\n").unwrap();
 
         let log_file = dir.path().join("frames.log");
-        let file_size = 6 * 1024 * 1024usize;
+        let max_win = MAX_REMOTE_CONTENT_WINDOW;
+        let init_win = INITIAL_REMOTE_CONTENT_WINDOW;
+        let over_max_len = max_win + 1024 * 1024;
+        let file_size = usize::try_from(over_max_len + 1024 * 1024).unwrap();
         // Fake `legion stream` script that logs each requested `(offset, length)` and returns
         // zero-filled bytes of the requested size.
         let script = dir.path().join("window-logger.sh");
@@ -5209,7 +5212,7 @@ done
         assert_eq!(buf.len(), 1024 * 1024);
         assert_eq!(read_frames(&log_file), vec![(131_072, 1024 * 1024)]);
 
-        // 2. Bounded 5 MiB range (> MAX_REMOTE_CONTENT_WINDOW = 4 MiB) must issue 4 MiB + 1 MiB.
+        // 2. Bounded range exceeding MAX_REMOTE_CONTENT_WINDOW splits into MAX_REMOTE_CONTENT_WINDOW + remainder.
         std::fs::write(&log_file, "").unwrap();
         let mut opened = fleet
             .open_content(
@@ -5218,7 +5221,7 @@ done
                     machine: Some("far".to_owned()),
                     path: "/video.mp4".to_owned(),
                     offset: 0,
-                    length: Some(5 * 1024 * 1024),
+                    length: Some(over_max_len),
                     principal: "owner".to_owned(),
                     holder: None,
                     door: Door::Http,
@@ -5230,13 +5233,14 @@ done
             .unwrap();
         buf.clear();
         opened.reader.read_to_end(&mut buf).await.unwrap();
-        assert_eq!(buf.len(), 5 * 1024 * 1024);
+        assert_eq!(buf.len(), usize::try_from(over_max_len).unwrap());
         assert_eq!(
             read_frames(&log_file),
-            vec![(0, 4 * 1024 * 1024), (4 * 1024 * 1024, 1024 * 1024)]
+            vec![(0, max_win), (max_win, over_max_len - max_win)]
         );
 
-        // 3. Unbounded full read (6 MiB) starts at 256 KiB for TTFB, then doubles up to 4 MiB.
+        // 3. Unbounded full read starts at INITIAL_REMOTE_CONTENT_WINDOW for TTFB, then doubles up
+        //    to MAX_REMOTE_CONTENT_WINDOW.
         std::fs::write(&log_file, "").unwrap();
         let mut opened = fleet
             .open_content(
@@ -5258,16 +5262,17 @@ done
         buf.clear();
         opened.reader.read_to_end(&mut buf).await.unwrap();
         assert_eq!(buf.len(), file_size);
-        assert_eq!(
-            read_frames(&log_file),
-            vec![
-                (0, 256 * 1024),
-                (256 * 1024, 512 * 1024),
-                (768 * 1024, 1024 * 1024),
-                (1792 * 1024, 2 * 1024 * 1024),
-                (3840 * 1024, 2304 * 1024),
-            ]
-        );
+        let mut expected_unbounded = Vec::new();
+        let mut off = 0u64;
+        let mut win = init_win;
+        let total = file_size as u64;
+        while off < total {
+            let take = (total - off).min(win);
+            expected_unbounded.push((off, take));
+            off += take;
+            win = win.saturating_mul(2).min(max_win);
+        }
+        assert_eq!(read_frames(&log_file), expected_unbounded);
 
         fleet.close().await;
     }

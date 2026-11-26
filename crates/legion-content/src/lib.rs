@@ -32,7 +32,9 @@ mod range;
 mod serve;
 mod tickets;
 
-pub use body::{BoxAsyncRead, ContentBody, LIVENESS_CHECK_BYTES, LIVENESS_CHECK_INTERVAL};
+pub use body::{
+    BoxAsyncRead, CHUNK_SIZE, ContentBody, LIVENESS_CHECK_BYTES, LIVENESS_CHECK_INTERVAL,
+};
 pub use guard::{GuardRejection, HostOriginGuard};
 pub use limit::{
     ConcurrencyLimits, ContentLimiter, DEFAULT_MAX_STREAMS_GLOBAL, DEFAULT_MAX_STREAMS_PER_HOLDER,
