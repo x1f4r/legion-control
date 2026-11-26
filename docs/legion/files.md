@@ -511,8 +511,9 @@ nothing without a word, daily actions in reach of the thumb, plain words first, 
   is docked at the bottom.
 - **A folder**: a row per entry with a thumbnail or kind icon, name, and one line (kind, size,
   when). List or grid; the grid is for pictures and video. Sort, view and "more" sit in the dock,
-  not at the top. Swiping a row shows Star and Send to; a long press starts selecting, and the
-  dock becomes the action bar (Copy to, Move to, Download, Delete).
+  not at the top. Swiping a row shows Star and Send to; a long press opens the item's sheet (full
+  name, Copy name, Select, and item actions), and choosing Select turns the dock into the action
+  bar (Send to, Download, Star, Delete).
 - **Every step is history.** The address holds the machine and the path
   (`#/files/<machine>/<path>`), and going into a folder, opening a viewer and opening a sheet
   each push one entry. So the system's back gesture, the browser's back button and the header's
@@ -544,6 +545,38 @@ nothing without a word, daily actions in reach of the thumb, plain words first, 
   (size, changed) sit above the box. Results arrive machine by machine; a machine that is off is
   named as not searched.
 - **Thumbnails** are asked for in batches as rows come into view and kept in the device's cache.
+
+### Names
+
+Two different names in a listing never look the same.
+
+- **Wrapping and breaks.** List rows wrap up to two lines, grid cells up to three, and pinned
+  tiles up to two. Rows are only as tall as their name needs, so a one-line name keeps its usual
+  height. Line breaks prefer natural places: after spaces, `_`, `-`, and `.`, between a letter and
+  a digit, and between a lower-case and an upper-case letter. Breaking inside a word happens only
+  when a single word is wider than a line, and never inside a grapheme cluster, so emoji,
+  combining marks, and right-to-left names stay intact.
+- **Ellipsis placement.** When a name still does not fit, it is shortened with an ellipsis and
+  never cut at the end. The ending always stays: the extension and the eight characters before it
+  (with names without an extension, dotfiles, and very long extensions handled cleanly). When a
+  name shares at least eight leading characters with a neighbour before or after it, the first six
+  characters of the longer shared stretch stay and the cut goes into that shared part; otherwise
+  the ellipsis goes in the middle of the stem. What is cut is what is redundant; what differs
+  stays, so no two different names collapse to the same visible text.
+- **Shared beginning steps back.** When a name shares at least ten leading characters with a
+  neighbour in the current sort and filter, that shared lead is drawn in the secondary text colour
+  and the rest in the primary colour, whether or not anything was cut. The colour boundary snaps
+  back to the last natural break before the first difference, so `IMG_20261125_` steps back and
+  `140311.jpg` stands out rather than splitting `140311` mid-number. In search results, the match
+  highlight is used instead and nothing steps back.
+- **Full name one step away.** Hovering on desktop shows the full name. On a phone, the item's
+  sheet (opened with a long press or More) carries the full name at the top, wrapping as far as it
+  needs, with a **Copy name** button. The viewer's title follows the ellipsis rule on one line,
+  preserving the ending. Screen readers always receive the full name, never the shortened one.
+- **One place decides it.** Folder lists and grids, pinned tiles, favourites, recent, search hits,
+  both panes of split view, and the transfer list all share one pure layout function measured
+  against the row's real font. Widths are watched per list rather than per row, and only rows on
+  screen are measured so large folders scroll without a hitch.
 
 ## Keeping folders in sync
 
