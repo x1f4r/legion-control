@@ -1,11 +1,12 @@
 #!/usr/bin/env node
-// Generates an offline visual review contact sheet for Legion UI icons and buttons.
-// Not linked from the app. Writes HTML, PNGs, and centring measurements to:
-//   ~/Documents/legion/ui-shots/contact-sheet/ (override with --out <dir>)
+// Generates an offline visual review contact sheet for Legion UI icons and buttons,
+// and checks optical centring (area-weighted ink centroid at DPR 3 + bounding box)
+// and keyline rules. Not linked from the app.
 //
 // Usage:
 //   node scripts/ui-contact-sheet.mjs
 //   node scripts/ui-contact-sheet.mjs --out /path/to/dir
+//   node scripts/ui-contact-sheet.mjs --check
 
 import fs from 'node:fs';
 import http from 'node:http';
@@ -20,11 +21,15 @@ const UI_ROOT = path.join(REPO_ROOT, 'apps', 'ui');
 const ICONS_PATH = path.join(UI_ROOT, 'icons.js');
 const STYLES_PATH = path.join(UI_ROOT, 'styles.css');
 
+const RING_ICONS = new Set(['power', 'refresh', 'sync', 'skip-back-10', 'skip-fwd-10']);
+const CENTER_TOLERANCE_PX = 0.35;
+
 const require = createRequire(import.meta.url);
 const { chromium } = require(path.join(UI_ROOT, 'test', 'node_modules', 'playwright-core'));
 
 function parseArgs(argv) {
   let outDir = path.join(os.homedir(), 'Documents', 'legion', 'ui-shots', 'contact-sheet');
+  let check = false;
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--out' && argv[i + 1]) {
@@ -32,9 +37,11 @@ function parseArgs(argv) {
       i += 1;
     } else if (arg.startsWith('--out=')) {
       outDir = path.resolve(arg.slice('--out='.length));
+    } else if (arg === '--check') {
+      check = true;
     } else if (arg === '-h' || arg === '--help') {
       process.stdout.write(
-        'Usage: node scripts/ui-contact-sheet.mjs [--out <dir>]\n' +
+        'Usage: node scripts/ui-contact-sheet.mjs [--out <dir>] [--check]\n' +
           'Default output: ~/Documents/legion/ui-shots/contact-sheet\n',
       );
       process.exit(0);
@@ -42,7 +49,7 @@ function parseArgs(argv) {
       throw new Error(`Unknown option: ${arg}`);
     }
   }
-  return { outDir };
+  return { outDir, check };
 }
 
 function findBrowser() {
@@ -149,7 +156,6 @@ function buildIconsPageHtml(symbols, theme = 'dark') {
       display: inline-grid;
       place-items: center;
     }
-    /* Real .btn.icon hit target with icon explicitly drawn at 24px as specified. */
     .btn.icon.cs-icon-target {
       position: relative;
       z-index: 1;
@@ -276,7 +282,7 @@ const BUTTON_SPECS = [
     label: '.btn.icon.player-center-btn',
     note: 'Video ±10s centre button (player: absent when N/A)',
     mediaBackdrop: true,
-    absentWhenUnavailable: true,
+    absentLabel: 'absent (no disabled state)',
     render: () =>
       `<button type="button" class="btn icon player-center-btn" aria-label="Back 10 seconds">${iconMarkup('skip-back-10')}</button>`,
   },
@@ -285,7 +291,7 @@ const BUTTON_SPECS = [
     label: '.btn.icon.player-center-btn.main',
     note: 'Video main play/pause button (player: absent when N/A)',
     mediaBackdrop: true,
-    absentWhenUnavailable: true,
+    absentLabel: 'absent (no disabled state)',
     render: () =>
       `<button type="button" class="btn icon player-center-btn main" aria-label="Play">${iconMarkup('play')}</button>`,
   },
@@ -294,7 +300,7 @@ const BUTTON_SPECS = [
     label: '.btn.player-speed-btn',
     note: 'Video speed selector (player: absent when N/A)',
     mediaBackdrop: true,
-    absentWhenUnavailable: true,
+    absentLabel: 'absent (no disabled state)',
     render: () => `<button type="button" class="btn player-speed-btn">1.5×</button>`,
   },
   {
@@ -302,7 +308,7 @@ const BUTTON_SPECS = [
     label: '.btn.icon.music-ctl-btn',
     note: 'Music prev/next button (player: absent when N/A)',
     mediaBackdrop: true,
-    absentWhenUnavailable: true,
+    absentLabel: 'absent (no disabled state)',
     render: () =>
       `<button type="button" class="btn icon music-ctl-btn" aria-label="Next">${iconMarkup('next')}</button>`,
   },
@@ -311,7 +317,7 @@ const BUTTON_SPECS = [
     label: '.btn.icon.music-play-btn',
     note: 'Music main play/pause button (player: absent when N/A)',
     mediaBackdrop: true,
-    absentWhenUnavailable: true,
+    absentLabel: 'absent (no disabled state)',
     render: () =>
       `<button type="button" class="btn icon music-play-btn" aria-label="Play">${iconMarkup('play')}</button>`,
   },
@@ -320,58 +326,62 @@ const BUTTON_SPECS = [
     label: '.player-resume-btn',
     note: 'Start over inside resume chip (absent after 5 s)',
     mediaBackdrop: true,
-    absentWhenUnavailable: true,
+    absentLabel: 'absent (no disabled state)',
     render: () =>
       `<span class="player-resume-chip inline"><span>Resumed at 12:40</span><button type="button" class="player-resume-btn">Start over</button></span>`,
   },
   {
     id: 'btn-chip',
     label: '.chip-btn',
-    note: 'Toggle chip (unpressed / aria-pressed)',
+    note: 'Toggle chip (never rendered disabled)',
     mediaBackdrop: false,
-    render: ({ state }) =>
+    absentLabel: 'absent (never disabled)',
+    render: () =>
       `<div class="cs-pair">
-        <button type="button" class="chip-btn" aria-pressed="false"${state === 'disabled' ? ' disabled' : ''}>1×</button>
-        <button type="button" class="chip-btn" aria-pressed="true"${state === 'disabled' ? ' disabled' : ''}>1.5×</button>
+        <button type="button" class="chip-btn" aria-pressed="false">1×</button>
+        <button type="button" class="chip-btn" aria-pressed="true">1.5×</button>
       </div>`,
   },
   {
     id: 'btn-seg',
     label: '.seg button',
-    note: 'Segmented control (unpressed / aria-pressed)',
+    note: 'Segmented control (never rendered disabled)',
     mediaBackdrop: false,
-    render: ({ state }) =>
+    absentLabel: 'absent (never disabled)',
+    render: () =>
       `<div class="seg cs-seg">
-        <button type="button" aria-pressed="false"${state === 'disabled' ? ' disabled' : ''}>List</button>
-        <button type="button" aria-pressed="true"${state === 'disabled' ? ' disabled' : ''}>Grid</button>
+        <button type="button" aria-pressed="false">List</button>
+        <button type="button" aria-pressed="true">Grid</button>
       </div>`,
   },
   {
     id: 'btn-tabs',
     label: '.tabs button',
-    note: 'Machine detail tabs (unselected / aria-selected)',
+    note: 'Machine detail tabs (never rendered disabled)',
     mediaBackdrop: false,
-    render: ({ state }) =>
+    absentLabel: 'absent (never disabled)',
+    render: () =>
       `<div class="tabs cs-tabs" role="tablist">
-        <button type="button" role="tab" aria-selected="false"${state === 'disabled' ? ' disabled' : ''}>Overview</button>
-        <button type="button" role="tab" aria-selected="true"${state === 'disabled' ? ' disabled' : ''}>Files</button>
+        <button type="button" role="tab" aria-selected="false">Overview</button>
+        <button type="button" role="tab" aria-selected="true">Files</button>
       </div>`,
   },
   {
     id: 'btn-filters',
     label: '.filters button',
-    note: 'Files kind filter pills',
+    note: 'Files kind filter pills (never rendered disabled)',
     mediaBackdrop: false,
-    render: ({ state }) =>
+    absentLabel: 'absent (never disabled)',
+    render: () =>
       `<div class="filters cs-filters">
-        <button type="button" aria-pressed="false"${state === 'disabled' ? ' disabled' : ''}>Video</button>
-        <button type="button" aria-pressed="true"${state === 'disabled' ? ' disabled' : ''}>Audio</button>
+        <button type="button" aria-pressed="false">Video</button>
+        <button type="button" aria-pressed="true">Audio</button>
       </div>`,
   },
   {
     id: 'btn-bar4',
     label: '.bar4 button',
-    note: '4-column action bar (default / .active)',
+    note: '4-column action bar (default / .active; can be disabled)',
     mediaBackdrop: false,
     render: ({ state }) =>
       `<div class="bar4 cs-bar4">
@@ -382,7 +392,7 @@ const BUTTON_SPECS = [
   {
     id: 'btn-viewer-bar4',
     label: '.viewer-bar .bar4 button',
-    note: 'Viewer action bar on dark backdrop',
+    note: 'Viewer action bar on dark backdrop (Open in… can be disabled)',
     mediaBackdrop: true,
     render: ({ state }) =>
       `<div class="viewer-bar cs-viewer-bar"><div class="bar4 cs-bar4">
@@ -393,30 +403,32 @@ const BUTTON_SPECS = [
   {
     id: 'btn-swipe',
     label: '.swipe-action',
-    note: 'Row swipe actions (danger / neutral / accent)',
+    note: 'Row swipe actions (never rendered disabled)',
     mediaBackdrop: false,
-    render: ({ state }) =>
+    absentLabel: 'absent (never disabled)',
+    render: () =>
       `<div class="cs-swipe-group">
-        <button type="button" class="swipe-action"${state === 'disabled' ? ' disabled' : ''}>Delete</button>
-        <button type="button" class="swipe-action neutral"${state === 'disabled' ? ' disabled' : ''}>Rename</button>
-        <button type="button" class="swipe-action accent"${state === 'disabled' ? ' disabled' : ''}>Star</button>
+        <button type="button" class="swipe-action">Delete</button>
+        <button type="button" class="swipe-action neutral">Rename</button>
+        <button type="button" class="swipe-action accent">Star</button>
       </div>`,
   },
   {
     id: 'btn-update-dismiss',
     label: '.update-note-dismiss',
-    note: 'Quiet post-update dismiss button',
+    note: 'Quiet post-update dismiss button (never rendered disabled)',
     mediaBackdrop: false,
-    render: ({ state }) =>
-      `<button type="button" class="update-note-dismiss" aria-label="Dismiss"${state === 'disabled' ? ' disabled' : ''}>×</button>`,
+    absentLabel: 'absent (never disabled)',
+    render: () =>
+      `<button type="button" class="update-note-dismiss" aria-label="Dismiss">×</button>`,
   },
 ];
 
 function buildButtonsPageHtml(symbols, theme) {
   const rows = BUTTON_SPECS.map((spec) => {
     const backdropCls = spec.mediaBackdrop ? ' cs-cell-dark' : '';
-    const disabledCell = spec.absentWhenUnavailable
-      ? `<span class="cs-absent-slot">absent (no disabled state)</span>`
+    const disabledCell = spec.absentLabel
+      ? `<span class="cs-absent-slot">${escapeHtml(spec.absentLabel)}</span>`
       : spec.render({ state: 'disabled' });
     return `
       <tr data-spec="${escapeHtml(spec.id)}">
@@ -479,8 +491,8 @@ function buildButtonsPageHtml(symbols, theme) {
     .cs-cell-dark { background: #0d0e10; color: #eceef0; }
     .cs-pair { display: inline-flex; gap: 8px; align-items: center; }
     .cs-seg { width: 150px; margin: 0 auto; }
-    .cs-tabs { margin: 0; padding: 0; justify-content: center; }
-    .cs-filters { padding: 0; justify-content: center; }
+    .cs-tabs { margin: 0; justify-content: center; }
+    .cs-filters { justify-content: center; }
     .cs-bar4 { width: 170px; margin: 0 auto; }
     .cs-viewer-bar { padding: 4px; background: none; }
     .cs-swipe-group { display: inline-flex; height: 44px; border-radius: 8px; overflow: hidden; }
@@ -530,21 +542,25 @@ function buildButtonsPageHtml(symbols, theme) {
 function buildReviewIndexHtml({ measurements, outDir }) {
   const rows = measurements
     .map((m) => {
-      const maxDist = Math.max(m.vector.dist, m.dpr1.dist, m.dpr2.dist, m.dpr3.dist);
-      const cls = maxDist <= 0.5 ? 'ok' : maxDist <= 1.5 ? 'warn' : 'off';
-      const fmt = (o) => `${o.dx >= 0 ? '+' : ''}${o.dx.toFixed(2)}, ${o.dy >= 0 ? '+' : ''}${o.dy.toFixed(2)} (${o.dist.toFixed(2)})`;
-      const extra = m.digitsVsCircle
-        ? `digits vs circle: dx=${m.digitsVsCircle.vector.dx.toFixed(2)}, dy=${m.digitsVsCircle.vector.dy.toFixed(2)} | @1x (${m.digitsVsCircle.dpr1.dx.toFixed(2)}, ${m.digitsVsCircle.dpr1.dy.toFixed(2)}) @2x (${m.digitsVsCircle.dpr2.dx.toFixed(2)}, ${m.digitsVsCircle.dpr2.dy.toFixed(2)}) @3x (${m.digitsVsCircle.dpr3.dx.toFixed(2)}, ${m.digitsVsCircle.dpr3.dy.toFixed(2)})`
-        : '';
+      const checkMetric = m.ringCenter || m.centroidDpr3;
+      const cls = checkMetric.dist <= CENTER_TOLERANCE_PX ? 'ok' : checkMetric.dist <= 0.75 ? 'warn' : 'off';
+      const fmt = (o) =>
+        `${o.dx >= 0 ? '+' : ''}${o.dx.toFixed(2)}, ${o.dy >= 0 ? '+' : ''}${o.dy.toFixed(2)} (${o.dist.toFixed(2)})`;
+      const notes = [];
+      if (m.ringCenter) notes.push(`ring: ${fmt(m.ringCenter)}`);
+      if (m.digitsVsCircle) {
+        notes.push(
+          `10 vs ring: vec=(${m.digitsVsCircle.vector.dx.toFixed(2)},${m.digitsVsCircle.vector.dy.toFixed(2)}) @3x=(${m.digitsVsCircle.dpr3.dx.toFixed(2)},${m.digitsVsCircle.dpr3.dy.toFixed(2)})`,
+        );
+      }
       return `
         <tr class="sev-${cls}">
           <td><code>${escapeHtml(m.name)}</code></td>
-          <td>${m.targetW.toFixed(0)}×${m.targetH.toFixed(0)}</td>
+          <td><code>${fmt(m.boxDpr3)}</code></td>
+          <td><code>${fmt(m.centroidDpr3)}</code></td>
           <td><code>${fmt(m.vector)}</code></td>
-          <td><code>${fmt(m.dpr1)}</code></td>
-          <td><code>${fmt(m.dpr2)}</code></td>
-          <td><code>${fmt(m.dpr3)}</code></td>
-          <td>${escapeHtml(extra)}</td>
+          <td><code>${m.bboxW.toFixed(1)}×${m.bboxH.toFixed(1)}</code></td>
+          <td>${escapeHtml(notes.join(' · '))}</td>
         </tr>`;
     })
     .join('\n');
@@ -589,18 +605,17 @@ function buildReviewIndexHtml({ measurements, outDir }) {
 </head>
 <body>
   <h1>Legion UI Contact Sheet</h1>
-  <p class="meta">Icons (${measurements.length} symbols from apps/ui/icons.js at 24 px inside .btn.icon) &amp; buttons (dark + light). Output: ${escapeHtml(outDir)}</p>
+  <p class="meta">Icons (${measurements.length} symbols from apps/ui/icons.js at 24 px inside .btn.icon) &amp; buttons (dark + light). Tolerance: ${CENTER_TOLERANCE_PX} px (ink centroid at DPR 3, or ring centre for ring icons). Output: ${escapeHtml(outDir)}</p>
 
-  <h2>Icon Centring Measurements (shape bbox centre minus target centre, CSS px)</h2>
+  <h2>Icon Centring Measurements (offset from target centre, CSS px at 24 px)</h2>
   <table>
     <thead>
       <tr>
         <th>Icon</th>
-        <th>Target</th>
-        <th>Vector dx, dy (dist)</th>
-        <th>DPR 1 dx, dy (dist)</th>
-        <th>DPR 2 dx, dy (dist)</th>
-        <th>DPR 3 dx, dy (dist)</th>
+        <th>Box @3x dx, dy (d)</th>
+        <th>Ink centroid @3x dx, dy (d)</th>
+        <th>Vector box dx, dy (d)</th>
+        <th>Ink size (px)</th>
         <th>Notes</th>
       </tr>
     </thead>
@@ -651,147 +666,218 @@ async function startServer(pages) {
   };
 }
 
-async function measureIconsOnPage(page, dpr) {
-  return page.evaluate(async (scaleFactor) => {
-    const label = document.getElementById('cs-dpr-label');
-    if (label) {
-      label.textContent = `DPR ${scaleFactor} · target outline (dashed) · target centre cross (red)`;
-    }
+async function measureIconsOnPage(page, dpr, ringIconNames) {
+  return page.evaluate(
+    async ({ scaleFactor, ringNames }) => {
+      const ringSet = new Set(ringNames);
+      const label = document.getElementById('cs-dpr-label');
+      if (label) {
+        label.textContent = `DPR ${scaleFactor} · target outline (dashed) · target centre cross (red)`;
+      }
 
-    async function rasterInkCenter(svgMarkup, cssW, cssH, dprVal) {
-      const pxW = Math.round(cssW * dprVal);
-      const pxH = Math.round(cssH * dprVal);
-      const img = new Image();
-      img.width = pxW;
-      img.height = pxH;
-      const url = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgMarkup)}`;
-      await new Promise((resolve, reject) => {
-        img.onload = resolve;
-        img.onerror = reject;
-        img.src = url;
-      });
-      const canvas = document.createElement('canvas');
-      canvas.width = pxW;
-      canvas.height = pxH;
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(img, 0, 0, pxW, pxH);
-      const data = ctx.getImageData(0, 0, pxW, pxH).data;
-      let minX = pxW;
-      let minY = pxH;
-      let maxX = -1;
-      let maxY = -1;
-      for (let y = 0; y < pxH; y += 1) {
-        for (let x = 0; x < pxW; x += 1) {
-          if (data[(y * pxW + x) * 4 + 3] > 8) {
-            if (x < minX) minX = x;
-            if (x > maxX) maxX = x;
-            if (y < minY) minY = y;
-            if (y > maxY) maxY = y;
+      async function rasterInkStats(svgMarkup, cssW, cssH, dprVal) {
+        const pxW = Math.round(cssW * dprVal);
+        const pxH = Math.round(cssH * dprVal);
+        const img = new Image();
+        img.width = pxW;
+        img.height = pxH;
+        const url = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgMarkup)}`;
+        await new Promise((resolve, reject) => {
+          img.onload = resolve;
+          img.onerror = reject;
+          img.src = url;
+        });
+        const canvas = document.createElement('canvas');
+        canvas.width = pxW;
+        canvas.height = pxH;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, pxW, pxH);
+        const data = ctx.getImageData(0, 0, pxW, pxH).data;
+        let minX = pxW;
+        let minY = pxH;
+        let maxX = -1;
+        let maxY = -1;
+        let sumW = 0;
+        let sumX = 0;
+        let sumY = 0;
+        for (let y = 0; y < pxH; y += 1) {
+          for (let x = 0; x < pxW; x += 1) {
+            const a = data[(y * pxW + x) * 4 + 3];
+            if (a > 0) {
+              sumW += a;
+              sumX += a * (x + 0.5);
+              sumY += a * (y + 0.5);
+            }
+            if (a > 8) {
+              if (x < minX) minX = x;
+              if (x > maxX) maxX = x;
+              if (y < minY) minY = y;
+              if (y > maxY) maxY = y;
+            }
           }
         }
-      }
-      if (maxX < minX || maxY < minY) {
-        return { cx: cssW / 2, cy: cssH / 2 };
-      }
-      return {
-        cx: (minX + maxX + 1) / 2 / dprVal,
-        cy: (minY + maxY + 1) / 2 / dprVal,
-      };
-    }
-
-    const cards = Array.from(document.querySelectorAll('.cs-icon-card'));
-    const results = [];
-
-    for (const card of cards) {
-      const name = card.getAttribute('data-icon');
-      const btn = card.querySelector('.cs-icon-target');
-      const svg = btn.querySelector('svg');
-      const btnRect = btn.getBoundingClientRect();
-      const svgRect = svg.getBoundingClientRect();
-      const style = getComputedStyle(svg);
-      const sym = document.getElementById(`i-${name}`);
-      const viewBox = sym.getAttribute('viewBox') || '0 0 24 24';
-      const [, , vbW, vbH] = viewBox.split(/\s+/).map(Number);
-
-      // Exact SVG geometry bounding box inside the live 24x24 viewport.
-      const probe = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-      probe.setAttribute('viewBox', viewBox);
-      probe.setAttribute('width', String(svgRect.width));
-      probe.setAttribute('height', String(svgRect.height));
-      probe.style.position = 'fixed';
-      probe.style.left = '-9999px';
-      probe.innerHTML = sym.innerHTML;
-      document.body.appendChild(probe);
-      const allBox = probe.getBBox();
-      const circleEl = probe.querySelector('[data-part="circle"]');
-      const digitsEl = probe.querySelector('[data-part="digits"]');
-      const circleBox = circleEl ? circleEl.getBBox() : null;
-      const digitsBox = digitsEl ? digitsEl.getBBox() : null;
-      probe.remove();
-
-      const targetCx = btnRect.width / 2;
-      const targetCy = btnRect.height / 2;
-      const svgLeftInBtn = svgRect.left - btnRect.left;
-      const svgTopInBtn = svgRect.top - btnRect.top;
-      const sx = svgRect.width / vbW;
-      const sy = svgRect.height / vbH;
-
-      const vecCxInBtn = svgLeftInBtn + (allBox.x + allBox.width / 2) * sx;
-      const vecCyInBtn = svgTopInBtn + (allBox.y + allBox.height / 2) * sy;
-      const vecDx = vecCxInBtn - targetCx;
-      const vecDy = vecCyInBtn - targetCy;
-
-      const baseAttrs =
-        `xmlns="http://www.w3.org/2000/svg" viewBox="${viewBox}" ` +
-        `width="${svgRect.width}" height="${svgRect.height}" fill="none" stroke="#ffffff" ` +
-        `stroke-width="${style.strokeWidth}" stroke-linecap="${style.strokeLinecap}" stroke-linejoin="${style.strokeLinejoin}"`;
-      const fullInk = await rasterInkCenter(`<svg ${baseAttrs}>${sym.innerHTML}</svg>`, svgRect.width, svgRect.height, scaleFactor);
-      const pxDx = svgLeftInBtn + fullInk.cx - targetCx;
-      const pxDy = svgTopInBtn + fullInk.cy - targetCy;
-
-      let digitsVsCircle = null;
-      if (circleBox && digitsBox) {
-        const vecDvcDx = (digitsBox.x + digitsBox.width / 2 - (circleBox.x + circleBox.width / 2)) * sx;
-        const vecDvcDy = (digitsBox.y + digitsBox.height / 2 - (circleBox.y + circleBox.height / 2)) * sy;
-        const circleInk = await rasterInkCenter(
-          `<svg ${baseAttrs}>${sym.querySelector('[data-part="circle"]').outerHTML}</svg>`,
-          svgRect.width,
-          svgRect.height,
-          scaleFactor,
-        );
-        const digitsInk = await rasterInkCenter(
-          `<svg ${baseAttrs}>${sym.querySelector('[data-part="digits"]').outerHTML}</svg>`,
-          svgRect.width,
-          svgRect.height,
-          scaleFactor,
-        );
-        digitsVsCircle = {
-          vector: { dx: vecDvcDx, dy: vecDvcDy },
-          pixel: { dx: digitsInk.cx - circleInk.cx, dy: digitsInk.cy - circleInk.cy },
+        if (maxX < minX || maxY < minY || sumW === 0) {
+          return {
+            boxCx: cssW / 2,
+            boxCy: cssH / 2,
+            boxW: 0,
+            boxH: 0,
+            centroidCx: cssW / 2,
+            centroidCy: cssH / 2,
+          };
+        }
+        return {
+          boxCx: (minX + maxX + 1) / 2 / dprVal,
+          boxCy: (minY + maxY + 1) / 2 / dprVal,
+          boxW: (maxX - minX + 1) / dprVal,
+          boxH: (maxY - minY + 1) / dprVal,
+          centroidCx: sumX / sumW / dprVal,
+          centroidCy: sumY / sumW / dprVal,
         };
       }
 
-      const metaEl = card.querySelector(`[data-meta-for="${name}"]`);
-      if (metaEl) {
-        metaEl.textContent =
-          `vec ${vecDx >= 0 ? '+' : ''}${vecDx.toFixed(2)}, ${vecDy >= 0 ? '+' : ''}${vecDy.toFixed(2)}\n` +
-          `px  ${pxDx >= 0 ? '+' : ''}${pxDx.toFixed(2)}, ${pxDy >= 0 ? '+' : ''}${pxDy.toFixed(2)}`;
+      const cards = Array.from(document.querySelectorAll('.cs-icon-card'));
+      const results = [];
+
+      for (const card of cards) {
+        const name = card.getAttribute('data-icon');
+        const btn = card.querySelector('.cs-icon-target');
+        const svg = btn.querySelector('svg');
+        const btnRect = btn.getBoundingClientRect();
+        const svgRect = svg.getBoundingClientRect();
+        const style = getComputedStyle(svg);
+        const sym = document.getElementById(`i-${name}`);
+        const viewBox = sym.getAttribute('viewBox') || '0 0 24 24';
+        const [, , vbW, vbH] = viewBox.split(/\s+/).map(Number);
+
+        const probe = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        probe.setAttribute('viewBox', viewBox);
+        probe.setAttribute('width', String(svgRect.width));
+        probe.setAttribute('height', String(svgRect.height));
+        probe.style.position = 'fixed';
+        probe.style.left = '-9999px';
+        probe.innerHTML = sym.innerHTML;
+        document.body.appendChild(probe);
+        const allBox = probe.getBBox();
+        const ringEl = probe.querySelector('[data-part="ring"], [data-part="circle"]');
+        const digitsEl = probe.querySelector('[data-part="digits"]');
+        const ringBox = ringEl ? ringEl.getBBox() : null;
+        const digitsBox = digitsEl ? digitsEl.getBBox() : null;
+        probe.remove();
+
+        const targetCx = btnRect.width / 2;
+        const targetCy = btnRect.height / 2;
+        const svgLeftInBtn = svgRect.left - btnRect.left;
+        const svgTopInBtn = svgRect.top - btnRect.top;
+        const sx = svgRect.width / vbW;
+        const sy = svgRect.height / vbH;
+
+        const vecDx = svgLeftInBtn + (allBox.x + allBox.width / 2) * sx - targetCx;
+        const vecDy = svgTopInBtn + (allBox.y + allBox.height / 2) * sy - targetCy;
+
+        const baseAttrs =
+          `xmlns="http://www.w3.org/2000/svg" viewBox="${viewBox}" ` +
+          `width="${svgRect.width}" height="${svgRect.height}" color="#ffffff" fill="none" stroke="currentColor" ` +
+          `stroke-width="${style.strokeWidth}" stroke-linecap="${style.strokeLinecap}" stroke-linejoin="${style.strokeLinejoin}"`;
+
+        const fullStats = await rasterInkStats(
+          `<svg ${baseAttrs}>${sym.innerHTML}</svg>`,
+          svgRect.width,
+          svgRect.height,
+          scaleFactor,
+        );
+        const boxDx = svgLeftInBtn + fullStats.boxCx - targetCx;
+        const boxDy = svgTopInBtn + fullStats.boxCy - targetCy;
+        const centDx = svgLeftInBtn + fullStats.centroidCx - targetCx;
+        const centDy = svgTopInBtn + fullStats.centroidCy - targetCy;
+
+        // Ring centre: uses explicit [data-part="ring"|"circle"] when present; for legacy ring icons
+        // without data-part (power, refresh, sync before tagging), locate the circular arc path.
+        let ringCenter = null;
+        if (ringSet.has(name)) {
+          let symRingEl = sym.querySelector('[data-part="ring"], [data-part="circle"]');
+          if (!symRingEl) {
+            const paths = Array.from(sym.querySelectorAll('path'));
+            symRingEl = paths.find((p) => /[aA]\s*[\d.]/.test(p.getAttribute('d') || '')) || null;
+          }
+          if (symRingEl) {
+            // Compute geometric centre of the arc's bounding circle if tagged, or raster box centre of arc.
+            const ringStats = await rasterInkStats(
+              `<svg ${baseAttrs}>${symRingEl.outerHTML}</svg>`,
+              svgRect.width,
+              svgRect.height,
+              scaleFactor,
+            );
+            // For incomplete arcs (e.g. power gap at top, skip gap at top-left), prefer explicit circle cx/cy
+            // attributes if declared on data-cx/data-cy, else vector bbox centre when full 360-extent is covered.
+            const attrCx = Number(symRingEl.getAttribute('data-cx'));
+            const attrCy = Number(symRingEl.getAttribute('data-cy'));
+            let rDx;
+            let rDy;
+            if (Number.isFinite(attrCx) && Number.isFinite(attrCy) && symRingEl.hasAttribute('data-cx')) {
+              rDx = svgLeftInBtn + attrCx * sx - targetCx;
+              rDy = svgTopInBtn + attrCy * sy - targetCy;
+            } else if (ringBox) {
+              rDx = svgLeftInBtn + (ringBox.x + ringBox.width / 2) * sx - targetCx;
+              rDy = svgTopInBtn + (ringBox.y + ringBox.height / 2) * sy - targetCy;
+            } else {
+              rDx = svgLeftInBtn + ringStats.boxCx - targetCx;
+              rDy = svgTopInBtn + ringStats.boxCy - targetCy;
+            }
+            ringCenter = { dx: rDx, dy: rDy, dist: Math.hypot(rDx, rDy) };
+          }
+        }
+
+        let digitsVsCircle = null;
+        if (ringBox && digitsBox) {
+          const vecDvcDx = (digitsBox.x + digitsBox.width / 2 - (ringBox.x + ringBox.width / 2)) * sx;
+          const vecDvcDy = (digitsBox.y + digitsBox.height / 2 - (ringBox.y + ringBox.height / 2)) * sy;
+          const ringInk = await rasterInkStats(
+            `<svg ${baseAttrs}>${sym.querySelector('[data-part="ring"], [data-part="circle"]').outerHTML}</svg>`,
+            svgRect.width,
+            svgRect.height,
+            scaleFactor,
+          );
+          const digitsInk = await rasterInkStats(
+            `<svg ${baseAttrs}>${sym.querySelector('[data-part="digits"]').outerHTML}</svg>`,
+            svgRect.width,
+            svgRect.height,
+            scaleFactor,
+          );
+          digitsVsCircle = {
+            vector: { dx: vecDvcDx, dy: vecDvcDy },
+            pixel: { dx: digitsInk.boxCx - ringInk.boxCx, dy: digitsInk.boxCy - ringInk.boxCy },
+            centroid: { dx: digitsInk.centroidCx - ringInk.boxCx, dy: digitsInk.centroidCy - ringInk.boxCy },
+          };
+        }
+
+        const metaEl = card.querySelector(`[data-meta-for="${name}"]`);
+        if (metaEl) {
+          metaEl.textContent =
+            `box ${boxDx >= 0 ? '+' : ''}${boxDx.toFixed(2)}, ${boxDy >= 0 ? '+' : ''}${boxDy.toFixed(2)}\n` +
+            `ink ${centDx >= 0 ? '+' : ''}${centDx.toFixed(2)}, ${centDy >= 0 ? '+' : ''}${centDy.toFixed(2)}`;
+        }
+
+        results.push({
+          name,
+          targetW: btnRect.width,
+          targetH: btnRect.height,
+          iconW: svgRect.width,
+          iconH: svgRect.height,
+          bboxW: fullStats.boxW,
+          bboxH: fullStats.boxH,
+          vector: { dx: vecDx, dy: vecDy, dist: Math.hypot(vecDx, vecDy) },
+          box: { dx: boxDx, dy: boxDy, dist: Math.hypot(boxDx, boxDy) },
+          centroid: { dx: centDx, dy: centDy, dist: Math.hypot(centDx, centDy) },
+          ringCenter,
+          digitsVsCircle,
+        });
       }
 
-      results.push({
-        name,
-        targetW: btnRect.width,
-        targetH: btnRect.height,
-        iconW: svgRect.width,
-        iconH: svgRect.height,
-        vector: { dx: vecDx, dy: vecDy, dist: Math.hypot(vecDx, vecDy) },
-        pixel: { dx: pxDx, dy: pxDy, dist: Math.hypot(pxDx, pxDy) },
-        digitsVsCircle,
-      });
-    }
-
-    return results;
-  }, dpr);
+      return results;
+    },
+    { scaleFactor: dpr, ringNames: [...ringIconNames] },
+  );
 }
 
 async function applyForcedButtonPseudoStates(context, page) {
@@ -827,7 +913,7 @@ async function applyForcedButtonPseudoStates(context, page) {
 }
 
 async function main() {
-  const { outDir } = parseArgs(process.argv.slice(2));
+  const { outDir, check } = parseArgs(process.argv.slice(2));
   fs.mkdirSync(outDir, { recursive: true });
 
   const iconSource = fs.readFileSync(ICONS_PATH, 'utf8');
@@ -850,7 +936,6 @@ async function main() {
   try {
     const byIcon = new Map();
 
-    // 1. Icons at DPR 1, 2, and 3 (dark theme) + light theme at DPR 2.
     for (const dpr of [1, 2, 3]) {
       const context = await browser.newContext({
         viewport: { width: 1120, height: 900 },
@@ -859,7 +944,7 @@ async function main() {
       });
       const page = await context.newPage();
       await page.goto(`${server.url}/icons-dark.html`, { waitUntil: 'load' });
-      const rows = await measureIconsOnPage(page, dpr);
+      const rows = await measureIconsOnPage(page, dpr, RING_ICONS);
       await page.screenshot({
         path: path.join(outDir, `icons-dpr${dpr}.png`),
         fullPage: true,
@@ -872,17 +957,29 @@ async function main() {
             targetH: r.targetH,
             iconW: r.iconW,
             iconH: r.iconH,
+            bboxW: r.bboxW,
+            bboxH: r.bboxH,
             vector: r.vector,
-            dpr1: null,
-            dpr2: null,
-            dpr3: null,
+            boxDpr1: null,
+            boxDpr2: null,
+            boxDpr3: null,
+            centroidDpr1: null,
+            centroidDpr2: null,
+            centroidDpr3: null,
+            ringCenter: r.ringCenter,
             digitsVsCircle: r.digitsVsCircle
               ? { vector: r.digitsVsCircle.vector, dpr1: null, dpr2: null, dpr3: null }
               : null,
           });
         }
         const entry = byIcon.get(r.name);
-        entry[`dpr${dpr}`] = r.pixel;
+        entry[`boxDpr${dpr}`] = r.box;
+        entry[`centroidDpr${dpr}`] = r.centroid;
+        if (dpr === 3) {
+          entry.bboxW = r.bboxW;
+          entry.bboxH = r.bboxH;
+          entry.ringCenter = r.ringCenter;
+        }
         if (r.digitsVsCircle && entry.digitsVsCircle) {
           entry.digitsVsCircle[`dpr${dpr}`] = r.digitsVsCircle.pixel;
         }
@@ -898,7 +995,7 @@ async function main() {
       });
       const page = await context.newPage();
       await page.goto(`${server.url}/icons-light.html`, { waitUntil: 'load' });
-      await measureIconsOnPage(page, 2);
+      await measureIconsOnPage(page, 2, RING_ICONS);
       await page.screenshot({
         path: path.join(outDir, 'icons-light-dpr2.png'),
         fullPage: true,
@@ -906,7 +1003,6 @@ async function main() {
       await context.close();
     }
 
-    // 2. Button matrix in dark and light themes with real :active and :focus-visible states.
     for (const theme of ['dark', 'light']) {
       const context = await browser.newContext({
         viewport: { width: 1320, height: 1000 },
@@ -927,31 +1023,44 @@ async function main() {
     const measurements = Array.from(byIcon.values());
     fs.writeFileSync(
       path.join(outDir, 'measurements.json'),
-      `${JSON.stringify({ outDir, iconCount: measurements.length, measurements }, null, 2)}\n`,
+      `${JSON.stringify({ outDir, iconCount: measurements.length, tolerancePx: CENTER_TOLERANCE_PX, measurements }, null, 2)}\n`,
     );
     fs.writeFileSync(path.join(outDir, 'index.html'), buildReviewIndexHtml({ measurements, outDir }));
 
-    // Print aligned summary table.
     const pad = (s, n) => String(s).padEnd(n);
-    const fmtPair = (o) => `${o.dx >= 0 ? '+' : ''}${o.dx.toFixed(2)},${o.dy >= 0 ? '+' : ''}${o.dy.toFixed(2)} (${o.dist.toFixed(2)})`;
+    const fmtPair = (o) =>
+      `${o.dx >= 0 ? '+' : ''}${o.dx.toFixed(2)},${o.dy >= 0 ? '+' : ''}${o.dy.toFixed(2)} (${o.dist.toFixed(2)})`;
     process.stdout.write(`Contact sheet written to: ${outDir}\n`);
     process.stdout.write(
-      `${pad('icon', 18)} ${pad('vector dx,dy (d)', 22)} ${pad('dpr1 dx,dy (d)', 22)} ${pad('dpr2 dx,dy (d)', 22)} ${pad('dpr3 dx,dy (d)', 22)}\n`,
+      `${pad('icon', 18)} ${pad('box@3x dx,dy (d)', 22)} ${pad('ink@3x dx,dy (d)', 22)} ${pad('size(px)', 11)} ${pad('ring/notes', 24)}\n`,
     );
-    process.stdout.write(`${'-'.repeat(108)}\n`);
+    process.stdout.write(`${'-'.repeat(102)}\n`);
+    const failures = [];
     for (const m of measurements) {
+      const checkMetric = m.ringCenter || m.centroidDpr3;
+      const metricKind = m.ringCenter ? 'ring' : 'ink';
+      const note = m.ringCenter ? `ring ${fmtPair(m.ringCenter)}` : '';
+      const pass = checkMetric.dist <= CENTER_TOLERANCE_PX + 1e-6;
+      if (!pass) {
+        failures.push(`${m.name}: ${metricKind} offset ${fmtPair(checkMetric)} > ${CENTER_TOLERANCE_PX} px`);
+      }
       process.stdout.write(
-        `${pad(m.name, 18)} ${pad(fmtPair(m.vector), 22)} ${pad(fmtPair(m.dpr1), 22)} ${pad(fmtPair(m.dpr2), 22)} ${pad(fmtPair(m.dpr3), 22)}\n`,
+        `${pad(m.name, 18)} ${pad(fmtPair(m.boxDpr3), 22)} ${pad(fmtPair(m.centroidDpr3), 22)} ${pad(`${m.bboxW.toFixed(1)}x${m.bboxH.toFixed(1)}`, 11)} ${note}${pass ? '' : '  [OFF]'}\n`,
       );
       if (m.digitsVsCircle) {
         const d = m.digitsVsCircle;
         process.stdout.write(
-          `  └─ 10 vs circle: vec=(${d.vector.dx.toFixed(2)}, ${d.vector.dy.toFixed(2)}) ` +
+          `  └─ 10 vs ring: vec=(${d.vector.dx.toFixed(2)}, ${d.vector.dy.toFixed(2)}) ` +
             `@1x=(${d.dpr1.dx.toFixed(2)}, ${d.dpr1.dy.toFixed(2)}) ` +
             `@2x=(${d.dpr2.dx.toFixed(2)}, ${d.dpr2.dy.toFixed(2)}) ` +
             `@3x=(${d.dpr3.dx.toFixed(2)}, ${d.dpr3.dy.toFixed(2)})\n`,
         );
       }
+    }
+    if (check && failures.length > 0) {
+      process.stderr.write(`\nCentring check failed (${failures.length} icon(s) outside ${CENTER_TOLERANCE_PX} px):\n`);
+      for (const f of failures) process.stderr.write(`  - ${f}\n`);
+      process.exitCode = 1;
     }
   } finally {
     await browser.close();
