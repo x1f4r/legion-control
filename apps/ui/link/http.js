@@ -5,6 +5,85 @@ import { isFanOut } from '../lib/result.js';
 import { createSseParser } from '../lib/sse.js';
 
 const TOKEN_KEY = 'legion.token';
+const DEFAULT_NETWORK_RETRY_DELAY_MS = 150;
+
+// Built-in read-only tools that are safe to retry once if the browser aborts an in-flight
+// localhost fetch during a host network-interface change (e.g. VPN connect, Wi-Fi switch, or
+// Docker bridge teardown -> Chromium `net::ERR_NETWORK_CHANGED`). Mutating tools (`write`,
+// `exec`, `destroy`, `power`, mutating `admin`) are intentionally excluded because a dropped
+// fetch does not prove the local door did not already receive and start the call.
+const SAFE_RETRY_TOOLS = new Set([
+  'agent.list',
+  'audit.tail',
+  'config.list',
+  'config.read',
+  'device.endpoint',
+  'device.list',
+  'device.roles',
+  'ext.list',
+  'ext.show',
+  'fav.list',
+  'fleet.discover',
+  'fleet.list',
+  'fleet.ping',
+  'fs.find',
+  'fs.grep',
+  'fs.hash',
+  'fs.list',
+  'fs.manifest',
+  'fs.read',
+  'fs.stat',
+  'fs.tags',
+  'fs.thumb',
+  'job.list',
+  'job.logs',
+  'job.status',
+  'job.wait',
+  'meta.doctor',
+  'meta.version',
+  'meta.whoami',
+  'power.status',
+  'proj.discover',
+  'proj.list',
+  'proj.status',
+  'svc.list',
+  'svc.logs',
+  'svc.status',
+  'sys.info',
+  'sys.procs',
+  'token.list',
+  'update.list',
+  'update.read',
+]);
+
+function makeAbortError() {
+  const err = new Error('The request was aborted.');
+  err.name = 'AbortError';
+  return err;
+}
+
+function isTransientFetchError(err, signal) {
+  if (signal?.aborted || !err || err.name === 'AbortError') return false;
+  if (err instanceof TypeError) return true;
+  const msg = typeof err.message === 'string' ? err.message : '';
+  return /err_network_changed|network.?changed|failed to fetch|load failed|networkerror/i.test(msg);
+}
+
+function waitAbortable(ms, signal) {
+  if (signal?.aborted) return Promise.reject(makeAbortError());
+  if (!Number.isFinite(ms) || ms <= 0) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(makeAbortError());
+    };
+    const timer = setTimeout(() => {
+      if (signal) signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
 
 function toError(body, status) {
   if (body && typeof body === 'object' && typeof body.message === 'string') {
@@ -44,7 +123,7 @@ function writeToken(token) {
 
 const CAPABILITY_TOOLS = new Set(['meta.version', 'meta.whoami', 'meta.tools']);
 
-export function createHttpLink() {
+export function createHttpLink({ retryDelayMs = DEFAULT_NETWORK_RETRY_DELAY_MS } = {}) {
   let token = readToken();
   let doorSupportsContent = false;
   let localNodeName = '';
@@ -52,6 +131,25 @@ export function createHttpLink() {
   let cachedLocalTools = null;
   const unsupportedContentMachines = new Set();
   const contentSupportListeners = new Set();
+
+  function isSafeToRetryTool(tool) {
+    if (typeof tool !== 'string' || !tool) return false;
+    if (SAFE_RETRY_TOOLS.has(tool)) return true;
+    return Array.isArray(cachedLocalTools) && cachedLocalTools.some((t) => t?.name === tool && t?.effect === 'read');
+  }
+
+  async function fetchOnceOrRetry(url, init, { retry = true } = {}) {
+    const signal = init?.signal;
+    try {
+      return await fetch(url, init);
+    } catch (err) {
+      if (!retry || !isTransientFetchError(err, signal)) {
+        throw err;
+      }
+      await waitAbortable(retryDelayMs, signal);
+      return await fetch(url, init);
+    }
+  }
 
   // Baseline v1 argument schemas used only when inspecting a remote machine over HTTP whose
   // build differs from the HTTP door's own node (since GET /v1/tools only serves the local door).
@@ -152,7 +250,7 @@ export function createHttpLink() {
 
   async function fetchHealth() {
     try {
-      const res = await fetch('/v1/health', {
+      const res = await fetchOnceOrRetry('/v1/health', {
         headers: { Accept: 'application/json' },
       });
       if (!res.ok) return null;
@@ -199,16 +297,20 @@ export function createHttpLink() {
     const wantStream = typeof onEvent === 'function';
     let res;
     try {
-      res = await fetch('/v1/call', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${current}`,
-          'Content-Type': 'application/json',
-          Accept: wantStream ? 'text/event-stream' : 'application/json',
+      res = await fetchOnceOrRetry(
+        '/v1/call',
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${current}`,
+            'Content-Type': 'application/json',
+            Accept: wantStream ? 'text/event-stream' : 'application/json',
+          },
+          body: JSON.stringify(body),
+          signal,
         },
-        body: JSON.stringify(body),
-        signal,
-      });
+        { retry: isSafeToRetryTool(tool) },
+      );
     } catch (err) {
       if (err && err.name === 'AbortError') {
         throw {
@@ -328,7 +430,7 @@ export function createHttpLink() {
     }
     let res;
     try {
-      res = await fetch('/v1/tools?all=1', {
+      res = await fetchOnceOrRetry('/v1/tools?all=1', {
         headers: {
           Authorization: `Bearer ${current}`,
           Accept: 'application/json',
@@ -509,7 +611,7 @@ export function createHttpLink() {
 
     let res;
     try {
-      res = await fetch('/v1/content', {
+      res = await fetchOnceOrRetry('/v1/content', {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${current}`,
