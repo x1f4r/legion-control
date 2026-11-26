@@ -26,7 +26,25 @@ import { MusicPlayer, VideoPlayer } from './player.js';
 
 const TEXT_CHUNK_BYTES = 131072; // 128 KiB
 const MEDIA_RECOVERY_WINDOW_MS = 10_000;
+const HTTP_RESTART_RETRY_DELAYS_MS = [250, 500, 1000];
 const PREVIEW_THUMB_SIZE = 512;
+
+function waitAbortable(ms, signal) {
+  if (signal?.aborted) {
+    return Promise.reject({ code: 'cancelled', message: 'The request was cancelled.' });
+  }
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      if (signal) signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    function onAbort() {
+      window.clearTimeout(timer);
+      reject({ code: 'cancelled', message: 'The request was cancelled.' });
+    }
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
 
 function isLocalMediaUrl(url) {
   return typeof url === 'string' && (url.startsWith('data:') || url.startsWith('blob:'));
@@ -1602,6 +1620,9 @@ export function FilesViewer({
     if (!inspection || activeFileKeyRef.current !== expectedKey || activeMediaUrlRef.current !== expectedUrl) {
       return;
     }
+    if (recoveryRef.current.key === expectedKey && recoveryRef.current.inFlight) {
+      return;
+    }
 
     // On a first failure outside the 10-second loop guard, silently request ONE fresh content
     // address for non-fatal responses (never retry 413/403 or local blob:/data: URLs) so
@@ -1628,7 +1649,23 @@ export function FilesViewer({
 
       recoveryRef.current = { key: expectedKey, lastAttemptAt: now, inFlight: true };
       try {
-        const res = await link.contentUrl({ machine, path, signal });
+        let res = null;
+        for (let attempt = 0; ; attempt += 1) {
+          try {
+            res = await link.contentUrl({ machine, path, signal });
+            break;
+          } catch (mintErr) {
+            const isRestartingDoor =
+              link?.kind === 'http' &&
+              mintErr?.code === 'unreachable' &&
+              mintErr?.status == null &&
+              attempt < HTTP_RESTART_RETRY_DELAYS_MS.length;
+            if (!isRestartingDoor || signal?.aborted || activeFileKeyRef.current !== expectedKey) {
+              throw mintErr;
+            }
+            await waitAbortable(HTTP_RESTART_RETRY_DELAYS_MS[attempt], signal);
+          }
+        }
         if (signal?.aborted || activeFileKeyRef.current !== expectedKey) {
           if (res?.url) revokeContentUrlNow(res.url);
           return;
