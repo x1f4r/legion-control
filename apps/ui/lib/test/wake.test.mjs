@@ -251,3 +251,53 @@ test('immediate wake starts directly in waking state, fires onWakeSent, and form
   const res = await p;
   assert.deepEqual(res, { awake: false, forgotten: true });
 });
+
+test('wake controller pauses polling and tick timers when hidden and resumes with one ping on return', async () => {
+  const clock = createFakeClock();
+  const calls = [];
+  let visible = true;
+  let laptopReachable = false;
+
+  const link = {
+    async call(tool, args) {
+      calls.push({ tool, args });
+      if (tool === 'power.wake') return { machine: args.machine, awake: false, sent_by: 'pi' };
+      if (tool === 'fleet.ping') return { results: [{ machine: 'laptop', reachable: laptopReachable }] };
+      return { ok: true };
+    },
+  };
+
+  const controller = createWakeController({
+    link,
+    clock,
+    isVisible: () => visible,
+    getMachines: () => [
+      { name: 'pi', reachable: true, canWake: false },
+      { name: 'laptop', reachable: laptopReachable, canWake: true },
+    ],
+    getLocalNode: () => 'pi',
+    getAllowedSet: () => new Set(['power.wake', 'fleet.ping']),
+  });
+
+  const p = controller.ensureAwake('laptop', { kind: 'action', immediate: true });
+  await Promise.resolve();
+  assert.equal(calls.filter((c) => c.tool === 'power.wake').length, 1);
+
+  // Hide before any ping fires: advancing 30s makes zero fleet.ping calls.
+  visible = false;
+  controller.onVisibilityChange();
+  await clock.advance(30_000);
+  assert.equal(calls.filter((c) => c.tool === 'fleet.ping').length, 0, 'hidden wake must send zero pings');
+
+  // Return to foreground: runs exactly one immediate ping and catches up elapsed time.
+  laptopReachable = true;
+  visible = true;
+  controller.onVisibilityChange();
+  controller.onVisibilityChange();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(calls.filter((c) => c.tool === 'fleet.ping').length, 1, 'resuming must send exactly one immediate ping');
+  const result = await p;
+  assert.deepEqual(result, { awake: true, woke: true });
+  controller.dispose();
+});

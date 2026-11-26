@@ -951,13 +951,19 @@ test('createAppLink onAppResume listens to native tauri://resumed and deduplicat
   try {
     const link = createAppLink();
     const events = [];
+    const suspends = [];
     const unsub = link.onAppResume((ev) => events.push(ev.source));
+    const unsubSuspend = link.onAppSuspend((ev) => suspends.push(ev.source));
     // Allow async listen() promises to settle.
     await new Promise((r) => setTimeout(r, 0));
 
     assert.ok(handlers.has('tauri://resumed'));
     assert.ok(handlers.has('tauri://suspended'));
     assert.ok(handlers.has('tauri://focus'));
+    assert.ok(handlers.has('legion://window-hidden'));
+    assert.ok(handlers.has('legion://window-shown'));
+    assert.ok(handlers.has('legion://window-visibility'));
+    assert.equal(link.isAppSuspended(), false);
 
     // Focus alone without prior suspend (e.g. startup or desktop focus) never triggers resume.
     handlers.get('tauri://focus')({});
@@ -969,17 +975,45 @@ test('createAppLink onAppResume listens to native tauri://resumed and deduplicat
 
     // Standard iOS/Android sequence: suspended -> resumed -> focus fires once only.
     handlers.get('tauri://suspended')({});
+    assert.equal(link.isAppSuspended(), true);
+    assert.deepEqual(suspends, ['tauri://suspended']);
     handlers.get('tauri://resumed')({});
+    assert.equal(link.isAppSuspended(), false);
     handlers.get('tauri://focus')({});
     assert.deepEqual(events, ['tauri://resumed', 'tauri://resumed']);
 
     // Short iOS inactive -> active without sceneDidEnterBackground: suspended -> focus fires once.
     handlers.get('tauri://suspended')({});
+    assert.equal(link.isAppSuspended(), true);
     handlers.get('tauri://focus')({});
+    assert.equal(link.isAppSuspended(), false);
     assert.deepEqual(events, ['tauri://resumed', 'tauri://resumed', 'tauri://focus']);
+    assert.deepEqual(suspends, ['tauri://suspended', 'tauri://suspended']);
+
+    // Desktop hidden/minimized -> shown/visible pauses and resumes cleanly without duplicate fires.
+    handlers.get('legion://window-hidden')({});
+    assert.equal(link.isAppSuspended(), true);
+    handlers.get('legion://window-visibility')({ payload: false });
+    assert.equal(link.isAppSuspended(), true);
+    handlers.get('legion://window-shown')({});
+    assert.equal(link.isAppSuspended(), false);
+    handlers.get('legion://window-visibility')({ payload: true });
+    assert.equal(link.isAppSuspended(), false);
+    assert.deepEqual(suspends, ['tauri://suspended', 'tauri://suspended', 'legion://window-hidden']);
+    assert.deepEqual(events, ['tauri://resumed', 'tauri://resumed', 'tauri://focus', 'legion://window-shown']);
+
+    // Minimized -> unminimized via legion://window-visibility toggles suspended state cleanly.
+    handlers.get('legion://window-visibility')({ payload: false });
+    assert.equal(link.isAppSuspended(), true);
+    handlers.get('legion://window-visibility')({ payload: true });
+    assert.equal(link.isAppSuspended(), false);
+    assert.equal(suspends.at(-1), 'legion://window-visibility');
+    assert.equal(events.at(-1), 'legion://window-visibility');
 
     unsub();
-    assert.equal(unlistenCount, 3);
+    assert.equal(unlistenCount, 0);
+    unsubSuspend();
+    assert.equal(unlistenCount, 6);
     assert.equal(handlers.size, 0);
   } finally {
     if (prevWindow === undefined) {
@@ -1392,6 +1426,32 @@ test('createForegroundResumeController runs session invalidation on native resum
   await resumePromise;
   assert.equal(slowCtrl.isResuming(), false);
   assert.deepEqual(resumingStates, [true, false]);
+
+  // 5) Browser path (invalidateSessions: null): visibilitychange -> visible followed immediately
+  // by window focus produces exactly ONE refresh, never a burst.
+  let browserVis = 'hidden';
+  let browserClock = 50_000;
+  let browserRefreshes = 0;
+  const browserCtrl = createForegroundResumeController({
+    getVisibilityState: () => browserVis,
+    invalidateSessions: null,
+    onRefresh: () => {
+      browserRefreshes += 1;
+    },
+    dedupeMs: 1500,
+    now: () => browserClock,
+  });
+  await browserCtrl.handleVisibilityChange();
+  assert.equal(browserRefreshes, 0);
+  browserVis = 'visible';
+  assert.equal(await browserCtrl.handleVisibilityChange(), true);
+  assert.equal(browserRefreshes, 1);
+  browserClock += 20;
+  assert.equal(browserCtrl.handleFocus(), false, 'focus right after visibility return must not duplicate refresh');
+  assert.equal(browserRefreshes, 1);
+  browserClock += 2000;
+  assert.equal(browserCtrl.handleFocus(), true, 'focus after dedupe window refreshes once');
+  assert.equal(browserRefreshes, 2);
 });
 
 test('createAppLink onImmersiveChange and debug verifyDesktopImmersive cover both WM full-screen sequences', async () => {
@@ -2311,5 +2371,227 @@ test('createAppLink restorePairing() invokes restore_pairing with existingPrinci
   } finally {
     if (prevWindow === undefined) delete globalThis.window;
     else globalThis.window = prevWindow;
+  }
+});
+
+test('createAppLink exposes nativeAudio only on Android, asks notification permission once on first play, and forwards state events', async () => {
+  const prevWindow = globalThis.window;
+  const prevNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  const calls = [];
+  const listeners = new Map();
+
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { userAgent: 'Mozilla/5.0 (Linux; Android 16; Pixel 10) AppleWebKit/537.36' },
+  });
+  globalThis.window = {
+    location: { origin: 'http://tauri.localhost' },
+    __TAURI__: {
+      core: {
+        invoke(command, payload) {
+          calls.push({ command, payload });
+          if (command === 'audio_request_notification_permission') {
+            return Promise.resolve(false);
+          }
+          if (command === 'audio_state') {
+            return Promise.resolve({ loaded: true, playing: true, path: '/music/01.mp3' });
+          }
+          return Promise.resolve({ ok: true });
+        },
+      },
+      event: {
+        listen(name, handler) {
+          listeners.set(name, handler);
+          return Promise.resolve(() => listeners.delete(name));
+        },
+      },
+    },
+  };
+
+  try {
+    const link = createAppLink();
+    assert.ok(link.nativeAudio, 'Android app link must expose nativeAudio');
+
+    const seen = [];
+    const unsub = link.nativeAudio.onState((st) => seen.push(st));
+    await Promise.resolve();
+    listeners.get('legion://audio-state')?.({ payload: { loaded: true, playing: false, path: '/music/01.mp3' } });
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].path, '/music/01.mp3');
+
+    // Loading paused does not ask notification permission yet.
+    await link.nativeAudio.loadQueue({ machine: 'tower', tracks: [{ path: '/music/01.mp3', name: '01.mp3' }], startIndex: 0, autoPlay: false });
+    assert.equal(calls.filter((c) => c.command === 'audio_request_notification_permission').length, 0);
+
+    // First play asks notification permission once and still sends play even if refused.
+    await link.nativeAudio.command('play');
+    await link.nativeAudio.command('play');
+    assert.equal(calls.filter((c) => c.command === 'audio_request_notification_permission').length, 1);
+    assert.equal(calls.filter((c) => c.command === 'audio_command' && c.payload?.action === 'play').length, 2);
+
+    const st = await link.nativeAudio.getState();
+    assert.equal(st.playing, true);
+    await link.nativeAudio.setModes({ shuffle: true, repeat: 'folder', order: ['/music/01.mp3'] });
+    await link.nativeAudio.dismiss();
+    unsub();
+
+    // Desktop app link omits nativeAudio.
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: { userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36' },
+    });
+    const desktopLink = createAppLink();
+    assert.equal(desktopLink.nativeAudio, undefined);
+  } finally {
+    if (prevWindow === undefined) delete globalThis.window;
+    else globalThis.window = prevWindow;
+    if (prevNavigator) Object.defineProperty(globalThis, 'navigator', prevNavigator);
+    else delete globalThis.navigator;
+  }
+});
+
+test('createAppLink exposes iosAudio when iOS legionAudio handler exists and routes Now Playing & remote commands', () => {
+  const prevWindow = globalThis.window;
+  const prevNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  const posted = [];
+
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15' },
+  });
+  globalThis.window = {
+    location: { origin: 'tauri://localhost' },
+    webkit: {
+      messageHandlers: {
+        legionAudio: {
+          postMessage(msg) {
+            posted.push(msg);
+          },
+        },
+      },
+    },
+    __TAURI__: { core: { invoke: () => Promise.resolve({}) } },
+  };
+
+  try {
+    const link = createAppLink();
+    assert.ok(link.iosAudio, 'iOS app link must expose iosAudio when handler is attached');
+    assert.equal(link.nativeAudio, undefined);
+
+    const received = [];
+    const unsub = link.iosAudio.onRemoteCommand((cmd) => received.push(cmd));
+    link.iosAudio.activateSession();
+    link.iosAudio.updateNowPlaying({ title: 'Track 1', artist: 'Clara', playing: true, canNext: true });
+    link.iosAudio.updatePlaybackState({ elapsed: 12, duration: 60, playing: true, rate: 1, canNext: true });
+    globalThis.window.__LEGION_IOS_AUDIO_DISPATCH__?.({ action: 'next' });
+    globalThis.window.__LEGION_IOS_AUDIO_DISPATCH__?.({ action: 'route_unavailable' });
+    link.iosAudio.clearNowPlaying();
+    unsub();
+
+    assert.deepEqual(
+      posted.map((m) => m.type),
+      ['activate', 'now_playing', 'playback_state', 'clear'],
+    );
+    assert.deepEqual(received, [{ action: 'next' }, { action: 'route_unavailable' }]);
+    assert.equal(globalThis.window.__LEGION_IOS_AUDIO_DISPATCH__, undefined);
+  } finally {
+    if (prevWindow === undefined) delete globalThis.window;
+    else globalThis.window = prevWindow;
+    if (prevNavigator) Object.defineProperty(globalThis, 'navigator', prevNavigator);
+    else delete globalThis.navigator;
+  }
+});
+
+test('createAppLink exposes nativePip only on Android bridge and routes config, enter, ackDismiss, and events', async () => {
+  const prevWindow = globalThis.window;
+  const prevNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  const listeners = new Map();
+  const configs = [];
+  let acked = 0;
+  let enterCount = 0;
+  let supported = true;
+
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { userAgent: 'Mozilla/5.0 (Linux; Android 15; Phone) AppleWebKit/537.36' },
+  });
+  globalThis.window = {
+    addEventListener(name, fn) {
+      if (!listeners.has(name)) listeners.set(name, new Set());
+      listeners.get(name).add(fn);
+    },
+    removeEventListener(name, fn) {
+      listeners.get(name)?.delete(fn);
+    },
+    __LEGION_ANDROID__: {
+      setImmersive: () => Promise.resolve(true),
+      hasPip: () => supported,
+      setPipConfig: (cfg) => configs.push(cfg),
+      enterPip: () => {
+        enterCount += 1;
+        return Promise.resolve(true);
+      },
+      ackPipDismiss: () => {
+        acked += 1;
+      },
+    },
+    __TAURI__: { core: { invoke: () => Promise.resolve({}) } },
+  };
+
+  const dispatch = (name, detail) => {
+    for (const fn of listeners.get(name) || []) {
+      fn({ detail });
+    }
+  };
+
+  try {
+    const link = createAppLink();
+    assert.ok(link.nativePip, 'Android app link must expose nativePip');
+    assert.equal(link.nativePip.hasPip(), true);
+
+    const supportEvents = [];
+    const changeEvents = [];
+    const actionEvents = [];
+    const u1 = link.nativePip.onSupportChange((v) => supportEvents.push(v));
+    const u2 = link.nativePip.onChange((ev) => changeEvents.push(ev));
+    const u3 = link.nativePip.onAction((ev) => actionEvents.push(ev));
+
+    link.nativePip.sync({ active: true, playing: true, width: 1280, height: 720, rect: { left: 0, top: 10, width: 400, height: 225 } });
+    assert.equal(await link.nativePip.enter(), true);
+    link.nativePip.ackDismiss();
+
+    dispatch('legion:pip-support', { supported: false });
+    dispatch('legion:pip-change', { active: true, dismissed: false });
+    dispatch('legion:pip-action', { action: 'seek_fwd_10' });
+    dispatch('legion:pip-change', { active: false, dismissed: true });
+
+    u1();
+    u2();
+    u3();
+
+    assert.equal(configs.length, 1);
+    assert.equal(configs[0].playing, true);
+    assert.equal(enterCount, 1);
+    assert.equal(acked, 1);
+    assert.deepEqual(supportEvents, [false]);
+    assert.deepEqual(changeEvents, [
+      { active: true, dismissed: false },
+      { active: false, dismissed: true },
+    ]);
+    assert.deepEqual(actionEvents, [{ action: 'seek_fwd_10' }]);
+
+    // Desktop link must not expose nativePip.
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: { userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36' },
+    });
+    globalThis.window = { __TAURI__: { core: { invoke: () => Promise.resolve({}) } } };
+    const desktopLink = createAppLink();
+    assert.equal(desktopLink.nativePip, undefined);
+  } finally {
+    if (prevWindow === undefined) delete globalThis.window;
+    else globalThis.window = prevWindow;
+    if (prevNavigator) Object.defineProperty(globalThis, 'navigator', prevNavigator);
+    else delete globalThis.navigator;
   }
 });

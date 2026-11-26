@@ -24,6 +24,7 @@ import {
   isOverviewBusy,
   selectBusyPrograms,
 } from '../lib/machine-monitor.js';
+import { isForegroundVisible, subscribeForegroundVisibility } from '../lib/resume.js';
 import { routeHref, WIDE_MACHINE_TABS } from '../lib/route.js';
 import { describePowerConfirm, unavailableReason } from '../lib/schema.js';
 
@@ -310,6 +311,7 @@ function OverviewTab({
 
     let mounted = true;
     const poller = createOverviewPoller({
+      isVisible: () => isForegroundVisible(link),
       onStaleChange(nextStale) {
         if (mounted) setStale(nextStale);
       },
@@ -351,17 +353,12 @@ function OverviewTab({
     pollerRef.current = poller;
     poller.start({ immediate: true });
 
-    const onVis = () => poller.onVisibilityChange();
-    if (typeof document !== 'undefined') {
-      document.addEventListener('visibilitychange', onVis);
-    }
+    const unsubVis = subscribeForegroundVisibility(link, () => poller.onVisibilityChange());
     return () => {
       mounted = false;
       poller.stop();
       pollerRef.current = null;
-      if (typeof document !== 'undefined') {
-        document.removeEventListener('visibilitychange', onVis);
-      }
+      unsubVis();
     };
   }, [machine.name, machine.reachable, link, capsStore, on]);
 

@@ -21,6 +21,7 @@ import {
 } from '../lib/activity.js';
 import { callWithTimeout, DETAIL_TIMEOUT_MS } from '../lib/fleet.js';
 import { formatBytes } from '../lib/format.js';
+import { isForegroundVisible, subscribeForegroundVisibility } from '../lib/resume.js';
 import { routeHref } from '../lib/route.js';
 
 function targetFor(machineName, nodeName) {
@@ -50,13 +51,35 @@ export function ActivityDetail({
   useEffect(() => {
     let alive = true;
     let timer = null;
+    let inFlight = false;
+    let keepPolling = true;
+    let isTransferJob = false;
+    let pausedWhileHidden = false;
     offsetRef.current = 0;
     setLogText('');
     setStatus(null);
     setError(null);
 
+    const canPollNow = () =>
+      isTransferJob ? !link?.isAppSuspended?.() : isForegroundVisible(link);
+
+    const clearTimer = () => {
+      if (timer !== null) {
+        window.clearTimeout(timer);
+        timer = null;
+      }
+    };
+
     async function poll() {
-      if (!alive) return;
+      if (!alive || inFlight) return;
+      if (!canPollNow()) {
+        pausedWhileHidden = true;
+        clearTimer();
+        return;
+      }
+      inFlight = true;
+      pausedWhileHidden = false;
+      clearTimer();
       try {
         const [st, logs] = await Promise.all([
           link.call('job.status', { id: jobId }, { on }),
@@ -64,6 +87,7 @@ export function ActivityDetail({
         ]);
         if (!alive) return;
         setStatus(st);
+        isTransferJob = st?.kind === 'transfer';
         if (onObserveTransferJobs && st) {
           onObserveTransferJobs([{ ...st, machine: machineName }]);
         }
@@ -73,22 +97,41 @@ export function ActivityDetail({
         if (typeof logs?.next_offset === 'number') {
           offsetRef.current = logs.next_offset;
         }
-        if (st.state === 'starting' || st.state === 'running') {
-          timer = window.setTimeout(poll, 700);
+        keepPolling = st.state === 'starting' || st.state === 'running';
+        if (keepPolling) {
+          if (canPollNow()) {
+            timer = window.setTimeout(poll, 700);
+          } else {
+            pausedWhileHidden = true;
+          }
         }
       } catch (err) {
         if (alive) setError(err);
+      } finally {
+        inFlight = false;
       }
     }
+
+    const unsubVis = subscribeForegroundVisibility(link, () => {
+      if (!alive || !keepPolling) return;
+      if (!canPollNow()) {
+        pausedWhileHidden = true;
+        clearTimer();
+      } else if (pausedWhileHidden) {
+        pausedWhileHidden = false;
+        poll();
+      }
+    });
 
     pollRef.current = poll;
     poll();
     return () => {
       alive = false;
       pollRef.current = null;
-      if (timer) window.clearTimeout(timer);
+      unsubVis();
+      clearTimer();
     };
-  }, [machineName, jobId, onObserveTransferJobs]);
+  }, [machineName, jobId, link, on, onObserveTransferJobs]);
 
   useEffect(() => {
     if (typeof onRegisterRefresh !== 'function') return undefined;
@@ -612,11 +655,40 @@ export function ActivityView({
 
   useEffect(() => {
     if (!hasRunningTransferJob) return undefined;
-    const timer = window.setInterval(() => {
-      if (document.visibilityState === 'visible') load(targetNames);
-    }, 1000);
-    return () => window.clearInterval(timer);
-  }, [hasRunningTransferJob, targetKey]);
+    let timer = null;
+    const stopTimer = () => {
+      if (timer !== null) {
+        window.clearInterval(timer);
+        timer = null;
+      }
+    };
+    const startTimer = () => {
+      if (timer === null && !link.isAppSuspended?.()) {
+        timer = window.setInterval(() => {
+          if (link.isAppSuspended?.()) {
+            stopTimer();
+            return;
+          }
+          load(targetNames);
+        }, 1000);
+      }
+    };
+    startTimer();
+    const unsubSuspend =
+      typeof link?.onAppSuspend === 'function' ? link.onAppSuspend(() => stopTimer()) : () => {};
+    const unsubResume =
+      typeof link?.onAppResume === 'function'
+        ? link.onAppResume(() => {
+            startTimer();
+            load(targetNames);
+          })
+        : () => {};
+    return () => {
+      unsubSuspend();
+      unsubResume();
+      stopTimer();
+    };
+  }, [hasRunningTransferJob, targetKey, link]);
 
   async function handleStopJob(job) {
     setError(null);

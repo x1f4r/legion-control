@@ -13,6 +13,7 @@ import {
 } from '../lib/activity.js';
 import { formatRelativeTime } from '../lib/format.js';
 import { createPairingController } from '../lib/pairing.js';
+import { isForegroundVisible, subscribeForegroundVisibility } from '../lib/resume.js';
 import { routeHref } from '../lib/route.js';
 import { describeRoleAccess } from '../lib/schema.js';
 import {
@@ -685,10 +686,39 @@ function InviteDeviceSubpage({
       }
     }
 
-    const timer = window.setInterval(poll, intervalMs);
+    let timer = null;
+    const stopTimer = () => {
+      if (timer !== null) {
+        window.clearInterval(timer);
+        timer = null;
+      }
+    };
+    const startTimer = () => {
+      if (timer === null && alive && isForegroundVisible(link)) {
+        timer = window.setInterval(() => {
+          if (!isForegroundVisible(link)) {
+            stopTimer();
+            return;
+          }
+          poll();
+        }, intervalMs);
+      }
+    };
+
+    startTimer();
+    const unsubVis = subscribeForegroundVisibility(link, ({ visible }) => {
+      if (!alive) return;
+      if (!visible) {
+        stopTimer();
+      } else {
+        startTimer();
+        poll();
+      }
+    });
     return () => {
       alive = false;
-      window.clearInterval(timer);
+      unsubVis();
+      stopTimer();
     };
   }, [inviteRes, canListDevices, targetNode, pairedDelivery, link, onDevicePaired]);
 

@@ -38,7 +38,12 @@ import {
   PENDING_LOCAL_MACHINE_NAME,
 } from './lib/local-machine.js';
 import { createPairingController } from './lib/pairing.js';
-import { createForegroundResumeController } from './lib/resume.js';
+import { createMusicController } from './lib/music-controller.js';
+import {
+  createForegroundResumeController,
+  isForegroundVisible,
+  subscribeForegroundVisibility,
+} from './lib/resume.js';
 import { createThumbCache } from './lib/thumb-cache.js';
 import {
   classifyHorizontalSwipe,
@@ -73,8 +78,10 @@ import { ActionsView } from './views/actions.js';
 import { ActivityView } from './views/activity.js';
 import { Notice, Sheet, WakeSheet } from './views/common.js';
 import { FilesDock, FilesView } from './views/files.js';
+import { FilesViewer } from './views/files-viewer.js';
 import { CommandComposer } from './views/machine.js';
 import { MachinesView } from './views/machines.js';
+import { MiniPlayer } from './views/music-mini.js';
 import { ScrollContainer } from './views/scroll-container.js';
 import { SettingsView } from './views/settings.js';
 import { StartView } from './views/start.js';
@@ -309,6 +316,20 @@ function App() {
   const thumbCache = useMemo(() => createThumbCache({ maxEntries: 180, storage: null }), []);
   const capsStore = useMemo(() => createCapabilitiesStore(link), [link]);
   const folderChanges = useMemo(() => createFolderChangesStore(), []);
+  const musicController = useMemo(
+    () => createMusicController({ link, capsStore, thumbCache }),
+    [link, capsStore, thumbCache],
+  );
+  const [musicState, setMusicState] = useState(() => musicController.getState());
+  const [musicOverlayOpen, setMusicOverlayOpen] = useState(false);
+  const [musicTransitionFromRect, setMusicTransitionFromRect] = useState(null);
+  const musicOverlayHistoryRef = useRef(false);
+  const prevMusicTrackRef = useRef({ machine: null, path: null });
+  useEffect(() => {
+    setMusicState(musicController.getState());
+    return musicController.subscribe(setMusicState);
+  }, [musicController]);
+  useEffect(() => () => musicController.dispose(), [musicController]);
   useEffect(() => () => capsStore.dispose(), [capsStore]);
   useEffect(() => () => folderChanges.dispose(), [folderChanges]);
 
@@ -926,6 +947,11 @@ function App() {
         setConfirmRequest(null);
         return;
       }
+      if (musicOverlayHistoryRef.current && !st?.legionMusicOverlay) {
+        musicOverlayHistoryRef.current = false;
+        setMusicOverlayOpen(false);
+        return;
+      }
       if (filesSheetHistoryRef.current && !st?.legionFilesSheet) {
         filesSheetHistoryRef.current = false;
         setFilesSheet(null);
@@ -1123,6 +1149,8 @@ function App() {
       folderChanges.renameMachine(PENDING_LOCAL_MACHINE_NAME, realName);
       thumbCache.renameMachine(LOCAL_PIPE_CONNECTION, realName);
       thumbCache.renameMachine(PENDING_LOCAL_MACHINE_NAME, realName);
+      musicController.renameMachine(LOCAL_PIPE_CONNECTION, realName);
+      musicController.renameMachine(PENDING_LOCAL_MACHINE_NAME, realName);
 
       const cur = routeRef.current;
       if (cur) {
@@ -1530,19 +1558,40 @@ function App() {
     };
   }, [link]);
 
-  // Trigger periodic (6h) update checks while the app is open and visible, and retry sooner (5m)
-  // after a transient check or download error.
+  // Trigger periodic (6h) update checks only while the app is open and visible; pause timers
+  // while hidden/suspended (returning to foreground checks once via resumeController when due).
   useEffect(() => {
     if (!linkState?.ready || typeof link.checkUpdates !== 'function') return;
 
-    const periodicTimer = window.setInterval(() => {
-      if (document.visibilityState === 'visible') {
-        checkUpdatesQuietly();
+    let periodicTimer = null;
+    const stopPeriodic = () => {
+      if (periodicTimer !== null) {
+        window.clearInterval(periodicTimer);
+        periodicTimer = null;
       }
-    }, PERIODIC_CHECK_INTERVAL_MS);
+    };
+    const syncPeriodic = () => {
+      if (isForegroundVisible(link)) {
+        if (periodicTimer === null) {
+          periodicTimer = window.setInterval(() => {
+            if (isForegroundVisible(link)) {
+              checkUpdatesQuietly();
+            } else {
+              stopPeriodic();
+            }
+          }, PERIODIC_CHECK_INTERVAL_MS);
+        }
+      } else {
+        stopPeriodic();
+      }
+    };
+
+    syncPeriodic();
+    const unsubVis = subscribeForegroundVisibility(link, syncPeriodic);
 
     return () => {
-      window.clearInterval(periodicTimer);
+      unsubVis();
+      stopPeriodic();
     };
   }, [link, linkState?.ready, checkUpdatesQuietly]);
 
@@ -1555,13 +1604,32 @@ function App() {
     ) {
       return;
     }
-    const retryTimer = window.setTimeout(() => {
-      if (document.visibilityState === 'visible') {
-        checkUpdatesQuietly();
+    let retryTimer = null;
+    const stopRetry = () => {
+      if (retryTimer !== null) {
+        window.clearTimeout(retryTimer);
+        retryTimer = null;
       }
-    }, ERROR_RETRY_INTERVAL_MS);
+    };
+    const syncRetry = () => {
+      if (isForegroundVisible(link)) {
+        if (retryTimer === null) {
+          retryTimer = window.setTimeout(() => {
+            retryTimer = null;
+            if (isForegroundVisible(link)) {
+              checkUpdatesQuietly();
+            }
+          }, ERROR_RETRY_INTERVAL_MS);
+        }
+      } else {
+        stopRetry();
+      }
+    };
+    syncRetry();
+    const unsubVis = subscribeForegroundVisibility(link, syncRetry);
     return () => {
-      window.clearTimeout(retryTimer);
+      unsubVis();
+      stopRetry();
     };
   }, [link, linkState?.ready, updateState?.phase, updateState?.failed_update, updateState?.last_checked_at, checkUpdatesQuietly]);
 
@@ -1653,17 +1721,46 @@ function App() {
     };
   }, [link, hydrate]);
 
-  // Poll on the user's configured interval while visible and refresh on resume/focus.
+  // Poll on the user's configured interval only while visible; stop timers when hidden/suspended
+  // and fire one immediate deduplicated refresh on return (never a burst).
   useEffect(() => {
     if (!linkState?.ready || !nodeInfo) return;
 
+    const checkVisible = () => isForegroundVisible(link);
+    let timer = null;
+
+    const stopPollTimer = () => {
+      if (timer !== null) {
+        window.clearInterval(timer);
+        timer = null;
+      }
+    };
+
+    const restartPollTimer = () => {
+      stopPollTimer();
+      if (settings.refreshSeconds > 0 && checkVisible()) {
+        timer = window.setInterval(() => {
+          if (!checkVisible()) {
+            stopPollTimer();
+            return;
+          }
+          if (!resumeController.isResuming()) {
+            resumeController.recordRefresh();
+            refreshFleet(nodeInfo, { background: true });
+          }
+        }, settings.refreshSeconds * 1000);
+      }
+    };
+
     const resumeController = createForegroundResumeController({
+      getVisibilityState: () => (checkVisible() ? 'visible' : 'hidden'),
       invalidateSessions:
         typeof link.invalidateSessions === 'function' ? () => link.invalidateSessions() : null,
       onResumingChange: (active) => {
         resumingRef.current = active;
       },
       onBackground: () => {
+        stopPollTimer();
         if (
           typeof link.maybeAutoInstall === 'function' &&
           isSafeForAutoInstall({
@@ -1690,6 +1787,7 @@ function App() {
       },
       onRefresh: () => {
         refreshFleet(nodeInfo, { background: true });
+        restartPollTimer();
       },
       onCheckUpdates: () => {
         if (
@@ -1703,6 +1801,7 @@ function App() {
     });
 
     const onVisibilityChange = () => {
+      if (!checkVisible()) stopPollTimer();
       resumeController.handleVisibilityChange().catch(() => {});
     };
 
@@ -1713,32 +1812,29 @@ function App() {
           })
         : () => {};
 
+    const unsubNativeSuspend =
+      typeof link.onAppSuspend === 'function'
+        ? link.onAppSuspend(() => {
+            stopPollTimer();
+            resumeController.handleVisibilityChange().catch(() => {});
+          })
+        : () => {};
+
     const onFocus = () => {
-      if (
-        document.visibilityState === 'visible' &&
-        !resumeController.isHidden() &&
-        !resumeController.isResuming() &&
-        settings.refreshSeconds > 0
-      ) {
-        refreshFleet(nodeInfo, { background: true });
+      if (settings.refreshSeconds > 0 && checkVisible()) {
+        resumeController.handleFocus();
       }
     };
 
-    const timer =
-      settings.refreshSeconds > 0
-        ? window.setInterval(() => {
-            if (document.visibilityState === 'visible' && !resumeController.isResuming()) {
-              refreshFleet(nodeInfo, { background: true });
-            }
-          }, settings.refreshSeconds * 1000)
-        : null;
+    restartPollTimer();
 
     window.addEventListener('focus', onFocus);
     document.addEventListener('visibilitychange', onVisibilityChange);
     return () => {
-      if (timer !== null) window.clearInterval(timer);
+      stopPollTimer();
       resumingRef.current = false;
       unsubNativeResume();
+      unsubNativeSuspend();
       window.removeEventListener('focus', onFocus);
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
@@ -1877,6 +1973,7 @@ function App() {
     const ctrl = createWakeController({
       link,
       clock: customClock,
+      isVisible: () => isForegroundVisible(link),
       getMachines: () => snapshotRef.current?.machines || [],
       getLocalNode: () => nodeInfoRef.current?.node || null,
       getAllowedSet: () => allowedSetRef.current,
@@ -1922,12 +2019,14 @@ function App() {
     setDefaultWakeController(wakeController);
     setWakeUiState(wakeController.getState());
     const unsub = wakeController.subscribe((st) => setWakeUiState(st));
+    const unsubVis = subscribeForegroundVisibility(link, () => wakeController.onVisibilityChange());
     return () => {
+      unsubVis();
       unsub();
       wakeController.dispose();
       setDefaultWakeController(null);
     };
-  }, [wakeController]);
+  }, [wakeController, link]);
 
   const ensureAwakeMachine = useCallback(
     (machine, options) => wakeController.ensureAwake(machine, options),
@@ -2887,15 +2986,87 @@ function App() {
     `;
   }
 
+  const openMusicOverlay = useCallback((fromRect = null) => {
+    if (!musicController.getState().loaded) return;
+    setMusicTransitionFromRect(fromRect || null);
+    if (!musicOverlayHistoryRef.current) {
+      window.history.pushState({ legionMusicOverlay: true }, '');
+      musicOverlayHistoryRef.current = true;
+    }
+    setMusicOverlayOpen(true);
+  }, [musicController]);
+
+  const closeMusicOverlay = useCallback(() => {
+    setMusicOverlayOpen(false);
+    setMusicTransitionFromRect(null);
+    if (musicOverlayHistoryRef.current) {
+      musicOverlayHistoryRef.current = false;
+      window.history.back();
+    }
+  }, []);
+
+  const clearMusicTransitionRect = useCallback(() => {
+    setMusicTransitionFromRect(null);
+  }, []);
+
+  // Close the overlay if playback is dismissed (e.g. 10-minute pause timeout or native stop)
+  // or if a route viewer opens over it.
+  useEffect(() => {
+    if (musicOverlayOpen && (!musicState.loaded || route.viewer)) {
+      closeMusicOverlay();
+    }
+  }, [musicOverlayOpen, musicState.loaded, route.viewer, closeMusicOverlay]);
+
+  // Android notification tap asks the page to open the active song's screen.
+  useEffect(() => {
+    const onOpenMusic = () => {
+      if (musicController.getState().loaded && !routeRef.current?.viewer) {
+        openMusicOverlay(null);
+      }
+    };
+    window.addEventListener('legion:open-music-player', onOpenMusic);
+    return () => window.removeEventListener('legion:open-music-player', onOpenMusic);
+  }, [musicController, openMusicOverlay]);
+
+  // Keep route.viewer in sync when music auto-advances or changes via MediaSession/notification
+  // while the song's screen is currently open from a Files route.
+  useEffect(() => {
+    const prev = prevMusicTrackRef.current;
+    const nextMachine = musicState.loaded ? musicState.machine : null;
+    const nextPath = musicState.loaded ? musicState.path : null;
+    prevMusicTrackRef.current = { machine: nextMachine, path: nextPath };
+
+    if (!nextMachine || !nextPath) return;
+    if (prev.machine === nextMachine && prev.path === nextPath) return;
+    const cur = routeRef.current;
+    if (
+      cur?.viewer &&
+      prev.machine &&
+      prev.path &&
+      cur.viewer.machine === prev.machine &&
+      cur.viewer.path === prev.path &&
+      cur.viewer.machine === nextMachine &&
+      cur.viewer.path !== nextPath
+    ) {
+      const href = routeHref({ ...cur, viewer: { machine: nextMachine, path: nextPath } });
+      window.history.replaceState(window.history.state, '', href);
+      window.dispatchEvent(new HashChangeEvent('hashchange'));
+    }
+  }, [musicState.loaded, musicState.machine, musicState.path]);
+
   const hideToastOnRoute =
     route.section === 'activity' &&
     Boolean(toast?.suppressOnActivity || toast?.actionHref === '#/activity');
   const visibleToast = hideToastOnRoute ? null : toast;
+  const showMiniPlayer = Boolean(
+    linkState?.ready && !booting && !pairingOpen && musicState.loaded && !musicOverlayOpen && !route.viewer,
+  );
 
   const appClasses = [
     'app',
     !showBottomNav ? 'standalone' : '',
     hasDock ? 'docked' : '',
+    showMiniPlayer ? 'has-mini' : '',
     isWideSplitScreen ? 'split-screen' : '',
   ]
     .filter(Boolean)
@@ -3057,6 +3228,8 @@ function App() {
                             settings=${settings}
                             deviceNoun=${deviceNoun}
                             thumbCache=${thumbCache}
+                            musicController=${musicController}
+                            musicState=${musicState}
                             filesState=${{
                               sortPref: filesSortPref,
                               kindFilter: filesKindFilter,
@@ -3163,6 +3336,7 @@ function App() {
                                         persistentCache.clear();
                                         capsStore.invalidate();
                                         folderChanges.clearCache();
+                                        musicController.dismiss();
                                         setSnapshot(null);
                                         setTools([]);
                                         const next = await link.selectNode(node);
@@ -3189,9 +3363,87 @@ function App() {
                             `}
                 <//>
                 ${renderDock()}
+                ${showMiniPlayer
+                  ? html`
+                      <${MiniPlayer}
+                        musicState=${musicState}
+                        musicController=${musicController}
+                        onOpenScreen=${openMusicOverlay}
+                      />
+                    `
+                  : null}
                 ${renderNav()}
               </div>
             `}
+      ${!musicState.usingNative
+        ? html`
+            <audio
+              class="app-audio-host"
+              data-legion-music-audio="true"
+              ref=${musicController.bindAudioElement}
+              preload="metadata"
+              aria-hidden="true"
+              onLoadedMetadata=${musicController.audioHandlers.onLoadedMetadata}
+              onPlay=${musicController.audioHandlers.onPlay}
+              onPlaying=${musicController.audioHandlers.onPlaying}
+              onPause=${musicController.audioHandlers.onPause}
+              onWaiting=${musicController.audioHandlers.onWaiting}
+              onCanPlay=${musicController.audioHandlers.onCanPlay}
+              onSeeked=${musicController.audioHandlers.onSeeked}
+              onTimeUpdate=${musicController.audioHandlers.onTimeUpdate}
+              onProgress=${musicController.audioHandlers.onProgress}
+              onEnded=${musicController.audioHandlers.onEnded}
+              onError=${musicController.audioHandlers.onError}
+            />
+          `
+        : null}
+      ${musicOverlayOpen && musicState.loaded && !route.viewer
+        ? html`
+            <${FilesViewer}
+              machine=${musicState.machine}
+              path=${musicState.path}
+              entry=${musicState.entry}
+              siblings=${musicState.siblings}
+              link=${link}
+              caps=${musicState.caps}
+              capsStore=${capsStore}
+              thumbCache=${thumbCache}
+              musicController=${musicController}
+              musicState=${musicState}
+              transitionFromRect=${musicTransitionFromRect}
+              onConsumeTransitionRect=${clearMusicTransitionRect}
+              onRegisterPopState=${registerPopStateInterceptor}
+              deviceNoun=${deviceNoun}
+              technical=${Boolean(settings.technical)}
+              onClose=${closeMusicOverlay}
+              onDownload=${
+                typeof link?.download === 'function'
+                  ? (item) =>
+                      link.download({
+                        machine: musicState.machine,
+                        path: item.path,
+                        name: item.name,
+                        size: item.size,
+                        mime: item.mime,
+                      })
+                  : null
+              }
+              onOpenExternally=${
+                typeof link?.openExternally === 'function'
+                  ? (item) =>
+                      link.openExternally({
+                        machine: musicState.machine,
+                        path: item.path,
+                        name: item.name,
+                        size: item.size,
+                        mime: item.mime,
+                      })
+                  : null
+              }
+              onToast=${showToast}
+            />
+          `
+        : null}
       ${whatIsNewOpen && updateState?.just_updated
         ? html`
             <${Sheet}

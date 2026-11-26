@@ -157,6 +157,10 @@ export function FilesViewer({
   capsStore = null,
   caps,
   thumbCache = null,
+  musicController = null,
+  musicState = null,
+  transitionFromRect = null,
+  onConsumeTransitionRect = null,
   onRegisterPopState = null,
   deviceNoun = 'phone',
   technical = false,
@@ -185,7 +189,7 @@ export function FilesViewer({
 
   const [chromeHidden, setChromeHidden] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
-  const [musicPlaybackRate, setMusicPlaybackRate] = useState(1);
+  const [pipActive, setPipActive] = useState(false);
   const [videoZoomAction, setVideoZoomAction] = useState(null);
   const [fullscreenState, setFullscreenState] = useState({
     active: false,
@@ -223,6 +227,7 @@ export function FilesViewer({
   const category = isBinaryTs ? 'video' : rawCategory;
   const skipMediaPlayer =
     !isBinaryTs && (category === 'video' || category === 'audio') && tableMode === 'fallback';
+  const managedAudio = Boolean(category === 'audio' && !skipMediaPlayer && musicController);
   const preferThumbPreview =
     category === 'image' &&
     tableMode === 'thumb_or_fallback' &&
@@ -243,7 +248,10 @@ export function FilesViewer({
         };
   const mediaUrl = activeMedia.url;
   const mediaLoading = activeMedia.loading;
-  const mediaError = activeMedia.error;
+  const activeMusicMatches = Boolean(
+    managedAudio && musicState?.loaded && musicState.machine === machine && musicState.path === path,
+  );
+  const mediaError = managedAudio ? (activeMusicMatches ? musicState.mediaError : null) : activeMedia.error;
 
   const activeText =
     textState.key === fileKey
@@ -294,6 +302,7 @@ export function FilesViewer({
   const pendingResumeRef = useRef(null);
   const recoveryRef = useRef({ key: fileKey, lastAttemptAt: 0, inFlight: false });
   const windowHiddenPauseRef = useRef(null);
+  const endedRevokedRef = useRef(null);
   const prevHasContentRef = useRef(hasContentUrl);
 
   // Gesture state for picture zoom/pan/swipe.
@@ -332,24 +341,28 @@ export function FilesViewer({
   }
 
   function revokeContentUrlNow(url) {
-    if (!url || typeof link?.revokeContentUrl !== 'function') return;
+    if (!url || typeof link?.revokeContentUrl !== 'function') return Promise.resolve();
     if (mintedUrlRef.current === url) {
       mintedUrlRef.current = null;
     }
     try {
       const res = link.revokeContentUrl(url);
-      if (res && typeof res.catch === 'function') res.catch(() => {});
+      if (res && typeof res.catch === 'function') {
+        return res.catch(() => {});
+      }
     } catch {
       // Best-effort ticket cleanup when closing or replacing a viewer address.
     }
+    return Promise.resolve();
   }
 
   function revokeActiveMintedUrl() {
     const url = mintedUrlRef.current;
     if (url) {
       mintedUrlRef.current = null;
-      revokeContentUrlNow(url);
+      return revokeContentUrlNow(url);
     }
+    return Promise.resolve();
   }
 
   useEffect(() => {
@@ -401,8 +414,22 @@ export function FilesViewer({
       abortRef.current.abort();
       abortRef.current = null;
     }
-    stopMediaElements();
-    revokeActiveMintedUrl();
+    if (
+      typeof document !== 'undefined' &&
+      videoRef.current &&
+      document.pictureInPictureElement === videoRef.current &&
+      typeof document.exitPictureInPicture === 'function'
+    ) {
+      try {
+        await document.exitPictureInPicture();
+      } catch {
+        // Ignore PiP exit errors on close.
+      }
+    }
+    if (!managedAudio) {
+      stopMediaElements();
+      revokeActiveMintedUrl();
+    }
     if (fullscreenController.getState().active) {
       await fullscreenController.leave();
     }
@@ -887,8 +914,58 @@ export function FilesViewer({
     }
   }, [hasContentUrl, fileKey]);
 
+  // Delegate playable audio tracks to the single app-wide music controller so closing the
+  // song's screen never stops playback and opening the same song resumes in place.
+  const siblingsRef = useRef(siblings);
+  siblingsRef.current = siblings;
+  const entryRef = useRef(effectiveEntry);
+  entryRef.current = effectiveEntry;
+  const capsRef = useRef(caps);
+  capsRef.current = caps;
+  useLayoutEffect(() => {
+    if (!managedAudio || !musicController) return;
+    musicController.openTrack({
+      machine,
+      path,
+      entry: entryRef.current,
+      siblings: siblingsRef.current,
+      caps: capsRef.current,
+    });
+  }, [
+    managedAudio,
+    musicController,
+    machine,
+    path,
+    caps?.known,
+    caps?.hasContentUrl,
+    caps?.hasTags,
+    caps?.hasAudioThumb,
+  ]);
+
+  // Once capabilities have resolved for the active file, keep them latched across transient
+  // `capsStore.invalidate()` refreshes (such as expanding Android Picture-in-Picture or returning
+  // to the foreground) so a playing video or open viewer is never torn down and restarted at 0:00.
+  const latchedCapsRef = useRef(null);
+  if (latchedCapsRef.current?.key !== fileKey) {
+    latchedCapsRef.current = null;
+  }
+  if (caps && caps.known !== false) {
+    latchedCapsRef.current = {
+      key: fileKey,
+      known: true,
+      hasContentUrl: Boolean(caps.hasContentUrl),
+      hasThumb: Boolean(caps.hasThumb),
+      hasRead: Boolean(caps.hasRead),
+    };
+  }
+  const loadCaps =
+    caps && caps.known === false && latchedCapsRef.current?.key === fileKey
+      ? latchedCapsRef.current
+      : caps;
+
   // Load media URL, machine preview, or text content whenever machine/path/mode changes.
   useEffect(() => {
+    if (managedAudio) return undefined;
     if (abortRef.current) abortRef.current.abort();
     const ctrl = new AbortController();
     abortRef.current = ctrl;
@@ -899,6 +976,8 @@ export function FilesViewer({
     pendingResumeRef.current = null;
     recoveryRef.current = { key: targetKey, lastAttemptAt: 0, inFlight: false };
     windowHiddenPauseRef.current = null;
+    endedRevokedRef.current = null;
+    setPipActive(false);
     setMediaState({
       key: targetKey,
       url: null,
@@ -924,7 +1003,7 @@ export function FilesViewer({
         ? capsStore.call(tool, args, { ...opts, on: machine }).then((r) => r.value)
         : link.call(tool, args, { ...opts, on: machine });
 
-    if (caps && caps.known === false) {
+    if (loadCaps && loadCaps.known === false) {
       if (category === 'text' || isExtensionlessProbe) {
         setTextState((prev) => ({ ...prev, key: targetKey, loading: true, error: null }));
       } else if (category === 'image' || category === 'video' || category === 'audio') {
@@ -1182,6 +1261,7 @@ export function FilesViewer({
       revokeActiveMintedUrl();
     };
   }, [
+    managedAudio,
     machine,
     path,
     category,
@@ -1189,10 +1269,10 @@ export function FilesViewer({
     skipMediaPlayer,
     preferThumbPreview,
     retryNonce,
-    caps?.known,
-    caps?.hasContentUrl,
-    caps?.hasThumb,
-    caps?.hasRead,
+    loadCaps?.known,
+    loadCaps?.hasContentUrl,
+    loadCaps?.hasThumb,
+    loadCaps?.hasRead,
     capsStore,
   ]);
 
@@ -1313,6 +1393,10 @@ export function FilesViewer({
   }
 
   function handleRetryMedia() {
+    if (managedAudio && musicController) {
+      musicController.retry();
+      return;
+    }
     recoveryRef.current = { key: fileKey, lastAttemptAt: 0, inFlight: false };
     pendingResumeRef.current = null;
     setRetryNonce((n) => n + 1);
@@ -1332,6 +1416,9 @@ export function FilesViewer({
 
   function noteMediaPlay(expectedKey, el) {
     if (!el || activeFileKeyRef.current !== expectedKey) return;
+    if (category === 'video') {
+      musicController?.pause?.();
+    }
     if (playbackRef.current.key !== expectedKey) {
       playbackRef.current = { key: expectedKey, time: el.currentTime || 0, wantPlay: true };
     } else {
@@ -1487,44 +1574,21 @@ export function FilesViewer({
     }
   }
 
-  function handleBeforeResumePlay(kind, expectedKey, expectedUrl, el) {
-    const hidden = windowHiddenPauseRef.current;
-    if (!hidden || hidden.key !== expectedKey || hidden.url !== expectedUrl) {
-      return false;
+  function handlePipActiveChange(active) {
+    const next = Boolean(active);
+    setPipActive(next);
+    if (next) {
+      setMoreOpen(false);
     }
-    if (hidden.refreshInFlight) return true;
+  }
 
-    const brokenAfterHide =
-      hidden.teardownDetected || Boolean(el?.error) || el?.networkState === 3;
-    const canRefresh = Boolean(
-      !isLocalMediaUrl(expectedUrl) &&
-        caps?.hasContentUrl &&
-        typeof link?.contentUrl === 'function',
-    );
-    const savedTime =
-      el && typeof el.currentTime === 'number' && Number.isFinite(el.currentTime) && el.currentTime > 0
-        ? el.currentTime
-        : hidden.time > 0
-          ? hidden.time
-          : playbackRef.current.key === expectedKey
-            ? playbackRef.current.time
-            : 0;
-    if (!brokenAfterHide || !canRefresh) {
-      windowHiddenPauseRef.current = null;
-      playbackRef.current = { key: expectedKey, time: savedTime, wantPlay: true };
-      return false;
-    }
-
-    hidden.refreshInFlight = true;
-
+  function mintFreshMediaUrlForResume(expectedKey, expectedUrl, { time = 0, play = true, clearRef = null } = {}) {
     const signal = abortRef.current?.signal;
     recoveryRef.current = { key: expectedKey, lastAttemptAt: Date.now(), inFlight: true };
     link
       .contentUrl({ machine, path, signal })
       .then((res) => {
-        if (windowHiddenPauseRef.current === hidden) {
-          windowHiddenPauseRef.current = null;
-        }
+        if (clearRef) clearRef();
         if (signal?.aborted || activeFileKeyRef.current !== expectedKey) {
           if (res?.url) revokeContentUrlNow(res.url);
           return;
@@ -1549,8 +1613,8 @@ export function FilesViewer({
         pendingResumeRef.current = {
           key: expectedKey,
           url: res.url,
-          time: savedTime,
-          play: true,
+          time,
+          play,
         };
         setMediaState({
           key: expectedKey,
@@ -1562,9 +1626,7 @@ export function FilesViewer({
         });
       })
       .catch((err) => {
-        if (windowHiddenPauseRef.current === hidden) {
-          windowHiddenPauseRef.current = null;
-        }
+        if (clearRef) clearRef();
         if (err?.code === 'cancelled' || signal?.aborted || activeFileKeyRef.current !== expectedKey) {
           return;
         }
@@ -1579,12 +1641,156 @@ export function FilesViewer({
           isMachinePreview: false,
         });
       });
+  }
+
+  function handleMediaEnded(expectedKey, expectedUrl) {
+    if (activeFileKeyRef.current !== expectedKey) return;
+    if (!expectedUrl || isLocalMediaUrl(expectedUrl)) return;
+    endedRevokedRef.current = {
+      key: expectedKey,
+      url: expectedUrl,
+      refreshInFlight: false,
+    };
+    revokeContentUrlNow(expectedUrl);
+  }
+
+  function handleMediaPipDismiss(expectedKey, expectedUrl, el) {
+    if (activeFileKeyRef.current !== expectedKey) return Promise.resolve();
+    playbackRef.current.wantPlay = false;
+    if (pendingResumeRef.current) {
+      pendingResumeRef.current = { ...pendingResumeRef.current, play: false };
+    }
+    const savedTime =
+      el && typeof el.currentTime === 'number' && Number.isFinite(el.currentTime) && el.currentTime > 0
+        ? el.currentTime
+        : playbackRef.current.key === expectedKey
+          ? playbackRef.current.time
+          : 0;
+    if (expectedUrl && !isLocalMediaUrl(expectedUrl)) {
+      windowHiddenPauseRef.current = {
+        key: expectedKey,
+        url: expectedUrl,
+        time: savedTime,
+        teardownDetected: true,
+        refreshInFlight: false,
+      };
+      return revokeContentUrlNow(expectedUrl);
+    }
+    return Promise.resolve();
+  }
+
+  function handleBeforeVideoSeek(expectedKey, expectedUrl, targetTime) {
+    const canRefresh = Boolean(
+      expectedUrl &&
+        !isLocalMediaUrl(expectedUrl) &&
+        caps?.hasContentUrl &&
+        typeof link?.contentUrl === 'function',
+    );
+    if (!canRefresh) return false;
+
+    const ended = endedRevokedRef.current;
+    if (ended && ended.key === expectedKey && ended.url === expectedUrl) {
+      if (ended.refreshInFlight) return true;
+      ended.refreshInFlight = true;
+      mintFreshMediaUrlForResume(expectedKey, expectedUrl, {
+        time: Math.max(0, Number.isFinite(targetTime) ? targetTime : 0),
+        play: false,
+        clearRef: () => {
+          if (endedRevokedRef.current === ended) endedRevokedRef.current = null;
+        },
+      });
+      return true;
+    }
+
+    const hidden = windowHiddenPauseRef.current;
+    if (hidden && hidden.key === expectedKey && hidden.url === expectedUrl && hidden.teardownDetected) {
+      if (hidden.refreshInFlight) return true;
+      hidden.refreshInFlight = true;
+      mintFreshMediaUrlForResume(expectedKey, expectedUrl, {
+        time: Math.max(0, Number.isFinite(targetTime) ? targetTime : 0),
+        play: false,
+        clearRef: () => {
+          if (windowHiddenPauseRef.current === hidden) windowHiddenPauseRef.current = null;
+        },
+      });
+      return true;
+    }
+    return false;
+  }
+
+  function handleBeforeResumePlay(kind, expectedKey, expectedUrl, el) {
+    const ended = endedRevokedRef.current;
+    if (ended && ended.key === expectedKey && ended.url === expectedUrl) {
+      if (ended.refreshInFlight) return true;
+      const canRefresh = Boolean(
+        !isLocalMediaUrl(expectedUrl) &&
+          caps?.hasContentUrl &&
+          typeof link?.contentUrl === 'function',
+      );
+      if (!canRefresh) {
+        endedRevokedRef.current = null;
+        return false;
+      }
+      ended.refreshInFlight = true;
+      mintFreshMediaUrlForResume(expectedKey, expectedUrl, {
+        time: 0,
+        play: true,
+        clearRef: () => {
+          if (endedRevokedRef.current === ended) endedRevokedRef.current = null;
+        },
+      });
+      return true;
+    }
+
+    const hidden = windowHiddenPauseRef.current;
+    if (!hidden || hidden.key !== expectedKey || hidden.url !== expectedUrl) {
+      return false;
+    }
+    if (hidden.refreshInFlight) return true;
+
+    const brokenAfterHide =
+      hidden.teardownDetected || Boolean(el?.error) || el?.networkState === 3;
+    const canRefresh = Boolean(
+      !isLocalMediaUrl(expectedUrl) &&
+        caps?.hasContentUrl &&
+        typeof link?.contentUrl === 'function',
+    );
+    const savedTime = el?.ended
+      ? 0
+      : el && typeof el.currentTime === 'number' && Number.isFinite(el.currentTime) && el.currentTime > 0
+        ? el.currentTime
+        : hidden.time > 0
+          ? hidden.time
+          : playbackRef.current.key === expectedKey
+            ? playbackRef.current.time
+            : 0;
+    if (!brokenAfterHide || !canRefresh) {
+      windowHiddenPauseRef.current = null;
+      playbackRef.current = { key: expectedKey, time: savedTime, wantPlay: true };
+      return false;
+    }
+
+    hidden.refreshInFlight = true;
+    mintFreshMediaUrlForResume(expectedKey, expectedUrl, {
+      time: savedTime,
+      play: true,
+      clearRef: () => {
+        if (windowHiddenPauseRef.current === hidden) {
+          windowHiddenPauseRef.current = null;
+        }
+      },
+    });
     return true;
   }
 
   function handleMediaElementError(kind, expectedKey, expectedUrl, el) {
     if (activeFileKeyRef.current !== expectedKey || activeMediaUrlRef.current !== expectedUrl) {
       return false;
+    }
+
+    const ended = endedRevokedRef.current;
+    if (kind !== 'image' && ended && ended.key === expectedKey && ended.url === expectedUrl) {
+      return true;
     }
 
     const hidden = windowHiddenPauseRef.current;
@@ -1594,8 +1800,8 @@ export function FilesViewer({
       hidden.key === expectedKey &&
       hidden.url === expectedUrl
     ) {
-      // Loopback stream aborted while paused for a hidden desktop window: keep the element
-      // paused and resumable without retrying the dead URL until the person presses play again.
+      // Loopback stream aborted while paused for a hidden desktop window or dismissed PiP: keep
+      // the element paused and resumable without retrying the dead URL until the person plays.
       hidden.teardownDetected = true;
       if (el && typeof el.currentTime === 'number' && Number.isFinite(el.currentTime) && el.currentTime > 0) {
         hidden.time = el.currentTime;
@@ -1934,7 +2140,7 @@ export function FilesViewer({
     !skipMediaPlayer &&
     (category === 'image' || category === 'video' || category === 'audio') &&
     !mediaError &&
-    Boolean(mediaUrl);
+    (managedAudio ? Boolean(musicState?.loaded) : Boolean(mediaUrl));
   const stageIsFallbackCard = !isShowingText && !isShowingInlineMedia;
 
   function renderFallbackCard(heading, body, { showRetry = false, hideActions = false, hint = '' } = {}) {
@@ -2481,6 +2687,7 @@ export function FilesViewer({
     'viewer',
     usingCustomPlayer ? 'player-viewer' : '',
     effectiveChromeHidden && !usingCustomPlayer ? 'chrome-hidden' : '',
+    pipActive ? 'pip-active' : '',
   ]
     .filter(Boolean)
     .join(' ');
@@ -2520,12 +2727,19 @@ export function FilesViewer({
               onClose=${handleClose}
               onNavigateSibling=${onNavigateSibling}
               onZoomActionChange=${setVideoZoomAction}
+              onPipActiveChange=${handlePipActiveChange}
               onMediaLoadedMetadata=${(el) => applyPendingResume(expectedKey, expectedUrl, el)}
               onMediaTime=${(el) => noteMediaTime(expectedKey, el)}
               onMediaPlay=${(el) => noteMediaPlay(expectedKey, el)}
               onMediaPause=${(el) => noteMediaPause(expectedKey, el)}
-              onBeforePlay=${(el) =>
-                expectedUrl ? handleBeforeResumePlay('video', expectedKey, expectedUrl, el) : false}
+              onMediaEnded=${(el) => handleMediaEnded(expectedKey, expectedUrl, el)}
+              onMediaPipDismiss=${(el) => handleMediaPipDismiss(expectedKey, expectedUrl, el)}
+              onBeforeSeek=${(target, el) =>
+                expectedUrl ? handleBeforeVideoSeek(expectedKey, expectedUrl, target, el) : false}
+              onBeforePlay=${(el) => {
+                musicController?.pause?.();
+                return expectedUrl ? handleBeforeResumePlay('video', expectedKey, expectedUrl, el) : false;
+              }}
               onMediaError=${(el) =>
                 expectedUrl ? handleMediaElementError('video', expectedKey, expectedUrl, el) : false}
             />
@@ -2534,32 +2748,14 @@ export function FilesViewer({
         : useMusicPlayer
           ? html`
               <${MusicPlayer}
-                machine=${machine}
-                path=${path}
-                entry=${effectiveEntry}
+                musicController=${musicController}
+                musicState=${musicState}
                 name=${name}
-                mediaUrl=${expectedUrl}
-                mediaLoading=${mediaLoading || !expectedUrl}
-                mediaRef=${audioRef}
-                autoPlayNextRef=${musicAutoPlayRef}
-                siblings=${siblings}
-                link=${link}
-                capsStore=${capsStore}
-                caps=${caps}
-                thumbCache=${thumbCache}
                 moreOpen=${moreOpen}
-                playbackRate=${musicPlaybackRate}
+                transitionFromRect=${transitionFromRect}
+                onConsumeTransitionRect=${onConsumeTransitionRect}
                 onOpenMore=${() => setMoreOpen(true)}
                 onClose=${handleClose}
-                onNavigateSibling=${onNavigateSibling}
-                onMediaLoadedMetadata=${(el) => applyPendingResume(expectedKey, expectedUrl, el)}
-                onMediaTime=${(el) => noteMediaTime(expectedKey, el)}
-                onMediaPlay=${(el) => noteMediaPlay(expectedKey, el)}
-                onMediaPause=${(el) => noteMediaPause(expectedKey, el)}
-                onBeforePlay=${(el) =>
-                  expectedUrl ? handleBeforeResumePlay('audio', expectedKey, expectedUrl, el) : false}
-                onMediaError=${(el) =>
-                  expectedUrl ? handleMediaElementError('audio', expectedKey, expectedUrl, el) : false}
               />
               ${openBanner ? html`<div class="player-open-banner-wrap">${openBanner}</div>` : null}
             `
@@ -2675,8 +2871,8 @@ export function FilesViewer({
                             key=${rate}
                             type="button"
                             class="chip-btn"
-                            aria-pressed=${rate === musicPlaybackRate ? 'true' : 'false'}
-                            onClick=${() => setMusicPlaybackRate(rate)}
+                            aria-pressed=${rate === (musicState?.playbackRate ?? 1) ? 'true' : 'false'}
+                            onClick=${() => musicController?.setPlaybackRate?.(rate)}
                           >
                             ${formatSpeed(rate)}
                           </button>

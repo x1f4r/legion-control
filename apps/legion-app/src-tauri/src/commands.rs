@@ -16,6 +16,7 @@ use tauri::Manager;
 use tauri::State;
 use tauri::ipc::Channel;
 
+use crate::audio::SharedAudio;
 use crate::backend::{
     AppError, AppState, Backend, CallId, CallRequest, CancelResult, ErrorCode, LearnResult,
     RepairResult, UnpairResult,
@@ -120,6 +121,14 @@ pub const EVENT_IMMERSIVE_CHANGED: &str = "legion://immersive-changed";
 /// background transfers drain) or closed, so active playback pauses where it is and leaves full
 /// screen.
 pub const EVENT_WINDOW_HIDDEN: &str = "legion://window-hidden";
+
+/// Native desktop event emitted to the web view when a previously hidden desktop window is shown
+/// again (for example via single-instance reopen or macOS dock click).
+pub const EVENT_WINDOW_SHOWN: &str = "legion://window-shown";
+
+/// Native desktop event carrying a boolean visibility flag (`true` = visible, `false` = minimized
+/// or withdrawn) so background polling stops when nobody is looking at the desktop window.
+pub const EVENT_WINDOW_VISIBILITY: &str = "legion://window-visibility";
 
 /// Tracks whether Legion entered desktop full screen so leaving only undoes what Legion did.
 ///
@@ -578,9 +587,11 @@ pub async fn cancel_pair(backend: State<'_, SharedBackend>) -> Result<CancelResu
 pub async fn unpair(
     backend: State<'_, SharedBackend>,
     content: State<'_, SharedContentServer>,
+    audio: State<'_, SharedAudio>,
     node: String,
 ) -> Result<UnpairResult, AppError> {
     validate_label_size("Node name", &node)?;
+    audio.0.on_machine_unpaired(&node).await;
     let result = backend.0.unpair(node).await?;
     content.0.revoke_stale_pairings();
     Ok(result)
@@ -602,7 +613,9 @@ pub async fn select_node(
 pub async fn repair_store(
     backend: State<'_, SharedBackend>,
     content: State<'_, SharedContentServer>,
+    audio: State<'_, SharedAudio>,
 ) -> Result<RepairResult, AppError> {
+    let _ = audio.0.dismiss().await;
     let result = backend.0.repair_store().await?;
     content.0.revoke_all();
     Ok(result)
@@ -691,6 +704,69 @@ pub fn content_status(content: State<'_, SharedContentServer>, url: String) -> C
 #[tauri::command]
 pub fn content_revoke(content: State<'_, SharedContentServer>, url: String) -> bool {
     content.0.revoke_url(&url)
+}
+
+/// Loads a music folder queue into the native Android background playback service.
+#[tauri::command]
+pub async fn audio_load_queue(
+    audio: State<'_, SharedAudio>,
+    payload: Value,
+) -> Result<Value, AppError> {
+    audio.0.load_queue(payload).await
+}
+
+/// Sends a transport command (`play`, `pause`, `toggle`, `next`, `prev`, `seek`, `speed`) to the
+/// native Android background playback service.
+#[tauri::command]
+pub async fn audio_command(
+    audio: State<'_, SharedAudio>,
+    action: String,
+    payload: Option<Value>,
+) -> Result<Value, AppError> {
+    validate_label_size("Audio command", &action)?;
+    audio
+        .0
+        .command(
+            &action,
+            payload.unwrap_or_else(|| Value::Object(Map::new())),
+        )
+        .await
+}
+
+/// Updates shuffle/repeat modes and playback order in the native Android background service.
+#[tauri::command]
+pub async fn audio_set_modes(
+    audio: State<'_, SharedAudio>,
+    payload: Value,
+) -> Result<Value, AppError> {
+    audio.0.set_modes(payload).await
+}
+
+/// Dismisses the native Android background music player, releasing ExoPlayer and the media ticket.
+#[tauri::command]
+pub async fn audio_dismiss(audio: State<'_, SharedAudio>) -> Result<Value, AppError> {
+    audio.0.dismiss().await
+}
+
+/// Returns the latest native Android background playback state snapshot.
+#[tauri::command]
+pub fn audio_state(audio: State<'_, SharedAudio>) -> Value {
+    audio.0.state()
+}
+
+/// Requests Android 13+ notification permission once when music starts for the first time.
+#[tauri::command]
+pub async fn audio_request_notification_permission(
+    audio: State<'_, SharedAudio>,
+) -> Result<bool, AppError> {
+    Ok(audio.0.request_notification_permission().await)
+}
+
+/// Debug/test-only readout of the native Android music service's 1-second position and event log.
+#[cfg(debug_assertions)]
+#[tauri::command]
+pub async fn audio_debug_trace(audio: State<'_, SharedAudio>) -> Result<Value, AppError> {
+    audio.0.debug_trace().await
 }
 
 /// Enqueues a non-blocking download from `machine:path` into the device's Downloads folder.
@@ -1311,11 +1387,13 @@ pub async fn update_install(
     backend: State<'_, SharedBackend>,
     content: State<'_, SharedContentServer>,
     transfers: State<'_, SharedTransfers>,
+    audio: State<'_, SharedAudio>,
     updater: State<'_, SharedUpdater>,
     confirm_interrupt: Option<bool>,
 ) -> Result<UpdateState, AppError> {
     let confirmed = confirm_interrupt.unwrap_or(false);
-    let busy = has_active_native_work(backend.0.as_ref(), &transfers.0, &content.0, &updater.0);
+    let busy = has_active_native_work(backend.0.as_ref(), &transfers.0, &content.0, &updater.0)
+        || audio.0.is_playing();
 
     #[cfg(target_os = "android")]
     {
@@ -1413,19 +1491,21 @@ pub async fn update_maybe_auto_install(
     backend: State<'_, SharedBackend>,
     content: State<'_, SharedContentServer>,
     transfers: State<'_, SharedTransfers>,
+    audio: State<'_, SharedAudio>,
     updater: State<'_, SharedUpdater>,
     trigger: Option<String>,
 ) -> Result<UpdateState, AppError> {
     let trigger_kind = trigger.as_deref().unwrap_or("startup");
-    if !evaluate_and_quiesce_auto_install(
-        &updater.0,
-        backend.0.as_ref(),
-        &transfers.0,
-        &content.0,
-        trigger_kind,
-        crate::BACKGROUND_REFRESH_DRAIN_TIMEOUT,
-    )
-    .await
+    if audio.0.is_playing()
+        || !evaluate_and_quiesce_auto_install(
+            &updater.0,
+            backend.0.as_ref(),
+            &transfers.0,
+            &content.0,
+            trigger_kind,
+            crate::BACKGROUND_REFRESH_DRAIN_TIMEOUT,
+        )
+        .await
     {
         return Ok(updater.0.snapshot());
     }

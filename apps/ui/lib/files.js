@@ -699,6 +699,8 @@ export function createThumbQueue({
   capsStore = null,
   thumbCache,
   onUpdate = null,
+  isVisible = () => true,
+  shouldKeep = null,
   size = 128,
   fit = 'cover',
   debounceMs = 24,
@@ -709,30 +711,80 @@ export function createThumbQueue({
   let alive = true;
   const queue = new Map();
   const inFlight = new Set();
-  const pendingRetry = new Set();
+  const pendingRetry = new Map();
   const retryCount = new Map();
-  const retryTimers = new Set();
+  const retryTimers = new Map();
   let flushTimer = null;
 
   function scheduleFlush(delayMs) {
-    if (!alive || flushTimer !== null) return;
+    if (!alive || flushTimer !== null || !isVisible()) return;
     flushTimer = schedule(flush, delayMs);
   }
 
+  function dequeuePath(filePath) {
+    if (!filePath) return;
+    queue.delete(filePath);
+    pendingRetry.delete(filePath);
+    retryCount.delete(filePath);
+    const tid = retryTimers.get(filePath);
+    if (tid !== undefined) {
+      cancel(tid);
+      retryTimers.delete(filePath);
+    }
+    if (queue.size === 0 && flushTimer !== null) {
+      cancel(flushTimer);
+      flushTimer = null;
+    }
+  }
+
+  function pauseForHidden() {
+    if (flushTimer !== null) {
+      cancel(flushTimer);
+      flushTimer = null;
+    }
+    for (const tid of retryTimers.values()) cancel(tid);
+    retryTimers.clear();
+    for (const [p, item] of pendingRetry.entries()) {
+      if (!inFlight.has(p) && !queue.has(p) && (!shouldKeep || shouldKeep(p))) {
+        queue.set(p, item);
+      }
+    }
+    pendingRetry.clear();
+  }
+
   function scheduleRetry(item) {
+    if (shouldKeep && !shouldKeep(item.path)) {
+      retryCount.delete(item.path);
+      return false;
+    }
     const attempt = retryCount.get(item.path) || 0;
     if (attempt >= THUMB_MAX_RETRIES) return false;
     retryCount.set(item.path, attempt + 1);
-    pendingRetry.add(item.path);
+    const prevTid = retryTimers.get(item.path);
+    if (prevTid !== undefined) {
+      cancel(prevTid);
+      retryTimers.delete(item.path);
+    }
+    if (!isVisible()) {
+      queue.set(item.path, item);
+      return true;
+    }
+    pendingRetry.set(item.path, item);
     const delayMs = THUMB_RETRY_BASE_MS * (2 ** attempt);
     const tid = schedule(() => {
-      retryTimers.delete(tid);
+      retryTimers.delete(item.path);
       pendingRetry.delete(item.path);
       if (!alive || inFlight.has(item.path)) return;
+      if (shouldKeep && !shouldKeep(item.path)) {
+        retryCount.delete(item.path);
+        return;
+      }
       queue.set(item.path, item);
-      scheduleFlush(debounceMs);
+      if (isVisible()) {
+        scheduleFlush(debounceMs);
+      }
     }, delayMs);
-    retryTimers.add(tid);
+    retryTimers.set(item.path, tid);
     return true;
   }
 
@@ -747,6 +799,10 @@ export function createThumbQueue({
   async function flush() {
     flushTimer = null;
     if (!alive || !machine || queue.size === 0) return;
+    if (!isVisible()) {
+      pauseForHidden();
+      return;
+    }
 
     const batch = [];
     for (const item of queue.values()) {
@@ -820,7 +876,7 @@ export function createThumbQueue({
         thumbCache.set(key, { failed: true });
       }
     } finally {
-      if (alive && queue.size > 0) {
+      if (alive && queue.size > 0 && isVisible()) {
         scheduleFlush(batchGapMs);
       }
     }
@@ -845,7 +901,43 @@ export function createThumbQueue({
         return;
       }
       queue.set(item.path, { path: item.path, mtime, isAudio });
-      scheduleFlush(debounceMs);
+      if (isVisible()) {
+        scheduleFlush(debounceMs);
+      }
+    },
+
+    dequeue(filePath) {
+      if (!alive) return;
+      dequeuePath(filePath);
+    },
+
+    prune(keep) {
+      if (!alive) return;
+      const shouldKeepPath =
+        typeof keep === 'function'
+          ? keep
+          : keep && typeof keep.has === 'function'
+            ? (p) => keep.has(p)
+            : () => false;
+      for (const p of Array.from(queue.keys())) {
+        if (!shouldKeepPath(p)) dequeuePath(p);
+      }
+      for (const p of Array.from(pendingRetry.keys())) {
+        if (!shouldKeepPath(p)) dequeuePath(p);
+      }
+    },
+
+    pendingCount() {
+      return queue.size + pendingRetry.size;
+    },
+
+    onVisibilityChange() {
+      if (!alive) return;
+      if (!isVisible()) {
+        pauseForHidden();
+      } else if (queue.size > 0) {
+        scheduleFlush(debounceMs);
+      }
     },
 
     dispose() {
@@ -854,7 +946,7 @@ export function createThumbQueue({
         cancel(flushTimer);
         flushTimer = null;
       }
-      for (const tid of retryTimers) cancel(tid);
+      for (const tid of retryTimers.values()) cancel(tid);
       retryTimers.clear();
       pendingRetry.clear();
       queue.clear();

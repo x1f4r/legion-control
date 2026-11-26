@@ -148,6 +148,10 @@ export function IconSprite() {
       <symbol id="i-exit-fullscreen" viewBox="0 0 24 24">
         <path d="M9 4v3.5A1.5 1.5 0 0 1 7.5 9H4M20 9h-3.5A1.5 1.5 0 0 1 15 7.5V4M15 20v-3.5a1.5 1.5 0 0 1 1.5-1.5H20M4 15h3.5A1.5 1.5 0 0 1 9 16.5V20" />
       </symbol>
+      <symbol id="i-pip" viewBox="0 0 24 24">
+        <path d="M20.6 9.8V6.8a2.5 2.5 0 0 0-2.5-2.5h-13a2.5 2.5 0 0 0-2.5 2.5v10a2.5 2.5 0 0 0 2.5 2.5h4" />
+        <rect x="12.1" y="12.3" width="8.5" height="7" rx="1.5" />
+      </symbol>
       <symbol id="i-volume" viewBox="0 0 24 24">
         <path d="M3.5 9.2H7l4.5-3.7v13L7 14.8H3.5z" />
         <path d="M15 9.1a4.2 4.2 0 0 1 0 5.8M17.8 6.4a7.8 7.8 0 0 1 0 11.2" />
@@ -155,6 +159,23 @@ export function IconSprite() {
       <symbol id="i-volume-mute" viewBox="0 0 24 24">
         <path d="M4.1 9.2h3.5l4.5-3.7v13L7.6 14.8H4.1z" />
         <path d="m15.6 9.2 5.2 5.6M20.8 9.2l-5.2 5.6" />
+      </symbol>
+      <symbol id="i-shuffle" viewBox="0 0 24 24">
+        <path d="M3.1 7.5h3.5l6.4 9h5.6M3.1 16.5h3.5l6.4-9h5.6" />
+        <path d="M16.2 4.9 18.8 7.5l-2.6 2.6M16.2 13.9l2.6 2.6-2.6 2.6" />
+      </symbol>
+      <symbol id="i-repeat" viewBox="0 0 24 24">
+        <path d="M4.5 10.6V8.8a2.5 2.5 0 0 1 2.5-2.5h12.5" />
+        <path d="M16.9 3.7 19.5 6.3l-2.6 2.6" />
+        <path d="M19.5 13.4v1.8a2.5 2.5 0 0 1-2.5 2.5H4.5" />
+        <path d="M7.1 20.3 4.5 17.7l2.6-2.6" />
+      </symbol>
+      <symbol id="i-repeat-1" viewBox="0 0 24 24">
+        <path d="M4.5 10.6V8.8a2.5 2.5 0 0 1 2.5-2.5h12.5" />
+        <path d="M16.9 3.7 19.5 6.3l-2.6 2.6" />
+        <path d="M19.5 13.4v1.8a2.5 2.5 0 0 1-2.5 2.5H4.5" />
+        <path d="M7.1 20.3 4.5 17.7l2.6-2.6" />
+        <path d="M10.9 10.7 12.3 9.5v5" stroke-width="1.9" />
       </symbol>
     </svg>
   `;

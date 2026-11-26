@@ -52,6 +52,7 @@ import {
   PENDING_LOCAL_MACHINE_NAME,
 } from '../lib/local-machine.js';
 import { routeHref } from '../lib/route.js';
+import { isForegroundVisible, subscribeForegroundVisibility } from '../lib/resume.js';
 import { thumbCacheKey } from '../lib/thumb-cache.js';
 import { Notice, OlderMachineNote, ProgressBar, SwipeRow } from './common.js';
 import {
@@ -233,6 +234,8 @@ function VirtualFileList({
   returnTarget = null,
   onReturnHandled = null,
   lines = 2,
+  link = null,
+  refreshSeq = 0,
 }) {
   const listRef = useRef(null);
   const topSpacerRef = useRef(null);
@@ -254,6 +257,8 @@ function VirtualFileList({
   const handledReturnTokenRef = useRef(0);
   const onNearEndRef = useRef(onNearEnd);
   onNearEndRef.current = onNearEnd;
+  const linkRef = useRef(link);
+  linkRef.current = link;
 
   const total = items.length;
   const totalRef = useRef(total);
@@ -326,13 +331,15 @@ function VirtualFileList({
         prevWindow: forceImmediate ? null : winRef.current,
       });
 
-      if (typeof onNearEndRef.current === 'function' && count > 0) {
+      if (typeof onNearEndRef.current === 'function' && count > 0 && isForegroundVisible(linkRef.current)) {
         const preloadMargin = Math.max(400, Math.round(m.viewportHeight * 0.75));
         const nearBottom =
           m.scrollOffset + m.viewportHeight + preloadMargin >= layout.getTotalHeight();
         if (nearBottom && nearEndForCountRef.current !== count) {
-          nearEndForCountRef.current = count;
-          onNearEndRef.current();
+          const triggered = onNearEndRef.current();
+          if (triggered !== false) {
+            nearEndForCountRef.current = count;
+          }
         }
       }
 
@@ -594,9 +601,17 @@ function VirtualFileList({
       window.visualViewport.addEventListener('resize', onViewportResize, { passive: true });
     }
 
+    const unsubVis = subscribeForegroundVisibility(link, ({ visible }) => {
+      if (visible) {
+        nearEndForCountRef.current = -1;
+        syncWindowFromDom({ forceImmediate: false });
+      }
+    });
+
     syncWindowFromDom({ forceImmediate: false });
 
     return () => {
+      unsubVis();
       scrollTarget.removeEventListener('scroll', onScroll);
       window.removeEventListener('resize', onViewportResize);
       if (window.visualViewport) {
@@ -609,13 +624,14 @@ function VirtualFileList({
         observedRowsRef.current.clear();
       }
     };
-  }, [virtualized, resetKey, syncWindowFromDom, measureMountedAndStabilize]);
+  }, [virtualized, resetKey, link, syncWindowFromDom, measureMountedAndStabilize]);
 
-  // Re-sync window whenever new pages append to `items` without recreating observers.
+  // Re-sync window whenever new pages append to `items` or a quiet refresh completes.
   useEffect(() => {
     if (!virtualized) return;
+    nearEndForCountRef.current = -1;
     syncWindowFromDom({ forceImmediate: false });
-  }, [virtualized, total, syncWindowFromDom]);
+  }, [virtualized, total, refreshSeq, syncWindowFromDom]);
 
   // "Scroll to the item I came back from" (viewer sibling swipe close or Back from subfolder).
   useEffect(() => {
@@ -789,6 +805,8 @@ function VirtualFileGrid({
   returnTarget = null,
   onReturnHandled = null,
   lines = 3,
+  link = null,
+  refreshSeq = 0,
 }) {
   const gridRef = useRef(null);
   const topSpacerRef = useRef(null);
@@ -798,6 +816,8 @@ function VirtualFileGrid({
   const handledReturnTokenRef = useRef(0);
   const onNearEndRef = useRef(onNearEnd);
   onNearEndRef.current = onNearEnd;
+  const linkRef = useRef(link);
+  linkRef.current = link;
 
   const total = items.length;
   const totalRef = useRef(total);
@@ -837,12 +857,14 @@ function VirtualFileGrid({
       overscanRows: 4,
     });
 
-    if (typeof onNearEndRef.current === 'function' && count > 0) {
+    if (typeof onNearEndRef.current === 'function' && count > 0 && isForegroundVisible(linkRef.current)) {
       const preloadMargin = Math.max(400, Math.round(m.viewportHeight * 0.75));
       if (m.scrollOffset + m.viewportHeight + preloadMargin >= next.totalHeight) {
         if (nearEndForCountRef.current !== count) {
-          nearEndForCountRef.current = count;
-          onNearEndRef.current();
+          const triggered = onNearEndRef.current();
+          if (triggered !== false) {
+            nearEndForCountRef.current = count;
+          }
         }
       }
     }
@@ -903,18 +925,26 @@ function VirtualFileGrid({
       if (scroller) ro.observe(scroller);
       if (scroller !== gridEl) ro.observe(gridEl);
     }
+    const unsubVis = subscribeForegroundVisibility(link, ({ visible }) => {
+      if (visible) {
+        nearEndForCountRef.current = -1;
+        computeFromDom();
+      }
+    });
     computeFromDom();
     return () => {
+      unsubVis();
       scrollTarget.removeEventListener('scroll', onUpdate);
       window.removeEventListener('resize', onUpdate);
       if (ro) ro.disconnect();
     };
-  }, [virtualized, resetKey, computeFromDom]);
+  }, [virtualized, resetKey, link, computeFromDom]);
 
   useEffect(() => {
     if (!virtualized) return;
+    nearEndForCountRef.current = -1;
     computeFromDom();
-  }, [virtualized, total, computeFromDom]);
+  }, [virtualized, total, refreshSeq, computeFromDom]);
 
   useEffect(() => {
     if (!returnTarget || !returnTarget.path || returnTarget.token <= handledReturnTokenRef.current) {
@@ -1197,6 +1227,23 @@ function joinMemberNames(members) {
 
 // ── Batched lazy thumbnail loader hooks ──────────────────────────────────────────────────────
 
+function isElementNearViewport(el, marginPx = 200) {
+  if (!el || !el.isConnected) return false;
+  const rect = el.getBoundingClientRect();
+  if (!(rect.width > 0 || rect.height > 0)) return false;
+  const scroller = findScrollParent(el);
+  const isDoc =
+    !scroller || scroller === document.documentElement || scroller === document.body;
+  let top = 0;
+  let bottom = typeof window !== 'undefined' ? window.innerHeight || 720 : 720;
+  if (!isDoc) {
+    const sr = scroller.getBoundingClientRect();
+    top = Math.max(top, sr.top);
+    bottom = Math.min(bottom, sr.bottom);
+  }
+  return rect.bottom >= top - marginPx && rect.top <= bottom + marginPx;
+}
+
 function useBatchedThumbs({
   machine,
   entries,
@@ -1205,43 +1252,34 @@ function useBatchedThumbs({
   enabled,
   allowAudio = false,
   thumbCache,
+  containerRef = null,
+  scrollKey = null,
 }) {
   const [, setTick] = useState(0);
   const queueRef = useRef(null);
   const observerRef = useRef(null);
-  const observedElsRef = useRef(new Set());
-  const entryMapRef = useRef(new Map());
+  const mountedElsRef = useRef(new Map()); // Element -> path
+  const mountedPathCountsRef = useRef(new Map()); // path -> mounted element count
+  const intersectingElsRef = useRef(new Set());
+  const allowAudioRef = useRef(allowAudio);
+  allowAudioRef.current = allowAudio;
 
-  useEffect(() => {
+  const entryMap = useMemo(() => {
     const map = new Map();
     for (const e of entries || []) {
       if (e?.path && isThumbEligible(e, { allowAudio: true })) map.set(e.path, e);
     }
-    entryMapRef.current = map;
+    return map;
   }, [entries]);
+  const entryMapRef = useRef(entryMap);
+  entryMapRef.current = entryMap;
 
-  useEffect(() => () => {
-    observedElsRef.current.clear();
-  }, []);
-
-  useEffect(() => {
-    if (!enabled || !machine) {
-      queueRef.current = null;
-      return undefined;
+  const hasIntersectingPath = useCallback((filePath) => {
+    for (const el of intersectingElsRef.current) {
+      if (el.isConnected && mountedElsRef.current.get(el) === filePath) return true;
     }
-    const q = createThumbQueue({
-      machine,
-      link,
-      capsStore,
-      thumbCache,
-      onUpdate: () => setTick((n) => n + 1),
-    });
-    queueRef.current = q;
-    return () => {
-      q.dispose();
-      if (queueRef.current === q) queueRef.current = null;
-    };
-  }, [enabled, machine, link, capsStore, thumbCache]);
+    return false;
+  }, []);
 
   const requestPath = useCallback(
     (entry) => {
@@ -1254,69 +1292,187 @@ function useBatchedThumbs({
     },
     [enabled, machine, allowAudio],
   );
+  const requestPathRef = useRef(requestPath);
+  requestPathRef.current = requestPath;
 
-  // Immediately enqueue the first visible batch so initial paint fills thumbnails promptly.
+  useEffect(() => () => {
+    mountedElsRef.current.clear();
+    mountedPathCountsRef.current.clear();
+    intersectingElsRef.current.clear();
+  }, []);
+
+  useEffect(() => {
+    if (!enabled || !machine) {
+      queueRef.current = null;
+      return undefined;
+    }
+    const q = createThumbQueue({
+      machine,
+      link,
+      capsStore,
+      thumbCache,
+      isVisible: () => isForegroundVisible(link),
+      shouldKeep: (p) => mountedPathCountsRef.current.has(p),
+      onUpdate: () => setTick((n) => n + 1),
+    });
+    queueRef.current = q;
+    const unsubVis = subscribeForegroundVisibility(link, ({ visible }) => {
+      if (!visible) {
+        q.onVisibilityChange();
+        return;
+      }
+      // On foreground return, keep only thumbnails for mounted rows currently in view (dropping
+      // anything that scrolled out while hidden) and enqueue mounted in-view rows whose
+      // IntersectionObserver delivery was deferred while hidden.
+      const inViewPaths = new Set();
+      const staleEls = [];
+      for (const [el, p] of mountedElsRef.current.entries()) {
+        if (!el.isConnected) {
+          staleEls.push([el, p]);
+          continue;
+        }
+        if (isElementNearViewport(el, 200)) {
+          inViewPaths.add(p);
+          intersectingElsRef.current.add(el);
+          const entry = entryMapRef.current.get(p);
+          if (entry && isThumbEligible(entry, { allowAudio: allowAudioRef.current })) {
+            requestPathRef.current(entry);
+          }
+        } else {
+          intersectingElsRef.current.delete(el);
+        }
+      }
+      for (const [el, p] of staleEls) {
+        observerRef.current?.unobserve(el);
+        intersectingElsRef.current.delete(el);
+        mountedElsRef.current.delete(el);
+        const nextCount = (mountedPathCountsRef.current.get(p) || 1) - 1;
+        if (nextCount <= 0) mountedPathCountsRef.current.delete(p);
+        else mountedPathCountsRef.current.set(p, nextCount);
+      }
+      if (typeof IntersectionObserver !== 'undefined') {
+        q.prune(inViewPaths);
+      }
+      q.onVisibilityChange();
+    });
+    return () => {
+      unsubVis();
+      q.dispose();
+      if (queueRef.current === q) queueRef.current = null;
+    };
+  }, [enabled, machine, link, capsStore, thumbCache]);
+
+  // Re-evaluate currently intersecting rows when `entries` or `allowAudio` changes (e.g. a quiet
+  // refresh updated mtime or audio-thumb capabilities arrived). Never eagerly enqueue off-screen
+  // rows at the top of a scrolled virtual list.
   useEffect(() => {
     if (!enabled || !machine || !Array.isArray(entries)) return;
-    let count = 0;
-    const scanLimit = Math.min(entries.length, 60);
-    for (let i = 0; i < scanLimit; i += 1) {
-      const e = entries[i];
-      if (count >= 24) break;
-      if (isThumbEligible(e, { allowAudio })) {
-        requestPath(e);
-        count += 1;
+    if (typeof IntersectionObserver === 'undefined') {
+      let count = 0;
+      const scanLimit = Math.min(entries.length, 60);
+      for (let i = 0; i < scanLimit; i += 1) {
+        const e = entries[i];
+        if (count >= 24) break;
+        if (isThumbEligible(e, { allowAudio })) {
+          requestPath(e);
+          count += 1;
+        }
+      }
+      return;
+    }
+    for (const el of intersectingElsRef.current) {
+      if (!el.isConnected) continue;
+      const p = mountedElsRef.current.get(el);
+      const entry = p ? entryMapRef.current.get(p) : null;
+      if (entry && isThumbEligible(entry, { allowAudio })) {
+        requestPath(entry);
       }
     }
   }, [enabled, machine, entries, allowAudio, link, capsStore, thumbCache, requestPath]);
 
   useEffect(() => {
     if (!enabled || typeof IntersectionObserver === 'undefined') return undefined;
+    const anchorEl =
+      containerRef?.current || mountedElsRef.current.keys().next().value || null;
+    const scroller = anchorEl ? findScrollParent(anchorEl) : null;
+    const root =
+      scroller && scroller !== document.documentElement && scroller !== document.body
+        ? scroller
+        : null;
     const obs = new IntersectionObserver(
       (items) => {
         for (const item of items) {
-          if (!item.isIntersecting) continue;
-          const p = item.target?.dataset?.thumbPath;
-          if (!p) continue;
-          const entry = entryMapRef.current.get(p);
-          if (entry && isThumbEligible(entry, { allowAudio })) {
-            requestPath(entry);
-            obs.unobserve(item.target);
-            observedElsRef.current.delete(item.target);
-          } else if (!entry || entryCategory(entry) !== 'audio') {
-            obs.unobserve(item.target);
-            observedElsRef.current.delete(item.target);
+          const el = item.target;
+          const p = mountedElsRef.current.get(el);
+          if (!p || !el.isConnected) {
+            obs.unobserve(el);
+            intersectingElsRef.current.delete(el);
+            continue;
+          }
+          if (item.isIntersecting) {
+            intersectingElsRef.current.add(el);
+            const entry = entryMapRef.current.get(p);
+            if (entry && isThumbEligible(entry, { allowAudio })) {
+              requestPath(entry);
+            }
+          } else {
+            intersectingElsRef.current.delete(el);
+            if (!hasIntersectingPath(p)) {
+              queueRef.current?.dequeue(p);
+            }
           }
         }
       },
-      { rootMargin: '200px 0px' },
+      { root, rootMargin: '200px 0px' },
     );
     observerRef.current = obs;
-    for (const el of observedElsRef.current) {
-      if (el.isConnected) obs.observe(el);
-      else observedElsRef.current.delete(el);
+    for (const [el, p] of Array.from(mountedElsRef.current.entries())) {
+      if (el.isConnected) {
+        obs.observe(el);
+      } else {
+        intersectingElsRef.current.delete(el);
+        mountedElsRef.current.delete(el);
+        const nextCount = (mountedPathCountsRef.current.get(p) || 1) - 1;
+        if (nextCount <= 0) {
+          mountedPathCountsRef.current.delete(p);
+          queueRef.current?.dequeue(p);
+        } else {
+          mountedPathCountsRef.current.set(p, nextCount);
+        }
+      }
     }
     return () => {
       obs.disconnect();
       observerRef.current = null;
+      intersectingElsRef.current.clear();
     };
-  }, [enabled, requestPath]);
+  }, [enabled, allowAudio, requestPath, hasIntersectingPath, containerRef, scrollKey]);
 
-  const observeEl = useCallback((el) => {
-    if (!el) return;
-    const observed = observedElsRef.current;
-    if (observed.size > 120) {
-      for (const prev of observed) {
-        if (!prev.isConnected) {
-          observerRef.current?.unobserve(prev);
-          observed.delete(prev);
-        }
-      }
-    }
-    observed.add(el);
+  const registerThumb = useCallback((el, filePath) => {
+    if (!el || !filePath) return undefined;
+    mountedElsRef.current.set(el, filePath);
+    mountedPathCountsRef.current.set(filePath, (mountedPathCountsRef.current.get(filePath) || 0) + 1);
     if (observerRef.current) {
       observerRef.current.observe(el);
+    } else if (typeof IntersectionObserver === 'undefined') {
+      const entry = entryMapRef.current.get(filePath);
+      if (entry) requestPathRef.current(entry);
     }
+    return () => {
+      observerRef.current?.unobserve(el);
+      intersectingElsRef.current.delete(el);
+      const prevPath = mountedElsRef.current.get(el);
+      mountedElsRef.current.delete(el);
+      if (prevPath) {
+        const nextCount = (mountedPathCountsRef.current.get(prevPath) || 1) - 1;
+        if (nextCount <= 0) {
+          mountedPathCountsRef.current.delete(prevPath);
+          queueRef.current?.dequeue(prevPath);
+        } else {
+          mountedPathCountsRef.current.set(prevPath, nextCount);
+        }
+      }
+    };
   }, []);
 
   const getUrl = useCallback(
@@ -1328,7 +1484,7 @@ function useBatchedThumbs({
     [enabled, machine, thumbCache],
   );
 
-  return { getUrl, observeEl };
+  return { getUrl, registerThumb };
 }
 
 function useMultiMachineThumbs({ itemsByMachine, enabled, link, capsStore = null, thumbCache }) {
@@ -1343,7 +1499,11 @@ function useMultiMachineThumbs({ itemsByMachine, enabled, link, capsStore = null
 
   useEffect(() => {
     const queues = queuesRef.current;
+    const unsubVis = subscribeForegroundVisibility(link, () => {
+      for (const q of queues.values()) q.onVisibilityChange();
+    });
     return () => {
+      unsubVis();
       for (const q of queues.values()) q.dispose();
       queues.clear();
     };
@@ -1372,6 +1532,7 @@ function useMultiMachineThumbs({ itemsByMachine, enabled, link, capsStore = null
           link,
           capsStore,
           thumbCache,
+          isVisible: () => isForegroundVisible(link),
           onUpdate: () => setTick((n) => n + 1),
         });
         queues.set(mName, q);
@@ -1394,7 +1555,15 @@ function useMultiMachineThumbs({ itemsByMachine, enabled, link, capsStore = null
 
 // ── Thumbnail box (fixed size, zero layout shift) ────────────────────────────────────────────
 
-function EntryThumb({ entry, thumbUrl, observeEl }) {
+function EntryThumb({ entry, thumbUrl, registerThumb = null }) {
+  const thumbRef = useRef(null);
+  const canThumb = entry.kind !== 'dir' && isThumbEligible(entry, { allowAudio: true });
+
+  useLayoutEffect(() => {
+    if (!canThumb || !thumbRef.current || typeof registerThumb !== 'function') return undefined;
+    return registerThumb(thumbRef.current, entry.path);
+  }, [canThumb, entry.path, registerThumb]);
+
   if (entry.kind === 'dir') {
     return html`
       <span class="thumb folder" aria-hidden="true">
@@ -1402,11 +1571,10 @@ function EntryThumb({ entry, thumbUrl, observeEl }) {
       </span>
     `;
   }
-  const canThumb = isThumbEligible(entry, { allowAudio: true });
   return html`
     <span
       class="thumb"
-      ref=${canThumb ? observeEl : null}
+      ref=${canThumb ? thumbRef : null}
       data-thumb-path=${canThumb ? entry.path : undefined}
       aria-hidden="true"
     >
@@ -1414,6 +1582,83 @@ function EntryThumb({ entry, thumbUrl, observeEl }) {
         ? html`<img src=${thumbUrl} alt="" loading="lazy" decoding="async" />`
         : html`<${Icon} name=${entryIconName(entry)} />`}
     </span>
+  `;
+}
+
+function FolderGridCell({
+  entry,
+  beforeName,
+  afterName,
+  href,
+  cls,
+  thumbUrl,
+  selecting,
+  starred,
+  registerThumb = null,
+  onPointerDown,
+  onPointerMove,
+  onPointerUp,
+  onPointerCancel,
+  onContextMenu,
+  onClick,
+}) {
+  const cellRef = useRef(null);
+  const isDir = entry.kind === 'dir';
+  const canThumb = !isDir && isThumbEligible(entry, { allowAudio: true });
+
+  useLayoutEffect(() => {
+    if (!canThumb || !cellRef.current || typeof registerThumb !== 'function') return undefined;
+    return registerThumb(cellRef.current, entry.path);
+  }, [canThumb, entry.path, registerThumb]);
+
+  return html`
+    <a
+      ref=${canThumb ? cellRef : null}
+      class=${cls}
+      href=${href}
+      aria-label=${entry.name}
+      title=${entry.name}
+      data-thumb-path=${canThumb ? entry.path : undefined}
+      onPointerDown=${onPointerDown}
+      onPointerMove=${onPointerMove}
+      onPointerUp=${onPointerUp}
+      onPointerCancel=${onPointerCancel}
+      onContextMenu=${onContextMenu}
+      onClick=${onClick}
+    >
+      ${isDir
+        ? html`
+            <${Icon} name="files" />
+            <${FileName}
+              className="cell-name"
+              name=${entry.name}
+              before=${beforeName}
+              after=${afterName}
+              lines=${3}
+              titleOnHover=${false}
+            />
+          `
+        : thumbUrl
+          ? html`<img src=${thumbUrl} alt=${entry.name} loading="lazy" decoding="async" />`
+          : html`
+              <span class="cell-icon">
+                <${Icon} name=${entryIconName(entry)} />
+                <${FileName}
+                  className="cell-name"
+                  name=${entry.name}
+                  before=${beforeName}
+                  after=${afterName}
+                  lines=${3}
+                  titleOnHover=${false}
+                />
+              </span>
+            `}
+      ${entry.duration_s != null
+        ? html`<span class="len">${formatElapsed(entry.duration_s)}</span>`
+        : null}
+      ${starred && !selecting ? html`<span class="cell-star" aria-label="Favourite">★</span>` : null}
+      ${selecting ? html`<span class="cell-check" aria-hidden="true"></span>` : null}
+    </a>
   `;
 }
 
@@ -1777,11 +2022,15 @@ export function FolderBrowser({
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [renderLimit, setRenderLimit] = useState(RENDER_STEP);
+  const [quietRefreshSeq, setQuietRefreshSeq] = useState(0);
   const [error, setError] = useState(null);
   const [justAddedPaths, setJustAddedPaths] = useState(() => new Set());
 
+  const browserRootRef = useRef(null);
   const pagerRef = useRef(null);
   const crumbsRef = useRef(null);
+  const loadingMoreRef = useRef(false);
+  const quietFetchCountRef = useRef(0);
   const entryLongPress = useItemLongPress(
     useCallback(
       (entry) => {
@@ -1846,11 +2095,38 @@ export function FolderBrowser({
     if ((reachable && error?.code !== 'unreachable') || !isWaking || typeof onRefreshFleet !== 'function') {
       return undefined;
     }
-    const timer = window.setInterval(() => {
-      onRefreshFleet({ background: true, forceOffline: true });
-    }, 600);
-    return () => window.clearInterval(timer);
-  }, [reachable, error?.code, isWaking, onRefreshFleet]);
+    let timer = null;
+    const stopTimer = () => {
+      if (timer !== null) {
+        window.clearInterval(timer);
+        timer = null;
+      }
+    };
+    const startTimer = () => {
+      if (timer === null && isForegroundVisible(link)) {
+        timer = window.setInterval(() => {
+          if (!isForegroundVisible(link)) {
+            stopTimer();
+            return;
+          }
+          onRefreshFleet({ background: true, forceOffline: true });
+        }, 600);
+      }
+    };
+    startTimer();
+    const unsubVis = subscribeForegroundVisibility(link, ({ visible }) => {
+      if (!visible) {
+        stopTimer();
+      } else {
+        startTimer();
+        onRefreshFleet({ background: true, forceOffline: true });
+      }
+    });
+    return () => {
+      unsubVis();
+      stopTimer();
+    };
+  }, [reachable, error?.code, isWaking, onRefreshFleet, link]);
 
   const runDirectoryFetch = useCallback(async ({ quiet = false, highlightNew = false, signal = null } = {}) => {
     const p = propsRef.current;
@@ -1872,13 +2148,25 @@ export function FolderBrowser({
       activeSignal = ctrl.signal;
     }
 
-    if (!quiet) {
+    if (quiet) {
+      quietFetchCountRef.current += 1;
+    } else {
+      loadingMoreRef.current = false;
+      setLoadingMore(false);
       setLoading(true);
       setError(null);
       setRenderLimit(RENDER_STEP);
       setOldTruncated(false);
       offsetRef.current = 0;
     }
+
+    let releasedQuietCount = false;
+    const releaseQuietCount = () => {
+      if (quiet && !releasedQuietCount) {
+        releasedQuietCount = true;
+        quietFetchCountRef.current = Math.max(0, quietFetchCountRef.current - 1);
+      }
+    };
 
     try {
       if (p.capsStore && !p.capsStore.isKnown(p.machine)) {
@@ -1890,11 +2178,18 @@ export function FolderBrowser({
         ? p.capsStore.fileCapabilities(p.machine, { fallbackAllowedSet: p.allowedSet })
         : p.caps;
 
+      const quietRefreshTarget =
+        quiet && liveCaps?.hasListOffset && rawEntriesRef.current.length > PAGE_SIZE
+          ? rawEntriesRef.current.length
+          : 0;
+
       const reqArgs = {
         path: reqPath,
         depth: 1,
         hidden: p.showHidden,
-        limit: liveCaps?.hasListOffset ? PAGE_SIZE : 500,
+        limit: liveCaps?.hasListOffset
+          ? Math.min(5000, Math.max(PAGE_SIZE, quietRefreshTarget))
+          : 500,
       };
       if (liveCaps?.hasListSort) {
         reqArgs.sort = p.sortPref.sort;
@@ -1907,24 +2202,27 @@ export function FolderBrowser({
         reqArgs.offset = 0;
       }
 
-      let res;
-      let dropped = [];
-      if (p.capsStore) {
-        const outcome = await p.capsStore.call('fs.list', reqArgs, {
-          on: p.machine,
-          optional: ['sort', 'order', 'categories', 'offset'],
-          signal: activeSignal,
-          onDrop(sentArgs, droppedList) {
-            if (droppedList.includes('offset')) {
-              sentArgs.limit = 500;
-            }
-          },
-        });
-        res = outcome.value;
-        dropped = outcome.dropped;
-      } else {
-        res = await p.link.call('fs.list', reqArgs, { on: p.machine, signal: activeSignal });
-      }
+      const fetchPage = async (args) => {
+        if (p.capsStore) {
+          const outcome = await p.capsStore.call('fs.list', args, {
+            on: p.machine,
+            optional: ['sort', 'order', 'categories', 'offset'],
+            signal: activeSignal,
+            onDrop(sentArgs, droppedList) {
+              if (droppedList.includes('offset')) {
+                sentArgs.limit = 500;
+              }
+            },
+          });
+          return outcome;
+        }
+        const value = await p.link.call('fs.list', args, { on: p.machine, signal: activeSignal });
+        return { value, dropped: [] };
+      };
+
+      const firstOutcome = await fetchPage(reqArgs);
+      let res = firstOutcome.value;
+      const dropped = firstOutcome.dropped;
       if (activeSignal.aborted) return;
 
       const usedServerSort = Boolean(
@@ -1936,7 +2234,42 @@ export function FolderBrowser({
       const usedServerOffset = Boolean(liveCaps?.hasListOffset && !dropped.includes('offset'));
 
       const actualPath = res?.path || reqPath;
-      const list = Array.isArray(res?.entries) ? res.entries : [];
+      const firstList = Array.isArray(res?.entries) ? res.entries : [];
+      let list = firstList;
+      let lastRes = res;
+
+      // If a quiet refresh of a scrolled-down folder hit the server's 1 MiB single-reply cap
+      // before covering the already-loaded window, pull the remaining slice so rows and scroll
+      // position stay intact.
+      if (
+        quietRefreshTarget > 0 &&
+        usedServerOffset &&
+        lastRes?.truncated &&
+        list.length > 0 &&
+        list.length < quietRefreshTarget
+      ) {
+        const seen = new Set(list.map((e) => e.path));
+        list = [...list];
+        while (lastRes?.truncated && list.length < quietRefreshTarget) {
+          const nextArgs = {
+            ...reqArgs,
+            offset: list.length,
+            limit: Math.min(5000, quietRefreshTarget - list.length),
+          };
+          const nextOutcome = await fetchPage(nextArgs);
+          if (activeSignal.aborted) return;
+          lastRes = nextOutcome.value;
+          const more = Array.isArray(lastRes?.entries) ? lastRes.entries : [];
+          if (more.length === 0) break;
+          for (const e of more) {
+            if (!seen.has(e.path)) {
+              seen.add(e.path);
+              list.push(e);
+            }
+          }
+        }
+      }
+
       const nowMs = Date.now();
 
       if (p.folderChanges) {
@@ -1973,10 +2306,10 @@ export function FolderBrowser({
         setError(null);
       }
 
-      const nextTotalCount = typeof res?.total === 'number' ? res.total : list.length;
-      const nextTotalExact = res?.total_exact !== false;
-      const nextHasMorePages = Boolean(res?.truncated && usedServerOffset);
-      const nextOldTruncated = Boolean(res?.truncated && !usedServerOffset);
+      const nextTotalCount = typeof lastRes?.total === 'number' ? lastRes.total : list.length;
+      const nextTotalExact = lastRes?.total_exact !== false;
+      const nextHasMorePages = Boolean(lastRes?.truncated && usedServerOffset);
+      const nextOldTruncated = Boolean(lastRes?.truncated && !usedServerOffset);
 
       lastLoadRef.current = {
         machine: p.machine,
@@ -1991,6 +2324,7 @@ export function FolderBrowser({
       };
       loadedAtRef.current = nowMs;
 
+      releaseQuietCount();
       setResolvedPath(actualPath);
       setRawEntries(list);
       setTotalCount(nextTotalCount);
@@ -2001,6 +2335,9 @@ export function FolderBrowser({
       setOldTruncated(nextOldTruncated);
       offsetRef.current = list.length;
       setLoading(false);
+      if (quiet) {
+        setQuietRefreshSeq((n) => n + 1);
+      }
 
       if (p.folderChanges) {
         const cacheSnap = {
@@ -2029,6 +2366,8 @@ export function FolderBrowser({
       } else {
         setError(err);
       }
+    } finally {
+      releaseQuietCount();
     }
   }, []);
 
@@ -2044,6 +2383,8 @@ export function FolderBrowser({
     if (!machine || !reachable) {
       lastLoadRef.current = null;
       loadedAtRef.current = null;
+      loadingMoreRef.current = false;
+      setLoadingMore(false);
       setLoading(false);
       setRawEntries([]);
       setOldTruncated(false);
@@ -2144,6 +2485,7 @@ export function FolderBrowser({
     if (!folderChanges || !machine || !reachable) return undefined;
     const reqPath = path || '~';
     const onChanged = () => {
+      if (!isForegroundVisible(link)) return;
       coalescedRef.current?.trigger({ highlightNew: true });
     };
     const unsubs = [folderChanges.subscribe(machine, reqPath, onChanged)];
@@ -2153,30 +2495,37 @@ export function FolderBrowser({
     return () => {
       for (const u of unsubs) u();
     };
-  }, [folderChanges, machine, path, resolvedPath, reachable]);
+  }, [folderChanges, machine, path, resolvedPath, reachable, link]);
 
   // Refetch quietly for external changes when returning to foreground/focus if older than 10s.
   useEffect(() => {
     if (!machine || !reachable) return undefined;
+    let lastCheckedAt = -Infinity;
     const checkStaleOnVisible = () => {
-      if (document.visibilityState !== 'visible') return;
+      if (!isForegroundVisible(link)) return;
+      const now = Date.now();
+      if (now - lastCheckedAt < 1500) return;
       const loadedAt = loadedAtRef.current;
       if (typeof loadedAt !== 'number') return;
       const targetPath = resolvedPathRef.current || path || '~';
       const stale = folderChanges
         ? folderChanges.isStale(machine, targetPath, { loadedAt, maxAgeMs: STALE_AFTER_MS })
-        : Date.now() - loadedAt > STALE_AFTER_MS;
+        : now - loadedAt > STALE_AFTER_MS;
       if (stale) {
+        lastCheckedAt = now;
         coalescedRef.current?.trigger({ highlightNew: false });
       }
     };
+    const unsubResume =
+      typeof link?.onAppResume === 'function' ? link.onAppResume(checkStaleOnVisible) : () => {};
     document.addEventListener('visibilitychange', checkStaleOnVisible);
     window.addEventListener('focus', checkStaleOnVisible);
     return () => {
+      unsubResume();
       document.removeEventListener('visibilitychange', checkStaleOnVisible);
       window.removeEventListener('focus', checkStaleOnVisible);
     };
-  }, [folderChanges, machine, path, reachable]);
+  }, [folderChanges, machine, path, reachable, link]);
 
   // Register this folder's quiet refetch with the shell's pull-to-refresh container.
   useEffect(() => {
@@ -2194,74 +2543,90 @@ export function FolderBrowser({
     });
   }, [onRegisterRefresh, runDirectoryFetch, machine, path, reachable]);
 
-  const loadNextPage = useCallback(() => {
-    if (loadingMore || !hasMorePages || !caps?.hasListOffset) return;
-    setLoadingMore(true);
-    const reqArgs = {
-      path: resolvedPath,
-      depth: 1,
-      hidden: showHidden,
-      limit: NEXT_PAGE_SIZE,
-      offset: offsetRef.current,
-    };
-    if (caps?.hasListSort) {
-      reqArgs.sort = sortPref.sort;
-      reqArgs.order = sortPref.order;
-    }
-    if (caps?.hasListCategories && kindFilter) {
-      reqArgs.categories = [kindFilter];
-    }
-    const nextPromise = capsStore
-      ? capsStore
-          .call('fs.list', reqArgs, {
-            on: machine,
-            optional: ['sort', 'order', 'categories'],
-            signal: abortRef.current?.signal,
-          })
-          .then((r) => r.value)
-      : link.call('fs.list', reqArgs, { on: machine, signal: abortRef.current?.signal });
-    nextPromise
-      .then((res) => {
-        const more = Array.isArray(res?.entries) ? res.entries : [];
-        let mergedList = null;
-        setRawEntries((prev) => {
-          const seen = new Set(prev.map((e) => e.path));
-          const merged = [...prev];
-          for (const e of more) {
-            if (!seen.has(e.path)) merged.push(e);
-          }
-          mergedList = merged;
-          return merged;
-        });
-        offsetRef.current += more.length;
-        const nextHasMore = Boolean(res?.truncated && more.length > 0);
-        setHasMorePages(nextHasMore);
-        setRenderLimit((n) =>
-          Math.max(n + RENDER_STEP, mergedList ? mergedList.length : 0, offsetRef.current),
-        );
-        setLoadingMore(false);
-        if (folderChanges && mergedList) {
-          const prevSnap =
-            folderChanges.getCached(machine, resolvedPath) ||
-            folderChanges.getCached(machine, path || '~');
-          if (prevSnap) {
-            const updatedSnap = {
-              ...prevSnap,
-              rawEntries: mergedList,
-              hasMorePages: nextHasMore,
-            };
-            folderChanges.setCached(machine, resolvedPath, updatedSnap);
-            const reqPath = path || '~';
-            if (resolvedPath !== reqPath) {
-              folderChanges.setCached(machine, reqPath, updatedSnap);
+  const loadNextPage = useCallback(
+    ({ manual = false } = {}) => {
+      if (
+        loadingMoreRef.current ||
+        loadingMore ||
+        quietFetchCountRef.current > 0 ||
+        !hasMorePages ||
+        !caps?.hasListOffset
+      ) {
+        return false;
+      }
+      if (!manual && !isForegroundVisible(link)) return false;
+      loadingMoreRef.current = true;
+      setLoadingMore(true);
+      const reqArgs = {
+        path: resolvedPath,
+        depth: 1,
+        hidden: showHidden,
+        limit: NEXT_PAGE_SIZE,
+        offset: offsetRef.current,
+      };
+      if (caps?.hasListSort) {
+        reqArgs.sort = sortPref.sort;
+        reqArgs.order = sortPref.order;
+      }
+      if (caps?.hasListCategories && kindFilter) {
+        reqArgs.categories = [kindFilter];
+      }
+      const nextPromise = capsStore
+        ? capsStore
+            .call('fs.list', reqArgs, {
+              on: machine,
+              optional: ['sort', 'order', 'categories'],
+              signal: abortRef.current?.signal,
+            })
+            .then((r) => r.value)
+        : link.call('fs.list', reqArgs, { on: machine, signal: abortRef.current?.signal });
+      nextPromise
+        .then((res) => {
+          const more = Array.isArray(res?.entries) ? res.entries : [];
+          let mergedList = null;
+          setRawEntries((prev) => {
+            const seen = new Set(prev.map((e) => e.path));
+            const merged = [...prev];
+            for (const e of more) {
+              if (!seen.has(e.path)) merged.push(e);
+            }
+            mergedList = merged;
+            return merged;
+          });
+          offsetRef.current += more.length;
+          const nextHasMore = Boolean(res?.truncated && more.length > 0);
+          setHasMorePages(nextHasMore);
+          setRenderLimit((n) =>
+            Math.max(n + RENDER_STEP, mergedList ? mergedList.length : 0, offsetRef.current),
+          );
+          loadingMoreRef.current = false;
+          setLoadingMore(false);
+          if (folderChanges && mergedList) {
+            const prevSnap =
+              folderChanges.getCached(machine, resolvedPath) ||
+              folderChanges.getCached(machine, path || '~');
+            if (prevSnap) {
+              const updatedSnap = {
+                ...prevSnap,
+                rawEntries: mergedList,
+                hasMorePages: nextHasMore,
+              };
+              folderChanges.setCached(machine, resolvedPath, updatedSnap);
+              const reqPath = path || '~';
+              if (resolvedPath !== reqPath) {
+                folderChanges.setCached(machine, reqPath, updatedSnap);
+              }
             }
           }
-        }
-      })
-      .catch(() => {
-        setLoadingMore(false);
-      });
-  }, [loadingMore, hasMorePages, caps?.hasListOffset, caps?.hasListSort, caps?.hasListCategories, resolvedPath, path, showHidden, sortPref.sort, sortPref.order, kindFilter, capsStore, folderChanges, link, machine]);
+        })
+        .catch(() => {
+          loadingMoreRef.current = false;
+          setLoadingMore(false);
+        });
+      return true;
+    },
+    [loadingMore, hasMorePages, caps?.hasListOffset, caps?.hasListSort, caps?.hasListCategories, resolvedPath, path, showHidden, sortPref.sort, sortPref.order, kindFilter, capsStore, folderChanges, link, machine],
+  );
 
   // Client-side filter & sort guarantees consistent behavior on older nodes too.
   const entries = useMemo(() => {
@@ -2315,12 +2680,16 @@ export function FolderBrowser({
   }, [activeReturnTarget, entries, renderLimit]);
 
   const handleNearEnd = useCallback(() => {
+    if (!isForegroundVisible(link)) return false;
     if (hasMoreToRender) {
       setRenderLimit((n) => Math.max(n + RENDER_STEP, entries.length));
-    } else if (hasMorePages) {
-      loadNextPage();
+      return true;
     }
-  }, [hasMoreToRender, hasMorePages, entries.length, loadNextPage]);
+    if (hasMorePages) {
+      return loadNextPage();
+    }
+    return false;
+  }, [link, hasMoreToRender, hasMorePages, entries.length, loadNextPage]);
 
   // Auto-advance incremental slice or fetch next offset page when sentinel scrolls into view.
   useEffect(() => {
@@ -2331,20 +2700,26 @@ export function FolderBrowser({
       scroller && scroller !== document.documentElement && scroller !== document.body
         ? scroller
         : null;
+    let isIntersecting = false;
     const obs = new IntersectionObserver(
       (hits) => {
-        if (!hits.some((h) => h.isIntersecting)) return;
-        if (hasMoreToRender) {
-          setRenderLimit((n) => n + RENDER_STEP);
-        } else if (hasMorePages) {
-          loadNextPage();
-        }
+        isIntersecting = hits.some((h) => h.isIntersecting);
+        if (!isIntersecting) return;
+        handleNearEnd();
       },
       { root, rootMargin: '360px 0px' },
     );
     obs.observe(el);
-    return () => obs.disconnect();
-  }, [hasMoreToRender, hasMorePages, loadNextPage]);
+    const unsubVis = subscribeForegroundVisibility(link, ({ visible }) => {
+      if (visible && isIntersecting) {
+        handleNearEnd();
+      }
+    });
+    return () => {
+      unsubVis();
+      obs.disconnect();
+    };
+  }, [link, handleNearEnd, quietRefreshSeq]);
 
   useEffect(() => {
     if (crumbsRef.current) {
@@ -2352,7 +2727,7 @@ export function FolderBrowser({
     }
   }, [resolvedPath]);
 
-  const { getUrl: getThumbUrl, observeEl: observeThumb } = useBatchedThumbs({
+  const { getUrl: getThumbUrl, registerThumb } = useBatchedThumbs({
     machine,
     entries: visibleEntries,
     link,
@@ -2360,6 +2735,8 @@ export function FolderBrowser({
     enabled: Boolean(caps?.known && caps?.hasThumb && reachable),
     allowAudio: Boolean(caps?.hasAudioThumb),
     thumbCache,
+    containerRef: browserRootRef,
+    scrollKey: `${wide ? 'w' : 'n'}:${embedded ? 'e' : 'f'}`,
   });
 
   if (!reachable || error?.code === 'unreachable') {
@@ -2448,7 +2825,7 @@ export function FolderBrowser({
         onContextMenu=${(e) => entryLongPress.contextMenu(e, entry)}
         onClick=${(e) => handleEntryTap(e, entry)}
       >
-        <${EntryThumb} entry=${entry} thumbUrl=${thumbUrl} observeEl=${observeThumb} />
+        <${EntryThumb} entry=${entry} thumbUrl=${thumbUrl} registerThumb=${registerThumb} />
         <span class="body">
           <${FileName}
             className=${technical ? 'title mono fn-title' : 'title fn-title'}
@@ -2527,54 +2904,24 @@ export function FolderBrowser({
       .filter(Boolean)
       .join(' ');
     return html`
-      <a
+      <${FolderGridCell}
         key=${entry.path}
-        class=${cls}
+        entry=${entry}
+        beforeName=${beforeName}
+        afterName=${afterName}
         href=${href}
-        aria-label=${entry.name}
-        title=${entry.name}
-        ref=${!isDir ? observeThumb : null}
-        data-thumb-path=${!isDir ? entry.path : undefined}
+        cls=${cls}
+        thumbUrl=${thumbUrl}
+        selecting=${selecting}
+        starred=${starred}
+        registerThumb=${registerThumb}
         onPointerDown=${(e) => entryLongPress.start(e, entry)}
         onPointerMove=${entryLongPress.move}
         onPointerUp=${entryLongPress.cancel}
         onPointerCancel=${entryLongPress.cancel}
         onContextMenu=${(e) => entryLongPress.contextMenu(e, entry)}
         onClick=${(e) => handleEntryTap(e, entry)}
-      >
-        ${isDir
-          ? html`
-              <${Icon} name="files" />
-              <${FileName}
-                className="cell-name"
-                name=${entry.name}
-                before=${beforeName}
-                after=${afterName}
-                lines=${3}
-                titleOnHover=${false}
-              />
-            `
-          : thumbUrl
-            ? html`<img src=${thumbUrl} alt=${entry.name} loading="lazy" decoding="async" />`
-            : html`
-                <span class="cell-icon">
-                  <${Icon} name=${entryIconName(entry)} />
-                  <${FileName}
-                    className="cell-name"
-                    name=${entry.name}
-                    before=${beforeName}
-                    after=${afterName}
-                    lines=${3}
-                    titleOnHover=${false}
-                  />
-                </span>
-              `}
-        ${entry.duration_s != null
-          ? html`<span class="len">${formatElapsed(entry.duration_s)}</span>`
-          : null}
-        ${starred && !selecting ? html`<span class="cell-star" aria-label="Favourite">★</span>` : null}
-        ${selecting ? html`<span class="cell-check" aria-hidden="true"></span>` : null}
-      </a>
+      />
     `;
   }
 
@@ -2602,6 +2949,8 @@ export function FolderBrowser({
                 returnTarget=${activeReturnTarget}
                 onReturnHandled=${onReturnHandled}
                 lines=${3}
+                link=${link}
+                refreshSeq=${quietRefreshSeq}
               />
             `
           : null}
@@ -2617,6 +2966,8 @@ export function FolderBrowser({
                 returnTarget=${activeReturnTarget}
                 onReturnHandled=${onReturnHandled}
                 lines=${2}
+                link=${link}
+                refreshSeq=${quietRefreshSeq}
               />
             `
           : null}
@@ -2630,7 +2981,7 @@ export function FolderBrowser({
   const wideFolderHeading = folderDisplayName(resolvedPath, { technical, homePath });
 
   return html`
-    <div data-no-swipe="true">
+    <div ref=${browserRootRef} data-no-swipe="true">
       ${wide && !embedded && !hideWideChrome
         ? html`
             <div class="files-wide-head">
@@ -2821,6 +3172,8 @@ export function FolderBrowser({
                     returnTarget=${activeReturnTarget}
                     onReturnHandled=${onReturnHandled}
                     lines=${2}
+                    link=${link}
+                    refreshSeq=${quietRefreshSeq}
                   />
                 `}
 
@@ -2842,7 +3195,7 @@ export function FolderBrowser({
                 disabled=${loadingMore}
                 onClick=${() => {
                   if (hasMoreToRender) setRenderLimit((n) => n + RENDER_STEP);
-                  else loadNextPage();
+                  else loadNextPage({ manual: true });
                 }}
               >
                 ${loadingMore ? 'Loading more…' : 'Show more'}
@@ -3779,6 +4132,8 @@ export function FilesView({
   settings,
   deviceNoun,
   thumbCache,
+  musicController = null,
+  musicState = null,
   filesState,
   filesActions,
   wakePendingSet = null,
@@ -4278,6 +4633,14 @@ export function FilesView({
             }
           }
           filesActions.endSelect();
+          if (
+            musicController &&
+            musicState?.loaded &&
+            musicState.machine === machine &&
+            items.some((i) => i.path === musicState.path)
+          ) {
+            musicController.dismiss();
+          }
           if (route.viewer && items.some((i) => i.path === route.viewer.path)) {
             filesActions.closeViewer();
           }
@@ -4293,7 +4656,7 @@ export function FilesView({
         },
       });
     },
-    [machineCapsFor, onRequestConfirm, capsStore, folderChanges, link, filesActions, route.viewer, loadFavourites, onToast],
+    [machineCapsFor, onRequestConfirm, capsStore, folderChanges, link, filesActions, route.viewer, loadFavourites, onToast, musicController, musicState],
   );
 
   // Wire bulk selection actions triggered from the shell dock.
@@ -4825,6 +5188,8 @@ export function FilesView({
               caps=${viewerCaps}
               capsStore=${capsStore}
               thumbCache=${thumbCache}
+              musicController=${musicController}
+              musicState=${musicState}
               onRegisterPopState=${onRegisterPopState}
               deviceNoun=${deviceNoun}
               technical=${technical}
@@ -4996,6 +5361,14 @@ export function FilesView({
               onRenamed=${(nextPath) => {
                 if (!folderChanges) setReloadToken((n) => n + 1);
                 loadFavourites();
+                if (
+                  musicController &&
+                  musicState?.loaded &&
+                  musicState.machine === sheet.machine &&
+                  musicState.path === sheet.entry.path
+                ) {
+                  musicController.dismiss();
+                }
                 if (route.viewer && route.viewer.path === sheet.entry.path) {
                   const href = routeHref({ ...route, viewer: { machine: sheet.machine, path: nextPath } });
                   window.history.replaceState(window.history.state, '', href);

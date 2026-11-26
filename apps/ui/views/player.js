@@ -4,17 +4,17 @@
 
 import { html, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
 import { Icon } from '../icons.js';
-import { extractThumbMap } from '../lib/files.js';
 import {
   clampVolume,
   classifyPlayerKey,
+  computeRenderedVideoRect,
   computeVideoZoomMetrics,
   createPictureGestureRecognizer,
   createResumeStore,
   createSpaceHoldController,
   createTurnWatcher,
   createVideoController,
-  extractTagsMap,
+  detectVideoPipSupport,
   formatMusicDisplay,
   formatPlayerTime,
   formatPositionValueText,
@@ -24,6 +24,8 @@ import {
   GESTURE_EDGE_MARGIN_PX,
   HOLD_PILL_FADE_MS,
   HOLD_PLAYBACK_RATE,
+  MINI_PLAYER_COVER_RADIUS_PX,
+  MINI_PLAYER_TRANSITION_MS,
   PLAYBACK_SPEEDS,
   preferredVideoOrientation,
   queueNeighbors,
@@ -35,7 +37,6 @@ import {
   ZOOM_CHIP_DURATION_MS,
   ZOOM_SETTLE_MS,
 } from '../lib/player.js';
-import { thumbCacheKey } from '../lib/thumb-cache.js';
 import { FileNameSingle } from './file-name.js';
 
 function safeStorage() {
@@ -353,10 +354,14 @@ export function VideoPlayer({
   onClose,
   onNavigateSibling,
   onZoomActionChange = null,
+  onPipActiveChange = null,
   onMediaLoadedMetadata,
   onMediaTime,
   onMediaPlay,
   onMediaPause,
+  onMediaEnded = null,
+  onMediaPipDismiss = null,
+  onBeforeSeek = null,
   onBeforePlay,
   onMediaError,
 }) {
@@ -365,6 +370,14 @@ export function VideoPlayer({
   const scrubBarWrapRef = useRef(null);
   const onBeforePlayRef = useRef(onBeforePlay);
   onBeforePlayRef.current = onBeforePlay;
+  const onBeforeSeekRef = useRef(onBeforeSeek);
+  onBeforeSeekRef.current = onBeforeSeek;
+  const onMediaEndedRef = useRef(onMediaEnded);
+  onMediaEndedRef.current = onMediaEnded;
+  const onMediaPipDismissRef = useRef(onMediaPipDismiss);
+  onMediaPipDismissRef.current = onMediaPipDismiss;
+  const onPipActiveChangeRef = useRef(onPipActiveChange);
+  onPipActiveChangeRef.current = onPipActiveChange;
   const onMediaErrorRef = useRef(onMediaError);
   onMediaErrorRef.current = onMediaError;
   const onZoomActionChangeRef = useRef(onZoomActionChange);
@@ -415,6 +428,12 @@ export function VideoPlayer({
   const [canFs, setCanFs] = useState(() =>
     typeof link?.canImmersive === 'function' ? Boolean(link.canImmersive({ element: viewerRef?.current })) : false,
   );
+  const [pipMode, setPipMode] = useState(null);
+  const [pipActive, setPipActive] = useState(false);
+  const pipModeRef = useRef(null);
+  pipModeRef.current = pipMode;
+  const pipActiveRef = useRef(false);
+  pipActiveRef.current = pipActive;
   const [viewportSize, setViewportSize] = useState({ width: 0, height: 0 });
   const [videoDims, setVideoDims] = useState({ width: 0, height: 0 });
   const [zoomMode, setZoomMode] = useState('fit');
@@ -488,6 +507,9 @@ export function VideoPlayer({
     const dur = Number.isFinite(v.duration) && v.duration > 0 ? v.duration : durationRef.current;
     const clamped = Math.max(0, dur > 0 ? Math.min(dur, targetTime) : targetTime);
     setCurrentTime(clamped);
+    if (onBeforeSeekRef.current?.(clamped, v) === true) {
+      return;
+    }
     try {
       v.currentTime = clamped;
     } catch {
@@ -608,28 +630,40 @@ export function VideoPlayer({
     }
   }, [mediaUrl, controller]);
 
-  // Re-evaluate full-screen availability once `<video>` and `.viewer` have mounted.
+  // Re-evaluate full-screen and picture-in-picture availability once `<video>` and `.viewer` have mounted.
   useEffect(() => {
     if (typeof link?.canImmersive === 'function') {
       setCanFs(Boolean(link.canImmersive({ element: viewerRef?.current, video: videoRef.current })));
     } else {
       setCanFs(false);
     }
+    const updatePipSupport = () => {
+      setPipMode(detectVideoPipSupport({ link, video: videoRef.current }));
+    };
+    updatePipSupport();
+    const unsub = link?.nativePip?.onSupportChange?.(() => updatePipSupport());
+    return () => {
+      if (typeof unsub === 'function') unsub();
+    };
   }, [link, viewerRef, mediaUrl]);
+
+  useLayoutEffect(() => {
+    onPipActiveChangeRef.current?.(pipActive);
+  }, [pipActive]);
 
   // Sync `inert` property on overlay container so hidden controls can never be focused or pressed.
   useEffect(() => {
     const el = overlayRef.current;
     if (!el) return;
-    el.inert = !ctrl.visible;
-    if (!ctrl.visible && document.activeElement && el.contains(document.activeElement)) {
+    el.inert = !ctrl.visible || pipActive;
+    if ((!ctrl.visible || pipActive) && document.activeElement && el.contains(document.activeElement)) {
       try {
         document.activeElement.blur();
       } catch {
         // Ignore blur errors.
       }
     }
-  }, [ctrl.visible]);
+  }, [ctrl.visible, pipActive]);
 
   // Keep overlay visible while More sheet or speed popover is open.
   useEffect(() => {
@@ -638,6 +672,8 @@ export function VideoPlayer({
 
   // Screen stays on while video plays (including across a file swap while playing); released on pause/end/close.
   const effectivePlaying = pendingPlayIntent != null ? pendingPlayIntent : ctrl.playing;
+  const effectivePlayingRef = useRef(effectivePlaying);
+  effectivePlayingRef.current = effectivePlaying;
   const holdScreenOn = Boolean(effectivePlaying);
   useEffect(() => {
     link?.keepScreenOn?.(holdScreenOn);
@@ -646,7 +682,7 @@ export function VideoPlayer({
   // On mobile native apps, hiding the overlay in portrait hides system bars too ("one state")
   // through the viewer's single full-screen controller.
   useEffect(() => {
-    if (!mobileNative || isFullscreen || !fullscreenController) {
+    if (!mobileNative || isFullscreen || pipActive || !fullscreenController) {
       return;
     }
     if (!ctrl.visible) {
@@ -654,7 +690,7 @@ export function VideoPlayer({
     } else if (fullscreenController.getState().source === 'bars') {
       fullscreenController.leave();
     }
-  }, [mobileNative, isFullscreen, ctrl.visible, fullscreenController]);
+  }, [mobileNative, isFullscreen, pipActive, ctrl.visible, fullscreenController]);
 
   const enterFullscreen = useCallback(
     async (source = 'button') => {
@@ -931,16 +967,33 @@ export function VideoPlayer({
     }, HOLD_PILL_FADE_MS);
   }, [clearClockTimeout, scheduleClockTimeout]);
 
-  // Always release keep-screen-on, timers, gestures, resume position, and `<video>` on unmount.
+  // Always release keep-screen-on, PiP state, timers, gestures, resume position, and `<video>` on unmount.
   useEffect(() => {
     return () => {
       onZoomActionChangeRef.current?.(null);
+      onPipActiveChangeRef.current?.(false);
+      link?.nativePip?.sync?.({ active: false, playing: false, width: 0, height: 0, rect: null });
       recognizerRef.current?.dispose?.();
       spaceHoldRef.current?.dispose?.();
       clearClockTimeout(zoomSettleTimerRef.current);
       clearClockTimeout(zoomChipTimerRef.current);
       clearClockTimeout(holdFadeTimerRef.current);
       const v = videoRef.current;
+      if (
+        typeof document !== 'undefined' &&
+        v &&
+        document.pictureInPictureElement === v &&
+        typeof document.exitPictureInPicture === 'function'
+      ) {
+        document.exitPictureInPicture().catch(() => {});
+      }
+      if (v && v.webkitPresentationMode === 'picture-in-picture' && typeof v.webkitSetPresentationMode === 'function') {
+        try {
+          v.webkitSetPresentationMode('inline');
+        } catch {
+          // Ignore WebKit PiP exit errors on unmount.
+        }
+      }
       if (v && Number.isFinite(v.duration) && v.duration > 0) {
         resumeStore.save(identityRef.current, v.currentTime, v.duration);
       }
@@ -957,54 +1010,60 @@ export function VideoPlayer({
     };
   }, [link, resumeStore, clearClockTimeout]);
 
-  const togglePlay = useCallback(() => {
-    const v = videoRef.current;
-    controller.notifyActivity({ show: true });
-    if (
-      v &&
-      mediaUrlRef.current &&
-      (v.paused || v.ended || v.error || v.readyState < 1) &&
-      onBeforePlayRef.current?.(v) === true
-    ) {
-      wantPlayAfterSwapRef.current = true;
-      pendingPlayIntentRef.current = true;
-      setPendingPlayIntent(true);
-      controller.setError(false);
-      controller.setLoading(true);
-      return;
-    }
-    const loadingNext = !v || !mediaUrlRef.current || v.readyState < 1;
-    if (loadingNext) {
-      const nextWant = !wantPlayAfterSwapRef.current;
-      wantPlayAfterSwapRef.current = nextWant;
-      pendingPlayIntentRef.current = nextWant;
-      setPendingPlayIntent(nextWant);
-      return;
-    }
-    wantPlayAfterSwapRef.current = false;
-    pendingPlayIntentRef.current = null;
-    setPendingPlayIntent(null);
-    if (v.paused || v.ended) {
-      if (v.ended) {
-        try {
-          v.currentTime = 0;
-        } catch {
-          // Ignore seek errors.
-        }
+  const togglePlay = useCallback(
+    ({ showOverlay = true } = {}) => {
+      const v = videoRef.current;
+      if (showOverlay) {
+        controller.notifyActivity({ show: true });
       }
-      v.play().catch((err) => {
-        if (err?.name !== 'NotAllowedError' && (v.error || v.networkState === 3)) {
-          onMediaErrorRef.current?.(v);
+      if (
+        v &&
+        mediaUrlRef.current &&
+        (v.paused || v.ended || v.error || v.readyState < 1) &&
+        onBeforePlayRef.current?.(v) === true
+      ) {
+        wantPlayAfterSwapRef.current = true;
+        pendingPlayIntentRef.current = true;
+        setPendingPlayIntent(true);
+        controller.setError(false);
+        controller.setLoading(true);
+        return;
+      }
+      const loadingNext = !v || !mediaUrlRef.current || v.readyState < 1;
+      if (loadingNext) {
+        const nextWant = !wantPlayAfterSwapRef.current;
+        wantPlayAfterSwapRef.current = nextWant;
+        pendingPlayIntentRef.current = nextWant;
+        setPendingPlayIntent(nextWant);
+        return;
+      }
+      wantPlayAfterSwapRef.current = false;
+      pendingPlayIntentRef.current = null;
+      setPendingPlayIntent(null);
+      if (v.paused || v.ended) {
+        if (v.ended) {
+          try {
+            v.currentTime = 0;
+          } catch {
+            // Ignore seek errors.
+          }
         }
-      });
-    } else {
-      v.pause();
-      controller.setPlaying(false);
-    }
-  }, [controller]);
+        linkRef.current?.iosAudio?.activateSession?.();
+        v.play().catch((err) => {
+          if (err?.name !== 'NotAllowedError' && (v.error || v.networkState === 3)) {
+            onMediaErrorRef.current?.(v);
+          }
+        });
+      } else {
+        v.pause();
+        controller.setPlaying(false);
+      }
+    },
+    [controller],
+  );
 
   const seekBy = useCallback(
-    (delta) => {
+    (delta, { showOverlay = true } = {}) => {
       const v = videoRef.current;
       const st = controller.getState();
       const base =
@@ -1015,11 +1074,224 @@ export function VideoPlayer({
             : 0;
       const dur = v && Number.isFinite(v.duration) && v.duration > 0 ? v.duration : durationRef.current;
       const next = Math.max(0, dur > 0 ? Math.min(dur, base + delta) : base + delta);
-      controller.notifyActivity({ show: true });
+      if (showOverlay) {
+        controller.notifyActivity({ show: true });
+      }
       controller.beginSeek(next);
     },
     [controller],
   );
+
+  const syncAndroidPipConfig = useCallback(() => {
+    if (!link?.nativePip) return;
+    const v = videoRef.current;
+    const st = ctrlRef.current;
+    const active = Boolean(mediaUrlRef.current && !st.error && !st.loading);
+    const playing = Boolean(active && effectivePlayingRef.current && !st.ended);
+    const width = (v?.videoWidth > 0 ? v.videoWidth : videoDims.width) || 0;
+    const height = (v?.videoHeight > 0 ? v.videoHeight : videoDims.height) || 0;
+    const rect =
+      active && v && !pipActiveRef.current
+        ? computeRenderedVideoRect(v.getBoundingClientRect(), width, height)
+        : null;
+    link.nativePip.sync({ active, playing, width, height, rect });
+  }, [link, videoDims.width, videoDims.height]);
+
+  useEffect(() => {
+    if (pipMode !== 'android' || !link?.nativePip) return;
+    syncAndroidPipConfig();
+  }, [
+    pipMode,
+    link,
+    mediaUrl,
+    effectivePlaying,
+    ctrl.loading,
+    ctrl.ended,
+    ctrl.error,
+    videoDims.width,
+    videoDims.height,
+    viewportSize.width,
+    viewportSize.height,
+    isFullscreen,
+    pipActive,
+    syncAndroidPipConfig,
+  ]);
+
+  useEffect(() => {
+    if (!link?.nativePip) return undefined;
+    const unsubChange = link.nativePip.onChange(({ active, dismissed }) => {
+      if (active) {
+        setPipActive(true);
+        setSpeedOpen(false);
+        endHold2x();
+        recognizerRef.current?.reset?.();
+        spaceHoldRef.current?.cancel?.();
+      } else {
+        setPipActive(false);
+        if (dismissed) {
+          endHold2x();
+          recognizerRef.current?.reset?.();
+          spaceHoldRef.current?.cancel?.();
+          wantPlayAfterSwapRef.current = false;
+          pendingPlayIntentRef.current = null;
+          setPendingPlayIntent(null);
+          const v = videoRef.current;
+          if (v && !v.paused) {
+            try {
+              v.pause();
+            } catch {
+              // Ignore pause errors on dismissed PiP.
+            }
+          }
+          controller.setPlaying(false);
+          link.keepScreenOn?.(false);
+          const revokePromise = onMediaPipDismissRef.current?.(v);
+          Promise.resolve(revokePromise).finally(() => {
+            link.nativePip?.ackDismiss?.();
+          });
+        } else {
+          controller.notifyActivity({ show: true });
+        }
+      }
+    });
+    const unsubAction = link.nativePip.onAction(({ action }) => {
+      if (action === 'seek_back_10') {
+        seekBy(-SEEK_STEP_S, { showOverlay: false });
+      } else if (action === 'toggle_play') {
+        togglePlay({ showOverlay: false });
+      } else if (action === 'seek_fwd_10') {
+        seekBy(SEEK_STEP_S, { showOverlay: false });
+      }
+    });
+    return () => {
+      unsubChange?.();
+      unsubAction?.();
+    };
+  }, [link, controller, endHold2x, seekBy, togglePlay]);
+
+  // Standard Web Picture-in-Picture and Safari/iOS WebKit presentation-mode events.
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return undefined;
+    const onEnterWebPip = () => {
+      setPipActive(true);
+      setSpeedOpen(false);
+      endHold2x();
+    };
+    const onLeaveWebPip = () => {
+      setPipActive(false);
+      controller.notifyActivity({ show: true });
+    };
+    const onWebkitPresentation = () => {
+      const inPip = v.webkitPresentationMode === 'picture-in-picture';
+      setPipActive(inPip);
+      if (inPip) {
+        setSpeedOpen(false);
+        endHold2x();
+      } else {
+        controller.notifyActivity({ show: true });
+      }
+    };
+    v.addEventListener('enterpictureinpicture', onEnterWebPip);
+    v.addEventListener('leavepictureinpicture', onLeaveWebPip);
+    v.addEventListener('webkitpresentationmodechanged', onWebkitPresentation);
+    return () => {
+      v.removeEventListener('enterpictureinpicture', onEnterWebPip);
+      v.removeEventListener('leavepictureinpicture', onLeaveWebPip);
+      v.removeEventListener('webkitpresentationmodechanged', onWebkitPresentation);
+    };
+  }, [controller, endHold2x, mediaUrl]);
+
+  const handleTogglePip = useCallback(async () => {
+    const mode = pipModeRef.current;
+    const v = videoRef.current;
+    if (!mode || !v) return;
+    setSpeedOpen(false);
+    if (mode === 'android') {
+      syncAndroidPipConfig();
+      await link?.nativePip?.enter?.();
+      return;
+    }
+    if (mode === 'web') {
+      try {
+        if (typeof document !== 'undefined' && document.pictureInPictureElement === v) {
+          await document.exitPictureInPicture();
+        } else {
+          await v.requestPictureInPicture();
+        }
+      } catch {
+        // Ignore platform rejections (e.g. metadata still loading).
+      }
+      return;
+    }
+    if (mode === 'webkit') {
+      try {
+        const nextMode = v.webkitPresentationMode === 'picture-in-picture' ? 'inline' : 'picture-in-picture';
+        v.webkitSetPresentationMode(nextMode);
+      } catch {
+        // Ignore WebKit presentation mode rejections.
+      }
+    }
+  }, [link, syncAndroidPipConfig]);
+
+  // Desktop & Browser MediaSession metadata and actions while video plays.
+  useEffect(() => {
+    if (mobileNative || typeof navigator === 'undefined' || !navigator.mediaSession) return undefined;
+    const ms = navigator.mediaSession;
+    const setHandler = (action, fn) => {
+      try {
+        ms.setActionHandler(action, fn);
+      } catch {
+        // Ignore unsupported actions in some browsers.
+      }
+    };
+    if (!mediaUrl) return undefined;
+    if (typeof MediaMetadata === 'function') {
+      try {
+        ms.metadata = new MediaMetadata({ title: name || '' });
+      } catch {
+        // Ignore MediaMetadata errors.
+      }
+    }
+    try {
+      ms.playbackState = effectivePlaying ? 'playing' : 'paused';
+    } catch {
+      // Ignore read-only playbackState errors.
+    }
+    setHandler('play', () => {
+      const v = videoRef.current;
+      if (v && (v.paused || v.ended)) togglePlay();
+    });
+    setHandler('pause', () => {
+      const v = videoRef.current;
+      if (v && !v.paused) togglePlay();
+    });
+    setHandler('seekbackward', (details) => {
+      const offset = Number.isFinite(details?.seekOffset) && details.seekOffset > 0 ? details.seekOffset : SEEK_STEP_S;
+      seekBy(-offset);
+    });
+    setHandler('seekforward', (details) => {
+      const offset = Number.isFinite(details?.seekOffset) && details.seekOffset > 0 ? details.seekOffset : SEEK_STEP_S;
+      seekBy(offset);
+    });
+    setHandler('seekto', (details) => {
+      if (typeof details?.seekTime === 'number' && Number.isFinite(details.seekTime)) {
+        controller.beginSeek(details.seekTime);
+      }
+    });
+    setHandler('previoustrack', queue.prev && onNavigateSibling ? () => onNavigateSibling(queue.prev) : null);
+    setHandler('nexttrack', queue.next && onNavigateSibling ? () => onNavigateSibling(queue.next) : null);
+    return () => {
+      for (const action of ['play', 'pause', 'seekbackward', 'seekforward', 'seekto', 'previoustrack', 'nexttrack']) {
+        setHandler(action, null);
+      }
+      try {
+        ms.playbackState = 'none';
+      } catch {
+        // Ignore cleanup errors.
+      }
+    };
+  }, [mobileNative, mediaUrl, name, effectivePlaying, queue.prev, queue.next, togglePlay, seekBy, controller, onNavigateSibling]);
 
   const applyVolume = useCallback((nextVol) => {
     const clamped = clampVolume(nextVol);
@@ -1414,14 +1686,14 @@ export function VideoPlayer({
       ? ctrl.pendingSeekTime
       : currentTime;
   const activeVideoScale =
-    !isFullscreen || !zoomMetrics.available
+    !isFullscreen || pipActive || !zoomMetrics.available
       ? 1
       : pinchScale != null
         ? pinchScale
         : zoomMode === 'fill'
           ? zoomMetrics.fillScale
           : 1;
-  const effectiveZoomMode = isFullscreen && zoomMetrics.available ? zoomMode : 'fit';
+  const effectiveZoomMode = isFullscreen && !pipActive && zoomMetrics.available ? zoomMode : 'fit';
 
   return html`
     <div
@@ -1432,6 +1704,7 @@ export function VideoPlayer({
         ctrl.visible ? 'overlay-visible' : '',
         isFullscreen ? 'is-fullscreen' : '',
         effectiveZoomMode === 'fill' ? 'is-zoom-fill' : '',
+        pipActive ? 'pip-active' : '',
       ]
         .filter(Boolean)
         .join(' ')}
@@ -1528,11 +1801,13 @@ export function VideoPlayer({
         }}
         onPlay=${(e) => {
           if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
+          linkRef.current?.iosAudio?.activateSession?.();
           onMediaPlay?.(e.currentTarget);
           controller.setPlaying(true);
         }}
         onPlaying=${(e) => {
           if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
+          linkRef.current?.iosAudio?.activateSession?.();
           onMediaPlay?.(e.currentTarget);
           controller.setPlaying(true);
           controller.onCanPlay();
@@ -1589,6 +1864,7 @@ export function VideoPlayer({
           spaceHoldRef.current?.cancel?.();
           wantPlayAfterSwapRef.current = false;
           onMediaPause?.(e.currentTarget);
+          onMediaEndedRef.current?.(e.currentTarget);
           resumeStore.clear(identityRef.current);
           controller.setEnded(true);
         }}
@@ -1701,6 +1977,19 @@ export function VideoPlayer({
           <span class="name" role="heading" aria-level="2" aria-label=${name} title=${name}>
             <${FileNameSingle} name=${name} lines=${1} titleOnHover=${false} />
           </span>
+          ${pipMode
+            ? html`
+                <button
+                  type="button"
+                  class="btn icon player-pip-btn"
+                  aria-label=${pipActive ? 'Exit picture in picture' : 'Picture in picture'}
+                  aria-pressed=${pipActive ? 'true' : 'false'}
+                  onClick=${handleTogglePip}
+                >
+                  <${Icon} name="pip" />
+                </button>
+              `
+            : null}
           <button
             type="button"
             class="btn icon"
@@ -1861,522 +2150,128 @@ export function VideoPlayer({
 
 // ── Music Player ─────────────────────────────────────────────────────────────────────────────
 
+function prefersReducedMotion() {
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
+  try {
+    return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  } catch {
+    return false;
+  }
+}
+
 export function MusicPlayer({
-  machine,
-  path,
-  entry,
+  musicController,
+  musicState,
   name,
-  mediaUrl,
-  mediaLoading = false,
-  mediaRef = null,
-  autoPlayNextRef: externalAutoPlayRef = null,
-  siblings = [],
-  link,
-  capsStore = null,
-  caps,
-  thumbCache = null,
   moreOpen = false,
-  playbackRate = 1,
+  transitionFromRect = null,
+  onConsumeTransitionRect = null,
   onOpenMore,
   onClose,
-  onNavigateSibling,
-  onMediaLoadedMetadata,
-  onMediaTime,
-  onMediaPlay,
-  onMediaPause,
-  onBeforePlay,
-  onMediaError,
 }) {
-  const audioRef = useRef(null);
-  const onBeforePlayRef = useRef(onBeforePlay);
-  onBeforePlayRef.current = onBeforePlay;
-  const onMediaErrorRef = useRef(onMediaError);
-  onMediaErrorRef.current = onMediaError;
-  const bindAudioRef = useCallback(
-    (el) => {
-      audioRef.current = el;
-      if (mediaRef) mediaRef.current = el;
-    },
-    [mediaRef],
-  );
-  const resumeStore = useMemo(() => createResumeStore(safeStorage()), []);
-  const identity = useMemo(
-    () => ({ machine, path, size: entry?.size, mtime: entry?.mtime }),
-    [machine, path, entry?.size, entry?.mtime],
-  );
-  const identityRef = useRef(identity);
-  identityRef.current = identity;
-
-  const queue = useMemo(() => queueNeighbors(siblings, path, 'audio'), [siblings, path]);
-  const queueRef = useRef(queue);
-  queueRef.current = queue;
   const showVolume = useMemo(() => !isMobileTouchDevice(), []);
-
-  const [tags, setTags] = useState(null);
-  const [coverUrl, setCoverUrl] = useState(() => {
-    if (!thumbCache) return null;
-    const largeKey = thumbCacheKey(machine, path, entry?.mtime || '', 1024);
-    const largeHit = thumbCache.get(largeKey);
-    if (largeHit && !largeHit.failed) return largeHit.url;
-    const smallKey = thumbCacheKey(machine, path, entry?.mtime || '', 128);
-    const smallHit = thumbCache.get(smallKey);
-    if (smallHit && !smallHit.failed) return smallHit.url;
-    return null;
-  });
-  const [playing, setPlaying] = useState(false);
-  const [currentTime, setCurrentTime] = useState(0);
-  const [duration, setDuration] = useState(entry?.duration_s > 0 ? entry.duration_s : 0);
-  const [bufferedEnd, setBufferedEnd] = useState(0);
-  const [pendingSeekTime, setPendingSeekTime] = useState(null);
-  const [stalled, setStalled] = useState(false);
-  const [resumeChip, setResumeChip] = useState(null);
-  const [volume, setVolume] = useState(1);
-  const [muted, setMuted] = useState(false);
-
-  const localAutoPlayNextRef = useRef(null);
-  const autoPlayNextRef = externalAutoPlayRef || localAutoPlayNextRef;
-  const resumedAppliedRef = useRef(false);
-  const stallTimerRef = useRef(null);
-  const chipTimerRef = useRef(null);
-  const durationRef = useRef(duration);
-  durationRef.current = duration;
-  const currentTimeRef = useRef(currentTime);
-  currentTimeRef.current = currentTime;
-  const mediaUrlRef = useRef(mediaUrl);
-  mediaUrlRef.current = mediaUrl;
-  const pathRef = useRef(path);
-  pathRef.current = path;
-  const prevIdentityRef = useRef(identity);
+  const screenRef = useRef(null);
+  const coverBoxRef = useRef(null);
   const moreOpenRef = useRef(moreOpen);
   moreOpenRef.current = moreOpen;
 
-  const display = useMemo(() => formatMusicDisplay(tags, name), [tags, name]);
+  const stateRef = useRef(musicState);
+  stateRef.current = musicState;
 
-  // Sync `<audio>` src cleanly via layout effect so Preact never writes `src=""` while the next
-  // track's URL is being minted.
+  const display = useMemo(
+    () => formatMusicDisplay(musicState?.tags, musicState?.name || name),
+    [musicState?.tags, musicState?.name, name],
+  );
+
+  // Shared-element feel when opening from the small player: the cover grows into place over
+  // 220 ms, while reduced motion cuts immediately with no animation.
   useLayoutEffect(() => {
-    const a = audioRef.current;
-    if (!a) return;
-    if (mediaUrl) {
-      if (a.getAttribute('src') !== mediaUrl) {
-        a.setAttribute('src', mediaUrl);
-      }
-    } else if (a.hasAttribute('src')) {
-      try {
-        a.pause();
-        a.removeAttribute('src');
-        a.load();
-      } catch {
-        // Ignore teardown errors.
-      }
-    }
-  }, [mediaUrl]);
+    if (!transitionFromRect) return;
+    onConsumeTransitionRect?.();
+    if (prefersReducedMotion()) return;
+    const coverBox = coverBoxRef.current;
+    const screen = screenRef.current;
+    if (!coverBox || typeof coverBox.animate !== 'function') return;
+    const toRect = coverBox.getBoundingClientRect();
+    if (!toRect || toRect.width <= 0 || toRect.height <= 0 || transitionFromRect.width <= 0) return;
 
-  // Apply playbackRate changes (set via More sheet) to `<audio>` immediately and on effect flush.
-  if (audioRef.current && audioRef.current.playbackRate !== playbackRate) {
-    audioRef.current.playbackRate = playbackRate;
-  }
-  useEffect(() => {
-    const a = audioRef.current;
-    if (a) a.playbackRate = playbackRate;
-  }, [playbackRate]);
+    const dx = transitionFromRect.left - toRect.left;
+    const dy = transitionFromRect.top - toRect.top;
+    const sx = Math.max(0.05, transitionFromRect.width / toRect.width);
+    const sy = Math.max(0.05, transitionFromRect.height / toRect.height);
+    const startRadius = `${Math.round((MINI_PLAYER_COVER_RADIUS_PX / sx) * 10) / 10}px`;
 
-  // Reset per-track state when switching songs inside the same mounted player instance.
-  useEffect(() => {
-    const prevId = prevIdentityRef.current;
-    if (prevId && (prevId.machine !== machine || prevId.path !== path)) {
-      if (durationRef.current > 0) {
-        const sameFileLocalRename =
-          prevId.path === path &&
-          (prevId.machine === 'local' || prevId.machine === 'This computer') &&
-          machine &&
-          machine !== 'local' &&
-          machine !== 'This computer';
-        resumeStore.save(
-          sameFileLocalRename ? { ...prevId, machine } : prevId,
-          currentTimeRef.current,
-          durationRef.current,
-        );
-      }
-      prevIdentityRef.current = identityRef.current;
-    } else {
-      prevIdentityRef.current = identityRef.current;
-    }
-    resumedAppliedRef.current = false;
-    setTags(null);
-    setCurrentTime(0);
-    setDuration(entry?.duration_s > 0 ? entry.duration_s : 0);
-    setBufferedEnd(0);
-    setPendingSeekTime(null);
-    setStalled(false);
-    setResumeChip(null);
-    if (stallTimerRef.current) {
-      clearTimeout(stallTimerRef.current);
-      stallTimerRef.current = null;
-    }
-    if (chipTimerRef.current) {
-      clearTimeout(chipTimerRef.current);
-      chipTimerRef.current = null;
-    }
-    if (thumbCache) {
-      const largeHit = thumbCache.get(thumbCacheKey(machine, path, entry?.mtime || '', 1024));
-      const smallHit = thumbCache.get(thumbCacheKey(machine, path, entry?.mtime || '', 128));
-      setCoverUrl(
-        largeHit && !largeHit.failed ? largeHit.url : smallHit && !smallHit.failed ? smallHit.url : null,
+    try {
+      coverBox.animate(
+        [
+          {
+            transformOrigin: 'top left',
+            transform: `translate3d(${dx}px, ${dy}px, 0) scale(${sx}, ${sy})`,
+            borderRadius: startRadius,
+          },
+          {
+            transformOrigin: 'top left',
+            transform: 'translate3d(0, 0, 0) scale(1, 1)',
+            borderRadius: 'var(--radius)',
+          },
+        ],
+        {
+          duration: MINI_PLAYER_TRANSITION_MS,
+          easing: 'cubic-bezier(0.2, 0.8, 0.2, 1)',
+        },
       );
-    } else {
-      setCoverUrl(null);
+      if (screen && typeof screen.animate === 'function') {
+        screen.animate([{ opacity: 0.92 }, { opacity: 1 }], {
+          duration: MINI_PLAYER_TRANSITION_MS,
+          easing: 'ease-out',
+        });
+      }
+    } catch {
+      // Ignore WAAPI errors in minimal test environments.
     }
-  }, [machine, path, entry?.mtime, thumbCache, resumeStore]);
+  }, [transitionFromRect, onConsumeTransitionRect]);
 
-  // Load tags (`fs.tags`) and high-res cover (`fs.thumb`) via per-machine capabilities, silently
-  // falling back to filename + music tile on machines that lack them.
-  useEffect(() => {
-    const ctrl = new AbortController();
-    let alive = true;
-
-    const runCall = (tool, args) =>
-      capsStore
-        ? capsStore.call(tool, args, { on: machine, signal: ctrl.signal }).then((r) => r.value)
-        : link.call(tool, args, { on: machine, signal: ctrl.signal });
-
-    const loadCover = async () => {
-      if (!caps?.hasAudioThumb) return;
-      const reqSize = Math.min(1024, caps?.thumbMaxSize || 512);
-      const cacheKey = thumbCacheKey(machine, path, entry?.mtime || '', reqSize);
-      const cached = thumbCache?.get(cacheKey);
-      if (cached) {
-        if (alive && !cached.failed) setCoverUrl(cached.url);
-        return;
-      }
-      try {
-        const res = await runCall('fs.thumb', { paths: [path], size: reqSize, fit: 'contain' });
-        if (!alive || ctrl.signal.aborted) return;
-        const map = extractThumbMap(res);
-        const item = map[path];
-        if (item?.content && item?.mime) {
-          const url = `data:${item.mime};base64,${item.content}`;
-          thumbCache?.set(cacheKey, { url });
-          setCoverUrl(url);
-        } else {
-          thumbCache?.set(cacheKey, { failed: true });
-        }
-      } catch {
-        // Older machines or songs without embedded/folder covers stay on the music tile quietly.
-      }
-    };
-
-    (async () => {
-      let hasCoverHint = null;
-      if (caps?.hasTags) {
-        try {
-          const res = await runCall('fs.tags', { paths: [path] });
-          if (!alive || ctrl.signal.aborted) return;
-          const map = extractTagsMap(res);
-          const item = map[path];
-          if (item?.ok) {
-            setTags(item.ok);
-            if (typeof item.ok.duration_s === 'number' && item.ok.duration_s > 0 && durationRef.current <= 0) {
-              setDuration(item.ok.duration_s);
-            }
-            hasCoverHint = Boolean(item.ok.cover);
-          }
-        } catch {
-          // Silently show filename when tags are unavailable.
-        }
-      }
-      if (!alive || ctrl.signal.aborted) return;
-      if (hasCoverHint !== false) {
-        await loadCover();
-      }
-    })();
-
-    return () => {
-      alive = false;
-      ctrl.abort();
-    };
-  }, [machine, path, entry?.mtime, caps?.hasTags, caps?.hasAudioThumb, caps?.thumbMaxSize, capsStore, link, thumbCache]);
-
-  // Pause in place and clear pending autoplay if the desktop window is hidden/closed.
-  useEffect(() => {
-    if (typeof link?.onWindowHidden !== 'function') return undefined;
-    return link.onWindowHidden(() => {
-      autoPlayNextRef.current = null;
-      const a = audioRef.current;
-      if (a && !a.paused) {
-        try {
-          a.pause();
-        } catch {
-          // Ignore pause errors.
-        }
-      }
-      setPlaying(false);
-    });
-  }, [link, autoPlayNextRef]);
-
-  // Save resume position & clean up timers/audio on unmount.
-  useEffect(() => {
-    return () => {
-      if (stallTimerRef.current) clearTimeout(stallTimerRef.current);
-      if (chipTimerRef.current) clearTimeout(chipTimerRef.current);
-      const a = audioRef.current;
-      if (a && Number.isFinite(a.duration) && a.duration > 0) {
-        resumeStore.save(identityRef.current, a.currentTime, a.duration);
-      }
-      if (a) {
-        try {
-          a.pause();
-          a.removeAttribute('src');
-          a.load();
-        } catch {
-          // Ignore teardown errors.
-        }
-      }
-    };
-  }, [resumeStore]);
-
-  const startStallTimer = useCallback(() => {
-    if (stallTimerRef.current) clearTimeout(stallTimerRef.current);
-    stallTimerRef.current = window.setTimeout(() => {
-      stallTimerRef.current = null;
-      setStalled(true);
-    }, 400);
-  }, []);
-
-  const clearStallTimer = useCallback(() => {
-    if (stallTimerRef.current) {
-      clearTimeout(stallTimerRef.current);
-      stallTimerRef.current = null;
-    }
-    setStalled(false);
-  }, []);
+  const togglePlay = useCallback(() => {
+    musicController?.togglePlay?.();
+  }, [musicController]);
 
   const commitSeek = useCallback(
     (targetTime) => {
-      const a = audioRef.current;
-      const dur = a && Number.isFinite(a.duration) && a.duration > 0 ? a.duration : durationRef.current;
-      const clamped = Math.max(0, dur > 0 ? Math.min(dur, targetTime) : targetTime);
-      setPendingSeekTime(clamped);
-      setCurrentTime(clamped);
-      startStallTimer();
-      if (a) {
-        try {
-          a.currentTime = clamped;
-        } catch {
-          // Ignore seek before ready.
-        }
-      }
+      musicController?.seek?.(targetTime);
     },
-    [startStallTimer],
+    [musicController],
   );
 
-  const togglePlay = useCallback(() => {
-    const a = audioRef.current;
-    if (
-      a &&
-      mediaUrlRef.current &&
-      (a.paused || a.ended || a.error || a.readyState < 1) &&
-      onBeforePlayRef.current?.(a) === true
-    ) {
-      autoPlayNextRef.current = { path: pathRef.current, play: true };
-      setPlaying(true);
-      return;
-    }
-    const loadingNext = !a || !mediaUrlRef.current || a.readyState < 1;
-    if (loadingNext) {
-      const currentWant = Boolean(
-        autoPlayNextRef.current?.play &&
-          (!autoPlayNextRef.current.path || autoPlayNextRef.current.path === pathRef.current),
-      );
-      const nextWant = !currentWant;
-      autoPlayNextRef.current = { path: pathRef.current, play: nextWant };
-      setPlaying(nextWant);
-      return;
-    }
-    if (a.paused || a.ended) {
-      autoPlayNextRef.current = null;
-      if (a.ended) {
-        try {
-          a.currentTime = 0;
-        } catch {
-          // Ignore seek errors.
-        }
-      }
-      a.play().catch((err) => {
-        if (err?.name !== 'NotAllowedError' && (a.error || a.networkState === 3)) {
-          onMediaErrorRef.current?.(a);
-        }
-      });
-    } else {
-      autoPlayNextRef.current = null;
-      a.pause();
-      setPlaying(false);
-      setPendingSeekTime(null);
-      clearStallTimer();
-    }
-  }, [autoPlayNextRef, clearStallTimer]);
-
   const handlePrev = useCallback(() => {
-    const a = audioRef.current;
-    const t = pendingSeekTime != null ? pendingSeekTime : a && Number.isFinite(a.currentTime) ? a.currentTime : currentTimeRef.current;
-    if (!queueRef.current.prev || shouldMusicPrevRestart(t)) {
-      commitSeek(0);
-      return;
-    }
-    if (onNavigateSibling) {
-      const wantContinue = Boolean(
-        (mediaUrlRef.current && a && !a.paused) ||
-          (autoPlayNextRef.current?.play &&
-            (!autoPlayNextRef.current.path || autoPlayNextRef.current.path === pathRef.current)),
-      );
-      autoPlayNextRef.current = wantContinue ? { path: queueRef.current.prev.path, play: true } : null;
-      onNavigateSibling(queueRef.current.prev);
-    }
-  }, [pendingSeekTime, commitSeek, onNavigateSibling, autoPlayNextRef]);
+    musicController?.prev?.();
+  }, [musicController]);
 
   const handleNext = useCallback(() => {
-    const a = audioRef.current;
-    if (queueRef.current.next && onNavigateSibling) {
-      const wantContinue = Boolean(
-        (mediaUrlRef.current && a && !a.paused) ||
-          (autoPlayNextRef.current?.play &&
-            (!autoPlayNextRef.current.path || autoPlayNextRef.current.path === pathRef.current)),
-      );
-      autoPlayNextRef.current = wantContinue ? { path: queueRef.current.next.path, play: true } : null;
-      onNavigateSibling(queueRef.current.next);
-    }
-  }, [onNavigateSibling, autoPlayNextRef]);
+    musicController?.next?.();
+  }, [musicController]);
+
+  const handleToggleShuffle = useCallback(() => {
+    musicController?.toggleShuffle?.();
+  }, [musicController]);
+
+  const handleCycleRepeat = useCallback(() => {
+    musicController?.cycleRepeat?.();
+  }, [musicController]);
 
   const handleStartOver = useCallback(() => {
-    resumeStore.clear(identityRef.current);
-    setResumeChip(null);
-    if (chipTimerRef.current) {
-      clearTimeout(chipTimerRef.current);
-      chipTimerRef.current = null;
-    }
-    commitSeek(0);
-  }, [resumeStore, commitSeek]);
+    musicController?.startOver?.();
+  }, [musicController]);
 
-  const applyVolume = useCallback((nextVol) => {
-    const clamped = clampVolume(nextVol);
-    setVolume(clamped);
-    setMuted(clamped === 0);
-    const a = audioRef.current;
-    if (a) {
-      a.volume = clamped;
-      a.muted = clamped === 0;
-    }
-  }, []);
+  const applyVolume = useCallback(
+    (nextVol) => {
+      musicController?.setVolume?.(nextVol);
+    },
+    [musicController],
+  );
 
   const toggleMute = useCallback(() => {
-    const a = audioRef.current;
-    if (!a) return;
-    if (a.muted || a.volume === 0) {
-      const restored = volume > 0 ? volume : 1;
-      a.muted = false;
-      a.volume = restored;
-      setMuted(false);
-      setVolume(restored);
-    } else {
-      a.muted = true;
-      setMuted(true);
-    }
-  }, [volume]);
-
-  // Platform media keys & lock-screen player (`navigator.mediaSession`).
-  useEffect(() => {
-    const ms = typeof navigator !== 'undefined' ? navigator.mediaSession : null;
-    if (!ms) return undefined;
-    try {
-      if (typeof window !== 'undefined' && typeof window.MediaMetadata === 'function') {
-        ms.metadata = new window.MediaMetadata({
-          title: display.title,
-          artist: tags?.artist || '',
-          album: tags?.album || '',
-          artwork: coverUrl ? [{ src: coverUrl }] : [],
-        });
-      }
-    } catch {
-      // Ignore MediaMetadata errors on unsupported platforms.
-    }
-    const safeSet = (action, handler) => {
-      try {
-        ms.setActionHandler(action, handler);
-      } catch {
-        // Some browsers do not support every action name.
-      }
-    };
-    safeSet('play', () => {
-      const a = audioRef.current;
-      if (!a || a.paused || a.ended || a.error || a.readyState < 1) {
-        togglePlay();
-      }
-    });
-    safeSet('pause', () => audioRef.current?.pause?.());
-    safeSet('previoustrack', handlePrev);
-    safeSet('nexttrack', queue.next ? handleNext : null);
-    safeSet('seekto', (details) => {
-      if (typeof details?.seekTime === 'number' && Number.isFinite(details.seekTime)) {
-        commitSeek(details.seekTime);
-      }
-    });
-    safeSet('seekbackward', (details) => {
-      const offset = typeof details?.seekOffset === 'number' && details.seekOffset > 0 ? details.seekOffset : SEEK_STEP_S;
-      commitSeek(Math.max(0, currentTimeRef.current - offset));
-    });
-    safeSet('seekforward', (details) => {
-      const offset = typeof details?.seekOffset === 'number' && details.seekOffset > 0 ? details.seekOffset : SEEK_STEP_S;
-      commitSeek(currentTimeRef.current + offset);
-    });
-
-    return () => {
-      for (const action of ['play', 'pause', 'previoustrack', 'nexttrack', 'seekto', 'seekbackward', 'seekforward']) {
-        safeSet(action, null);
-      }
-    };
-  }, [display.title, tags?.artist, tags?.album, coverUrl, queue.prev, queue.next, handlePrev, handleNext, commitSeek, togglePlay]);
-
-  useEffect(() => {
-    const ms = typeof navigator !== 'undefined' ? navigator.mediaSession : null;
-    if (!ms) return;
-    try {
-      ms.playbackState = playing ? 'playing' : 'paused';
-      if (typeof ms.setPositionState === 'function' && Number.isFinite(duration) && duration > 0) {
-        ms.setPositionState({
-          duration,
-          playbackRate,
-          position: Math.max(0, Math.min(duration, currentTime)),
-        });
-      }
-    } catch {
-      // Ignore position state clamping errors.
-    }
-  }, [playing, duration, playbackRate, currentTime]);
-
-  // Clear MediaSession metadata, playbackState, and handlers completely when the music player closes.
-  useEffect(() => {
-    return () => {
-      const ms = typeof navigator !== 'undefined' ? navigator.mediaSession : null;
-      if (!ms) return;
-      for (const action of ['play', 'pause', 'previoustrack', 'nexttrack', 'seekto', 'seekbackward', 'seekforward']) {
-        try {
-          ms.setActionHandler(action, null);
-        } catch {
-          // Ignore unsupported action names.
-        }
-      }
-      try {
-        ms.metadata = null;
-      } catch {
-        // Ignore browsers that reject null metadata.
-      }
-      try {
-        ms.playbackState = 'none';
-      } catch {
-        // Ignore playbackState errors.
-      }
-    };
-  }, []);
+    musicController?.toggleMute?.();
+  }, [musicController]);
 
   // Keyboard shortcuts (desktop & browser).
   useEffect(() => {
@@ -2387,21 +2282,22 @@ export function MusicPlayer({
       if (!action) return;
       e.preventDefault();
       e.stopImmediatePropagation?.();
+      const st = stateRef.current || {};
       switch (action) {
         case 'toggle_play':
           togglePlay();
           break;
         case 'seek_back':
-          commitSeek(Math.max(0, currentTimeRef.current - SEEK_STEP_S));
+          commitSeek(Math.max(0, (st.currentTime || 0) - SEEK_STEP_S));
           break;
         case 'seek_forward':
-          commitSeek(currentTimeRef.current + SEEK_STEP_S);
+          commitSeek((st.currentTime || 0) + SEEK_STEP_S);
           break;
         case 'volume_up':
-          if (showVolume) applyVolume((muted ? 0 : volume) + VOLUME_STEP);
+          if (showVolume) applyVolume((st.muted ? 0 : st.volume ?? 1) + VOLUME_STEP);
           break;
         case 'volume_down':
-          if (showVolume) applyVolume((muted ? 0 : volume) - VOLUME_STEP);
+          if (showVolume) applyVolume((st.muted ? 0 : st.volume ?? 1) - VOLUME_STEP);
           break;
         case 'toggle_mute':
           if (showVolume) toggleMute();
@@ -2421,14 +2317,33 @@ export function MusicPlayer({
     }
     window.addEventListener('keydown', onKeyDown, true);
     return () => window.removeEventListener('keydown', onKeyDown, true);
-  }, [togglePlay, commitSeek, showVolume, applyVolume, muted, volume, toggleMute, handleNext, handlePrev, onClose]);
+  }, [togglePlay, commitSeek, showVolume, applyVolume, toggleMute, handleNext, handlePrev, onClose]);
 
-  const displayTime = pendingSeekTime != null ? pendingSeekTime : currentTime;
+  const queue = musicState?.queue || { items: [], index: -1, prev: null, next: null };
+  const coverUrl = musicState?.coverUrl || null;
+  const playing = Boolean(musicState?.playing);
+  const duration = Number.isFinite(musicState?.duration) ? musicState.duration : 0;
+  const currentTime = Number.isFinite(musicState?.currentTime) ? musicState.currentTime : 0;
+  const bufferedEnd = Number.isFinite(musicState?.bufferedEnd) ? musicState.bufferedEnd : 0;
+  const displayTime = musicState?.pendingSeekTime != null ? musicState.pendingSeekTime : currentTime;
+  const busy = Boolean(musicState?.stalled || musicState?.mediaLoading);
+  const resumeChip = musicState?.resumeChip || null;
+  const shuffle = Boolean(musicState?.shuffle);
+  const repeat = musicState?.repeat || 'off';
+  const volume = musicState?.volume ?? 1;
+  const muted = Boolean(musicState?.muted);
+
   const prevIsRestart = !queue.prev || shouldMusicPrevRestart(displayTime);
   const showNext = Boolean(queue.next);
+  const repeatLabel =
+    repeat === 'folder'
+      ? 'Repeat folder (tap for repeat one)'
+      : repeat === 'one'
+        ? 'Repeat one song (tap to turn off)'
+        : 'Repeat off (tap to repeat folder)';
 
   return html`
-    <div class=${coverUrl ? 'music-screen has-cover' : 'music-screen'}>
+    <div ref=${screenRef} class=${coverUrl ? 'music-screen has-cover' : 'music-screen'}>
       ${coverUrl
         ? html`
             <div class="music-backdrop" aria-hidden="true">
@@ -2451,7 +2366,7 @@ export function MusicPlayer({
 
       <div class="music-body">
         <div class="music-cover-wrap">
-          <div class="music-cover-box">
+          <div ref=${coverBoxRef} class="music-cover-box">
             ${coverUrl
               ? html`<img class="music-cover" src=${coverUrl} alt=${display.title} />`
               : html`
@@ -2499,6 +2414,17 @@ export function MusicPlayer({
             <div class="music-transport-slot">
               <button
                 type="button"
+                class=${shuffle ? 'btn icon music-mode-btn active' : 'btn icon music-mode-btn'}
+                aria-label=${shuffle ? 'Shuffle on' : 'Shuffle off'}
+                aria-pressed=${shuffle ? 'true' : 'false'}
+                onClick=${handleToggleShuffle}
+              >
+                <${Icon} name="shuffle" />
+              </button>
+            </div>
+            <div class="music-transport-slot">
+              <button
+                type="button"
                 class="btn icon music-ctl-btn"
                 aria-label=${prevIsRestart ? 'Restart track' : 'Previous track'}
                 onClick=${handlePrev}
@@ -2513,7 +2439,7 @@ export function MusicPlayer({
                 aria-label=${playing ? 'Pause' : 'Play'}
                 onClick=${togglePlay}
               >
-                ${stalled || mediaLoading
+                ${busy
                   ? html`<span class="music-spinner" aria-hidden="true"></span>`
                   : html`<${Icon} name=${playing ? 'pause' : 'play'} />`}
               </button>
@@ -2532,6 +2458,18 @@ export function MusicPlayer({
                   `
                 : null}
             </div>
+            <div class="music-transport-slot">
+              <button
+                type="button"
+                class=${repeat !== 'off' ? 'btn icon music-mode-btn active' : 'btn icon music-mode-btn'}
+                aria-label=${repeatLabel}
+                aria-pressed=${repeat !== 'off' ? 'true' : 'false'}
+                data-repeat=${repeat}
+                onClick=${handleCycleRepeat}
+              >
+                <${Icon} name=${repeat === 'one' ? 'repeat-1' : 'repeat'} />
+              </button>
+            </div>
           </div>
 
           ${showVolume
@@ -2548,137 +2486,6 @@ export function MusicPlayer({
             : null}
         </div>
       </div>
-
-      <audio
-        ref=${bindAudioRef}
-        preload="metadata"
-        aria-label=${display.title}
-        onLoadedMetadata=${(e) => {
-          const a = e.currentTarget;
-          if (!mediaUrlRef.current || !a.getAttribute('src')) return;
-          const dur = Number.isFinite(a.duration) && a.duration > 0 ? a.duration : entry?.duration_s || 0;
-          if (dur > 0) setDuration(dur);
-          setBufferedEnd(readBufferedEnd(a));
-          a.playbackRate = playbackRate;
-          const recovered = Boolean(onMediaLoadedMetadata?.(a));
-          if (!recovered && !resumedAppliedRef.current && dur > 0) {
-            resumedAppliedRef.current = true;
-            const saved = resumeStore.load(identityRef.current, dur);
-            if (saved != null) {
-              try {
-                a.currentTime = saved;
-                setCurrentTime(saved);
-              } catch {
-                // Ignore seek before ready.
-              }
-              setResumeChip({ position: saved });
-              chipTimerRef.current = window.setTimeout(() => {
-                chipTimerRef.current = null;
-                setResumeChip(null);
-              }, 5000);
-            }
-          }
-          const pendingAuto = autoPlayNextRef.current;
-          autoPlayNextRef.current = null;
-          if (!recovered) {
-            const matchesTrack = !pendingAuto?.path || pendingAuto.path === path;
-            if (pendingAuto?.play && matchesTrack) {
-              setPlaying(true);
-              a.play().catch(() => {
-                setPlaying(false);
-              });
-            } else if (pendingAuto && pendingAuto.play === false && matchesTrack) {
-              if (!a.paused) {
-                try {
-                  a.pause();
-                } catch {
-                  // Ignore pause errors.
-                }
-              }
-              setPlaying(false);
-            } else {
-              // Preserve playback that already started before the queued loadedmetadata event fired.
-              setPlaying(!a.paused && !a.ended);
-            }
-          }
-        }}
-        onPlay=${(e) => {
-          if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
-          onMediaPlay?.(e.currentTarget);
-          setPlaying(true);
-        }}
-        onPlaying=${(e) => {
-          if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
-          onMediaPlay?.(e.currentTarget);
-          setPlaying(true);
-          clearStallTimer();
-        }}
-        onPause=${(e) => {
-          const a = e.currentTarget;
-          if (!mediaUrlRef.current || !a.getAttribute('src')) return;
-          onMediaPause?.(a);
-          if (Number.isFinite(a.duration) && a.duration > 0) {
-            resumeStore.save(identityRef.current, a.currentTime, a.duration);
-          }
-          setPlaying(false);
-        }}
-        onWaiting=${() => {
-          if (mediaUrlRef.current) startStallTimer();
-        }}
-        onCanPlay=${(e) => {
-          if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
-          setBufferedEnd(readBufferedEnd(e.currentTarget));
-          clearStallTimer();
-        }}
-        onSeeked=${(e) => {
-          const a = e.currentTarget;
-          if (!mediaUrlRef.current || !a.getAttribute('src')) return;
-          onMediaTime?.(a);
-          setPendingSeekTime(null);
-          setCurrentTime(Number.isFinite(a.currentTime) ? a.currentTime : 0);
-          setBufferedEnd(readBufferedEnd(a));
-          clearStallTimer();
-          if (Number.isFinite(a.duration) && a.duration > 0) {
-            resumeStore.save(identityRef.current, a.currentTime, a.duration);
-          }
-        }}
-        onTimeUpdate=${(e) => {
-          const a = e.currentTarget;
-          if (!mediaUrlRef.current || !a.getAttribute('src')) return;
-          onMediaTime?.(a);
-          if (pendingSeekTime != null) return;
-          const t = Number.isFinite(a.currentTime) ? a.currentTime : 0;
-          setCurrentTime(t);
-          setBufferedEnd(readBufferedEnd(a));
-          if (Number.isFinite(a.duration) && a.duration > 0) {
-            const now = getPlayerClock()?.now?.() ?? Date.now();
-            resumeStore.savePeriodic(identityRef.current, t, a.duration, now);
-          }
-        }}
-        onProgress=${(e) => {
-          if (mediaUrlRef.current && e.currentTarget.getAttribute('src')) {
-            setBufferedEnd(readBufferedEnd(e.currentTarget));
-          }
-        }}
-        onEnded=${(e) => {
-          if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
-          onMediaPause?.(e.currentTarget);
-          resumeStore.clear(identityRef.current);
-          clearStallTimer();
-          if (queueRef.current.next && onNavigateSibling) {
-            autoPlayNextRef.current = { path: queueRef.current.next.path, play: true };
-            onNavigateSibling(queueRef.current.next);
-          } else {
-            setPlaying(false);
-          }
-        }}
-        onError=${(e) => {
-          if (!mediaUrlRef.current || !e.currentTarget.getAttribute('src')) return;
-          clearStallTimer();
-          setPlaying(false);
-          if (onMediaError) onMediaError(e.currentTarget);
-        }}
-      />
     </div>
   `;
 }

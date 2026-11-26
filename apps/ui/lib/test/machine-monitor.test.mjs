@@ -195,14 +195,18 @@ test('overview poller never overlaps in-flight calls, pauses when hidden, and di
   await Promise.resolve();
   assert.equal(poller.getState().stale, false);
 
-  // Hide the screen: advancing 20 seconds makes zero calls.
+  // Hide the screen: clears both poll and stale timers and makes zero calls.
   visible = false;
+  poller.onVisibilityChange();
+  assert.equal(poller.getState().timersRunning, false, 'hidden screen must stop poll and stale timers');
   await clock.advance(20_000);
   assert.equal(calls, 1, 'hidden screen must ask nothing');
 
-  // Show again -> fetches immediately.
+  // Show again -> restarts timers and fetches immediately exactly once (no burst on duplicate events).
   visible = true;
   poller.onVisibilityChange();
+  poller.onVisibilityChange();
+  assert.equal(poller.getState().timersRunning, true);
   assert.equal(calls, 2);
 
   poller.stop();

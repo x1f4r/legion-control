@@ -14,7 +14,9 @@ const NEVER_DISABLED_BUTTON_CLASSES = [
   'player-speed-btn',
   'player-resume-btn',
   'music-ctl-btn',
+  'music-mode-btn',
   'music-play-btn',
+  'mini-player-btn',
 ];
 
 // Buttons rendered inside these containers (including .swipe-action inside .swipe-actions).
