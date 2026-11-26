@@ -1140,7 +1140,9 @@ mod enrol_client {
                 match read_line(&mut buf_reader, &mut reply_buf, MAX_REPLY_LINE).await {
                     Ok(Line::End) => {
                         let stderr_text = if let Some(h) = handle.as_mut() {
-                            h.collect_exit_info(Duration::from_millis(200)).await.1
+                            h.collect_exit_info(crate::session::EXIT_COLLECT_WAIT)
+                                .await
+                                .1
                         } else {
                             stderr.map_or_else(String::new, |s| s.text())
                         };
@@ -2343,5 +2345,77 @@ mod tests {
         .unwrap_err();
         assert_eq!(foreign_conflict.code, ErrorCode::Conflict);
         assert!(foreign_conflict.details.is_none());
+    }
+
+    #[cfg(feature = "ssh")]
+    #[tokio::test]
+    async fn enrol_eof_collects_delayed_remote_stderr_past_200ms() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::time::Duration;
+
+        use tokio_util::sync::CancellationToken;
+
+        use crate::session::TransportHandle;
+
+        struct DelayedStderrHandle {
+            delay: Duration,
+        }
+
+        impl TransportHandle for DelayedStderrHandle {
+            fn collect_exit_info(
+                &mut self,
+                wait_limit: Duration,
+            ) -> Pin<Box<dyn Future<Output = (Option<i32>, String)> + Send + '_>> {
+                let delay = self.delay;
+                Box::pin(async move {
+                    if wait_limit >= delay {
+                        tokio::time::sleep(delay).await;
+                        (Some(1), "legion gate: invite already used".to_owned())
+                    } else {
+                        tokio::time::sleep(wait_limit).await;
+                        (None, String::new())
+                    }
+                })
+            }
+
+            fn close(
+                self: Box<Self>,
+                _grace: Duration,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                Box::pin(async {})
+            }
+        }
+
+        let invite = sample_invite();
+        let pub_line = format!("{SAMPLE_HOST_KEY} phone");
+        let (client_r, server_w) = tokio::io::duplex(4 * 1024);
+        let (_server_r, client_w) = tokio::io::duplex(4 * 1024);
+        drop(server_w);
+
+        let mut handle = DelayedStderrHandle {
+            delay: Duration::from_millis(300),
+        };
+        let err = enrol_client::enrol_exchange(
+            client_r,
+            client_w,
+            Some(&mut handle),
+            None,
+            &invite,
+            &pub_line,
+            "phone",
+            Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|h| h.contains("legion gate: invite already used")),
+            "expected remote stderr hint after 300 ms drain, got: {:?}",
+            err.hint
+        );
     }
 }

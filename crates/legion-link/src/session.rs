@@ -49,8 +49,8 @@ pub fn cancel_reply_timeout(hops: u32) -> Duration {
 
 /// Grace window for clean EOF exit when closing a session.
 const CLOSE_GRACE: Duration = Duration::from_millis(500);
-/// Brief wait for process exit + stderr drain when a pipe closes unexpectedly.
-const EXIT_COLLECT_WAIT: Duration = Duration::from_millis(200);
+/// Bounded wait for process exit + stderr drain when a pipe closes unexpectedly.
+pub(crate) const EXIT_COLLECT_WAIT: Duration = Duration::from_secs(1);
 
 /// Lifecycle handle for the underlying transport backing a [`Session`] (such as a child process
 /// pipe in `legion-net` or an in-process SSH exec channel).
@@ -2314,5 +2314,73 @@ mod tests {
 
         session.close().await;
         let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn handshake_eof_collects_delayed_remote_stderr_past_200ms() {
+        struct DelayedStderrHandle {
+            delay: Duration,
+        }
+
+        impl TransportHandle for DelayedStderrHandle {
+            fn collect_exit_info(
+                &mut self,
+                wait_limit: Duration,
+            ) -> Pin<Box<dyn Future<Output = (Option<i32>, String)> + Send + '_>> {
+                let delay = self.delay;
+                Box::pin(async move {
+                    if wait_limit >= delay {
+                        tokio::time::sleep(delay).await;
+                        (Some(1), "legion gate: key expired on remote".to_owned())
+                    } else {
+                        tokio::time::sleep(wait_limit).await;
+                        (None, String::new())
+                    }
+                })
+            }
+
+            fn close(
+                self: Box<Self>,
+                _grace: Duration,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                Box::pin(async {})
+            }
+        }
+
+        // Separate read/write pipes so writing hello succeeds while reading sees immediate EOF
+        // and stderr/exit status arrive 300 ms later.
+        let (client_r, server_w) = tokio::io::duplex(4 * 1024);
+        let (_server_r, client_w) = tokio::io::duplex(4 * 1024);
+        drop(server_w);
+
+        let Err(open_err) = Session::open_transport(
+            client_r,
+            client_w,
+            Box::new(DelayedStderrHandle {
+                delay: Duration::from_millis(300),
+            }),
+            "tower",
+            None,
+            Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .await
+        else {
+            panic!("expected handshake EOF error");
+        };
+        let err = open_err.into_error();
+
+        assert!(
+            err.message.contains("exit status 1"),
+            "expected remote exit status after 300 ms stderr drain, got: {}",
+            err.message
+        );
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|h| h.contains("legion gate: key expired on remote")),
+            "expected remote stderr hint after 300 ms drain, got: {:?}",
+            err.hint
+        );
     }
 }
