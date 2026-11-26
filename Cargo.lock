@@ -1198,7 +1198,6 @@ dependencies = [
  "legion-doors",
  "legion-net",
  "legion-os",
- "legion-proto",
  "legion-tools",
  "qrcode",
  "serde",
@@ -1299,7 +1298,6 @@ dependencies = [
  "legion-tools",
  "legion-update",
  "legion-xfer",
- "same-file",
  "schemars",
  "serde",
  "serde_json",
@@ -1307,9 +1305,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
- "toml",
  "toml_edit",
- "unicode-normalization",
 ]
 
 [[package]]
