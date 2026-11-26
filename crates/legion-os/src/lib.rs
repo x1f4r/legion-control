@@ -20,6 +20,7 @@ pub mod open_regular;
 pub mod pipe;
 pub mod procid;
 pub mod run;
+pub mod sandbox;
 pub mod shell;
 pub mod user;
 pub mod webview2;

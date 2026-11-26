@@ -129,6 +129,17 @@ node.
   capping heavier progressive/16-bit/interlaced encodings). Over-cap JPEGs fall back to a validated
   embedded MPF preview (preferred) or EXIF IFD1 thumbnail through the same limits with the main
   image's EXIF orientation, returning a per-path `too_large` error only when none is usable. Every
+  worker irreversibly enters (Linux `PR_SET_NO_NEW_PRIVS` + strict seccomp-BPF allowlist blocking
+  file opens, sockets, child spawns, and executable mappings, plus an empty Landlock ruleset where
+  the kernel supports it; macOS deny-default Seatbelt profile via `sandbox_init`) or runs inside
+  (Windows zero-capability AppContainer + single-process UI-restricted Job Object, with
+  Low-Integrity Restricted Token fallback only if AppContainer cannot launch) an OS sandbox before
+  reading byte 0 of untrusted input; if the sandbox cannot be enforced, the worker refuses to
+  decode and returns per-path `unsupported` (`details.reason = "sandbox_unavailable"`) without
+  poisoning the bad-file cache or masking audio errors as `not_found`, `meta.doctor` reports
+  sandbox health in `decode worker sandbox`, and debug builds only may bypass it with
+  `LEGION_ALLOW_UNSANDBOXED_DECODE=1` (ignored in release builds, reported in top-level reply
+  `details`). Every
   worker enforces an exact cross-OS live-heap cap via a capped global allocator (sized at
   `1.35x estimated_peak + 8 MiB`, floored at `16 MiB`, exiting immediately on overshoot; unlimited
   in the normal node at the cost of one relaxed atomic load) backed by a 10 ms RSS watchdog on
@@ -150,7 +161,13 @@ node.
   diagnostics). Timeouts are never remembered permanently as bad; repeated CPU-busy timeouts of the
   same file/size/fit trigger a short 5-minute in-memory back-off. Output is JPEG, or PNG when the
   source has transparency. Video posters (including sniffed MPEG-TS `.ts` recordings) run `ffmpeg`
-  by resolved absolute path with a cleared minimal environment and `MALLOC_ARENA_MAX=2` (capping
+  by resolved absolute path inside an OS sandbox (Linux Landlock granting read-only access solely
+  to the one input video file plus dynamic libraries and read-write access solely to the throwaway
+  temp directory, paired with a seccomp-BPF network-deny filter; macOS `/usr/bin/sandbox-exec`
+  deny-default profile blocking network and process forks; Windows zero-capability AppContainer +
+  single-process Job Object over inherited `stdin` `-fd 0 -i fd:` and stdout `pipe:1`, or
+  Low-Integrity Restricted Token + Job Object over `file,pipe` when `ffmpeg` predates `fd:`) with
+  a cleared minimal environment and `MALLOC_ARENA_MAX=2` (capping
   glibc arena reservations; `-threads 1` limits decoder, encoder, and filter threads rather than
   making `ffmpeg` strictly single-threaded), under the RSS watchdog as the deciding resident limit
   plus a +1 GiB virtual-address backstop (256 MiB resident cap for `<= 1080p` videos sharing the

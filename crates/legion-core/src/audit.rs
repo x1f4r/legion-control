@@ -165,11 +165,19 @@ impl Drop for Held {
 pub(crate) fn create_private_dir_all(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::DirBuilderExt as _;
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
-            .create(dir)
+            .create(dir)?;
+        if let Ok(meta) = std::fs::symlink_metadata(dir)
+            && meta.is_dir()
+            && !meta.file_type().is_symlink()
+            && meta.permissions().mode() & 0o077 != 0
+        {
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+        Ok(())
     }
     #[cfg(not(unix))]
     {
@@ -191,6 +199,22 @@ fn private_open_options() -> OpenOptions {
     }
 }
 
+fn tighten_private_file(file: &File) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Ok(meta) = file.metadata()
+            && meta.permissions().mode() & 0o077 != 0
+        {
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+    }
+}
+
 impl AuditLog {
     /// The audit log under a node's state directory.
     pub fn new(paths: &Paths) -> AuditLog {
@@ -209,12 +233,14 @@ impl AuditLog {
         if let Some(dir) = self.lock.parent() {
             create_private_dir_all(dir)?;
         }
-        private_open_options()
+        let file = private_open_options()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(&self.lock)
+            .open(&self.lock)?;
+        tighten_private_file(&file);
+        Ok(file)
     }
 
     fn hold(&self, shared: bool) -> io::Result<Held> {
@@ -232,11 +258,12 @@ impl AuditLog {
         let mut line = serde_json::to_vec(entry)?;
         line.push(b'\n');
         let _held = self.hold(false)?;
-        private_open_options()
+        let mut log = private_open_options()
             .append(true)
             .create(true)
-            .open(&self.log)
-            .and_then(|mut log| log.write_all(&line))
+            .open(&self.log)?;
+        tighten_private_file(&log);
+        log.write_all(&line)
     }
 
     /// The last `limit` entries that match `filter`, oldest first.
@@ -255,7 +282,10 @@ impl AuditLog {
     ) -> io::Result<Tail> {
         let _held = self.hold(true)?;
         let mut file = match File::open(&self.log) {
-            Ok(file) => file,
+            Ok(file) => {
+                tighten_private_file(&file);
+                file
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Tail::default()),
             Err(error) => return Err(error),
         };
@@ -1045,5 +1075,72 @@ mod tests {
         assert_eq!(state_mode & 0o077, 0, "state dir too open: {state_mode:o}");
         assert_eq!(log_mode & 0o077, 0, "audit.jsonl too open: {log_mode:o}");
         assert_eq!(lock_mode & 0o077, 0, "audit.lock too open: {lock_mode:o}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_loose_audit_log_lock_and_state_dir_are_tightened_on_open() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path().join("legion"));
+        std::fs::create_dir_all(paths.state_dir()).unwrap();
+        std::fs::write(paths.audit_log(), "").unwrap();
+        std::fs::write(paths.audit_lock(), "").unwrap();
+        std::fs::set_permissions(paths.state_dir(), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::fs::set_permissions(paths.audit_log(), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        std::fs::set_permissions(paths.audit_lock(), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+
+        let log = AuditLog::new(&paths);
+        log.append(&entry("meta.version", "owner", Outcome::Ok))
+            .unwrap();
+
+        let state_mode = std::fs::metadata(paths.state_dir())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let log_mode = std::fs::metadata(paths.audit_log())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let lock_mode = std::fs::metadata(paths.audit_lock())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            state_mode, 0o700,
+            "state dir was not tightened: {state_mode:o}"
+        );
+        assert_eq!(
+            log_mode, 0o600,
+            "audit.jsonl was not tightened: {log_mode:o}"
+        );
+        assert_eq!(
+            lock_mode, 0o600,
+            "audit.lock was not tightened: {lock_mode:o}"
+        );
+
+        // Widening audit.jsonl again and opening it via tail also tightens it back to 0600.
+        std::fs::set_permissions(paths.audit_log(), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        let tail = log
+            .tail(10, &Filter::default(), &CancellationToken::new())
+            .unwrap();
+        assert_eq!(tail.entries.len(), 1);
+        let log_mode_after_tail = std::fs::metadata(paths.audit_log())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            log_mode_after_tail, 0o600,
+            "audit.jsonl was not tightened on tail open: {log_mode_after_tail:o}"
+        );
     }
 }

@@ -17,6 +17,22 @@ on:
         description: Run only the macOS fleet tests
         type: boolean
         default: false
+      linux_worker_sandbox_only:
+        description: Run only the Linux decode worker and ffmpeg sandbox tests
+        type: boolean
+        default: false
+      macos_worker_sandbox_only:
+        description: Run only the macOS decode worker and ffmpeg sandbox tests
+        type: boolean
+        default: false
+      windows_worker_sandbox_only:
+        description: Run only the Windows decode worker and ffmpeg sandbox tests
+        type: boolean
+        default: false
+      bench_thumb:
+        description: Also benchmark fs.thumb BEFORE (origin/main) vs AFTER on targeted worker sandbox legs
+        type: boolean
+        default: false
       repeat_count:
         description: Number of times to run targeted tests (1-30)
         type: number
@@ -34,7 +50,7 @@ concurrency:
 jobs:
   scripts:
     name: Scripts and UI (${{ matrix.os }})
-    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only && !inputs.macos_fleet_only) }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only && !inputs.macos_fleet_only && !inputs.linux_worker_sandbox_only && !inputs.macos_worker_sandbox_only && !inputs.windows_worker_sandbox_only) }}
     strategy:
       fail-fast: false
       matrix:
@@ -132,9 +148,280 @@ jobs:
             cargo test -p legion-cli --test fleet --locked
           done
 
+  linux-worker-sandbox:
+    name: Linux worker sandbox
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.linux_worker_sandbox_only }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: ${{ inputs.bench_thumb }}
+        with:
+          node-version: 24
+      - name: Install Rust
+        run: rustup toolchain install
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+      - name: Ensure ffmpeg for benchmark (Linux)
+        if: ${{ inputs.bench_thumb }}
+        run: |
+          set -euo pipefail
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q --no-install-recommends ffmpeg
+          fi
+          ffmpeg -version | head -n 1
+      - name: Run Linux decode worker and ffmpeg sandbox tests
+        run: |
+          set -euo pipefail
+          command -v ffmpeg || true
+          cargo test -p legion-os --lib sandbox:: --locked -- --nocapture
+          cargo test -p legion-tools --lib meta::doctor::tests::worker_sandbox --locked -- --nocapture
+          cargo test -p legion-tools --test thumb_worker --locked -- --nocapture
+      - name: Benchmark fs.thumb BEFORE (origin/main) vs AFTER (Linux)
+        if: ${{ inputs.bench_thumb }}
+        run: |
+          set -euo pipefail
+          bench="$RUNNER_TEMP/thumb-bench"
+          mkdir -p "$bench"
+          cargo build --release --locked --bin legion
+          cp target/release/legion "$bench/legion-after"
+          git fetch --no-tags --depth=1 origin main
+          git worktree add --detach "$bench/main-wt" FETCH_HEAD
+          trap 'git worktree remove --force "$bench/main-wt" >/dev/null 2>&1 || true' EXIT
+          CARGO_TARGET_DIR="$PWD/target" cargo build --manifest-path "$bench/main-wt/Cargo.toml" --release --locked --bin legion
+          cp target/release/legion "$bench/legion-before"
+          "$bench/legion-before" --version
+          "$bench/legion-after" --version
+          LEGION_HOME="$bench/doctor-home" "$bench/legion-after" init --name bench --json >/dev/null
+          LEGION_HOME="$bench/doctor-home" "$bench/legion-after" meta.doctor quick=true --json | grep -E 'decode worker sandbox|sandbox active'
+          node scripts/bench/run.mjs \
+            --suite fs-tools \
+            --case fs-thumb-300-cold \
+            --runs 5 \
+            --bin "$bench/legion-after" \
+            --label sandbox \
+            --compare "$bench/legion-before" \
+            --compare-label main \
+            --scratch "$bench/work" \
+            --out "$bench/out"
+          node -e '
+            const fs = require("node:fs");
+            const r = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            const row = r.suites[0].rows.find((x) => x.id === "fs-thumb-300-cold");
+            const b = row.baseline.wall_ms;
+            const c = row.candidate.wall_ms;
+            console.log(JSON.stringify({
+              machine: r.machine,
+              case: row.id,
+              before_total_ms: b,
+              after_total_ms: c,
+              before_ms_per_decode: b.median / 300,
+              after_ms_per_decode: c.median / 300,
+              delta_ms_per_decode: (c.median - b.median) / 300,
+              delta_pct: ((c.median - b.median) / b.median) * 100,
+            }, null, 2));
+          ' "$bench/out/results.json"
+
+  macos-worker-sandbox:
+    name: macOS worker sandbox
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.macos_worker_sandbox_only }}
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: ${{ inputs.bench_thumb }}
+        with:
+          node-version: 24
+      - name: Install Rust
+        run: rustup toolchain install
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+      - name: Ensure ffmpeg for benchmark (macOS)
+        if: ${{ inputs.bench_thumb }}
+        run: |
+          set -euo pipefail
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            brew install --quiet ffmpeg
+          fi
+          ffmpeg -version | head -n 1
+      - name: Run macOS decode worker and ffmpeg sandbox tests
+        run: |
+          set -euo pipefail
+          which ffmpeg || true
+          cargo test -p legion-os --lib sandbox:: --locked -- --nocapture
+          cargo test -p legion-tools --lib meta::doctor::tests::worker_sandbox --locked -- --nocapture
+          cargo test -p legion-tools --test thumb_worker --locked -- --nocapture
+      - name: Benchmark fs.thumb BEFORE (origin/main) vs AFTER (macOS)
+        if: ${{ inputs.bench_thumb }}
+        run: |
+          set -euo pipefail
+          bench="$RUNNER_TEMP/thumb-bench"
+          mkdir -p "$bench"
+          cargo build --release --locked --bin legion
+          cp target/release/legion "$bench/legion-after"
+          git fetch --no-tags --depth=1 origin main
+          git worktree add --detach "$bench/main-wt" FETCH_HEAD
+          trap 'git worktree remove --force "$bench/main-wt" >/dev/null 2>&1 || true' EXIT
+          CARGO_TARGET_DIR="$PWD/target" cargo build --manifest-path "$bench/main-wt/Cargo.toml" --release --locked --bin legion
+          cp target/release/legion "$bench/legion-before"
+          "$bench/legion-before" --version
+          "$bench/legion-after" --version
+          LEGION_HOME="$bench/doctor-home" "$bench/legion-after" init --name bench --json >/dev/null
+          LEGION_HOME="$bench/doctor-home" "$bench/legion-after" meta.doctor quick=true --json | grep -E 'decode worker sandbox|sandbox active'
+          node scripts/bench/run.mjs \
+            --suite fs-tools \
+            --case fs-thumb-300-cold \
+            --runs 5 \
+            --bin "$bench/legion-after" \
+            --label sandbox \
+            --compare "$bench/legion-before" \
+            --compare-label main \
+            --scratch "$bench/work" \
+            --out "$bench/out"
+          node -e '
+            const fs = require("node:fs");
+            const r = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            const row = r.suites[0].rows.find((x) => x.id === "fs-thumb-300-cold");
+            const b = row.baseline.wall_ms;
+            const c = row.candidate.wall_ms;
+            console.log(JSON.stringify({
+              machine: r.machine,
+              case: row.id,
+              before_total_ms: b,
+              after_total_ms: c,
+              before_ms_per_decode: b.median / 300,
+              after_ms_per_decode: c.median / 300,
+              delta_ms_per_decode: (c.median - b.median) / 300,
+              delta_pct: ((c.median - b.median) / b.median) * 100,
+            }, null, 2));
+          ' "$bench/out/results.json"
+
+  windows-worker-sandbox:
+    name: Windows worker sandbox
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.windows_worker_sandbox_only }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: ${{ inputs.bench_thumb }}
+        with:
+          node-version: 24
+      - name: Install Rust
+        run: rustup toolchain install
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+      - name: Ensure ffmpeg for benchmark (Windows)
+        if: ${{ inputs.bench_thumb }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
+            choco install ffmpeg --no-progress -y
+          }
+          # Prefer the real ffmpeg.exe over Chocolatey's shim binary so single-process Job Object
+          # tests can execute ffmpeg directly without a shim spawning a child process.
+          $realFfmpeg = Get-ChildItem -Path 'C:\ProgramData\chocolatey\lib' -Recurse -Filter 'ffmpeg.exe' -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notlike '*\chocolatey\bin\*' } |
+            Select-Object -First 1 -ExpandProperty FullName
+          if ($realFfmpeg) {
+            $realDir = Split-Path -Parent $realFfmpeg
+            Add-Content -Path $env:GITHUB_PATH -Value $realDir
+            $env:PATH = "$realDir;$env:PATH"
+          } elseif (Test-Path -LiteralPath 'C:\ProgramData\chocolatey\bin') {
+            Add-Content -Path $env:GITHUB_PATH -Value 'C:\ProgramData\chocolatey\bin'
+            $env:PATH = "C:\ProgramData\chocolatey\bin;$env:PATH"
+          }
+          (Get-Command ffmpeg).Source
+          ffmpeg -version | Select-Object -First 1
+      - name: Run Windows decode worker and ffmpeg sandbox tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v ffmpeg || true
+          cargo test -p legion-os --lib sandbox:: --locked -- --nocapture
+          cargo test -p legion-tools --lib meta::doctor::tests::worker_sandbox --locked -- --nocapture
+          cargo test -p legion-tools --test thumb_worker --locked -- --nocapture
+      - name: Benchmark fs.thumb BEFORE (origin/main) vs AFTER (Windows)
+        if: ${{ inputs.bench_thumb }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bench="$(cygpath -m "$RUNNER_TEMP")/thumb-bench"
+          target_dir="$(cygpath -m "$PWD/target")"
+          mkdir -p "$bench"
+          cargo build --release --locked --bin legion
+          cp target/release/legion.exe "$bench/legion-after.exe"
+          git fetch --no-tags --depth=1 origin main
+          git worktree add --detach "$bench/main-wt" FETCH_HEAD
+          trap 'git worktree remove --force "$bench/main-wt" >/dev/null 2>&1 || true' EXIT
+          CARGO_TARGET_DIR="$target_dir" cargo build --manifest-path "$bench/main-wt/Cargo.toml" --release --locked --bin legion
+          cp target/release/legion.exe "$bench/legion-before.exe"
+          "$bench/legion-before.exe" --version
+          "$bench/legion-after.exe" --version
+          LEGION_HOME="$bench/doctor-home" "$bench/legion-after.exe" init --name bench --json >/dev/null
+          LEGION_HOME="$bench/doctor-home" "$bench/legion-after.exe" meta.doctor quick=true --json | grep -E 'decode worker sandbox|sandbox active'
+          node scripts/bench/run.mjs \
+            --suite fs-tools \
+            --case fs-thumb-300-cold \
+            --runs 5 \
+            --bin "$bench/legion-after.exe" \
+            --label sandbox \
+            --compare "$bench/legion-before.exe" \
+            --compare-label main \
+            --scratch "$bench/work" \
+            --out "$bench/out"
+          node -e '
+            const fs = require("node:fs");
+            const r = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            const row = r.suites[0].rows.find((x) => x.id === "fs-thumb-300-cold");
+            const b = row.baseline.wall_ms;
+            const c = row.candidate.wall_ms;
+            console.log(JSON.stringify({
+              machine: r.machine,
+              case: row.id,
+              before_total_ms: b,
+              after_total_ms: c,
+              before_ms_per_decode: b.median / 300,
+              after_ms_per_decode: c.median / 300,
+              delta_ms_per_decode: (c.median - b.median) / 300,
+              delta_pct: ((c.median - b.median) / b.median) * 100,
+            }, null, 2));
+          ' "$bench/out/results.json"
+
   rust:
     name: Rust (${{ matrix.os }})
-    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.macos_pipe_relay_only && !inputs.macos_fleet_only) }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.macos_pipe_relay_only && !inputs.macos_fleet_only && !inputs.linux_worker_sandbox_only && !inputs.macos_worker_sandbox_only && !inputs.windows_worker_sandbox_only) }}
     strategy:
       fail-fast: false
       matrix:
@@ -301,7 +588,7 @@ jobs:
 
   private-data:
     name: Private data
-    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only && !inputs.macos_fleet_only) }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only && !inputs.macos_fleet_only && !inputs.linux_worker_sandbox_only && !inputs.macos_worker_sandbox_only && !inputs.windows_worker_sandbox_only) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -320,7 +607,7 @@ jobs:
 
   shellcheck:
     name: ShellCheck
-    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only && !inputs.macos_fleet_only) }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only && !inputs.macos_fleet_only && !inputs.linux_worker_sandbox_only && !inputs.macos_worker_sandbox_only && !inputs.windows_worker_sandbox_only) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -334,7 +621,7 @@ jobs:
 
   powershell:
     name: PSScriptAnalyzer
-    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only && !inputs.macos_fleet_only) }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only && !inputs.macos_fleet_only && !inputs.linux_worker_sandbox_only && !inputs.macos_worker_sandbox_only && !inputs.windows_worker_sandbox_only) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -353,7 +640,7 @@ jobs:
 
   ui-browser:
     name: UI browser
-    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only && !inputs.macos_fleet_only) }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only && !inputs.macos_fleet_only && !inputs.linux_worker_sandbox_only && !inputs.macos_worker_sandbox_only && !inputs.windows_worker_sandbox_only) }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -383,7 +670,7 @@ jobs:
 
   rust-move-between-places:
     name: Rust move-between-places (ubuntu-latest)
-    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only && !inputs.macos_fleet_only) }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only && !inputs.macos_fleet_only && !inputs.linux_worker_sandbox_only && !inputs.macos_worker_sandbox_only && !inputs.windows_worker_sandbox_only) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -409,7 +696,7 @@ jobs:
 
   audit:
     name: Dependency audit
-    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only && !inputs.macos_fleet_only) }}
+    if: ${{ github.event_name != 'workflow_dispatch' || (!inputs.windows_rust_only && !inputs.macos_pipe_relay_only && !inputs.macos_fleet_only && !inputs.linux_worker_sandbox_only && !inputs.macos_worker_sandbox_only && !inputs.windows_worker_sandbox_only) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

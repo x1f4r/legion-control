@@ -26,6 +26,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
+import zlib from 'node:zlib';
 
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const windows = process.platform === 'win32';
@@ -56,7 +57,7 @@ const TRICKY_TEXT = TRICKY.join(' | ');
 
 function usage(message) {
   if (message) console.error(`legion-e2e: ${message}`);
-  console.error('Usage: node scripts/legion-e2e.mjs --bin <legion> --work <dir> --far <alias> --gate <alias> --far-home <dir> --far-bin <path> [--far-auth-keys <path>] [--far-host-key <path>] [--far-port <port>] [--far-shell cmd|powershell] [--skip <steps>] [--real-power]');
+  console.error('Usage: node scripts/legion-e2e.mjs --bin <legion> --work <dir> --far <alias> --gate <alias> --far-home <dir> --far-bin <path> [--far-auth-keys <path>] [--far-host-key <path>] [--far-port <port>] [--far-shell cmd|powershell] [--only <steps>] [--skip <steps>] [--real-power]');
   process.exit(2);
 }
 
@@ -93,6 +94,8 @@ function parseArgs(argv) {
     farHostKey: options['far-host-key'] ? path.resolve(options['far-host-key']) : null,
     farPort,
     farShell,
+    // Step names or their letters (`a,b`) to run exclusively; empty means all steps.
+    only: (options.only ?? '').split(',').map(s => s.trim()).filter(Boolean),
     // Step names or their letters (`h,i3`) to leave out, for a machine without, say, systemd.
     skip: (options.skip ?? '').split(',').map(s => s.trim()).filter(Boolean),
     realPower: options['real-power'] === true,
@@ -151,6 +154,116 @@ export function emergencyAbort(isWindows, farHome) {
  */
 export function blockerOf(needs, failedNames, skippedNames) {
   return [...failedNames, ...skippedNames].find(other => needs.some(prefix => other.startsWith(prefix)));
+}
+
+/** Whether `name` should run given optional `--only` and `--skip` step-prefix lists. */
+export function shouldRunStep(name, only = [], skip = []) {
+  if (only.length > 0 && !only.some(prefix => name.startsWith(prefix))) return false;
+  if (skip.some(prefix => name.startsWith(prefix))) return false;
+  return true;
+}
+
+/** Builds a minimal valid RGB PNG (width x height) for real decode-worker e2e checks. */
+export function buildTestPng(width = 64, height = 48) {
+  const crcTable = new Uint32Array(256);
+  for (let n = 0; n < 256; n += 1) {
+    let c = n;
+    for (let k = 0; k < 8; k += 1) {
+      c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    }
+    crcTable[n] = c >>> 0;
+  }
+  const crc32 = (buf) => {
+    let c = 0xffffffff;
+    for (let i = 0; i < buf.length; i += 1) {
+      c = crcTable[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+    }
+    return (c ^ 0xffffffff) >>> 0;
+  };
+  const chunk = (type, payload) => {
+    const typeBuf = Buffer.from(type, 'ascii');
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(payload.length, 0);
+    const crc = Buffer.alloc(4);
+    crc.writeUInt32BE(crc32(Buffer.concat([typeBuf, payload])), 0);
+    return Buffer.concat([len, typeBuf, payload, crc]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8; // 8-bit depth
+  ihdr[9] = 2; // RGB color type
+  const raw = Buffer.alloc(height * (1 + width * 3));
+  for (let y = 0; y < height; y += 1) {
+    const row = y * (1 + width * 3);
+    raw[row] = 0; // filter type None
+    for (let x = 0; x < width; x += 1) {
+      const p = row + 1 + x * 3;
+      raw[p] = (x * 4) & 0xff;
+      raw[p + 1] = (y * 5) & 0xff;
+      raw[p + 2] = ((x + y) * 3) & 0xff;
+    }
+  }
+  const sig = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  return Buffer.concat([
+    sig,
+    chunk('IHDR', ihdr),
+    chunk('IDAT', zlib.deflateSync(raw)),
+    chunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+/** Verifies decoded thumbnail bytes match the reported image MIME magic header. */
+export function hasImageMagic(buf, mime) {
+  if (!Buffer.isBuffer(buf) || buf.length < 8) return false;
+  if (mime === 'image/jpeg') return buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
+  if (mime === 'image/png') {
+    return buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47
+      && buf[4] === 0x0d && buf[5] === 0x0a && buf[6] === 0x1a && buf[7] === 0x0a;
+  }
+  if (mime === 'image/webp') {
+    return buf.length >= 12
+      && buf.subarray(0, 4).toString('ascii') === 'RIFF'
+      && buf.subarray(8, 12).toString('ascii') === 'WEBP';
+  }
+  return false;
+}
+
+/**
+ * Validates one `fs.thumb` reply for a single probe image: no dev unsandboxed override, one `ok`
+ * result with an image MIME type, positive dimensions no larger than `requestedSize`, and base64
+ * bytes matching that format's magic header. Returns `{ mime, width, height, byteLength }` or
+ * throws a descriptive Error.
+ */
+export function validateThumbReply(thumb, requestedSize) {
+  if (thumb?.details?.sandbox === 'disabled') {
+    throw new Error('fs.thumb reported dev unsandboxed override');
+  }
+  if (!Array.isArray(thumb?.results) || thumb.results.length !== 1) {
+    throw new Error('fs.thumb returned unexpected results array');
+  }
+  const entry = thumb.results[0];
+  const img = entry?.ok;
+  if (!img || typeof img !== 'object') {
+    throw new Error(`fs.thumb failed to decode probe PNG: ${JSON.stringify(entry)}`);
+  }
+  if (typeof img.mime !== 'string' || !img.mime.startsWith('image/')) {
+    throw new Error(`fs.thumb did not return an image MIME type: ${JSON.stringify(img)}`);
+  }
+  if (typeof img.content !== 'string' || img.content.length === 0) {
+    throw new Error('fs.thumb returned empty image content');
+  }
+  if (
+    !Number.isInteger(img.width) || img.width <= 0 || img.width > requestedSize
+    || !Number.isInteger(img.height) || img.height <= 0 || img.height > requestedSize
+  ) {
+    throw new Error(`fs.thumb returned out-of-range dimensions ${img.width}x${img.height} (requested <= ${requestedSize})`);
+  }
+  const bytes = Buffer.from(img.content, 'base64');
+  if (!hasImageMagic(bytes, img.mime)) {
+    throw new Error(`fs.thumb reply is not a valid ${img.mime} image (head=${bytes.subarray(0, 12).toString('hex')})`);
+  }
+  return { mime: img.mime, width: img.width, height: img.height, byteLength: bytes.length };
 }
 
 const knownSecrets = new Set();
@@ -247,7 +360,7 @@ export function buildOpenSshEd25519Key(seed32, comment = 'legion-e2e') {
 // goes. Compared through realpath, as scripts/check-syntax.mjs does.
 const real = (file) => { try { return fs.realpathSync(file); } catch { return path.resolve(file); } };
 const isMain = process.argv[1] !== undefined && real(process.argv[1]) === real(fileURLToPath(import.meta.url));
-const opts = isMain ? parseArgs(process.argv.slice(2)) : { work: '.', farHome: '.', farPort: 22, skip: [], realPower: false };
+const opts = isMain ? parseArgs(process.argv.slice(2)) : { work: '.', farHome: '.', farPort: 22, only: [], skip: [], realPower: false };
 if (isMain && realPowerRefusal(opts, process.env)) usage(realPowerRefusal(opts, process.env));
 const run = crypto.randomBytes(4).toString('hex');
 const farRoot = `~/legion-e2e-${run}`;
@@ -546,17 +659,46 @@ step('b5 init --on far names the far node, in the LEGION_HOME sshd gives it', ()
   check(fs.readFileSync(path.join(nearHome, 'config', 'node.toml'), 'utf8').includes('near'), 'the near node.toml changed');
 });
 
+function assertActiveDecodeSandbox(doctor, where) {
+  const sandbox = doctor.checks.find(c => c.name === 'decode worker sandbox');
+  check(
+    sandbox && sandbox.ok === true && !sandbox.warning && /sandbox active\b/i.test(sandbox.detail ?? ''),
+    `meta.doctor on ${where} did not report an active decode worker sandbox`,
+    sandbox ?? doctor.checks,
+  );
+  return sandbox.detail;
+}
+
 step('b6 meta.doctor on near now pings far too', () => {
   const doctor = ok('meta.doctor', {});
   fs.writeFileSync(path.join(artifacts, 'doctor-near.json'), JSON.stringify(doctor, null, 2));
   const failing = doctor.checks.filter(c => !c.ok);
   check(doctor.ok === true && failing.length === 0, 'meta.doctor reported problems', failing);
   check(doctor.checks.some(c => /far/.test(`${c.name} ${c.detail}`)), 'meta.doctor did not check far', doctor.checks);
+  assertActiveDecodeSandbox(doctor, 'near');
   const farDoctor = ok('meta.doctor', {}, { on: 'far' });
   fs.writeFileSync(path.join(artifacts, 'doctor-far.json'), JSON.stringify(farDoctor, null, 2));
   check(farDoctor.node === 'far', 'meta.doctor --on far did not run on far', farDoctor);
   const farFailing = farDoctor.checks.filter(c => !c.ok);
   check(farFailing.length === 0, 'meta.doctor --on far reported problems', farFailing);
+  return assertActiveDecodeSandbox(farDoctor, 'far');
+});
+
+step('b7 fs.thumb --on far decodes a real PNG through the sandboxed worker over sshd', () => {
+  const requestedSize = 128;
+  const localPng = path.join(data, 'sandbox-probe.png');
+  fs.writeFileSync(localPng, buildTestPng(64, 48));
+  const remotePng = `${farRoot}/sandbox/sandbox-probe.png`;
+  const sent = cp(localPng, `far:${remotePng}`);
+  check(sent.files_sent === 1, 'legion cp did not copy probe PNG to far', sent);
+  const thumb = ok('fs.thumb', { paths: [remotePng], size: requestedSize }, { on: 'far' });
+  let verified;
+  try {
+    verified = validateThumbReply(thumb, requestedSize);
+  } catch (err) {
+    throw new Failure(redactSecrets(`${err.message}\n${JSON.stringify(thumb, null, 2)}`));
+  }
+  return `${verified.mime} ${verified.width}x${verified.height} (${verified.byteLength} bytes)`;
 });
 
 // --- c. routed calls -----------------------------------------------------------------------------
@@ -849,6 +991,30 @@ step('g4 the gated key refuses to run an arbitrary command', () => {
     check(result.stderr.includes('legion gate:') && !result.stdout.includes('pwned'), `ssh ${opts.gate} ${command} was not refused by legion gate`, result.entry);
   }
 }, ['f1']);
+
+step('g5 through the gated key (sshd forced command), meta.doctor reports an active decode worker sandbox and fs.thumb decodes a real PNG', () => {
+  const gateDoctor = ok('meta.doctor', { quick: true }, { on: 'fargate' });
+  fs.writeFileSync(path.join(artifacts, 'doctor-fargate.json'), JSON.stringify(gateDoctor, null, 2));
+  check(gateDoctor.node === 'far', 'meta.doctor --on fargate did not run on far', gateDoctor);
+  const gateFailing = gateDoctor.checks.filter(c => !c.ok);
+  check(gateFailing.length === 0, 'meta.doctor --on fargate reported problems', gateFailing);
+  const sandboxDetail = assertActiveDecodeSandbox(gateDoctor, 'fargate');
+
+  const requestedSize = 128;
+  const localPng = path.join(data, 'gate-sandbox-probe.png');
+  fs.writeFileSync(localPng, buildTestPng(80, 48));
+  const remotePng = `${farRoot}/projects/gate-sandbox-probe.png`;
+  const sent = cp(localPng, `fargate:${remotePng}`);
+  check(sent.files_sent === 1, 'legion cp through fargate did not copy probe PNG', sent);
+  const thumb = ok('fs.thumb', { paths: [remotePng], size: requestedSize }, { on: 'fargate' });
+  let verified;
+  try {
+    verified = validateThumbReply(thumb, requestedSize);
+  } catch (err) {
+    throw new Failure(redactSecrets(`${err.message}\n${JSON.stringify(thumb, null, 2)}`));
+  }
+  return `${sandboxDetail} | ${verified.mime} ${verified.width}x${verified.height} (${verified.byteLength} bytes)`;
+}, ['g1']);
 
 // Device pairing over real sshd: on Unix, far points [devices] at the throwaway sshd's files; on
 // Windows, [devices] is left unset so far exercises %ProgramData%\ssh\administrators_authorized_keys
@@ -1764,7 +1930,7 @@ async function main() {
   const failed = [];
   const skipped = [];
   for (const { name, body, needs, fatal } of steps) {
-    if (opts.skip.some(prefix => name.startsWith(prefix))) {
+    if (!shouldRunStep(name, opts.only, opts.skip)) {
       skipped.push(name);
       process.stdout.write(`--- ${name}: skipped as asked\n`);
       continue;

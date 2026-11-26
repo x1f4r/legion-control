@@ -170,8 +170,11 @@ In the folder listing a song shows its cover where a picture shows its thumbnail
   `size` may now be up to 1024, for the player.
 - Read from: ID3v2 and ID3v1 (mp3, also inside wav and aiff), FLAC blocks, Vorbis comments in
   Ogg Vorbis and Opus (including `METADATA_BLOCK_PICTURE`), and MP4 items (m4a, m4b, mp4).
-- These files are untrusted input. Tags and the cover are read inside the same out-of-process
-  worker that decodes pictures, under the same memory cap and time limit, from the handle the
+- These files are untrusted input. Tags and the cover are read inside the same out-of-process,
+  OS-sandboxed worker that decodes pictures (entering Linux seccomp-BPF + Landlock, macOS Seatbelt,
+  or Windows AppContainer + Job Object before reading byte 0, and failing closed with `unsupported`
+  / `details.reason = "sandbox_unavailable"` if unavailable rather than masking as `not_found`),
+  under the same memory cap and time limit, from the handle the
   node already opened. At most 16 MiB of a file's tag data is read; a declared length is never
   believed beyond that; a cover is then decoded like any picture, with every limit a picture
   has. Text is trimmed, stripped of control characters and cut to 512 characters a field.

@@ -10,8 +10,10 @@ import { writeThrowawayNode } from './proc.mjs';
 const LIB_DIR = path.dirname(fileURLToPath(import.meta.url));
 const STREAM_PY = path.join(LIB_DIR, 'stream_bench.py');
 
+const PYTHON_BIN = process.platform === 'win32' ? 'python' : 'python3';
+
 function runPython(code, args = []) {
-  return execFileSync('python3', ['-c', code, ...args], {
+  return execFileSync(PYTHON_BIN, ['-c', code, ...args], {
     encoding: 'utf8',
     maxBuffer: 32 * 1024 * 1024,
   });
@@ -36,7 +38,8 @@ function statHashWithLegion(bin, legionHome, userHome, filePath) {
   return parsed.hash;
 }
 
-export function ensureFixtures(scratchRoot, bin, neededSuites) {
+export function ensureFixtures(scratchRoot, bin, neededSuites, neededCases = null) {
+  const wantCase = (id) => !neededCases || neededCases.has(id);
   const fixturesDir = path.join(scratchRoot, 'fixtures');
   const metaPath = path.join(fixturesDir, 'meta.json');
   fs.mkdirSync(fixturesDir, { recursive: true });
@@ -178,12 +181,13 @@ for k in range(n):
 
   // 3. Filesystem fixtures: 10,000-entry dir, 100,000-entry dir, 100,000-file tree, 300 pics, 300 songs.
   if (needFs) {
-    const list10k = path.join(fixturesDir, 'list-10k');
-    if (!fs.existsSync(path.join(list10k, 'entry_09999.md'))) {
-      console.error(`[bench] creating 10,000-entry directory ${list10k}...`);
-      fs.mkdirSync(list10k, { recursive: true });
-      runPython(
-        `
+    if (wantCase('fs-list-10k-500')) {
+      const list10k = path.join(fixturesDir, 'list-10k');
+      if (!fs.existsSync(path.join(list10k, 'entry_09999.md'))) {
+        console.error(`[bench] creating 10,000-entry directory ${list10k}...`);
+        fs.mkdirSync(list10k, { recursive: true });
+        runPython(
+          `
 import os, sys
 d = sys.argv[1]
 exts = [".txt", ".jpg", ".pdf", ".mp4", ".mp3", ".rs", ".json", ".zip", ".png", ".md"]
@@ -193,17 +197,19 @@ for i in range(10000):
     fd = os.open(p, os.O_CREAT | os.O_WRONLY, 0o644)
     os.close(fd)
 `,
-        [list10k],
-      );
+          [list10k],
+        );
+      }
+      out.list10k = list10k;
     }
-    out.list10k = list10k;
 
-    const list100k = path.join(fixturesDir, 'list-100k');
-    if (!fs.existsSync(path.join(list100k, 'entry_099999.md'))) {
-      console.error(`[bench] creating 100,000-entry directory ${list100k}...`);
-      fs.mkdirSync(list100k, { recursive: true });
-      runPython(
-        `
+    if (wantCase('fs-list-100k-500') || wantCase('fs-list-100k-5000')) {
+      const list100k = path.join(fixturesDir, 'list-100k');
+      if (!fs.existsSync(path.join(list100k, 'entry_099999.md'))) {
+        console.error(`[bench] creating 100,000-entry directory ${list100k}...`);
+        fs.mkdirSync(list100k, { recursive: true });
+        runPython(
+          `
 import os, sys
 d = sys.argv[1]
 exts = [".txt", ".jpg", ".pdf", ".mp4", ".mp3", ".rs", ".json", ".zip", ".png", ".md"]
@@ -213,17 +219,19 @@ for i in range(100000):
     fd = os.open(p, os.O_CREAT | os.O_WRONLY, 0o644)
     os.close(fd)
 `,
-        [list100k],
-      );
+          [list100k],
+        );
+      }
+      out.list100k = list100k;
     }
-    out.list100k = list100k;
 
-    const tree100k = path.join(fixturesDir, 'tree-100k');
-    if (!fs.existsSync(path.join(tree100k, 'dir_099', 'needle_report_099.txt'))) {
-      console.error(`[bench] creating 100,000-file directory tree ${tree100k}...`);
-      fs.mkdirSync(tree100k, { recursive: true });
-      runPython(
-        `
+    if (wantCase('fs-find-100k')) {
+      const tree100k = path.join(fixturesDir, 'tree-100k');
+      if (!fs.existsSync(path.join(tree100k, 'dir_099', 'needle_report_099.txt'))) {
+        console.error(`[bench] creating 100,000-file directory tree ${tree100k}...`);
+        fs.mkdirSync(tree100k, { recursive: true });
+        runPython(
+          `
 import os, sys
 root = sys.argv[1]
 exts = [".txt", ".jpg", ".pdf", ".rs", ".json", ".log", ".png", ".csv", ".md", ".bin"]
@@ -238,72 +246,76 @@ for d_idx in range(100):
         fd = os.open(os.path.join(sub, name), os.O_CREAT | os.O_WRONLY, 0o644)
         os.close(fd)
 `,
-        [tree100k],
-      );
+          [tree100k],
+        );
+      }
+      out.tree100k = tree100k;
     }
-    out.tree100k = tree100k;
 
     // 300 distinct real 1280x720 JPEG pictures generated once with ffmpeg.
-    const pics300 = path.join(fixturesDir, 'pics-300');
-    const lastPic = path.join(pics300, 'photo_0300.jpg');
-    if (!fs.existsSync(lastPic)) {
-      console.error(`[bench] generating 300 real 1280x720 JPEGs in ${pics300}...`);
-      fs.mkdirSync(pics300, { recursive: true });
-      execFileSync(
-        'ffmpeg',
-        [
-          '-hide_banner',
-          '-loglevel',
-          'error',
-          '-y',
-          '-f',
-          'lavfi',
-          '-i',
-          'testsrc2=size=1280x720:rate=30:duration=10',
-          '-frames:v',
-          '300',
-          '-q:v',
-          '4',
-          path.join(pics300, 'photo_%04d.jpg'),
-        ],
-        { stdio: 'inherit' },
-      );
+    if (wantCase('fs-thumb-300-cold')) {
+      const pics300 = path.join(fixturesDir, 'pics-300');
+      const lastPic = path.join(pics300, 'photo_0300.jpg');
+      if (!fs.existsSync(lastPic)) {
+        console.error(`[bench] generating 300 real 1280x720 JPEGs in ${pics300}...`);
+        fs.mkdirSync(pics300, { recursive: true });
+        execFileSync(
+          'ffmpeg',
+          [
+            '-hide_banner',
+            '-loglevel',
+            'error',
+            '-y',
+            '-f',
+            'lavfi',
+            '-i',
+            'testsrc2=size=1280x720:rate=30:duration=10',
+            '-frames:v',
+            '300',
+            '-q:v',
+            '4',
+            path.join(pics300, 'photo_%04d.jpg'),
+          ],
+          { stdio: 'inherit' },
+        );
+      }
+      out.pics300 = {
+        dir: pics300,
+        files: Array.from({ length: 300 }, (_, i) =>
+          path.join(pics300, `photo_${String(i + 1).padStart(4, '0')}.jpg`),
+        ),
+      };
     }
-    out.pics300 = {
-      dir: pics300,
-      files: Array.from({ length: 300 }, (_, i) =>
-        path.join(pics300, `photo_${String(i + 1).padStart(4, '0')}.jpg`),
-      ),
-    };
 
     // 300 distinct real ID3v2-tagged MP3 songs in one album folder.
-    const songs300 = path.join(fixturesDir, 'songs-300');
-    const lastSong = path.join(songs300, 'track_0300.mp3');
-    if (!fs.existsSync(lastSong)) {
-      console.error(`[bench] generating 300 real tagged MP3 files in ${songs300}...`);
-      fs.mkdirSync(songs300, { recursive: true });
-      const baseMp3 = path.join(fixturesDir, '_base_tone.mp3');
-      execFileSync(
-        'ffmpeg',
-        [
-          '-hide_banner',
-          '-loglevel',
-          'error',
-          '-y',
-          '-f',
-          'lavfi',
-          '-i',
-          'sine=frequency=440:duration=2',
-          '-c:a',
-          'libmp3lame',
-          '-b:a',
-          '128k',
-          baseMp3,
-        ],
-        { stdio: 'inherit' },
-      );
-      runPython(
-        `
+    if (wantCase('fs-tags-300-cold')) {
+      const songs300 = path.join(fixturesDir, 'songs-300');
+      const lastSong = path.join(songs300, 'track_0300.mp3');
+      if (!fs.existsSync(lastSong)) {
+        console.error(`[bench] generating 300 real tagged MP3 files in ${songs300}...`);
+        fs.mkdirSync(songs300, { recursive: true });
+        const baseMp3 = path.join(fixturesDir, '_base_tone.mp3');
+        execFileSync(
+          'ffmpeg',
+          [
+            '-hide_banner',
+            '-loglevel',
+            'error',
+            '-y',
+            '-f',
+            'lavfi',
+            '-i',
+            'sine=frequency=440:duration=2',
+            '-c:a',
+            'libmp3lame',
+            '-b:a',
+            '128k',
+            baseMp3,
+          ],
+          { stdio: 'inherit' },
+        );
+        runPython(
+          `
 import concurrent.futures, os, subprocess, sys
 base_mp3, out_dir = sys.argv[1], sys.argv[2]
 
@@ -323,16 +335,17 @@ def make_one(i):
 with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 4)) as ex:
     list(ex.map(make_one, range(1, 301)))
 `,
-        [baseMp3, songs300],
-      );
-      fs.unlinkSync(baseMp3);
+          [baseMp3, songs300],
+        );
+        fs.unlinkSync(baseMp3);
+      }
+      out.songs300 = {
+        dir: songs300,
+        files: Array.from({ length: 300 }, (_, i) =>
+          path.join(songs300, `track_${String(i + 1).padStart(4, '0')}.mp3`),
+        ),
+      };
     }
-    out.songs300 = {
-      dir: songs300,
-      files: Array.from({ length: 300 }, (_, i) =>
-        path.join(songs300, `track_${String(i + 1).padStart(4, '0')}.mp3`),
-      ),
-    };
   }
 
   // 4. UI 5,000-entry directory (text/docs/code files so list rendering & scroll are measured cleanly).

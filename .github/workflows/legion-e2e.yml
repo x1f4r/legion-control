@@ -14,11 +14,40 @@ on:
       - scripts/legion-e2e.mjs
       - .github/workflows/legion-e2e.yml
   workflow_dispatch:
+    inputs:
+      sandbox_only:
+        description: Run only far-machine meta.doctor and fs.thumb sandbox checks over sshd
+        type: boolean
+        default: false
+      target_os:
+        description: Platform(s) to run when manually dispatched
+        type: choice
+        default: all
+        options:
+          - all
+          - linux
+          - macos
+          - windows
+      windows_shell:
+        description: Windows OpenSSH DefaultShell leg(s) when manually dispatched
+        type: choice
+        default: both
+        options:
+          - both
+          - powershell
+          - cmd
+      build_profile:
+        description: Cargo build profile (debug for fast manual sandbox iteration)
+        type: choice
+        default: release
+        options:
+          - release
+          - debug
 permissions:
   contents: read
 concurrency:
-  group: legion-e2e-${{ github.ref }}
-  cancel-in-progress: true
+  group: legion-e2e-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 # Every action is pinned to the commit of the release named beside it, as in checks.yml.
 jobs:
   e2e:
@@ -26,20 +55,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: Linux
-            os: ubuntu-latest
-          - name: macOS
-            os: macos-latest
-          # Windows OpenSSH hands a session's command to cmd unless the DefaultShell registry
-          # value names another shell, and owners do switch it to PowerShell. The remote command
-          # shapes have to survive both, so both get a leg.
-          - name: Windows, cmd
-            os: windows-latest
-            shell: cmd
-          - name: Windows, PowerShell
-            os: windows-latest
-            shell: powershell
+        include: >-
+          ${{ fromJSON(
+            github.event_name == 'workflow_dispatch' && inputs.target_os == 'linux'
+              && '[{"name":"Linux","os":"ubuntu-latest"}]'
+            || (github.event_name == 'workflow_dispatch' && inputs.target_os == 'macos'
+              && '[{"name":"macOS","os":"macos-latest"}]')
+            || (github.event_name == 'workflow_dispatch' && inputs.target_os == 'windows' && inputs.windows_shell == 'powershell'
+              && '[{"name":"Windows, PowerShell","os":"windows-latest","shell":"powershell"}]')
+            || (github.event_name == 'workflow_dispatch' && inputs.target_os == 'windows' && inputs.windows_shell == 'cmd'
+              && '[{"name":"Windows, cmd","os":"windows-latest","shell":"cmd"}]')
+            || (github.event_name == 'workflow_dispatch' && inputs.target_os == 'windows'
+              && '[{"name":"Windows, cmd","os":"windows-latest","shell":"cmd"},{"name":"Windows, PowerShell","os":"windows-latest","shell":"powershell"}]')
+            || '[{"name":"Linux","os":"ubuntu-latest"},{"name":"macOS","os":"macos-latest"},{"name":"Windows, cmd","os":"windows-latest","shell":"cmd"},{"name":"Windows, PowerShell","os":"windows-latest","shell":"powershell"}]'
+          ) }}
     runs-on: ${{ matrix.os }}
     # The real power steps wait out a cancelled restart's ten minutes on top of the rest.
     timeout-minutes: 60
@@ -61,10 +90,14 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: cargo-e2e-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
-          restore-keys: cargo-e2e-${{ runner.os }}-
-      - name: Build legion
+          key: cargo-e2e-${{ runner.os }}${{ inputs.build_profile == 'debug' && '-debug' || '' }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-e2e-${{ runner.os }}${{ inputs.build_profile == 'debug' && '-debug' || '' }}-
+      - name: Build legion (release)
+        if: inputs.build_profile != 'debug'
         run: cargo build --release --locked -p legion-cli
+      - name: Build legion (debug)
+        if: inputs.build_profile == 'debug'
+        run: cargo build --locked -p legion-cli
 
       # Linux and macOS: a second sshd of the system's own, started for this job on a loopback
       # port with a configuration, host key and authorized_keys made here, so nothing about the
@@ -252,14 +285,99 @@ jobs:
       # --real-power: this runner is thrown away after the job, so here, and only here, the far node
       # really schedules a restart and a shutdown and calls them off (steps l of the driver). If
       # calling off ever fails, the job dies with its runner instead of reporting.
+      - name: Inspect Windows session window station and desktop under sshd (sandbox_only)
+        if: runner.os == 'Windows' && github.event_name == 'workflow_dispatch' && inputs.sandbox_only
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $probeScript = @'
+          Add-Type @"
+          using System;
+          using System.Runtime.InteropServices;
+          using System.Text;
+          public static class WinStaProbe {
+            [DllImport("user32.dll")] public static extern IntPtr GetProcessWindowStation();
+            [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+            [DllImport("user32.dll")] public static extern IntPtr GetThreadDesktop(uint dwThreadId);
+            [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+            public static extern bool GetUserObjectInformationW(IntPtr hObj, int nIndex, byte[] pvInfo, uint nLength, out uint lpnLengthNeeded);
+            [DllImport("advapi32.dll", SetLastError=true)]
+            public static extern uint GetSecurityInfo(IntPtr handle, int ObjectType, uint SecurityInfo, out IntPtr ppsidOwner, out IntPtr ppsidGroup, out IntPtr ppDacl, out IntPtr ppSacl, out IntPtr ppSecurityDescriptor);
+            [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+            public static extern bool ConvertSecurityDescriptorToStringSecurityDescriptorW(IntPtr sd, uint rev, uint info, out IntPtr str, out uint len);
+            [DllImport("kernel32.dll")] public static extern IntPtr LocalFree(IntPtr hMem);
+            [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+            public static extern IntPtr OpenWindowStationW(string name, bool inherit, uint access);
+            [DllImport("user32.dll", SetLastError=true)] public static extern bool CloseWindowStation(IntPtr h);
+            [DllImport("user32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+            public static extern IntPtr OpenDesktopW(string name, uint flags, bool inherit, uint access);
+            [DllImport("user32.dll", SetLastError=true)] public static extern bool CloseDesktop(IntPtr h);
+            public static string ObjName(IntPtr h) {
+              uint need = 0;
+              GetUserObjectInformationW(h, 2, null, 0, out need);
+              if (need == 0) return "<err:" + Marshal.GetLastWin32Error() + ">";
+              var buf = new byte[need];
+              if (!GetUserObjectInformationW(h, 2, buf, need, out need)) return "<err2:" + Marshal.GetLastWin32Error() + ">";
+              return Encoding.Unicode.GetString(buf).TrimEnd('\0');
+            }
+            public static string ObjSddl(IntPtr h) {
+              IntPtr o, g, d, s, sd;
+              uint rc = GetSecurityInfo(h, 7, 5, out o, out g, out d, out s, out sd);
+              if (rc != 0) return "<GetSecurityInfo err:" + rc + ">";
+              try {
+                IntPtr str; uint len;
+                if (!ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, 1, 5, out str, out len))
+                  return "<ConvertSD err:" + Marshal.GetLastWin32Error() + ">";
+                try { return Marshal.PtrToStringUni(str); } finally { LocalFree(str); }
+              } finally { LocalFree(sd); }
+            }
+          }
+          "@
+          $sid = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+          $ws = [WinStaProbe]::GetProcessWindowStation()
+          $dk = [WinStaProbe]::GetThreadDesktop([WinStaProbe]::GetCurrentThreadId())
+          $wsName = [WinStaProbe]::ObjName($ws)
+          $dkName = [WinStaProbe]::ObjName($dk)
+          Write-Output "SessionId=$sid WinSta=$wsName Desktop=$dkName"
+          Write-Output "WinStaSDDL=$([WinStaProbe]::ObjSddl($ws))"
+          Write-Output "DesktopSDDL=$([WinStaProbe]::ObjSddl($dk))"
+          $hws = [WinStaProbe]::OpenWindowStationW($wsName, $false, 0x00060000)
+          Write-Output "OpenWindowStation(READ_CONTROL|WRITE_DAC)=$(if ($hws -ne [IntPtr]::Zero) { [void][WinStaProbe]::CloseWindowStation($hws); 'OK' } else { 'ERR:' + [System.Runtime.InteropServices.Marshal]::GetLastWin32Error() })"
+          $hdk = [WinStaProbe]::OpenDesktopW($dkName, 0, $false, 0x00060000)
+          Write-Output "OpenDesktop(READ_CONTROL|WRITE_DAC)=$(if ($hdk -ne [IntPtr]::Zero) { [void][WinStaProbe]::CloseDesktop($hdk); 'OK' } else { 'ERR:' + [System.Runtime.InteropServices.Marshal]::GetLastWin32Error() })"
+          '@
+          $probePath = Join-Path $env:E2E_DIR 'winsta-probe.ps1'
+          Set-Content -Path $probePath -Value $probeScript -Encoding utf8
+          Write-Output '--- LOCAL RUNNER SESSION ---'
+          & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $probePath
+          Write-Output '--- SSHD FAR SESSION ---'
+          & ssh -T -o BatchMode=yes legion-e2e-far "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$probePath`""
       - name: Run the scenario (Linux and macOS)
         if: runner.os != 'Windows'
         shell: bash
-        run: >-
-          node scripts/legion-e2e.mjs --bin target/release/legion --work "$E2E_DIR/work"
-          --far legion-e2e-far --gate legion-e2e-gate --far-home "$E2E_FAR_HOME" --far-bin "$E2E_FAR_BIN"
-          --far-auth-keys "$E2E_FAR_AUTH_KEYS" --far-host-key "$E2E_FAR_HOST_KEY" --far-port 2222
-          --real-power
+        env:
+          E2E_BIN: target/${{ inputs.build_profile == 'debug' && 'debug' || 'release' }}/legion
+          E2E_SANDBOX_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.sandbox_only && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          args=(
+            scripts/legion-e2e.mjs
+            --bin "$E2E_BIN"
+            --work "$E2E_DIR/work"
+            --far legion-e2e-far
+            --gate legion-e2e-gate
+            --far-home "$E2E_FAR_HOME"
+            --far-bin "$E2E_FAR_BIN"
+            --far-auth-keys "$E2E_FAR_AUTH_KEYS"
+            --far-host-key "$E2E_FAR_HOST_KEY"
+            --far-port 2222
+          )
+          if [ "$E2E_SANDBOX_ONLY" = "true" ]; then
+            args+=(--only a,b,f1,g1,g5)
+          else
+            args+=(--real-power)
+          fi
+          node "${args[@]}"
       # From PowerShell rather than Git's bash, whose PATH would put Git's own ssh ahead of the
       # Windows OpenSSH client people use.
       - name: Run the scenario (Windows)
@@ -267,10 +385,43 @@ jobs:
         shell: pwsh
         env:
           E2E_SHELL: ${{ matrix.shell }}
-        run: >-
-          node scripts/legion-e2e.mjs --bin target/release/legion.exe --work "$env:E2E_DIR/work"
-          --far legion-e2e-far --gate legion-e2e-gate --far-home "$env:E2E_FAR_HOME" --far-bin "$env:E2E_FAR_BIN"
-          --far-shell "$env:E2E_SHELL" --real-power
+          E2E_BIN: target/${{ inputs.build_profile == 'debug' && 'debug' || 'release' }}/legion.exe
+          E2E_SANDBOX_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.sandbox_only && 'true' || 'false' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $argsList = @(
+            'scripts/legion-e2e.mjs',
+            '--bin', $env:E2E_BIN,
+            '--work', "$env:E2E_DIR/work",
+            '--far', 'legion-e2e-far',
+            '--gate', 'legion-e2e-gate',
+            '--far-home', $env:E2E_FAR_HOME,
+            '--far-bin', $env:E2E_FAR_BIN,
+            '--far-shell', $env:E2E_SHELL
+          )
+          if ($env:E2E_SANDBOX_ONLY -eq 'true') {
+            $argsList += @('--only', 'a,b,f1,g1,g5')
+          } else {
+            $argsList += '--real-power'
+          }
+          & node @argsList
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($env:E2E_SANDBOX_ONLY -eq 'true') {
+            $probePath = Join-Path $env:E2E_DIR 'winsta-probe.ps1'
+            if (Test-Path -LiteralPath $probePath) {
+              Write-Output '--- SAME-SESSION SSHD VERIFICATION (ACE REVOKED ON WORKER EXIT) ---'
+              $sameSessionCmd = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ""& '$probePath'; & '$env:E2E_FAR_BIN' meta.doctor --json | Out-Null; if (`$LASTEXITCODE -ne 0) { exit `$LASTEXITCODE }; Write-Output '--- AFTER DOCTOR ---'; & '$probePath'"""
+              $post = (& ssh -T -o BatchMode=yes legion-e2e-far $sameSessionCmd | Out-String)
+              Write-Output $post
+              if ($LASTEXITCODE -ne 0) {
+                throw "Same-session sshd meta.doctor check failed with exit $LASTEXITCODE"
+              }
+              $afterPart = ($post -split '--- AFTER DOCTOR ---', 2)[1]
+              if (-not $afterPart -or $afterPart -match 'S-1-15-2-') {
+                throw "Leftover AppContainer ACE remained on sshd Window Station/Desktop after worker exit:`n$post"
+              }
+            }
+          }
 
       # What there is to read when it fails: both audit logs, the doctor's answers, every call the
       # driver made, and sshd's log. None of it is key material, and the check below makes sure.

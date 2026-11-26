@@ -10,6 +10,7 @@
 //   --label <name>         Display label for candidate binary
 //   --compare-label <name> Display label for baseline binary (default: baseline)
 //   --suite <list>         Comma-separated subset of: stream,http-content,fs-tools,cold-start,ui-browser
+//   --case <list>          Optional comma-separated subset of case IDs within selected suites
 //   --runs <n>             Override run count per benchmark case
 //   --scratch <dir>        Scratch/fixture directory (default: ~/.cache/legion-perf/work)
 //   --out <dir>            Report output dir (default: ~/Documents/legion/perf/<date>-<rev>/)
@@ -41,6 +42,7 @@ function parseArgs(argv) {
     label: null,
     compareLabel: 'baseline',
     suites: [...ALL_SUITES],
+    cases: null,
     runs: null,
     scratch: path.join(os.homedir(), '.cache', 'legion-perf', 'work'),
     out: null,
@@ -68,6 +70,13 @@ function parseArgs(argv) {
         }
       }
       opts.suites = list;
+    } else if (arg === '--case') {
+      const list = next()
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (list.length === 0) throw new Error('--case requires at least one case id');
+      opts.cases = new Set(list);
     } else if (arg === '--runs') {
       const n = Number(next());
       if (!Number.isInteger(n) || n < 1) throw new Error('--runs must be a positive integer');
@@ -87,6 +96,7 @@ function parseArgs(argv) {
           '  --label <name>         Label for candidate binary',
           '  --compare-label <name> Label for baseline binary',
           `  --suite <list>         Subset of ${ALL_SUITES.join(',')}`,
+          '  --case <list>          Optional comma-separated case IDs to run',
           '  --runs <n>             Override iterations per case',
           '  --scratch <dir>        Scratch/fixture directory',
           '  --out <dir>            Output directory for results.json and index.html',
@@ -172,7 +182,7 @@ async function main() {
 
   const neededSuites = new Set(opts.suites);
   console.error(`[bench] preparing fixtures in ${opts.scratch}...`);
-  const fixtures = ensureFixtures(opts.scratch, variants[0].bin, neededSuites);
+  const fixtures = ensureFixtures(opts.scratch, variants[0].bin, neededSuites, opts.cases);
 
   const runners = {
     stream: runStreamSuite,
@@ -215,6 +225,7 @@ async function main() {
       fixtures,
       variants,
       runsOverride: opts.runs,
+      casesFilter: opts.cases,
     });
     result.loadBefore = loadBefore;
     suitesOut.push(result);
