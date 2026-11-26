@@ -9,6 +9,11 @@ use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop, ProcessGroup};
 
+use crate::Result;
+#[allow(unused_imports)]
+use crate::sandbox::SandboxPolicy;
+use crate::shell::ResolvedCommand;
+
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 const POST_KILL_WAIT: Duration = Duration::from_secs(2);
 
@@ -38,50 +43,128 @@ impl TreeDropGuard {
     }
 }
 
-/// Applies the platform hard memory limit to `cmd` before `exec` when `memory_limit` is set.
-///
-/// - **Linux**: sets `RLIMIT_AS` to `memory_limit + rlimit_as_headroom` (clamped to the current
-///   hard limit) so runaway allocations fail with `ENOMEM` immediately in the kernel.
-/// - **Other non-macOS Unix**: sets `RLIMIT_DATA` to `memory_limit`.
-/// - **macOS**: skipped because macOS `dyld` maps >2 GiB of shared cache into virtual space and
-///   ignores `RLIMIT_DATA`; enforcement is provided by the parent RSS watchdog.
-#[allow(unused_variables)]
-pub(super) fn configure_pre_exec_memory_limit(
-    cmd: &mut tokio::process::Command,
-    memory_limit: Option<u64>,
-    rlimit_as_headroom: u64,
-) {
-    let Some(limit) = memory_limit else {
-        return;
-    };
+/// Holds any parent-side sandbox resources (such as a Linux Landlock ruleset fd) alive across
+/// `CommandWrap::spawn` and drops them immediately afterwards.
+pub(super) struct PreSpawnSandbox {
+    #[cfg(target_os = "linux")]
+    ffmpeg_linux: Option<crate::sandbox::PreparedFfmpegSandbox>,
+}
 
+impl PreSpawnSandbox {
+    pub(super) fn release(self) {}
+}
+
+/// Prepares Unix OS-level sandbox hooks for `policy` before building `CommandWrap`.
+///
+/// - On Linux: prepares a Landlock ruleset + seccomp network-deny filter for [`SandboxPolicy::Ffmpeg`].
+/// - On macOS: wraps [`SandboxPolicy::Ffmpeg`] with `/usr/bin/sandbox-exec`.
+/// - For [`SandboxPolicy::Worker`]: the worker installs its own strict sandbox before reading input.
+pub(super) fn prepare_sandbox(
+    policy: Option<&SandboxPolicy>,
+    resolved: &mut ResolvedCommand,
+) -> Result<PreSpawnSandbox> {
     #[cfg(target_os = "linux")]
     {
-        let target = limit.saturating_add(rlimit_as_headroom);
-        // SAFETY: `pre_exec` runs between `fork` and `exec` and calls only async-signal-safe
-        // `getrlimit`/`setrlimit` syscalls with stack-allocated structs.
-        #[allow(unsafe_code)]
-        unsafe {
-            cmd.pre_exec(move || {
-                let mut cur = libc::rlimit {
-                    rlim_cur: 0,
-                    rlim_max: 0,
-                };
-                if libc::getrlimit(libc::RLIMIT_AS, &mut cur) == 0 {
-                    let capped = (target as libc::rlim_t).min(cur.rlim_max);
-                    let next = libc::rlimit {
-                        rlim_cur: capped,
-                        rlim_max: capped,
-                    };
-                    let _ = libc::setrlimit(libc::RLIMIT_AS, &next);
-                }
-                Ok(())
-            });
+        let ffmpeg_linux = match policy {
+            Some(SandboxPolicy::Ffmpeg {
+                ffmpeg_bin,
+                input_file,
+                temp_dir,
+            }) => Some(crate::sandbox::prepare_ffmpeg_sandbox(
+                ffmpeg_bin,
+                input_file.as_deref(),
+                temp_dir,
+            )?),
+            _ => None,
+        };
+        let _ = resolved;
+        Ok(PreSpawnSandbox { ffmpeg_linux })
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(SandboxPolicy::Ffmpeg {
+            ffmpeg_bin,
+            input_file,
+            temp_dir,
+        }) = policy
+        {
+            let (wrapped_prog, wrapped_args) = crate::sandbox::wrap_ffmpeg_command(
+                ffmpeg_bin,
+                input_file.as_deref(),
+                temp_dir,
+                &resolved.args,
+            )?;
+            resolved.program = wrapped_prog;
+            resolved.args = wrapped_args;
         }
+        Ok(PreSpawnSandbox {})
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
+        let _ = (policy, resolved);
+        Ok(PreSpawnSandbox {})
+    }
+}
+
+/// Applies the platform hard memory limit and any prepared Linux `pre_exec` sandbox to `cmd`
+/// before `exec`.
+///
+/// - **Linux**: sets `RLIMIT_AS` to `memory_limit + rlimit_as_headroom` (clamped to the current
+///   hard limit) so runaway allocations fail with `ENOMEM` immediately in the kernel, and installs
+///   any prepared `ffmpeg` Landlock + seccomp network-deny filter before `exec`.
+/// - **Other non-macOS Unix**: sets `RLIMIT_DATA` to `memory_limit`.
+/// - **macOS**: skipped because macOS `dyld` maps >2 GiB of shared cache into virtual space and
+///   ignores `RLIMIT_DATA`; enforcement is provided by the parent RSS watchdog.
+#[allow(unused_variables)]
+pub(super) fn configure_pre_exec(
+    cmd: &mut tokio::process::Command,
+    memory_limit: Option<u64>,
+    rlimit_as_headroom: u64,
+    pre_spawn: &PreSpawnSandbox,
+) {
+    #[cfg(target_os = "linux")]
+    {
+        let rlimit_target = memory_limit.map(|limit| limit.saturating_add(rlimit_as_headroom));
+        let ffmpeg_hook = pre_spawn
+            .ffmpeg_linux
+            .as_ref()
+            .map(|prepared| (prepared.landlock_raw_fd(), prepared.seccomp_filter_clone()));
+        if rlimit_target.is_some() || ffmpeg_hook.is_some() {
+            // SAFETY: `pre_exec` runs between `fork` and `exec` and calls only async-signal-safe
+            // syscalls (`getrlimit`, `setrlimit`, `prctl`, `landlock_restrict_self`).
+            #[allow(unsafe_code)]
+            unsafe {
+                cmd.pre_exec(move || {
+                    if let Some(target) = rlimit_target {
+                        let mut cur = libc::rlimit {
+                            rlim_cur: 0,
+                            rlim_max: 0,
+                        };
+                        if libc::getrlimit(libc::RLIMIT_AS, &mut cur) == 0 {
+                            let capped = (target as libc::rlim_t).min(cur.rlim_max);
+                            let next = libc::rlimit {
+                                rlim_cur: capped,
+                                rlim_max: capped,
+                            };
+                            let _ = libc::setrlimit(libc::RLIMIT_AS, &next);
+                        }
+                    }
+                    if let Some((landlock_fd, ref filter)) = ffmpeg_hook {
+                        crate::sandbox::PreparedFfmpegSandbox::apply_in_pre_exec(
+                            landlock_fd,
+                            filter,
+                        )?;
+                    }
+                    Ok(())
+                });
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    if let Some(limit) = memory_limit {
         // SAFETY: `pre_exec` calls only async-signal-safe `getrlimit`/`setrlimit` syscalls.
         #[allow(unsafe_code)]
         unsafe {

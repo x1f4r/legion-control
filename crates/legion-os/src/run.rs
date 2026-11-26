@@ -28,7 +28,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::shell::{self, CommandSpec};
+use crate::sandbox::SandboxPolicy;
+use crate::shell::{self, CommandSpec, ResolvedCommand};
 use crate::{OsError, Result};
 
 #[cfg(unix)]
@@ -114,6 +115,8 @@ pub struct RunOptions {
     pub cancel: CancellationToken,
     /// Optional callback receiving raw stdout/stderr chunks as they arrive.
     pub on_output: Option<ChunkCallback>,
+    /// Optional OS-level sandbox policy applied to the child process.
+    pub sandbox: Option<SandboxPolicy>,
 }
 
 impl fmt::Debug for RunOptions {
@@ -133,6 +136,7 @@ impl fmt::Debug for RunOptions {
             .field("raw_stdout", &self.raw_stdout)
             .field("cancelled", &self.cancel.is_cancelled())
             .field("has_on_output", &self.on_output.is_some())
+            .field("sandbox", &self.sandbox)
             .finish()
     }
 }
@@ -158,6 +162,7 @@ impl RunOptions {
             raw_stdout: false,
             cancel: CancellationToken::new(),
             on_output: None,
+            sandbox: None,
         }
     }
 
@@ -273,6 +278,12 @@ impl RunOptions {
         self.on_output = Some(callback);
         self
     }
+
+    /// Apply an OS-level sandbox policy to the child process.
+    pub fn sandbox(mut self, policy: SandboxPolicy) -> Self {
+        self.sandbox = Some(policy);
+        self
+    }
 }
 
 /// Bounded capture of one output stream.
@@ -333,9 +344,10 @@ impl RunOutput {
 ///
 /// If the requested executable does not exist, returns [`OsError::ProgramNotFound`] naming it.
 /// On timeout or cancellation, the entire process tree is stopped before returning.
-pub async fn run(options: RunOptions) -> Result<RunOutput> {
+#[allow(unused_mut)]
+pub async fn run(mut options: RunOptions) -> Result<RunOutput> {
     let started = Instant::now();
-    let resolved = shell::resolve(&options.command)?;
+    let mut resolved = shell::resolve(&options.command)?;
 
     // Validate cwd explicitly so a missing working directory is never misreported as a missing
     // executable (both produce ErrorKind::NotFound from spawn).
@@ -375,6 +387,12 @@ pub async fn run(options: RunOptions) -> Result<RunOutput> {
         });
     }
 
+    #[cfg(windows)]
+    if let Some(policy) = options.sandbox.take() {
+        return platform::run_sandboxed(options, resolved, policy, started).await;
+    }
+
+    let pre_spawn = prepare_sandbox(options.sandbox.as_ref(), &mut resolved)?;
     let program_display = resolved.program_display();
     let mut stdin_file = options.stdin_file;
     let has_stdin_bytes = stdin_file.is_none() && options.stdin.is_some();
@@ -408,13 +426,16 @@ pub async fn run(options: RunOptions) -> Result<RunOutput> {
         }
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
-        configure_pre_exec_memory_limit(cmd, memory_limit, rlimit_as_headroom);
+        configure_pre_exec(cmd, memory_limit, rlimit_as_headroom, &pre_spawn);
     });
     configure_containment(&mut wrapped, memory_limit.is_some())?;
 
     let mut child = wrapped
         .spawn()
         .map_err(|err| OsError::from_spawn_io(program_display, err))?;
+    // Release any parent-side pre-spawn sandbox resources (e.g. Linux Landlock ruleset fd)
+    // immediately after `spawn`.
+    pre_spawn.release();
     let child_pid = child.id();
     let mut tree_guard = create_drop_guard(child_pid, memory_limit, rlimit_as_headroom);
 
@@ -533,6 +554,37 @@ pub async fn run(options: RunOptions) -> Result<RunOutput> {
     let (stdout, stdout_bytes) = stdout_captured.unwrap_or_default();
     let (stderr, _) = stderr_captured.unwrap_or_default();
 
+    Ok(finalize_run_output(
+        exit_code,
+        signal,
+        stdout,
+        stdout_bytes,
+        stderr,
+        timed_out,
+        cancelled,
+        memory_watchdog_killed,
+        memory_limit,
+        peak_rss.load(Ordering::Relaxed),
+        cpu_time,
+        started.elapsed(),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_run_output(
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    stdout: CapturedOutput,
+    stdout_bytes: Vec<u8>,
+    stderr: CapturedOutput,
+    timed_out: bool,
+    cancelled: bool,
+    memory_watchdog_killed: bool,
+    memory_limit: Option<u64>,
+    peak_rss_bytes: u64,
+    cpu_time: Option<Duration>,
+    duration: Duration,
+) -> RunOutput {
     // Only classify a death as `killed_for_memory` when THIS node requested a memory limit for the
     // child and its own memory limit decided it:
     // - our RSS watchdog observed `rss > limit`,
@@ -561,7 +613,7 @@ pub async fn run(options: RunOptions) -> Result<RunOutput> {
         }
     }
 
-    Ok(RunOutput {
+    RunOutput {
         exit_code,
         signal,
         stdout,
@@ -571,10 +623,10 @@ pub async fn run(options: RunOptions) -> Result<RunOutput> {
         cancelled,
         killed_for_memory,
         memory_watchdog_killed,
-        peak_rss_bytes: peak_rss.load(Ordering::Relaxed),
+        peak_rss_bytes,
         cpu_time,
-        duration: started.elapsed(),
-    })
+        duration,
+    }
 }
 
 async fn watch_memory_limit(
@@ -830,19 +882,50 @@ fn create_drop_guard(
 }
 
 #[cfg(any(unix, windows))]
-fn configure_pre_exec_memory_limit(
-    cmd: &mut tokio::process::Command,
-    memory_limit: Option<u64>,
-    rlimit_as_headroom: u64,
-) {
-    platform::configure_pre_exec_memory_limit(cmd, memory_limit, rlimit_as_headroom);
+fn prepare_sandbox(
+    policy: Option<&SandboxPolicy>,
+    resolved: &mut ResolvedCommand,
+) -> Result<platform::PreSpawnSandbox> {
+    platform::prepare_sandbox(policy, resolved)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn configure_pre_exec_memory_limit(
+struct FallbackPreSpawnSandbox;
+
+#[cfg(not(any(unix, windows)))]
+impl FallbackPreSpawnSandbox {
+    fn release(self) {}
+}
+
+#[cfg(not(any(unix, windows)))]
+fn prepare_sandbox(
+    policy: Option<&SandboxPolicy>,
+    _resolved: &mut ResolvedCommand,
+) -> Result<FallbackPreSpawnSandbox> {
+    if policy.is_some() {
+        return Err(OsError::Unsupported {
+            detail: "process sandboxing is not supported on this platform".into(),
+        });
+    }
+    Ok(FallbackPreSpawnSandbox)
+}
+
+#[cfg(any(unix, windows))]
+fn configure_pre_exec(
+    cmd: &mut tokio::process::Command,
+    memory_limit: Option<u64>,
+    rlimit_as_headroom: u64,
+    pre_spawn: &platform::PreSpawnSandbox,
+) {
+    platform::configure_pre_exec(cmd, memory_limit, rlimit_as_headroom, pre_spawn);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_pre_exec(
     _cmd: &mut tokio::process::Command,
     _memory_limit: Option<u64>,
     _rlimit_as_headroom: u64,
+    _pre_spawn: &FallbackPreSpawnSandbox,
 ) {
 }
 
