@@ -230,6 +230,7 @@ accounts.
 | [AI agents](agents.md) | `legion mcp` (compact and full mode), `legion agents add`, operating rules for agents, the 13 error codes, and adding extension tools safely. |
 | [Guides](guides.md) | Task walk-throughs: file transfer, long jobs, projects, services, power and wake, device pairing, the HTTP door, extension tools, configuration sync, and updates. |
 | [Tool reference](tools.md) | Generated reference of every built-in tool, its effect, and its input schema. |
+| [Security](security.md) | Threat model by attacker class, standing security invariants, and known trust boundaries. |
 | [Design](design.md) | Architecture, workspace crates, wire and stream protocols, platform rules, and milestones. |
 | [Platforms](platforms.md) | Nodes, controllers, the three pipes (in-app ssh, local child, HTTP door), and packaging across platforms. |
 | [Machines](machines.md) | Machine status, hardware telemetry (`sys.info`, `sys.procs`, `sys.kill`), and wake-on-demand. |

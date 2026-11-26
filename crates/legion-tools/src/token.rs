@@ -10,12 +10,13 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jiff::{SignedDuration, Timestamp};
-use legion_core::config::{parse, write_atomically};
+use legion_core::config::parse;
 use legion_core::policy::Principal;
 use legion_core::proto::{Effect, ErrorBody, ErrorCode};
 use legion_core::tokens::{self, Tokens};
 use legion_core::{Ctx, NoArgs, Registry, ToolError};
 use legion_os::OsError;
+use legion_os::atomic::{WriteOptions, write_atomic};
 use legion_os::lock::{FileLock, LockMode};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -409,8 +410,12 @@ fn update(
         std::fs::create_dir_all(dir)
             .map_err(|error| failed(format!("{} cannot be created", dir.display()), &error))?;
     }
-    write_atomically(file, edited.as_bytes())
-        .map_err(|error| failed(format!("{} cannot be written", file.display()), &error))
+    write_atomic(
+        file,
+        edited.as_bytes(),
+        WriteOptions::with_mode(0o600).force_mode(true),
+    )
+    .map_err(|error| failed(format!("{} cannot be written", file.display()), &error))
 }
 
 /// `lgn_` and 32 random bytes from the operating system, in URL-safe base64 so the token can go in
@@ -681,5 +686,40 @@ role = "token_minter"
             .await
             .unwrap_or_else(|e| panic!("owner + allow_owner for {principal} failed: {e:?}"));
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tokens_toml_is_written_0600_and_tightens_looser_existing_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = legion_core::Paths::under(dir.path().join("legion"));
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::write(
+            paths.config_file("policy.toml"),
+            "[principals.phone]\nrole = \"observer\"\n[roles.observer]\nallow = [\"effect:read\"]\n",
+        )
+        .unwrap();
+        // Pre-create a world-readable tokens.toml; token.add must tighten it to 0o600.
+        let tokens_path = paths.config_file("tokens.toml");
+        std::fs::write(&tokens_path, "").unwrap();
+        std::fs::set_permissions(&tokens_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let node = legion_core::Node::new(paths.clone(), crate::registry());
+        node.call(legion_core::Call::new(
+            legion_core::Door::Cli,
+            "token.add",
+            serde_json::json!({ "name": "phone", "principal": "phone" }),
+        ))
+        .await
+        .unwrap();
+
+        let mode = std::fs::metadata(&tokens_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "tokens.toml mode was {mode:o}");
     }
 }

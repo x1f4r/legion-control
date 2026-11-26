@@ -1,7 +1,7 @@
 //! How the HTTP door answers: JSON bodies, and the status that fits each error code.
 
 use axum::body::Body;
-use axum::http::header::{CONTENT_TYPE, HeaderValue};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderValue};
 use axum::http::{Response, StatusCode};
 use legion_core::RouteOutcome;
 use legion_core::proto::{ErrorBody, ErrorCode};
@@ -36,9 +36,9 @@ pub(crate) fn json<T: Serialize>(status: StatusCode, value: &T) -> Response<Body
     });
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = status;
-    response
-        .headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 

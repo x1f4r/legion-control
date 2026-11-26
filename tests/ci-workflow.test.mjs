@@ -384,3 +384,35 @@ test('legion-app.yml preview desktop builds are workflow_dispatch-only, use vars
     );
   }
 });
+
+test('dependency audit runs cargo-audit, cargo-deny, and npm audit, and every allow-listed advisory gives a reason', () => {
+  const audit = job('audit');
+  assert.match(audit, /cargo audit --deny warnings --file Cargo\.lock/);
+  assert.match(audit, /cargo audit --deny warnings --file apps\/legion-app\/src-tauri\/Cargo\.lock/);
+  assert.match(audit, /cargo deny check/);
+  assert.match(audit, /cargo deny --manifest-path apps\/legion-app\/src-tauri\/Cargo\.toml check/);
+  assert.match(audit, /npm --prefix apps\/ui\/test audit --audit-level=low/);
+
+  const reasonedIds = new Set();
+  for (const file of ['deny.toml', 'apps/legion-app/src-tauri/deny.toml']) {
+    const text = read(file);
+    const advisories = /\[advisories\]([\s\S]*?)(?:\n\[|$)/.exec(text)?.[1] ?? '';
+    const ignoreBlock = /ignore\s*=\s*\[([\s\S]*?)\]/.exec(advisories)?.[1] ?? '';
+    for (const rawLine of ignoreBlock.split('\n')) {
+      const line = rawLine.replace(/#.*$/, '').trim();
+      if (!line) continue;
+      const match = /^\{\s*id\s*=\s*"(RUSTSEC-\d{4}-\d{4})"\s*,\s*reason\s*=\s*"([^"]+)"\s*\},?$/.exec(line);
+      assert.ok(match, `${file}: allow-listed advisory must specify an explicit non-empty reason: ${line}`);
+      assert.ok(match[2].trim().length >= 12, `${file}: reason for ${match[1]} is too terse`);
+      reasonedIds.add(match[1]);
+    }
+  }
+
+  const auditToml = read('.cargo/audit.toml');
+  for (const match of auditToml.matchAll(/"(RUSTSEC-\d{4}-\d{4})"/g)) {
+    assert.ok(
+      reasonedIds.has(match[1]),
+      `.cargo/audit.toml ignores ${match[1]} without a matching reasoned entry in deny.toml`,
+    );
+  }
+});
