@@ -770,7 +770,6 @@ pub struct TransferManager {
     cleanup_notify: Notify,
     scheduler_started: AtomicBool,
     shutdown_token: CancellationToken,
-    #[allow(dead_code)]
     id_salt: AtomicU64,
     #[cfg(test)]
     download_pause_once: Mutex<Option<Arc<DownloadPauseGate>>>,
