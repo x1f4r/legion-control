@@ -1,0 +1,17 @@
+# Shared cargo-audit ignore list. Keep strictly synchronized with `deny.toml` and
+# `apps/legion-app/src-tauri/deny.toml`, where each entry's justification is enforced by tests.
+[advisories]
+ignore = [
+    # chrono 0.4.45 unmaintained (rmcp/schemars/russh-util transitive; Legion uses jiff)
+    "RUSTSEC-2026-0543",
+    # proc-macro-error 1.0.4 unmaintained (build-time only; gtk/glib-macros via Tauri/wry)
+    "RUSTSEC-2024-0370",
+    # glib 0.18.5 VariantStrIter unsoundness (unused by Legion; gtk/webkit2gtk via Tauri/wry)
+    "RUSTSEC-2024-0429",
+    # zvariant 5.15.1 merged into zbus 6 (zbus 5.19 / tauri-plugin-single-instance)
+    "RUSTSEC-2026-0370",
+    # zbus_names 4.3.5 merged into zbus 6 (zbus 5.19 / tauri-plugin-single-instance)
+    "RUSTSEC-2026-0371",
+    # zvariant_derive 5.15.1 merged into zbus 6 (build-time macro; zbus 5.19)
+    "RUSTSEC-2026-0372",
+]

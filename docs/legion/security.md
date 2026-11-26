@@ -1,0 +1,84 @@
+# Legion Security & Threat Model
+
+This document defines the standing threat model for Legion (`legion` CLI/node binary, SSH/RPC/stream/HTTP/MCP doors, web interface, content server, decode worker, and updater). Pairing enrolment cryptography and `crates/legion-sync` are outside the scope of this document.
+
+Each item below names what an attacker class must not be able to do (`TM-N.M`), the mechanism that enforces it, and any known gap or trust boundary.
+
+---
+
+## 1. Someone on the same LAN (`TM-1`)
+
+- **TM-1.1 — No LAN reachability for HTTP, MCP, or local content listeners.**
+  The HTTP/MCP door (`legion serve`) refuses any non-loopback `--listen` address (`crates/legion-doors/src/http/mod.rs`, `crates/legion-cli/src/serve.rs`). The native desktop/mobile app's content server binds `127.0.0.1:0` only (`apps/legion-app/src-tauri/src/content.rs`). Remote access goes exclusively through Tailscale Serve or SSH, never open LAN listeners.
+- **TM-1.2 — No unauthenticated SSH command execution.**
+  Node-to-node and paired-device SSH sessions authenticate via OpenSSH public keys (`~/.ssh/authorized_keys` or Windows `administrators_authorized_keys`). Paired devices are pinned by a forced command (`legion gate --as <principal> --pairing <id>`) whose strict allowlist accepts only fixed `legion rpc` and `legion stream` invocations (`crates/legion-net/src/gate.rs`).
+- **TM-1.3 — No unauthenticated LAN discovery.**
+  Legion binds no UDP, mDNS, or broadcast discovery listeners. Fleet topology comes strictly from `fleet.toml` with explicit SSH host-key verification.
+
+## 2. A malicious file in a browsed folder (`TM-2`)
+
+- **TM-2.1 — Bounded memory and time during media decoding.**
+  `fs.thumb` and `fs.tags` open regular files once non-blockingly (`open_regular_read`), peek at most 128 KiB of header bytes, reserve budget from an in-flight pool, and pass only the open file descriptor on `stdin` to the hidden `__thumb-worker` subprocess with a cleared environment (`crates/legion-tools/src/fs/thumb_worker.rs`). Memory is enforced by `CappedAlloc` (exact live-heap cap, exit `107`), OS limits (`RLIMIT_AS` on Linux, `RLIMIT_DATA` on other non-macOS Unix, suspended-create Job Object on Windows), a 10 ms RSS watchdog, and a hard wall-clock timeout with immediate kill (`kill_grace = 0`).
+- **TM-2.2 — OS-level filesystem and network isolation for `__thumb-worker`.**
+  **Known gap:** `__thumb-worker` does not currently install an OS-level sandbox on Linux (no Landlock or seccomp-bpf), macOS (no Seatbelt profile), or Windows (no AppContainer or Restricted Token). Isolation currently depends on pure-Rust decoders with no C codecs, passing only the open `stdin` handle, and a minimal cleared environment. A code-execution bug in a decoder crate would still inherit the user's filesystem and network privileges.
+- **TM-2.3 — Untrusted file content must never execute in the web UI origin.**
+  `legion-content` serves HTML, XHTML, XML, JavaScript, and other text files as `text/plain; charset=utf-8` (never `text/html`), serves unknown types and PDF as `application/octet-stream` with `Content-Disposition: attachment`, and attaches `Content-Security-Policy: sandbox; default-src 'none'; frame-ancestors 'none'` (putting any inline document such as `image/svg+xml` in a unique opaque origin with scripts disabled), `X-Content-Type-Options: nosniff`, `Cross-Origin-Resource-Policy`, `Referrer-Policy: no-referrer`, and `Cache-Control: private, no-store` to every content response (`crates/legion-content/src/media.rs`, `crates/legion-content/src/serve.rs`).
+- **TM-2.4 — Special files and filenames must not hang threads or inject shell commands.**
+  Content reads, streams, and file tools use `open_regular_read` (`lstat` + `O_NONBLOCK | O_NOCTTY` + `fstat`, `crates/legion-os/src/open_regular.rs`) so FIFOs, sockets, and device nodes never block worker threads. Process spawns pass explicit argv vectors (`CommandSpec::Argv`) rather than interpolating untrusted paths into shell strings.
+
+## 3. A web page open in the same browser as the door (`TM-3`)
+
+- **TM-3.1 — No DNS rebinding against loopback listeners.**
+  `HostOriginGuard` requires exactly one valid `Host` header matching a loopback address and the exact listening port (or an explicitly listed `[serve] hosts` entry), rejecting mismatches with `421 Misdirected Request` and duplicate/malformed `Host`, `Origin`, or `Authorization` headers or mismatched absolute request URIs with `400 Bad Request` (`crates/legion-content/src/guard.rs`, `crates/legion-doors/src/http/gate.rs`).
+- **TM-3.2 — No cross-site API calls, cross-origin asset probing, or framing.**
+  `HostOriginGuard` rejects any `Origin` not listed in `[serve] origins` (or same-origin when `ui = true`) with `403 Forbidden`. CORS never emits `*` or `Access-Control-Allow-Credentials`. All API and MCP routes require `Authorization: Bearer <token>` (never cookies, never URL query tokens). Non-content responses emit a strict `Content-Security-Policy` with `frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and `Cross-Origin-Resource-Policy: same-origin` (`cross-origin` only when answering an explicitly listed `[serve] origins` caller); JSON API and error responses emit `Cache-Control: no-store` (`crates/legion-doors/src/http/mod.rs`, `reply.rs`).
+- **TM-3.3 — Content tickets stay scoped to one file, one route, and one live grant.**
+  Content tickets are 256-bit CSPRNG values bound to `(holder, principal, machine, path, exact filename)`. They authenticate only `GET`/`HEAD /v1/content/<ticket>/<filename>`, are rejected on all other routes and filenames, cannot read past the opened file's byte range (`416 Range Not Satisfiable` + bounded reader), are re-verified live against `tokens.toml` and `policy.toml` (cutting active streams within 2 s on revocation or role narrowing), and are redacted from request logs (`crates/legion-content/src/tickets.rs`, `serve.rs`, `crates/legion-doors/src/http/content.rs`).
+
+## 4. A paired device with a low role (`TM-4`)
+
+- **TM-4.1 — Role enforcement and no principal escalation (`as`).**
+  Paired SSH keys run behind `legion gate --as <principal> --pairing <id>`; HTTP bearer tokens resolve via BLAKE3 hash in `tokens.toml` to a fixed principal. `Policy::resolve` rejects any attempt to widen `as` past a pinned principal, and `Policy::authorize` denies by default (requiring `*` for any remote tool whose effect cannot be inspected).
+- **TM-4.2 — Path confinement, protected directories, and platform path tricks.**
+  `Grant::check_path`, `Grant::protected`, and `Grant::check_create` (`crates/legion-core/src/policy.rs`) reject relative paths, `..` out of missing directories, escaping or dangling symlinks, Windows alternate data streams (`file:stream`), trailing dots/spaces, reserved DOS device names (`CON`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, etc.), and Windows Win32 device namespace (`\\.\...`) or non-drive/non-UNC verbatim prefixes (`\\?\Volume{...}`, `\\?\GLOBALROOT\...`). Names are compared case-insensitively on Windows and macOS and canonically normalized (NFC/NFD) on macOS. Legion's own config/state directories and built-in/configured secret locations are blocked for roles lacking `effect:admin` by both resolved path and file/directory `PathIdentity`.
+  **Known gaps:**
+  1. *Path-check TOCTOU:* `Grant::check_path` returns a `PathBuf` rather than an open directory handle (`openat`/`O_NOFOLLOW`). Read/decode paths (`fs.read`, `fs.hash`, `fs.thumb`, `fs.tags`, `legion-content`, `stream.rs`) open regular files non-blockingly and verify handle metadata, while path-based mutations and walks (`fs.list`, `fs.stat`, `fs.find`, `fs.grep`, `fs.write` create/append/chmod, `fs.edit`, `fs.mkdir`, `fs.move`, `fs.copy` destination, `fs.remove`) retain a check-then-use window against a concurrent local process swapping path components.
+  2. *Hard links:* A pre-existing hard link inside a role's allowed root pointing to a file in a protected directory has an allowed parent directory and therefore is not caught by ancestor-based `PathIdentity` checks.
+- **TM-4.3 — No secret, token, invite, or out-of-grant path leakage in logs or errors.**
+  `crates/legion-core/src/audit.rs` redacts sensitive field names, `env` values, secret CLI flags, URL credentials, PEM blocks, `Authorization` headers, `lgn_` tokens, and `legion-invite-1.` invites before writing `audit.jsonl`. HTTP request logs redact `/v1/content/<ticket>` segments regardless of leading slashes or query strings and never log `Authorization` headers or bodies. `Grant::check_path` and `Grant::check_create` omit resolved out-of-grant symlink targets and expanded Legion directory paths from error messages and `details`.
+- **TM-4.4 — Relay policy enforcement for low-role callers.**
+  Relayed RPC calls (`crates/legion-net/src/pool.rs`) and relayed streams (`crates/legion-net/src/stream_relay.rs`) verify pairing revocation and authorize the call against the relay node's own live `policy.toml` for the pinned principal, strip inner `as` fields from relayed stream requests, cap forwarding at `MAX_HOPS` (4), and run a background revocation watchdog on active relayed streams.
+
+## 5. A compromised relay machine (`TM-5`)
+
+- **TM-5.1 — Honest trust boundary for `via` relays.**
+  Legion relays hop-by-hop over SSH: `caller -> relay` authenticates under the caller's forced `legion gate` command, and `relay -> target` opens a second SSH session using the relay machine's own SSH key (`crates/legion-net/src/pool.rs`, `stream_relay.rs`, `connector.rs`).
+  **Not protected against a compromised relay:** There is no end-to-end encryption or end-to-end authentication between the original caller and the target node. A compromised relay can:
+  1. Read and modify every forwarded RPC request, RPC reply, and bulk stream payload passing through it.
+  2. Forge calls with any `"as"` principal (including `owner`) to any downstream machine where the relay's SSH key is authorized without a restrictive `legion gate --as <role>` forced command.
+  Operators must treat every `via` relay as part of the trusted computing base for nodes behind it, or pin the relay's key on downstream hosts to a dedicated least-privilege role.
+
+## 6. A stolen phone (`TM-6`)
+
+- **TM-6.1 — Backup exclusion and rapid revocation.**
+  On Android (`apps/legion-app/src-tauri/gen/android/app/src/main/AndroidManifest.xml`, `res/xml/data_extraction_rules.xml`), `allowBackup="false"`, `fullBackupContent="false"`, `usesCleartextTraffic="false"`, and all `<cloud-backup>` and `<device-transfer>` domains are excluded so the device key and pairings cannot leave the device via backups or transfers. Once theft is noticed, running `device.remove` on fleet nodes removes the key from `authorized_keys`, records revocation in `devices.json`, kills live `legion gate --pairing <id>` sessions, and aborts active content/relayed streams within the recheck window.
+- **TM-6.2 — At-rest storage of the device private key.**
+  **Known gap:** `apps/legion-app/src-tauri/src/store.rs` stores the device Ed25519 private key in plaintext JSON (`legion-app.json`), relying on the OS app sandbox (Android/iOS) or file permissions (`0o600` on Unix, inherited user-profile ACL on Windows) rather than Android Keystore, iOS/macOS Keychain, or Windows DPAPI. Until revoked on the fleet, an unlocked stolen phone or a compromised local desktop account can use the key.
+
+## 7. A tampered update mirror (`TM-7`)
+
+- **TM-7.1 — Cryptographic signature, checksum, size, and channel key separation.**
+  `crates/legion-update` verifies offline Ed25519 signatures (`SHA256SUMS.sig`) against the compiled-in release public key (`RELEASE_PUBLIC_KEY`) and verifies both `update.json` and the target artifact by SHA-256 and exact byte size before installing (`crates/legion-update/src/verify.rs`, `apps/legion-app/src-tauri/src/updater/mod.rs`, `crates/legion-tools/src/update.rs`, `crates/legion-net/src/install.rs`). Release builds compile without a preview public key (`make-update-set.mjs check-artifact --forbid-preview-key` enforced in CI) and reject preview-signed sets.
+- **TM-7.2 — Anti-downgrade and anti-replay protection.**
+  The app updater (`crates/legion-update/src/floor.rs`, `apps/legion-app/src-tauri/src/updater/mod.rs`) and CLI/fleet installer (`crates/legion-tools/src/floor.rs`) persist a monotonic sequence/version floor (`floor.json`) and refuse any candidate with `sequence <= current_sequence` or `sequence <= floor` (plus plausibility bounds rejecting sequence `0` or implausible future dates).
+- **TM-7.3 — Partial download resilience and swap behavior under kill.**
+  Partial downloads write to `<artifact>.part` with per-range source provenance (`.part.meta.json`) and are stream-verified against signed size and SHA-256 before promotion; poisoned partials are discarded and retried clean from another node. Desktop self-updates hold an exclusive `update.lock`, verify a startup ready marker, and trap `TERM`/`HUP`/`INT` to roll back on interruption (`apps/legion-app/src-tauri/src/updater/desktop.rs`).
+  **Known residual window:** An uncatchable `SIGKILL` or power loss during the brief rename sequence (`mv target backup` followed by `mv new target`) leaves the previous install at the backup path without automatic startup recovery.
+
+---
+
+## Standing Invariants
+
+- **`unsafe` confinement:** Workspace lints set `unsafe_code = "forbid"` globally (`Cargo.toml`). Production `unsafe` is permitted only in `crates/legion-os`, where every block documents its safety invariant and handles platform FFI (allocator cap, file locks, `O_NONBLOCK` regular-file opens, Unix process groups/`rlimit`/signals, Windows Job Objects/WMI/process inspection).
+- **Secret and state file permissions:** On Unix, `tokens.toml`, `devices.json`, `pairing-sessions.json`, `audit.jsonl`, `audit.lock`, `legion-app.json`, and `~/.ssh/authorized_keys` are written with mode `0o600` (tightening looser pre-existing modes), and private directories (`state_dir`, `~/.ssh`, app data dir) with `0o700`. On Windows, `administrators_authorized_keys` and its lock file receive explicit `Administrators`/`SYSTEM` ACLs via `icacls`; other user config/state files rely on inherited per-user profile ACLs (see gap in TM-6.2 if `LEGION_HOME` is pointed at a shared directory).
+- **Dependency auditing:** `deny.toml` and `.cargo/audit.toml` enforce clean RustSec advisories, allowed licenses, and crates.io-only sources across both Rust workspaces (`Cargo.lock` and `apps/legion-app/src-tauri/Cargo.lock`), alongside `npm audit` for `apps/ui/test`, gated in CI (`.github/workflows/checks.yml`, `audit` job). Every allow-listed advisory requires an explicit written reason.
