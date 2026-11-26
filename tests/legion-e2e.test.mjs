@@ -5,10 +5,13 @@ import test from 'node:test';
 import {
   blockerOf,
   buildOpenSshEd25519Key,
+  buildTestPng,
   decodeInvite,
   emergencyAbort,
+  hasImageMagic,
   realPowerRefusal,
   redactSecrets,
+  shouldRunStep,
   windowsForcedCommandError,
 } from '../scripts/legion-e2e.mjs';
 
@@ -106,4 +109,19 @@ test('windowsForcedCommandError enforces PowerShell vs cmd forced-command quotin
     windowsForcedCommandError('# empty\n', 'legion-device:e2e-phone', 'powershell'),
     /does not contain/,
   );
+});
+
+test('shouldRunStep combines --only and --skip prefix filters', () => {
+  assert.equal(shouldRunStep('b6 meta.doctor', [], []), true);
+  assert.equal(shouldRunStep('b6 meta.doctor', ['a', 'b'], []), true);
+  assert.equal(shouldRunStep('c1 meta.version', ['a', 'b'], []), false);
+  assert.equal(shouldRunStep('b6 meta.doctor', ['a', 'b'], ['b6']), false);
+});
+
+test('buildTestPng produces a valid PNG recognized by hasImageMagic', () => {
+  const png = buildTestPng(32, 24);
+  assert.equal(hasImageMagic(png, 'image/png'), true);
+  assert.equal(hasImageMagic(png, 'image/jpeg'), false);
+  assert.equal(hasImageMagic(Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0]), 'image/jpeg'), true);
+  assert.equal(hasImageMagic(Buffer.from('not an image'), 'image/png'), false);
 });
