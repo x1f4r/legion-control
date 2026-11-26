@@ -3886,17 +3886,17 @@ async fn test_worker_sandbox_blocks_files_network_and_process_spawn() {
         }
 
         #[cfg(not(windows))]
-        let out_bind = {
-            let out = run_selftest_child(policy.clone(), "worker", "tcp_bind", None, None).await;
+        let out_bind = run_selftest_child(policy.clone(), "worker", "tcp_bind", None, None).await;
+        #[cfg(not(windows))]
+        {
             eprintln!(
                 "SANDBOX_NET_BIND: exit={:?} signal={:?} stderr={}",
-                out.exit_code,
-                out.signal,
-                out.stderr.text.trim()
+                out_bind.exit_code,
+                out_bind.signal,
+                out_bind.stderr.text.trim()
             );
-            assert_sandbox_blocked("worker tcp_bind", &out);
-            out
-        };
+            assert_sandbox_blocked("worker tcp_bind", &out_bind);
+        }
 
         let out_connect = run_selftest_child(
             policy.clone(),
