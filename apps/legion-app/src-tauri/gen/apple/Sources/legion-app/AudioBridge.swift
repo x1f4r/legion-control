@@ -71,7 +71,7 @@ final class LegionAudioBridge: NSObject, WKScriptMessageHandler {
   }
 
   func resetAll() {
-    let work = { [weak self] in
+    let work: () -> Void = { [weak self] in
       self?.clearNowPlayingAndSession()
     }
     if Thread.isMainThread {
