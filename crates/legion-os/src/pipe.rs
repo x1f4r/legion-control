@@ -48,7 +48,7 @@ fn fd_is_peer_stream(fd: libc::c_int) -> bool {
     mode == libc::S_IFIFO || mode == libc::S_IFSOCK
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[allow(unsafe_code)]
 fn fd_peer_closed(fd: libc::c_int) -> bool {
     let mut pfd = libc::pollfd {
@@ -62,6 +62,72 @@ fn fd_peer_closed(fd: libc::c_int) -> bool {
         return false;
     }
     (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn fd_peer_closed(fd: libc::c_int) -> bool {
+    struct KqGuard(libc::c_int);
+    impl Drop for KqGuard {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is an owned kqueue descriptor created in this function.
+            unsafe {
+                libc::close(self.0);
+            }
+        }
+    }
+
+    // On macOS/XNU, `poll(2)` with `events == 0` registers neither `EVFILT_READ` nor
+    // `EVFILT_WRITE` and returns 0 even after the peer has closed. Registering `EVFILT_WRITE`
+    // directly with `kqueue(2)` reports `EV_EOF` as soon as the peer's read half closes
+    // (`PIPE_EOF` on pipes, `SS_CANTSENDMORE` on sockets), even when the write buffer is full,
+    // without falsely triggering on a client's write-only half-close (`shutdown(SHUT_WR)`).
+    // SAFETY: `kqueue()` takes no pointers and returns a new fd or -1.
+    let kq = unsafe { libc::kqueue() };
+    if kq < 0 {
+        // Fallback when no fd is available for `kqueue()` (e.g. EMFILE): on macOS `poll(POLLOUT)`
+        // translates `EVFILT_WRITE` `EV_EOF` to `POLLHUP` without needing an extra descriptor.
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: `pfd` is a valid single-element `pollfd` array; timeout 0 returns immediately.
+        let rc = unsafe { libc::poll(&raw mut pfd, 1, 0) };
+        return rc > 0 && (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0;
+    }
+    let _guard = KqGuard(kq);
+
+    // SAFETY: `kevent` is a plain C struct; zero-initializing covers all fields.
+    let mut change: libc::kevent = unsafe { std::mem::zeroed() };
+    change.ident = fd as libc::uintptr_t;
+    change.filter = libc::EVFILT_WRITE;
+    change.flags = libc::EV_ADD | libc::EV_ONESHOT;
+
+    // SAFETY: `kevent` is a plain C struct; zero-initializing covers all fields.
+    let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+    let zero_timeout = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `change`, `event`, and `zero_timeout` are valid pointers for 1-element arrays.
+    let rc = unsafe {
+        libc::kevent(
+            kq,
+            &raw const change,
+            1,
+            &raw mut event,
+            1,
+            &raw const zero_timeout,
+        )
+    };
+    if rc <= 0 {
+        return false;
+    }
+    if (event.flags & libc::EV_ERROR) != 0 {
+        return event.data == libc::EBADF as libc::intptr_t;
+    }
+    (event.flags & libc::EV_EOF) != 0
 }
 
 #[cfg(all(test, unix))]
@@ -88,6 +154,43 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)]
+    fn pipe_with_full_buffer_detects_closed_reader_without_false_positive() {
+        let mut fds = [-1 as libc::c_int; 2];
+        // SAFETY: `fds` is a valid two-element array for `pipe`.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        // Set non-blocking on write end and fill the pipe buffer completely.
+        // SAFETY: valid fd and fcntl flags.
+        let flags = unsafe { libc::fcntl(write_fd, libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(write_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let chunk = [0x5Au8; 4096];
+        loop {
+            // SAFETY: valid buffer pointer and fd.
+            let n = unsafe { libc::write(write_fd, chunk.as_ptr().cast(), chunk.len()) };
+            if n <= 0 {
+                break;
+            }
+        }
+        assert!(
+            !fd_peer_closed(write_fd),
+            "full pipe with live reader must not look closed"
+        );
+        // SAFETY: `read_fd` is owned by this test and closed once.
+        assert_eq!(unsafe { libc::close(read_fd) }, 0);
+        assert!(
+            fd_peer_closed(write_fd),
+            "full pipe with closed reader must report closed"
+        );
+        // SAFETY: `write_fd` is owned by this test and closed once.
+        assert_eq!(unsafe { libc::close(write_fd) }, 0);
+    }
+
+    #[test]
     fn unix_socket_ignores_client_half_close_and_detects_full_close() {
         let (client, server) = UnixStream::pair().expect("unix stream pair");
         let server_fd = server.as_raw_fd();
@@ -99,6 +202,30 @@ mod tests {
         assert!(!fd_peer_closed(server_fd));
         drop(client);
         assert!(fd_peer_closed(server_fd));
+    }
+
+    #[test]
+    fn unix_socket_with_full_buffer_detects_full_close_without_false_positive() {
+        use std::io::Write;
+        let (client, mut server) = UnixStream::pair().expect("unix stream pair");
+        server.set_nonblocking(true).expect("set nonblocking");
+        let chunk = [0xA5u8; 4096];
+        while server.write(&chunk).is_ok() {}
+        let server_fd = server.as_raw_fd();
+        assert!(
+            !fd_peer_closed(server_fd),
+            "full unix socket with live client must not look closed"
+        );
+        client.shutdown(Shutdown::Write).expect("shutdown write");
+        assert!(
+            !fd_peer_closed(server_fd),
+            "full unix socket after client write half-close must not look closed"
+        );
+        drop(client);
+        assert!(
+            fd_peer_closed(server_fd),
+            "full unix socket after client drop must report closed"
+        );
     }
 
     #[test]

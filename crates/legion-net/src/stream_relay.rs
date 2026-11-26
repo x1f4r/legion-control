@@ -42,10 +42,14 @@ const MAX_NOISE_BYTES: usize = 64 * 1024;
 const MAX_REPLY_LINE: usize = 1024 * 1024;
 /// Maximum `{"done": true}` trailer line length on a `keep_open` `get`.
 const MAX_DONE_LINE: usize = 1024;
-/// Bounded grace period when tearing down a downstream stream process after normal completion.
-const DOWNSTREAM_CLOSE_GRACE: Duration = Duration::from_millis(500);
+/// Bounded grace period when tearing down a downstream stream process after normal completion or
+/// clean EOF delivery (such as a revoked upload/unpack so the target removes temporary files).
+const DOWNSTREAM_CLOSE_GRACE: Duration = Duration::from_millis(600);
 /// Short grace period when tearing down a timed-out, cancelled, or abandoned downstream process.
 const DOWNSTREAM_ABORT_GRACE: Duration = Duration::from_millis(200);
+/// Fallback delay before [`DownstreamGuard`] kills a write-op downstream process on revocation if
+/// the main relay task did not finish its clean EOF close first.
+const DOWNSTREAM_WRITE_REVOKE_FALLBACK: Duration = Duration::from_secs(2);
 /// Poll slice used to notice `shutdown` or `client_gone` while awaiting downstream I/O.
 const SHUTDOWN_POLL_SLICE: Duration = Duration::from_millis(50);
 
@@ -374,22 +378,7 @@ impl RelayAuthCheck {
         Ok(())
     }
 
-    fn verify(&self) -> Result<(), ErrorBody> {
-        const RETRY_DELAY: Duration = Duration::from_millis(200);
-        const RETRIES: usize = 2;
-
-        let mut res = self.verify_once();
-        if res.is_err() {
-            // Confirm a negative read twice after a short pause so an in-place editor save or
-            // momentary unreadable file never cancels an active relayed stream spuriously.
-            for _ in 0..RETRIES {
-                std::thread::sleep(RETRY_DELAY);
-                res = self.verify_once();
-                if res.is_ok() {
-                    break;
-                }
-            }
-        }
+    fn record_verify_result(&self, res: Result<(), ErrorBody>) -> Result<(), ErrorBody> {
         if let Ok(mut last) = self.last_check.lock() {
             *last = Instant::now();
         }
@@ -410,6 +399,67 @@ impl RelayAuthCheck {
         }
     }
 
+    fn verify(&self) -> Result<(), ErrorBody> {
+        const RETRY_DELAY: Duration = Duration::from_millis(200);
+        const RETRIES: usize = 2;
+
+        if self.is_revoked() {
+            return Err(self.denied_or_generic());
+        }
+        let mut res = self.verify_once();
+        if res.is_err() {
+            // Confirm a negative read twice after a short pause so an in-place editor save or
+            // momentary unreadable file never cancels an active relayed stream spuriously.
+            for _ in 0..RETRIES {
+                if self.is_revoked() {
+                    return Err(self.denied_or_generic());
+                }
+                std::thread::sleep(RETRY_DELAY);
+                if self.is_revoked() {
+                    return Err(self.denied_or_generic());
+                }
+                res = self.verify_once();
+                if res.is_ok() {
+                    break;
+                }
+            }
+        }
+        self.record_verify_result(res)
+    }
+
+    async fn verify_async(&self, stop: Option<&CancellationToken>) -> Result<(), ErrorBody> {
+        const RETRY_DELAY: Duration = Duration::from_millis(200);
+        const RETRIES: usize = 2;
+
+        if self.is_revoked() {
+            return Err(self.denied_or_generic());
+        }
+        let mut res = self.verify_once();
+        if res.is_err() {
+            for _ in 0..RETRIES {
+                tokio::select! {
+                    biased;
+                    () = self.revoked.cancelled() => return Err(self.denied_or_generic()),
+                    () = async {
+                        match stop {
+                            Some(tok) => tok.cancelled().await,
+                            None => std::future::pending().await,
+                        }
+                    } => return Err(self.denied_or_generic()),
+                    () = tokio::time::sleep(RETRY_DELAY) => {}
+                }
+                if self.is_revoked() {
+                    return Err(self.denied_or_generic());
+                }
+                res = self.verify_once();
+                if res.is_ok() {
+                    break;
+                }
+            }
+        }
+        self.record_verify_result(res)
+    }
+
     fn maybe_recheck(&self, bytes_since: &mut u64) -> Result<(), ErrorBody> {
         if let Some(err) = self.denied_error() {
             return Err(err);
@@ -426,6 +476,30 @@ impl RelayAuthCheck {
         if *bytes_since >= self.recheck_bytes || due_by_time {
             *bytes_since = 0;
             self.verify()?;
+        }
+        Ok(())
+    }
+
+    async fn maybe_recheck_async(
+        &self,
+        bytes_since: &mut u64,
+        stop: Option<&CancellationToken>,
+    ) -> Result<(), ErrorBody> {
+        if let Some(err) = self.denied_error() {
+            return Err(err);
+        }
+        if self.is_revoked() {
+            self.revoked.cancel();
+            return Err(self.denied_or_generic());
+        }
+        let due_by_time = self
+            .last_check
+            .lock()
+            .map(|last| last.elapsed() >= self.recheck_interval)
+            .unwrap_or(true);
+        if *bytes_since >= self.recheck_bytes || due_by_time {
+            *bytes_since = 0;
+            self.verify_async(stop).await?;
         }
         Ok(())
     }
@@ -501,14 +575,15 @@ struct DownstreamGuard {
 }
 
 impl DownstreamGuard {
-    fn new(handle: PipeHandle, revoked: CancellationToken) -> Self {
+    fn new(handle: PipeHandle, revoked: CancellationToken, revoke_kill_delay: Duration) -> Self {
         let shared = Arc::new(AsyncMutex::new(Some(handle)));
         let kill_shared = Arc::clone(&shared);
         let killer = tokio::spawn(async move {
             revoked.cancelled().await;
-            // Give the main relay task a brief chance to close cleanly first; if it is blocked on
-            // a stalled upstream client, kill and reap the downstream child right away.
-            tokio::time::sleep(Duration::from_millis(80)).await;
+            // Give the main relay task a chance to close cleanly first (short for reads that may
+            // be blocked writing to a stalled upstream client; longer for uploads/unpacks that
+            // deliver stdin EOF so the target cleans up temporary files before exiting).
+            tokio::time::sleep(revoke_kill_delay).await;
             if let Some(pipe_handle) = kill_shared.lock().await.take() {
                 pipe_handle.close(Duration::from_millis(50)).await;
             }
@@ -916,6 +991,7 @@ async fn open_and_greet_downstream(
     target: &str,
     options: &StreamServeOptions,
     auth_check: &RelayAuthCheck,
+    revoke_kill_delay: Duration,
 ) -> Result<OpenedDownstream, ErrorBody> {
     let pipe_cancel = CancellationToken::new();
     let opened_pipe = tokio::select! {
@@ -990,7 +1066,11 @@ async fn open_and_greet_downstream(
         Ok(()) => Ok(OpenedDownstream {
             stdin,
             stdout,
-            guard: DownstreamGuard::new(handle, auth_check.revoke_token().clone()),
+            guard: DownstreamGuard::new(
+                handle,
+                auth_check.revoke_token().clone(),
+                revoke_kill_delay,
+            ),
             stderr,
             next_hop,
             chained,
@@ -1236,26 +1316,35 @@ async fn relay_read_or_control<W: Write>(
     output: &mut BufWriter<W>,
 ) -> Result<(), ErrorBody> {
     let audit_tool = format!("stream.{}", inner_op.name());
-    let opened =
-        match open_and_greet_downstream(fleet, config, host, target, options, auth_check).await {
-            Ok(opened) => opened,
-            Err(error) => {
-                let error = machine_or(error, host.name());
-                let _ = reply_error(output, &error);
-                record_for_target(
-                    host,
-                    target,
-                    Some(principal),
-                    door,
-                    device,
-                    &audit_tool,
-                    recorded,
-                    started,
-                    &Err(error.clone()),
-                );
-                return Err(error);
-            }
-        };
+    let opened = match open_and_greet_downstream(
+        fleet,
+        config,
+        host,
+        target,
+        options,
+        auth_check,
+        Duration::from_millis(80),
+    )
+    .await
+    {
+        Ok(opened) => opened,
+        Err(error) => {
+            let error = machine_or(error, host.name());
+            let _ = reply_error(output, &error);
+            record_for_target(
+                host,
+                target,
+                Some(principal),
+                door,
+                device,
+                &audit_tool,
+                recorded,
+                started,
+                &Err(error.clone()),
+            );
+            return Err(error);
+        }
+    };
 
     let OpenedDownstream {
         mut stdin,
@@ -1512,7 +1601,7 @@ async fn pump_manifest_lines<W: Write>(
     let mut buf = Vec::new();
     let mut since_check = 0u64;
     loop {
-        if let Err(err) = auth_check.maybe_recheck(&mut since_check) {
+        if let Err(err) = auth_check.maybe_recheck_async(&mut since_check, None).await {
             let _ = reply_error(output, &err);
             return Err(err);
         }
@@ -1608,7 +1697,9 @@ async fn pump_exact_bytes<W: Write>(
         {
             return Err(relay_shutdown_error(host.name()));
         }
-        auth_check.maybe_recheck(&mut since_check)?;
+        auth_check
+            .maybe_recheck_async(&mut since_check, None)
+            .await?;
         if options
             .client_gone
             .as_ref()
@@ -1669,7 +1760,9 @@ async fn pump_exact_bytes<W: Write>(
             .map_err(|err| machine_or(gone(&err), host.name()))?;
         remaining -= n as u64;
         since_check = since_check.saturating_add(n as u64);
-        auth_check.maybe_recheck(&mut since_check)?;
+        auth_check
+            .maybe_recheck_async(&mut since_check, None)
+            .await?;
     }
     Ok(())
 }
@@ -1692,7 +1785,9 @@ async fn pump_bytes_to_eof<W: Write>(
         {
             return Err(relay_shutdown_error(host.name()));
         }
-        auth_check.maybe_recheck(&mut since_check)?;
+        auth_check
+            .maybe_recheck_async(&mut since_check, None)
+            .await?;
         if options
             .client_gone
             .as_ref()
@@ -1743,7 +1838,9 @@ async fn pump_bytes_to_eof<W: Write>(
             .and_then(|()| output.flush())
             .map_err(|err| machine_or(gone(&err), host.name()))?;
         since_check = since_check.saturating_add(n as u64);
-        auth_check.maybe_recheck(&mut since_check)?;
+        auth_check
+            .maybe_recheck_async(&mut since_check, None)
+            .await?;
     }
 }
 
@@ -1768,26 +1865,35 @@ async fn relay_keep_open_gets<W: Write>(
     output: &mut BufWriter<W>,
     mut next_header: impl FnMut(&mut Option<GetAuditBucket>) -> NextHeader,
 ) -> Result<(), ErrorBody> {
-    let opened =
-        match open_and_greet_downstream(fleet, config, host, target, options, auth_check).await {
-            Ok(opened) => opened,
-            Err(error) => {
-                let error = machine_or(error, host.name());
-                let _ = reply_error(output, &error);
-                record_for_target(
-                    host,
-                    target,
-                    Some(first_principal),
-                    door,
-                    device,
-                    "stream.get",
-                    first_recorded,
-                    first_started,
-                    &Err(error.clone()),
-                );
-                return Err(error);
-            }
-        };
+    let opened = match open_and_greet_downstream(
+        fleet,
+        config,
+        host,
+        target,
+        options,
+        auth_check,
+        Duration::from_millis(80),
+    )
+    .await
+    {
+        Ok(opened) => opened,
+        Err(error) => {
+            let error = machine_or(error, host.name());
+            let _ = reply_error(output, &error);
+            record_for_target(
+                host,
+                target,
+                Some(first_principal),
+                door,
+                device,
+                "stream.get",
+                first_recorded,
+                first_started,
+                &Err(error.clone()),
+            );
+            return Err(error);
+        }
+    };
 
     let OpenedDownstream {
         mut stdin,
@@ -2352,26 +2458,35 @@ async fn relay_write_spawned<R: Read + Send + 'static, W: Write>(
     mut input: BufReader<R>,
     output: &mut BufWriter<W>,
 ) -> Result<(), ErrorBody> {
-    let opened =
-        match open_and_greet_downstream(fleet, config, host, target, options, auth_check).await {
-            Ok(opened) => opened,
-            Err(error) => {
-                let error = machine_or(error, host.name());
-                let _ = reply_error(output, &error);
-                record_for_target(
-                    host,
-                    target,
-                    Some(principal),
-                    door,
-                    device,
-                    audit_tool,
-                    recorded,
-                    started,
-                    &Err(error.clone()),
-                );
-                return Err(error);
-            }
-        };
+    let opened = match open_and_greet_downstream(
+        fleet,
+        config,
+        host,
+        target,
+        options,
+        auth_check,
+        DOWNSTREAM_WRITE_REVOKE_FALLBACK,
+    )
+    .await
+    {
+        Ok(opened) => opened,
+        Err(error) => {
+            let error = machine_or(error, host.name());
+            let _ = reply_error(output, &error);
+            record_for_target(
+                host,
+                target,
+                Some(principal),
+                door,
+                device,
+                audit_tool,
+                recorded,
+                started,
+                &Err(error.clone()),
+            );
+            return Err(error);
+        }
+    };
 
     let OpenedDownstream {
         mut stdin,
@@ -2616,10 +2731,14 @@ async fn relay_write_spawned<R: Read + Send + 'static, W: Write>(
         }
     });
 
-    let writer_task = tokio::spawn(async move {
+    let mut writer_task = tokio::spawn(async move {
         let mut since_check = 0u64;
         loop {
-            if writer_auth.maybe_recheck(&mut since_check).is_err() {
+            if writer_auth
+                .maybe_recheck_async(&mut since_check, Some(&writer_stop))
+                .await
+                .is_err()
+            {
                 break;
             }
             let next = tokio::select! {
@@ -2642,7 +2761,11 @@ async fn relay_write_spawned<R: Read + Send + 'static, W: Write>(
             };
             match next {
                 Some(bytes) => {
-                    if writer_auth.maybe_recheck(&mut since_check).is_err() {
+                    if writer_auth
+                        .maybe_recheck_async(&mut since_check, Some(&writer_stop))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                     let chunk_len = bytes.len() as u64;
@@ -2660,7 +2783,11 @@ async fn relay_write_spawned<R: Read + Send + 'static, W: Write>(
                         DownstreamWait::Ready(Ok(())) => {
                             writer_progress.notify_one();
                             since_check = since_check.saturating_add(chunk_len);
-                            if writer_auth.maybe_recheck(&mut since_check).is_err() {
+                            if writer_auth
+                                .maybe_recheck_async(&mut since_check, Some(&writer_stop))
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                         }
@@ -2704,12 +2831,18 @@ async fn relay_write_spawned<R: Read + Send + 'static, W: Write>(
     .await;
 
     stop_writing.cancel();
-    let _ = tokio::time::timeout(DOWNSTREAM_ABORT_GRACE, writer_task).await;
+    if tokio::time::timeout(DOWNSTREAM_ABORT_GRACE, &mut writer_task)
+        .await
+        .is_err()
+    {
+        writer_task.abort();
+        let _ = writer_task.await;
+    }
 
     drop(stdout);
     let revoked_denied = auth_check.denied_error();
     let normal_ok = revoked_denied.is_none() && matches!(final_reply, Ok(ReplyLine::Json(_, _)));
-    let close_grace = if normal_ok {
+    let close_grace = if normal_ok || revoked_denied.is_some() {
         DOWNSTREAM_CLOSE_GRACE
     } else {
         DOWNSTREAM_ABORT_GRACE
