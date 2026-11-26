@@ -2655,7 +2655,7 @@ button.row:active {
 }
 
 .bar4 button[disabled] {
-  color: var(--faint);
+  opacity: 0.45;
   cursor: default;
 }
 
