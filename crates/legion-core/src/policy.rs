@@ -38,6 +38,7 @@ use legion_os::file_id::PathIdentity;
 use legion_proto::{Effect, ErrorBody, ErrorCode, ToolSpec};
 use serde::Deserialize;
 use serde_json::json;
+use unicode_normalization::UnicodeNormalization as _;
 
 use crate::config::Document;
 use crate::glob;
@@ -2741,6 +2742,23 @@ fn raw_path_within_raw(path: &Path, root: &Path, platform: Platform) -> bool {
             .all(|(r, p)| same_name_ignoring_existence(r, p, platform))
 }
 
+fn same_folded_utf8(a: &[u8], b: &[u8], platform: Platform) -> bool {
+    if a.is_ascii() && b.is_ascii() {
+        return a.eq_ignore_ascii_case(b);
+    }
+    // A name that is not Unicode is compared exactly: refusing a match is the safe mistake.
+    match (std::str::from_utf8(a), std::str::from_utf8(b)) {
+        // APFS and HFS+ treat canonically equivalent NFC and NFD names (such as `caf\u{00e9}`
+        // and `cafe\u{0301}`) as the same directory entry, so macOS comparisons normalize before
+        // comparing.
+        (Ok(a), Ok(b)) if platform == Platform::Mac => {
+            a.to_lowercase().nfd().eq(b.to_lowercase().nfd())
+        }
+        (Ok(a), Ok(b)) => a.to_lowercase() == b.to_lowercase(),
+        _ => false,
+    }
+}
+
 fn same_name_ignoring_existence(a: &[u8], b: &[u8], platform: Platform) -> bool {
     if a == b {
         return true;
@@ -2748,10 +2766,7 @@ fn same_name_ignoring_existence(a: &[u8], b: &[u8], platform: Platform) -> bool 
     if !platform.ignores_case() {
         return false;
     }
-    match (std::str::from_utf8(a), std::str::from_utf8(b)) {
-        (Ok(a), Ok(b)) => a.to_lowercase() == b.to_lowercase(),
-        _ => false,
-    }
+    same_folded_utf8(a, b, platform)
 }
 
 fn same_name(a: Name<'_>, b: Name<'_>, platform: Platform) -> bool {
@@ -2761,11 +2776,7 @@ fn same_name(a: Name<'_>, b: Name<'_>, platform: Platform) -> bool {
     if a.exists || b.exists || !platform.ignores_case() {
         return false;
     }
-    // A name that is not Unicode is compared exactly: refusing a match is the safe mistake.
-    match (std::str::from_utf8(a.bytes), std::str::from_utf8(b.bytes)) {
-        (Ok(a), Ok(b)) => a.to_lowercase() == b.to_lowercase(),
-        _ => false,
-    }
+    same_folded_utf8(a.bytes, b.bytes, platform)
 }
 
 #[cfg(test)]
@@ -3688,6 +3699,34 @@ deny = ["effect:admin"]
         assert!(!names_a_stream(br"\\?\C:\Users\me\key", Platform::Windows));
         assert!(!names_a_stream(b"/home/me/a:b", Platform::Unix));
         assert!(!names_a_stream(b"/Users/me/a:b", Platform::Mac));
+    }
+
+    #[test]
+    fn macos_comparisons_normalize_unicode_nfc_and_nfd_equivalents() {
+        // `Privé` in NFC (`\u{00e9}`) vs NFD (`e\u{0301}`), including mixed case.
+        let secret_nfc = resolved("/Users/me", &["Priv\u{00e9}"]);
+        let probe_nfd = resolved("/Users/me", &["Prive\u{0301}", "keys.txt"]);
+        let probe_upper_nfd = resolved("/Users/me", &["PRIVE\u{0301}", "keys.txt"]);
+        assert!(within_protected(&probe_nfd, &secret_nfc, Platform::Mac));
+        assert!(within_protected(
+            &probe_upper_nfd,
+            &secret_nfc,
+            Platform::Mac
+        ));
+        assert!(within(&probe_nfd, &secret_nfc, Platform::Mac));
+
+        // Even when the configured secret already exists as NFC and the probe uses NFD,
+        // `within_protected` must still match on macOS.
+        let existing_nfc = resolved("/Users/me/Priv\u{00e9}", &[]);
+        assert!(within_protected(&probe_nfd, &existing_nfc, Platform::Mac));
+
+        // Linux (ext4/btrfs) and Windows (NTFS) treat NFC and NFD as distinct names.
+        assert!(!within_protected(&probe_nfd, &secret_nfc, Platform::Unix));
+        assert!(!within_protected(
+            &resolved(r"C:\Users\me", &["Prive\u{0301}", "keys.txt"]),
+            &resolved(r"C:\Users\me", &["Priv\u{00e9}"]),
+            Platform::Windows
+        ));
     }
 
     #[test]
