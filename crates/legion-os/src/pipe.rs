@@ -56,8 +56,14 @@ fn fd_peer_closed(fd: libc::c_int) -> bool {
         events: 0,
         revents: 0,
     };
-    // SAFETY: `pfd` is a valid single-element `pollfd` array; timeout 0 returns immediately.
-    let rc = unsafe { libc::poll(&raw mut pfd, 1, 0) };
+    let rc = loop {
+        // SAFETY: `pfd` is a valid single-element `pollfd` array; timeout 0 returns immediately.
+        let rc = unsafe { libc::poll(&raw mut pfd, 1, 0) };
+        if rc < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        break rc;
+    };
     if rc <= 0 {
         return false;
     }
@@ -92,8 +98,14 @@ fn fd_peer_closed(fd: libc::c_int) -> bool {
             events: libc::POLLOUT,
             revents: 0,
         };
-        // SAFETY: `pfd` is a valid single-element `pollfd` array; timeout 0 returns immediately.
-        let rc = unsafe { libc::poll(&raw mut pfd, 1, 0) };
+        let rc = loop {
+            // SAFETY: `pfd` is a valid single-element `pollfd` array; timeout 0 returns immediately.
+            let rc = unsafe { libc::poll(&raw mut pfd, 1, 0) };
+            if rc < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break rc;
+        };
         return rc > 0 && (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0;
     }
     let _guard = KqGuard(kq);
@@ -110,16 +122,22 @@ fn fd_peer_closed(fd: libc::c_int) -> bool {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    // SAFETY: `change`, `event`, and `zero_timeout` are valid pointers for 1-element arrays.
-    let rc = unsafe {
-        libc::kevent(
-            kq,
-            &raw const change,
-            1,
-            &raw mut event,
-            1,
-            &raw const zero_timeout,
-        )
+    let rc = loop {
+        // SAFETY: `change`, `event`, and `zero_timeout` are valid pointers for 1-element arrays.
+        let rc = unsafe {
+            libc::kevent(
+                kq,
+                &raw const change,
+                1,
+                &raw mut event,
+                1,
+                &raw const zero_timeout,
+            )
+        };
+        if rc < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        break rc;
     };
     if rc <= 0 {
         return false;
@@ -136,19 +154,59 @@ mod tests {
     use std::net::Shutdown;
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant};
+
+    /// Creates a `CLOEXEC` pipe so sibling test threads spawning children never inherit the read
+    /// end across `execve`.
+    #[allow(unsafe_code)]
+    fn pipe_cloexec() -> (libc::c_int, libc::c_int) {
+        let mut fds = [-1 as libc::c_int; 2];
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: `fds` is a valid two-element array for `pipe2`.
+            assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // SAFETY: `fds` is a valid two-element array for `pipe`.
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            for fd in fds {
+                // SAFETY: valid freshly opened pipe descriptor.
+                assert_eq!(
+                    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                    0
+                );
+            }
+        }
+        (fds[0], fds[1])
+    }
+
+    /// Waits briefly for `fd_peer_closed` to turn `true`.
+    ///
+    /// Even with `O_CLOEXEC` / `SOCK_CLOEXEC`, a sibling test thread inside `cargo test` that
+    /// calls `fork()` (e.g. `Command::pre_exec`) temporarily holds an inherited copy of the closed
+    /// peer descriptor until its child completes `execve()`, delaying final kernel release by a
+    /// millisecond or two under parallel load.
+    fn wait_for_peer_closed(fd: libc::c_int) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !fd_peer_closed(fd) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        true
+    }
 
     #[test]
     #[allow(unsafe_code)]
     fn pipe_reports_closed_only_after_reader_drops() {
-        let mut fds = [-1 as libc::c_int; 2];
-        // SAFETY: `fds` is a valid two-element array for `pipe`.
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let (read_fd, write_fd) = (fds[0], fds[1]);
+        let (read_fd, write_fd) = pipe_cloexec();
         assert!(fd_is_peer_stream(write_fd));
         assert!(!fd_peer_closed(write_fd));
         // SAFETY: `read_fd` is owned by this test and closed once.
         assert_eq!(unsafe { libc::close(read_fd) }, 0);
-        assert!(fd_peer_closed(write_fd));
+        assert!(wait_for_peer_closed(write_fd));
         // SAFETY: `write_fd` is owned by this test and closed once.
         assert_eq!(unsafe { libc::close(write_fd) }, 0);
     }
@@ -156,10 +214,7 @@ mod tests {
     #[test]
     #[allow(unsafe_code)]
     fn pipe_with_full_buffer_detects_closed_reader_without_false_positive() {
-        let mut fds = [-1 as libc::c_int; 2];
-        // SAFETY: `fds` is a valid two-element array for `pipe`.
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let (read_fd, write_fd) = (fds[0], fds[1]);
+        let (read_fd, write_fd) = pipe_cloexec();
         // Set non-blocking on write end and fill the pipe buffer completely.
         // SAFETY: valid fd and fcntl flags.
         let flags = unsafe { libc::fcntl(write_fd, libc::F_GETFL) };
@@ -183,7 +238,7 @@ mod tests {
         // SAFETY: `read_fd` is owned by this test and closed once.
         assert_eq!(unsafe { libc::close(read_fd) }, 0);
         assert!(
-            fd_peer_closed(write_fd),
+            wait_for_peer_closed(write_fd),
             "full pipe with closed reader must report closed"
         );
         // SAFETY: `write_fd` is owned by this test and closed once.
@@ -201,7 +256,7 @@ mod tests {
         client.shutdown(Shutdown::Write).expect("shutdown write");
         assert!(!fd_peer_closed(server_fd));
         drop(client);
-        assert!(fd_peer_closed(server_fd));
+        assert!(wait_for_peer_closed(server_fd));
     }
 
     #[test]
@@ -223,8 +278,22 @@ mod tests {
         );
         drop(client);
         assert!(
-            fd_peer_closed(server_fd),
+            wait_for_peer_closed(server_fd),
             "full unix socket after client drop must report closed"
+        );
+    }
+
+    #[test]
+    fn unix_socket_shutdown_both_reports_closed_immediately_even_with_dup_fd() {
+        let (client, server) = UnixStream::pair().expect("unix stream pair");
+        let _dup = client.try_clone().expect("clone client");
+        let server_fd = server.as_raw_fd();
+        client.shutdown(Shutdown::Write).expect("shutdown write");
+        assert!(!fd_peer_closed(server_fd));
+        client.shutdown(Shutdown::Both).expect("shutdown both");
+        assert!(
+            fd_peer_closed(server_fd),
+            "explicit SHUT_RDWR must report closed synchronously even with a duplicated peer fd"
         );
     }
 
