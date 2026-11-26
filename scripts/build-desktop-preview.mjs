@@ -22,6 +22,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { checkBinaryPaths, collectDefaultPaths } from './check-binary-paths.mjs';
 import {
   checkShippedArtifact,
   publicKeyFingerprint,
@@ -33,6 +34,12 @@ import {
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DEFAULT_PUBKEY_ENV = 'LEGION_PREVIEW_UPDATE_PUBKEY';
 const VALID_OS = new Set(['linux', 'macos', 'windows']);
+const LINUX_MUSL_TRIPLE = 'x86_64-unknown-linux-musl';
+
+const ELF_MACHINES = new Map([
+  [62, 'x86_64'],
+  [183, 'aarch64'],
+]);
 
 const MACHO_CPU_NAMES = new Map([
   [0x0100000c, 'arm64'],
@@ -235,6 +242,64 @@ export function inspectMachoArchs(filePathOrBuffer) {
   };
 }
 
+/**
+ * Inspect an ELF64 little-endian executable and report `{ machine, isStatic, interp }`.
+ * A binary with no `PT_INTERP` program header has no dynamic loader dependency (static/static-pie).
+ */
+export function inspectElfLinkage(filePathOrBuffer) {
+  const buf = Buffer.isBuffer(filePathOrBuffer)
+    ? filePathOrBuffer
+    : fs.readFileSync(filePathOrBuffer);
+  if (
+    buf.length < 64 ||
+    buf[0] !== 0x7f ||
+    buf[1] !== 0x45 ||
+    buf[2] !== 0x4c ||
+    buf[3] !== 0x46
+  ) {
+    throw new Error('Binary is not a valid ELF executable.');
+  }
+  const eiClass = buf[4];
+  const eiData = buf[5];
+  if (eiClass !== 2 || eiData !== 1) {
+    throw new Error(
+      `Expected a 64-bit little-endian ELF executable (got class=${eiClass}, data=${eiData}).`,
+    );
+  }
+  const eMachine = buf.readUInt16LE(18);
+  const machine = ELF_MACHINES.get(eMachine) || `unknown(${eMachine})`;
+  const ePhoff = Number(buf.readBigUInt64LE(32));
+  const ePhentsize = buf.readUInt16LE(54);
+  const ePhnum = buf.readUInt16LE(56);
+  if (ePhentsize < 56 || ePhoff + ePhentsize * ePhnum > buf.length) {
+    throw new Error('ELF program header table is truncated or invalid.');
+  }
+  let interp = null;
+  for (let i = 0; i < ePhnum; i += 1) {
+    const off = ePhoff + i * ePhentsize;
+    const pType = buf.readUInt32LE(off);
+    if (pType === 3) {
+      // PT_INTERP
+      const pOffset = Number(buf.readBigUInt64LE(off + 8));
+      const pFilesz = Number(buf.readBigUInt64LE(off + 32));
+      if (pOffset + pFilesz <= buf.length) {
+        interp = buf
+          .subarray(pOffset, pOffset + pFilesz)
+          .toString('utf8')
+          .replace(/\0+$/, '');
+      } else {
+        interp = '(truncated)';
+      }
+      break;
+    }
+  }
+  return {
+    machine,
+    isStatic: interp === null,
+    interp,
+  };
+}
+
 /** Format the PREVIEW-INFO.txt metadata file carried inside each preview artifact. */
 export function formatPreviewInfo({
   os: targetOs,
@@ -247,6 +312,8 @@ export function formatPreviewInfo({
   fingerprint,
   macosAppArchs = null,
   macosNodeArchs = null,
+  linuxNodeTarget = null,
+  linuxAppBaseline = null,
   files = [],
 }) {
   const lines = [
@@ -274,6 +341,9 @@ export function formatPreviewInfo({
     lines.push(`macos_app_arch: ${appList.join(', ') || 'unknown'}`);
     lines.push(`macos_app_arm64: ${appArm64}`);
     lines.push(`macos_node_arch: ${nodeList.join(', ') || 'unknown'}`);
+  } else if (targetOs === 'linux') {
+    if (linuxNodeTarget) lines.push(`linux_node_target: ${linuxNodeTarget}`);
+    if (linuxAppBaseline) lines.push(`linux_app_baseline: ${linuxAppBaseline}`);
   }
 
   if (files.length > 0) {
@@ -384,6 +454,181 @@ function removeIfExists(targetPath) {
   }
 }
 
+function findExecutableOnPath(name, envPath = process.env.PATH || '') {
+  for (const dir of envPath.split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, name);
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      if (fs.statSync(candidate).isFile()) return candidate;
+    } catch {
+      // Not present or not executable in this PATH entry.
+    }
+  }
+  return null;
+}
+
+function detectDockerCommand() {
+  try {
+    execFileSync('docker', ['info'], { stdio: 'ignore' });
+    return ['docker'];
+  } catch {
+    // Try passwordless sudo when the user is not in the docker group.
+  }
+  try {
+    execFileSync('sudo', ['-n', 'docker', 'info'], { stdio: 'ignore' });
+    return ['sudo', 'docker'];
+  } catch {
+    throw new Error(
+      "Cannot reach the Docker daemon (neither 'docker' nor 'sudo -n docker' succeeded); install musl-tools on the host or enable Docker.",
+    );
+  }
+}
+
+function readToolchainChannel(repoRoot) {
+  const toml = fs.readFileSync(path.join(repoRoot, 'rust-toolchain.toml'), 'utf8');
+  const match = /^channel\s*=\s*"([^"]+)"/m.exec(toml.replace(/\r\n/g, '\n'));
+  if (!match) {
+    throw new Error('Could not read toolchain channel from rust-toolchain.toml.');
+  }
+  return match[1].trim();
+}
+
+function assertCleanBinaryPaths(binaryPath, repoRoot, label) {
+  const result = checkBinaryPaths(binaryPath, collectDefaultPaths({ cwd: repoRoot }));
+  if (!result.ok) {
+    const details = result.matches.map((m) => `${m.label}:${m.path}`).join(', ');
+    throw new Error(`Build host path leaked into ${label}: ${details}`);
+  }
+}
+
+async function buildLinuxMuslNodeBinary({
+  repoRoot,
+  targetDir,
+  pubkeyPath,
+  sequenceStr,
+  buildRev,
+  baseBuildEnv,
+  logPath,
+}) {
+  const hostHome = process.env.HOME || os.homedir();
+  const cargoHomeHost = process.env.CARGO_HOME || path.join(hostHome, '.cargo');
+  fs.mkdirSync(targetDir, { recursive: true });
+
+  if (findExecutableOnPath('musl-gcc', baseBuildEnv.PATH)) {
+    const remapFlags = [
+      `--remap-path-prefix=${hostHome}=/build/home`,
+      `--remap-path-prefix=${cargoHomeHost}=/cargo`,
+      `--remap-path-prefix=${repoRoot}=/build`,
+    ].join(' ');
+    const nodeEnv = {
+      ...baseBuildEnv,
+      CARGO_TARGET_DIR: targetDir,
+      CC_x86_64_unknown_linux_musl: 'musl-gcc',
+      RUSTFLAGS: [baseBuildEnv.RUSTFLAGS, remapFlags].filter(Boolean).join(' '),
+    };
+    await runLoggedCommand(
+      'cargo',
+      ['build', '--release', '--locked', '--target', LINUX_MUSL_TRIPLE, '--bin', 'legion'],
+      {
+        cwd: repoRoot,
+        env: nodeEnv,
+        logPath,
+      },
+    );
+    return;
+  }
+
+  // Fallback when musl-gcc is absent on the host (for example on non-Debian dev machines):
+  // build the same x86_64-unknown-linux-musl binary inside ubuntu:22.04 with musl-tools,
+  // reusing the host Rust toolchain and Cargo registry cache.
+  const dockerCmd = detectDockerCommand();
+  const channel = readToolchainChannel(repoRoot);
+  const rustupHomeHost = process.env.RUSTUP_HOME || path.join(hostHome, '.rustup');
+  const toolchainDir = path.join(rustupHomeHost, 'toolchains', `${channel}-x86_64-unknown-linux-gnu`);
+  const muslStdDir = path.join(toolchainDir, 'lib', 'rustlib', LINUX_MUSL_TRIPLE);
+  if (!fs.existsSync(path.join(toolchainDir, 'bin', 'rustc'))) {
+    throw new Error(
+      `Expected Rust toolchain at ${toolchainDir}; run 'rustup toolchain install' first.`,
+    );
+  }
+  if (!fs.existsSync(muslStdDir)) {
+    throw new Error(
+      `Missing Rust target ${LINUX_MUSL_TRIPLE} in ${toolchainDir}; run 'rustup target add ${LINUX_MUSL_TRIPLE}' first.`,
+    );
+  }
+  const hostRegistry = path.join(cargoHomeHost, 'registry');
+  const hostGit = path.join(cargoHomeHost, 'git');
+  fs.mkdirSync(hostRegistry, { recursive: true });
+
+  const keySha = sha256FileSync(pubkeyPath);
+  const containerKeyPath = `/opt/preview-keys/${keySha}.pub.pem`;
+  const hostUid = typeof process.getuid === 'function' ? process.getuid() : 0;
+  const hostGid = typeof process.getgid === 'function' ? process.getgid() : 0;
+
+  const dockerArgs = [
+    ...dockerCmd.slice(1),
+    'run',
+    '--rm',
+    '-v',
+    `${repoRoot}:/workspace/legion-control`,
+    '-v',
+    `${toolchainDir}:/opt/rust:ro`,
+    '-v',
+    `${hostRegistry}:/opt/host-registry`,
+    '-v',
+    `${targetDir}:/target-node`,
+    '-v',
+    `${pubkeyPath}:${containerKeyPath}:ro`,
+  ];
+  if (fs.existsSync(hostGit)) {
+    dockerArgs.push('-v', `${hostGit}:/opt/host-git`);
+  }
+  dockerArgs.push(
+    '-e',
+    `HOST_UID=${hostUid}`,
+    '-e',
+    `HOST_GID=${hostGid}`,
+    '-e',
+    `LEGION_BUILD_REV=${buildRev}`,
+    '-e',
+    `LEGION_BUILD_SEQUENCE=${sequenceStr}`,
+    '-e',
+    `LEGION_PREVIEW_UPDATE_KEY=${containerKeyPath}`,
+    'ubuntu:22.04',
+    'bash',
+    '-c',
+    [
+      'set -euo pipefail',
+      'export DEBIAN_FRONTEND=noninteractive',
+      'mkdir -p /home/me /tmp/cargo-home',
+      'cleanup_ownership() {',
+      '  chown -R "${HOST_UID}:${HOST_GID}" /target-node /opt/host-registry 2>/dev/null || true',
+      '  if [[ -d /opt/host-git ]]; then chown -R "${HOST_UID}:${HOST_GID}" /opt/host-git 2>/dev/null || true; fi',
+      '}',
+      'trap cleanup_ownership EXIT',
+      'apt-get update -qq',
+      'apt-get install -y -qq --no-install-recommends build-essential musl-tools ca-certificates >/dev/null',
+      'ln -s /opt/host-registry /tmp/cargo-home/registry',
+      'if [[ -d /opt/host-git ]]; then ln -s /opt/host-git /tmp/cargo-home/git; fi',
+      'export HOME=/home/me',
+      'export CARGO_HOME=/tmp/cargo-home',
+      'export CARGO_TARGET_DIR=/target-node',
+      'export CC_x86_64_unknown_linux_musl=musl-gcc',
+      'export PATH="/opt/rust/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"',
+      'export RUSTFLAGS="--remap-path-prefix=/home/me=/build/home --remap-path-prefix=/tmp/cargo-home=/cargo --remap-path-prefix=/opt/host-registry=/cargo/registry --remap-path-prefix=/workspace/legion-control=/build"',
+      'cd /workspace/legion-control',
+      `cargo build --release --locked --target ${LINUX_MUSL_TRIPLE} --bin legion`,
+    ].join('\n'),
+  );
+
+  await runLoggedCommand(dockerCmd[0], dockerArgs, {
+    cwd: repoRoot,
+    env: process.env,
+    logPath,
+  });
+}
+
 /**
  * Build the preview-keyed desktop app bundle(s) and `legion` node binary for `targetOs`, verify
  * compiled sequence + preview key markers on every artifact, and stage them with PREVIEW-INFO.txt.
@@ -475,39 +720,55 @@ export async function buildDesktopPreview({
     baseBuildEnv.LEGION_BUILD_REV = buildRev;
 
     // 1. Build and verify the platform `legion` node binary with the preview key and sequence.
-    const nodeEnv = {
-      ...baseBuildEnv,
-      CARGO_TARGET_DIR: effectiveNodeTargetDir,
-    };
-    const nodeArgs = ['build', '--release', '--locked', '--bin', 'legion'];
     let builtNodePath;
     let stagedNodeName;
-    if (targetOs === 'windows') {
-      const triple = 'x86_64-pc-windows-msvc';
-      nodeArgs.push('--target', triple);
-      // Match legion-release.yml: statically link the MSVC CRT so Windows machines need no VC++
-      // redistributable. Passing `--target` ensures RUSTFLAGS applies only to target crates.
-      nodeEnv.RUSTFLAGS = [nodeEnv.RUSTFLAGS, '-C target-feature=+crt-static']
-        .filter(Boolean)
-        .join(' ');
-      builtNodePath = path.join(effectiveNodeTargetDir, triple, 'release', 'legion.exe');
-      stagedNodeName = 'legion-windows-x86_64.exe';
-    } else if (targetOs === 'macos') {
-      const triple = 'aarch64-apple-darwin';
-      nodeArgs.push('--target', triple);
-      builtNodePath = path.join(effectiveNodeTargetDir, triple, 'release', 'legion');
-      stagedNodeName = 'legion-macos-aarch64';
-    } else {
-      builtNodePath = path.join(effectiveNodeTargetDir, 'release', 'legion');
+    if (targetOs === 'linux') {
+      builtNodePath = path.join(effectiveNodeTargetDir, LINUX_MUSL_TRIPLE, 'release', 'legion');
       stagedNodeName = 'legion-linux-x86_64';
-    }
+      console.log(
+        `Building preview legion node binary (${LINUX_MUSL_TRIPLE}, static) for linux (sequence ${sequenceStr}, ${fingerprint})...`,
+      );
+      await buildLinuxMuslNodeBinary({
+        repoRoot,
+        targetDir: effectiveNodeTargetDir,
+        pubkeyPath,
+        sequenceStr,
+        buildRev,
+        baseBuildEnv,
+        logPath: nodeBuildLog,
+      });
+    } else {
+      const nodeEnv = {
+        ...baseBuildEnv,
+        CARGO_TARGET_DIR: effectiveNodeTargetDir,
+      };
+      const nodeArgs = ['build', '--release', '--locked', '--bin', 'legion'];
+      if (targetOs === 'windows') {
+        const triple = 'x86_64-pc-windows-msvc';
+        nodeArgs.push('--target', triple);
+        // Match legion-release.yml: statically link the MSVC CRT so Windows machines need no VC++
+        // redistributable. Passing `--target` ensures RUSTFLAGS applies only to target crates.
+        nodeEnv.RUSTFLAGS = [nodeEnv.RUSTFLAGS, '-C target-feature=+crt-static']
+          .filter(Boolean)
+          .join(' ');
+        builtNodePath = path.join(effectiveNodeTargetDir, triple, 'release', 'legion.exe');
+        stagedNodeName = 'legion-windows-x86_64.exe';
+      } else {
+        const triple = 'aarch64-apple-darwin';
+        nodeArgs.push('--target', triple);
+        builtNodePath = path.join(effectiveNodeTargetDir, triple, 'release', 'legion');
+        stagedNodeName = 'legion-macos-aarch64';
+      }
 
-    console.log(`Building preview legion node binary for ${targetOs} (sequence ${sequenceStr}, ${fingerprint})...`);
-    await runLoggedCommand('cargo', nodeArgs, {
-      cwd: repoRoot,
-      env: nodeEnv,
-      logPath: nodeBuildLog,
-    });
+      console.log(
+        `Building preview legion node binary for ${targetOs} (sequence ${sequenceStr}, ${fingerprint})...`,
+      );
+      await runLoggedCommand('cargo', nodeArgs, {
+        cwd: repoRoot,
+        env: nodeEnv,
+        logPath: nodeBuildLog,
+      });
+    }
     if (!fs.existsSync(builtNodePath)) {
       throw new Error(`Expected built node binary not found at ${builtNodePath}`);
     }
@@ -515,6 +776,15 @@ export async function buildDesktopPreview({
     fs.copyFileSync(builtNodePath, stagedNodePath);
     if (targetOs !== 'windows') {
       fs.chmodSync(stagedNodePath, 0o755);
+    }
+    if (targetOs === 'linux') {
+      const elfInfo = inspectElfLinkage(stagedNodePath);
+      if (elfInfo.machine !== 'x86_64' || !elfInfo.isStatic) {
+        throw new Error(
+          `Built Linux node binary ${stagedNodeName} must be a static x86_64 ELF binary (found machine=${elfInfo.machine}, interp=${elfInfo.interp ?? 'none'}).`,
+        );
+      }
+      assertCleanBinaryPaths(stagedNodePath, repoRoot, stagedNodeName);
     }
     checkShippedArtifact({
       filePath: stagedNodePath,
@@ -537,26 +807,42 @@ export async function buildDesktopPreview({
 
     // 2. Clean prior bundles and build desktop app bundle(s) with the same preview key and sequence.
     removeIfExists(bundleDir);
-    const cfg = JSON.stringify(
-      tauriBundleConfig({ baseVersion: appVersion, sequence, os: targetOs }),
-    );
-    const appEnv = { ...baseBuildEnv };
     if (targetOs === 'linux') {
-      appEnv.APPIMAGE_EXTRACT_AND_RUN = '1';
-    }
-    const bundlesArg =
-      targetOs === 'linux' ? 'deb,appimage' : targetOs === 'macos' ? 'app,dmg' : 'nsis';
+      const buildLinuxScript = path.join(repoRoot, 'scripts', 'build-linux-app-bundles.sh');
+      const linuxAppEnv = { ...baseBuildEnv };
+      delete linuxAppEnv.LEGION_PREVIEW_UPDATE_KEY;
+      console.log(
+        `Building preview desktop app (deb,appimage via ubuntu:22.04 glibc baseline) for linux (sequence ${sequenceStr}, ${fingerprint})...`,
+      );
+      await runLoggedCommand(
+        'bash',
+        [buildLinuxScript, '--sequence', sequenceStr, '--preview-key', pubkeyPath],
+        {
+          cwd: repoRoot,
+          env: linuxAppEnv,
+          logPath: appBuildLog,
+        },
+      );
+    } else {
+      const cfg = JSON.stringify(
+        tauriBundleConfig({ baseVersion: appVersion, sequence, os: targetOs }),
+      );
+      const appEnv = { ...baseBuildEnv };
+      const bundlesArg = targetOs === 'macos' ? 'app,dmg' : 'nsis';
 
-    console.log(`Building preview desktop app (${bundlesArg}) for ${targetOs} (sequence ${sequenceStr}, ${fingerprint})...`);
-    await runLoggedCommand(
-      'cargo',
-      ['tauri', 'build', '--bundles', bundlesArg, '--config', cfg],
-      {
-        cwd: appDir,
-        env: appEnv,
-        logPath: appBuildLog,
-      },
-    );
+      console.log(
+        `Building preview desktop app (${bundlesArg}) for ${targetOs} (sequence ${sequenceStr}, ${fingerprint})...`,
+      );
+      await runLoggedCommand(
+        'cargo',
+        ['tauri', 'build', '--bundles', bundlesArg, '--config', cfg],
+        {
+          cwd: appDir,
+          env: appEnv,
+          logPath: appBuildLog,
+        },
+      );
+    }
 
     if (targetOs === 'linux') {
       const debFile = findExactlyOne(
@@ -569,6 +855,7 @@ export async function buildDesktopPreview({
         (e) => e.isFile() && e.name.endsWith('.AppImage'),
         '.AppImage bundle',
       );
+      assertCleanBinaryPaths(appReleaseBin, repoRoot, 'legion-app');
       checkShippedArtifact({
         filePath: appReleaseBin,
         kind: 'binary',
@@ -746,6 +1033,8 @@ export async function buildDesktopPreview({
       fingerprint,
       macosAppArchs,
       macosNodeArchs,
+      linuxNodeTarget: targetOs === 'linux' ? `${LINUX_MUSL_TRIPLE} (static)` : null,
+      linuxAppBaseline: targetOs === 'linux' ? 'ubuntu:22.04 (glibc 2.35)' : null,
       files: fileEntries,
     });
     const infoPath = path.join(resolvedOut, 'PREVIEW-INFO.txt');

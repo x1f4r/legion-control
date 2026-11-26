@@ -42,6 +42,23 @@ use crate::transfers::PauseReason;
 use crate::transfers::{SharedTransfers, TransferManager, TransferPlatform};
 use crate::updater::{SharedUpdater, UpdateManager};
 
+/// Returns `true` when the desktop executable was invoked solely to print its version (`--version`
+/// or `-V`), so package checks can verify the binary headlessly without initializing a display.
+pub fn is_version_flag(args: &[String]) -> bool {
+    matches!(args, [flag] if flag == "--version" || flag == "-V")
+}
+
+/// Formats the single-line version banner printed for `legion-app --version`.
+pub fn version_line() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let build = env!("LEGION_APP_BUILD_ID").trim();
+    if build.is_empty() {
+        format!("legion-app {version}")
+    } else {
+        format!("legion-app {version} ({build})")
+    }
+}
+
 /// Returns `true` when this desktop process was spawned by the update supervisor purely to verify
 /// startup (`LEGION_UPDATE_VERIFY_ONLY=1`) and exit without opening a window.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -1005,6 +1022,24 @@ mod tests {
     fn verify_only_launch_disables_single_instance_handover() {
         assert!(!should_register_single_instance(true));
         assert!(should_register_single_instance(false));
+    }
+
+    #[test]
+    fn version_flag_and_banner_work_headlessly() {
+        assert!(is_version_flag(&["--version".to_owned()]));
+        assert!(is_version_flag(&["-V".to_owned()]));
+        assert!(!is_version_flag(&[]));
+        assert!(!is_version_flag(&[
+            "--version".to_owned(),
+            "extra".to_owned()
+        ]));
+        assert!(!is_version_flag(&["--help".to_owned()]));
+
+        let line = version_line();
+        assert!(
+            line.starts_with(&format!("legion-app {}", env!("CARGO_PKG_VERSION"))),
+            "unexpected version banner: {line}"
+        );
     }
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
