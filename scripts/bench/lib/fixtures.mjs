@@ -73,6 +73,7 @@ export function ensureFixtures(scratchRoot, bin, neededSuites) {
     pics300: null,
     songs300: null,
     ui5k: null,
+    ui5kWrapped: null,
   };
 
   // 1. Binary blobs: 1 MiB, 64 MiB, 1 GiB (non-zero deterministic pattern).
@@ -354,6 +355,27 @@ for i in range(5000):
       );
     }
     out.ui5k = ui5k;
+
+    // 4b. UI 5,000-entry wrapped-names directory (every filename wraps to 2 lines on phone 390x844).
+    const ui5kWrapped = path.join(fixturesDir, 'ui-5k-wrapped');
+    const lastWrapped = 'Quarterly_Production_Cluster_Rollout_Archive_Snapshot_Node_04999.toml';
+    if (!fs.existsSync(path.join(ui5kWrapped, lastWrapped))) {
+      console.error(`[bench] creating 5,000-entry wrapped-names UI fixture directory ${ui5kWrapped}...`);
+      fs.mkdirSync(ui5kWrapped, { recursive: true });
+      runPython(
+        `
+import os, sys
+d = sys.argv[1]
+exts = [".txt", ".md", ".json", ".rs", ".js", ".pdf", ".zip", ".log", ".csv", ".toml"]
+for i in range(5000):
+    p = os.path.join(d, f"Quarterly_Production_Cluster_Rollout_Archive_Snapshot_Node_{i:05d}{exts[i % len(exts)]}")
+    with open(p, "wb") as f:
+        f.write(b"sample content\\n")
+`,
+        [ui5kWrapped],
+      );
+    }
+    out.ui5kWrapped = ui5kWrapped;
   }
 
   return out;

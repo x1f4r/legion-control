@@ -2,12 +2,22 @@
 // thumbnails, 5 000-entry paging, swipe actions, long-press selection), Search, Favourites, Recent,
 // and Kept-in-sync folder detail.
 
-import { html, useCallback, useEffect, useMemo, useRef, useState } from '../vendor/preact-htm.js';
+import {
+  html,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from '../vendor/preact-htm.js';
 import { Icon } from '../icons.js';
 import {
   baseFileName,
   changedPresetCutoff,
+  computeVirtualGridWindow,
   createThumbQueue,
+  createVirtualListLayout,
   detectFileCapabilities,
   entryCategory,
   entryIconName,
@@ -63,9 +73,921 @@ import { FilesViewer } from './files-viewer.js';
 import { SplitView } from './split-view.js';
 
 const PAGE_SIZE = 200;
+const NEXT_PAGE_SIZE = 500;
 const RENDER_STEP = 120;
 const LONG_PRESS_MS = 450;
 const LONG_PRESS_MOVE_TOLERANCE_PX = 8;
+const VIRTUAL_MIN_ITEMS = 60;
+const VIRTUAL_GRID_MIN_ITEMS = 60;
+const INITIAL_ROW_HEIGHT_FALLBACK_PX = 56;
+
+function findScrollParent(el) {
+  let node = el?.parentElement || null;
+  while (node && node !== document.body && node !== document.documentElement) {
+    const oy = window.getComputedStyle ? window.getComputedStyle(node).overflowY : '';
+    if (oy === 'auto' || oy === 'scroll' || oy === 'overlay') return node;
+    node = node.parentElement;
+  }
+  return document.scrollingElement || document.documentElement;
+}
+
+function readViewportMetrics(containerEl) {
+  const scroller = findScrollParent(containerEl);
+  const isDoc =
+    !scroller || scroller === document.documentElement || scroller === document.body;
+  const listRect = containerEl.getBoundingClientRect();
+  const listStyle = window.getComputedStyle ? window.getComputedStyle(containerEl) : null;
+  const listBorderTop = listStyle ? parseFloat(listStyle.borderTopWidth) || 0 : 0;
+  let scrollerTop = 0;
+  let scrollTop = 0;
+  let viewportHeight = typeof window !== 'undefined' ? window.innerHeight || 720 : 720;
+  let padTop = 0;
+  let padBottom = 0;
+
+  if (isDoc) {
+    scrollTop = window.scrollY || scroller?.scrollTop || 0;
+    viewportHeight = window.innerHeight || 720;
+  } else {
+    const sr = scroller.getBoundingClientRect();
+    scrollerTop = sr.top;
+    scrollTop = scroller.scrollTop;
+    viewportHeight = scroller.clientHeight || sr.height || window.innerHeight || 720;
+    const cs = window.getComputedStyle ? window.getComputedStyle(scroller) : null;
+    if (cs) {
+      padTop = parseFloat(cs.paddingTop) || 0;
+      padBottom =
+        (parseFloat(cs.paddingBottom) || 0) + (parseFloat(cs.scrollPaddingBottom) || 0);
+    }
+  }
+
+  const listTop = listRect.top - scrollerTop + scrollTop + listBorderTop;
+  const scrollOffset = scrollTop - listTop;
+
+  let stickyTop = 0;
+  const whereEl = !isDoc
+    ? scroller.querySelector('.where')
+    : document.querySelector('.where');
+  if (whereEl) {
+    const wr = whereEl.getBoundingClientRect();
+    if (wr.height > 0 && wr.top <= scrollerTop + padTop + 8) {
+      stickyTop = wr.height;
+    }
+  }
+
+  return {
+    scroller,
+    isDoc,
+    scrollTop,
+    scrollerTop,
+    listTop,
+    scrollOffset,
+    viewportHeight,
+    padTop,
+    padBottom,
+    stickyTop,
+    listWidth: containerEl.clientWidth || listRect.width || 0,
+  };
+}
+
+/**
+ * Measures the live one-line row height from mounted `.vlist-item` rows (never a hardcoded
+ * constant). Prefers a measured single-line fitted row, then a pending one-line row, and finally
+ * derives the exact single-line height from a multi-line row using live thumb/body/padding/border
+ * geometry so folders where every name wraps still estimate unmeasured rows with live metrics.
+ */
+function measureLiveOneLineHeight(listEl) {
+  if (!listEl) return null;
+  let readyZeroIdxHeight = null;
+  let pendingHeight = null;
+  let borderWidthSample = null;
+  let multiLineSample = null;
+
+  for (const child of listEl.children) {
+    if (!child.classList?.contains('vlist-item')) continue;
+    const rectH = child.getBoundingClientRect().height;
+    if (!(rectH > 1)) continue;
+    const idxAttr = child.dataset?.vlistIndex;
+    const isFirst = idxAttr === '0';
+    if (!isFirst && borderWidthSample === null) {
+      const bw = window.getComputedStyle ? parseFloat(window.getComputedStyle(child).borderTopWidth) : 0;
+      if (Number.isFinite(bw)) borderWidthSample = bw;
+    }
+
+    const slot = child.querySelector('.fn-slot');
+    if (slot) {
+      const ready = slot.getAttribute('data-fn-ready') === '1';
+      if (ready) {
+        const lines = slot.querySelectorAll('.fn-line');
+        if (lines.length === 1) {
+          if (!isFirst) return rectH;
+          if (readyZeroIdxHeight === null) readyZeroIdxHeight = rectH;
+        } else if (lines.length > 1 && !multiLineSample) {
+          multiLineSample = { child, lines, isFirst };
+        }
+      } else if (!isFirst && pendingHeight === null) {
+        pendingHeight = rectH;
+      }
+    } else if (!isFirst && pendingHeight === null) {
+      pendingHeight = rectH;
+    }
+  }
+
+  const divider = borderWidthSample ?? 1;
+  if (readyZeroIdxHeight !== null) return readyZeroIdxHeight + divider;
+  if (pendingHeight !== null) return pendingHeight;
+
+  if (multiLineSample) {
+    const { child, lines, isFirst } = multiLineSample;
+    const rowEl = child.querySelector('.row');
+    const bodyEl = rowEl?.querySelector('.body');
+    const thumbEl = rowEl?.querySelector('.thumb');
+    const lineH = lines[0]?.getBoundingClientRect().height || 0;
+    if (rowEl && bodyEl && lineH > 0) {
+      const cs = window.getComputedStyle(rowEl);
+      const padY = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
+      const minH = parseFloat(cs.minHeight) || 0;
+      const thumbH = thumbEl ? thumbEl.getBoundingClientRect().height : 0;
+      const bodyH = bodyEl.getBoundingClientRect().height;
+      const oneLineBodyH = Math.max(0, bodyH - Math.max(0, lines.length - 1) * lineH);
+      const itemBorder = isFirst
+        ? divider
+        : parseFloat(window.getComputedStyle(child).borderTopWidth) || 0;
+      const derived = Math.max(minH, Math.max(thumbH, oneLineBodyH) + padY) + itemBorder;
+      if (derived > 1) return derived;
+    }
+  }
+
+  return null;
+}
+
+function setSpacerHeight(el, heightPx) {
+  if (!el) return;
+  const h = Math.max(0, Math.round(heightPx));
+  el.style.height = `${h}px`;
+  el.dataset.empty = h === 0 ? 'true' : 'false';
+}
+
+function VirtualFileList({
+  items,
+  renderRow,
+  resetKey,
+  onNearEnd = null,
+  returnTarget = null,
+  onReturnHandled = null,
+  lines = 2,
+}) {
+  const listRef = useRef(null);
+  const topSpacerRef = useRef(null);
+  const bottomSpacerRef = useRef(null);
+  const layoutRef = useRef(null);
+  if (!layoutRef.current) {
+    layoutRef.current = createVirtualListLayout({
+      estimatedHeight: INITIAL_ROW_HEIGHT_FALLBACK_PX,
+    });
+  }
+  const layout = layoutRef.current;
+
+  const prevResetKeyRef = useRef(resetKey);
+  const lastListWidthRef = useRef(0);
+  const lastScrollerBoxRef = useRef({ w: 0, h: 0, clientH: 0, padBottom: 0 });
+  const observedRowsRef = useRef(new Set());
+  const rowRoRef = useRef(null);
+  const nearEndForCountRef = useRef(-1);
+  const handledReturnTokenRef = useRef(0);
+  const onNearEndRef = useRef(onNearEnd);
+  onNearEndRef.current = onNearEnd;
+
+  const total = items.length;
+  const totalRef = useRef(total);
+  totalRef.current = total;
+  const virtualized = total > VIRTUAL_MIN_ITEMS;
+
+  // Keep the layout index synchronized with `items` during render so offsets and window bounds are
+  // always valid before paint.
+  const resetChanged = prevResetKeyRef.current !== resetKey;
+  if (resetChanged) {
+    prevResetKeyRef.current = resetKey;
+    layout.resetMeasurements();
+    lastListWidthRef.current = 0;
+    nearEndForCountRef.current = -1;
+  }
+
+  const itemKeys = useMemo(() => items.map((e, i) => e?.path || String(i)), [items]);
+  layout.syncItems(itemKeys);
+
+  const [win, setWin] = useState(() =>
+    layout.computeWindow({
+      scrollOffset: 0,
+      viewportHeight: typeof window !== 'undefined' ? window.innerHeight || 720 : 720,
+      overscanPx: 640,
+    }),
+  );
+
+  // Clamp/recompute synchronously if `resetKey` changed or `total` changed before effects run.
+  const effectiveWin = useMemo(() => {
+    if (!virtualized) {
+      return { start: 0, end: total, topPad: 0, bottomPad: 0, totalHeight: 0 };
+    }
+    if (resetChanged || (win.end === 0 && total > 0)) {
+      const vp = typeof window !== 'undefined' ? window.innerHeight || 720 : 720;
+      return layout.computeWindow({
+        scrollOffset: 0,
+        viewportHeight: vp,
+        overscanPx: Math.max(600, Math.round(vp * 0.85)),
+      });
+    }
+    const start = Math.max(0, Math.min(total, win.start));
+    const end = Math.max(start, Math.min(total, win.end));
+    const totalHeight = layout.getTotalHeight();
+    return {
+      start,
+      end,
+      topPad: Math.round(layout.getOffset(start)),
+      bottomPad: Math.round(Math.max(0, totalHeight - layout.getOffset(end))),
+      totalHeight: Math.round(totalHeight),
+    };
+  }, [virtualized, total, resetChanged, win.start, win.end, itemKeys]);
+
+  const winRef = useRef(effectiveWin);
+  winRef.current = effectiveWin;
+
+  const syncWindowFromDom = useCallback(
+    ({ forceImmediate = false } = {}) => {
+      const listEl = listRef.current;
+      const count = totalRef.current;
+      if (!listEl || count <= VIRTUAL_MIN_ITEMS) return;
+      const m = readViewportMetrics(listEl);
+      const overscanPx = Math.max(600, Math.round(m.viewportHeight * 0.85));
+      const minBufferPx = forceImmediate ? 0 : Math.max(280, Math.round(overscanPx * 0.45));
+
+      const next = layout.computeWindow({
+        scrollOffset: m.scrollOffset,
+        viewportHeight: m.viewportHeight,
+        overscanPx,
+        minBufferPx,
+        prevWindow: forceImmediate ? null : winRef.current,
+      });
+
+      if (typeof onNearEndRef.current === 'function' && count > 0) {
+        const preloadMargin = Math.max(400, Math.round(m.viewportHeight * 0.75));
+        const nearBottom =
+          m.scrollOffset + m.viewportHeight + preloadMargin >= layout.getTotalHeight();
+        if (nearBottom && nearEndForCountRef.current !== count) {
+          nearEndForCountRef.current = count;
+          onNearEndRef.current();
+        }
+      }
+
+      const cur = winRef.current;
+      if (next.start !== cur.start || next.end !== cur.end) {
+        winRef.current = next;
+        setWin(next);
+      } else if (next.topPad !== cur.topPad || next.bottomPad !== cur.bottomPad) {
+        winRef.current = next;
+        setSpacerHeight(topSpacerRef.current, next.topPad);
+        setSpacerHeight(bottomSpacerRef.current, next.bottomPad);
+      }
+    },
+    [layout],
+  );
+
+  const measureMountedAndStabilize = useCallback(
+    (targetElements = null) => {
+      const listEl = listRef.current;
+      if (!listEl || totalRef.current <= VIRTUAL_MIN_ITEMS) return;
+      const m = readViewportMetrics(listEl);
+      const unobstructedTop = m.scrollerTop + m.padTop + m.stickyTop;
+
+      // If list width changed (window resize, orientation change, split-pane resize), previously
+      // measured heights for wrapped names may no longer match. Keep the visible anchor pinned.
+      if (
+        m.listWidth > 1 &&
+        lastListWidthRef.current > 1 &&
+        Math.abs(m.listWidth - lastListWidthRef.current) > 1
+      ) {
+        let anchorKey = null;
+        let anchorVisualTop = 0;
+        for (const child of listEl.children) {
+          if (!child.classList?.contains('vlist-item')) continue;
+          const r = child.getBoundingClientRect();
+          if (r.height > 0 && r.top >= unobstructedTop - 0.5) {
+            anchorKey = child.dataset?.vlistKey || null;
+            anchorVisualTop = r.top - m.scrollerTop;
+            break;
+          }
+        }
+        lastListWidthRef.current = m.listWidth;
+        const liveOneLine = measureLiveOneLineHeight(listEl);
+        layout.resetMeasurements({ estimatedHeight: liveOneLine });
+
+        const allUpdates = [];
+        for (const child of listEl.children) {
+          if (!child.classList?.contains('vlist-item')) continue;
+          const idx = Number(child.dataset?.vlistIndex);
+          const key = child.dataset?.vlistKey;
+          const h = child.getBoundingClientRect().height;
+          if (Number.isInteger(idx) && key !== undefined && h > 1) {
+            allUpdates.push({ index: idx, key, height: h });
+          }
+        }
+        layout.applyMeasurements({
+          updates: allUpdates,
+          estimatedHeight: liveOneLine,
+          scrollOffset: 0,
+        });
+
+        const cur = winRef.current;
+        const totalH = layout.getTotalHeight();
+        setSpacerHeight(topSpacerRef.current, layout.getOffset(cur.start));
+        setSpacerHeight(bottomSpacerRef.current, totalH - layout.getOffset(cur.end));
+
+        if (anchorKey !== null && m.scrollTop > 1) {
+          const anchorIdx = layout.indexOfKey(anchorKey);
+          if (anchorIdx >= 0) {
+            const nextTop = Math.max(0, m.listTop + layout.getOffset(anchorIdx) - anchorVisualTop);
+            if (Math.abs(nextTop - m.scrollTop) >= 0.5) {
+              if (m.isDoc) window.scrollTo(0, nextTop);
+              else m.scroller.scrollTop = nextTop;
+            }
+          }
+        }
+        syncWindowFromDom({ forceImmediate: true });
+        return;
+      }
+
+      if (lastListWidthRef.current === 0 && m.listWidth > 1) {
+        lastListWidthRef.current = m.listWidth;
+      }
+
+      const liveOneLine = measureLiveOneLineHeight(listEl);
+      const updates = [];
+      const source = targetElements || listEl.children;
+      for (const child of source) {
+        if (!child || !child.isConnected || !child.classList?.contains('vlist-item')) continue;
+        const idx = Number(child.dataset?.vlistIndex);
+        const key = child.dataset?.vlistKey;
+        const h = child.getBoundingClientRect().height;
+        if (Number.isInteger(idx) && key !== undefined && h > 1) {
+          updates.push({ index: idx, key, height: h });
+        }
+      }
+
+      // Anchor on the first row visible below any sticky header / top padding when scrolled away
+      // from the top so rows off-screen OR covered by the sticky breadcrumb bar absorb wrap deltas
+      // into scrollTop without shifting visible rows below them.
+      const anchorScrollOffset =
+        m.scrollTop > 1 ? Math.max(0, m.scrollOffset + m.padTop + m.stickyTop) : 0;
+
+      const cur = winRef.current;
+      const res = layout.applyMeasurements({
+        updates,
+        estimatedHeight: liveOneLine,
+        scrollOffset: anchorScrollOffset,
+      });
+      if (!res.changed) return;
+
+      const nextTopPad = Math.round(layout.getOffset(cur.start));
+      const nextBottomPad = Math.round(Math.max(0, res.totalHeight - layout.getOffset(cur.end)));
+      setSpacerHeight(topSpacerRef.current, nextTopPad);
+      setSpacerHeight(bottomSpacerRef.current, nextBottomPad);
+      winRef.current = {
+        ...cur,
+        topPad: nextTopPad,
+        bottomPad: nextBottomPad,
+        totalHeight: Math.round(res.totalHeight),
+      };
+
+      // Only shift scrollTop when the anchor row is mounted in the current window so DOM row
+      // height deltas plus spacer deltas match `res.scrollDelta` identically.
+      const anchorMounted = res.anchorIndex >= cur.start && res.anchorIndex < cur.end;
+      if (anchorMounted && Math.abs(res.scrollDelta) >= 0.5) {
+        if (m.isDoc) {
+          window.scrollBy(0, res.scrollDelta);
+        } else {
+          m.scroller.scrollTop = Math.max(0, m.scroller.scrollTop + res.scrollDelta);
+        }
+      }
+
+      // If rows shrank or total height shifted enough to thin our overscan buffer, extend window
+      // immediately so no blank gap can ever appear.
+      syncWindowFromDom({ forceImmediate: false });
+    },
+    [layout, syncWindowFromDom],
+  );
+
+  // Sync spacers, ResizeObserver row subscriptions, and initial row measurements before paint.
+  useLayoutEffect(() => {
+    const listEl = listRef.current;
+    if (!virtualized || !listEl) return;
+
+    setSpacerHeight(topSpacerRef.current, effectiveWin.topPad);
+    setSpacerHeight(bottomSpacerRef.current, effectiveWin.bottomPad);
+
+    const rowRo = rowRoRef.current;
+    if (rowRo) {
+      const nextObserved = new Set();
+      for (const child of listEl.children) {
+        if (!child.classList?.contains('vlist-item')) continue;
+        nextObserved.add(child);
+        if (!observedRowsRef.current.has(child)) {
+          rowRo.observe(child);
+        }
+      }
+      for (const prev of observedRowsRef.current) {
+        if (!nextObserved.has(prev)) {
+          rowRo.unobserve(prev);
+        }
+      }
+      observedRowsRef.current = nextObserved;
+    }
+
+    measureMountedAndStabilize();
+  }, [virtualized, effectiveWin.start, effectiveWin.end, effectiveWin.topPad, effectiveWin.bottomPad, itemKeys, resetKey, measureMountedAndStabilize]);
+
+  // Attach scroll listener, scroller ResizeObserver (tracks dynamic viewport height AND bottom
+  // padding/inset changes), and ONE shared ResizeObserver for mounted `.vlist-item` rows.
+  useEffect(() => {
+    const listEl = listRef.current;
+    if (!virtualized || !listEl) return undefined;
+
+    const scroller = findScrollParent(listEl);
+    const isDoc =
+      !scroller || scroller === document.documentElement || scroller === document.body;
+    const scrollTarget = isDoc ? window : scroller;
+
+    const onScroll = () => {
+      syncWindowFromDom({ forceImmediate: false });
+    };
+
+    let rowRo = null;
+    if (typeof ResizeObserver === 'function') {
+      rowRo = new ResizeObserver((entries) => {
+        const changedEls = [];
+        for (const entry of entries) {
+          if (entry.target && entry.target.isConnected) {
+            changedEls.push(entry.target);
+          }
+        }
+        if (changedEls.length > 0) {
+          measureMountedAndStabilize(changedEls);
+        }
+      });
+      rowRoRef.current = rowRo;
+      observedRowsRef.current.clear();
+      for (const child of listEl.children) {
+        if (child.classList?.contains('vlist-item')) {
+          rowRo.observe(child);
+          observedRowsRef.current.add(child);
+        }
+      }
+    }
+
+    let scrollerRo = null;
+    if (typeof ResizeObserver === 'function' && scroller) {
+      scrollerRo = new ResizeObserver((entries) => {
+        const m = readViewportMetrics(listEl);
+        const prev = lastScrollerBoxRef.current;
+        let scrollerContentH = prev.h;
+        let scrollerContentW = prev.w;
+        for (const entry of entries) {
+          if (entry.target === scroller && entry.contentRect) {
+            scrollerContentW = entry.contentRect.width;
+            scrollerContentH = entry.contentRect.height;
+          }
+        }
+        const widthChanged =
+          m.listWidth > 1 &&
+          lastListWidthRef.current > 1 &&
+          Math.abs(m.listWidth - lastListWidthRef.current) > 1;
+        if (
+          !widthChanged &&
+          Math.abs(scrollerContentW - prev.w) <= 0.5 &&
+          Math.abs(scrollerContentH - prev.h) <= 0.5 &&
+          Math.abs(m.viewportHeight - prev.clientH) <= 0.5 &&
+          Math.abs(m.padBottom - prev.padBottom) <= 0.5
+        ) {
+          return;
+        }
+        lastScrollerBoxRef.current = {
+          w: scrollerContentW,
+          h: scrollerContentH,
+          clientH: m.viewportHeight,
+          padBottom: m.padBottom,
+        };
+        if (widthChanged) {
+          measureMountedAndStabilize();
+        } else {
+          syncWindowFromDom({ forceImmediate: true });
+        }
+      });
+      scrollerRo.observe(scroller);
+      if (scroller !== listEl) {
+        scrollerRo.observe(listEl);
+      }
+    }
+
+    const onViewportResize = () => {
+      syncWindowFromDom({ forceImmediate: true });
+    };
+
+    scrollTarget.addEventListener('scroll', onScroll, { passive: true });
+    window.addEventListener('resize', onViewportResize, { passive: true });
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', onViewportResize, { passive: true });
+    }
+
+    syncWindowFromDom({ forceImmediate: false });
+
+    return () => {
+      scrollTarget.removeEventListener('scroll', onScroll);
+      window.removeEventListener('resize', onViewportResize);
+      if (window.visualViewport) {
+        window.visualViewport.removeEventListener('resize', onViewportResize);
+      }
+      if (scrollerRo) scrollerRo.disconnect();
+      if (rowRo) {
+        rowRo.disconnect();
+        rowRoRef.current = null;
+        observedRowsRef.current.clear();
+      }
+    };
+  }, [virtualized, resetKey, syncWindowFromDom, measureMountedAndStabilize]);
+
+  // Re-sync window whenever new pages append to `items` without recreating observers.
+  useEffect(() => {
+    if (!virtualized) return;
+    syncWindowFromDom({ forceImmediate: false });
+  }, [virtualized, total, syncWindowFromDom]);
+
+  // "Scroll to the item I came back from" (viewer sibling swipe close or Back from subfolder).
+  useEffect(() => {
+    if (!returnTarget || !returnTarget.path || returnTarget.token <= handledReturnTokenRef.current) {
+      return undefined;
+    }
+    const listEl = listRef.current;
+    if (!listEl) return undefined;
+    const targetIdx = layout.indexOfKey(returnTarget.path);
+    if (targetIdx < 0) return undefined;
+
+    handledReturnTokenRef.current = returnTarget.token;
+    if (typeof onReturnHandled === 'function') {
+      onReturnHandled(returnTarget.token);
+    }
+
+    if (!virtualized) {
+      const child = listEl.children[targetIdx];
+      const anchor = child?.querySelector?.('a.row') || child;
+      if (anchor && typeof anchor.scrollIntoView === 'function') {
+        const m = readViewportMetrics(listEl);
+        const r = anchor.getBoundingClientRect();
+        const topEdge = m.scrollerTop + m.padTop + m.stickyTop;
+        const bottomEdge = m.scrollerTop + m.viewportHeight - m.padBottom;
+        if (!returnTarget.onlyIfOffscreen || r.top < topEdge - 1 || r.bottom > bottomEdge + 1) {
+          anchor.scrollIntoView({ block: 'center', behavior: 'auto' });
+        }
+        if (
+          !document.querySelector('.viewer, .scrim') &&
+          typeof anchor.focus === 'function' &&
+          (!document.activeElement || document.activeElement === document.body)
+        ) {
+          try {
+            anchor.focus({ preventScroll: true });
+          } catch {
+            // Ignore focus failures.
+          }
+        }
+      }
+      return undefined;
+    }
+
+    const m = readViewportMetrics(listEl);
+    const targetScrollTop = layout.computeScrollTargetForIndex(targetIdx, {
+      listTop: m.listTop,
+      viewportHeight: m.viewportHeight,
+      topInset: m.padTop + m.stickyTop,
+      bottomInset: m.padBottom,
+      currentScrollTop: m.scrollTop,
+      onlyIfOffscreen: Boolean(returnTarget.onlyIfOffscreen),
+      align: 'center',
+    });
+
+    if (targetScrollTop !== null) {
+      const cur = winRef.current;
+      setSpacerHeight(topSpacerRef.current, layout.getOffset(cur.start));
+      setSpacerHeight(bottomSpacerRef.current, layout.getTotalHeight() - layout.getOffset(cur.end));
+      if (m.isDoc) window.scrollTo(0, targetScrollTop);
+      else m.scroller.scrollTop = targetScrollTop;
+      syncWindowFromDom({ forceImmediate: true });
+    }
+
+    // Refine scroll once the target row has mounted and its name has laid out, and restore focus.
+    let raf2 = 0;
+    const raf1 = window.requestAnimationFrame(() => {
+      raf2 = window.requestAnimationFrame(() => {
+        const el = listRef.current;
+        if (!el) return;
+        const rowWrap = el.querySelector(`.vlist-item[data-vlist-index="${targetIdx}"]`);
+        if (!rowWrap) return;
+        const m2 = readViewportMetrics(el);
+        const r = rowWrap.getBoundingClientRect();
+        const topEdge = m2.scrollerTop + m2.padTop + m2.stickyTop;
+        const bottomEdge = m2.scrollerTop + m2.viewportHeight - m2.padBottom;
+        if (r.top < topEdge - 1 || r.bottom > bottomEdge + 1) {
+          const usable = Math.max(1, bottomEdge - topEdge);
+          const desiredTop = topEdge + Math.max(0, (usable - r.height) / 2);
+          const adjust = r.top - desiredTop;
+          if (Math.abs(adjust) >= 1) {
+            if (m2.isDoc) window.scrollBy(0, adjust);
+            else m2.scroller.scrollTop = Math.max(0, m2.scroller.scrollTop + adjust);
+            syncWindowFromDom({ forceImmediate: true });
+          }
+        }
+        const focusEl = rowWrap.querySelector('a.row');
+        if (
+          focusEl &&
+          !document.querySelector('.viewer, .scrim') &&
+          (!document.activeElement ||
+            document.activeElement === document.body ||
+            el.contains(document.activeElement))
+        ) {
+          try {
+            focusEl.focus({ preventScroll: true });
+          } catch {
+            // Ignore focus failures.
+          }
+        }
+      });
+    });
+
+    return () => {
+      window.cancelAnimationFrame(raf1);
+      if (raf2) window.cancelAnimationFrame(raf2);
+    };
+  }, [returnTarget, virtualized, layout, syncWindowFromDom, total]);
+
+  if (!virtualized) {
+    return html`
+      <${FileNameList} className="list" lines=${lines} containerRef=${listRef}>
+        ${items.map((entry, idx) => renderRow(entry, idx, items))}
+      <//>
+    `;
+  }
+
+  const mounted = [];
+  for (let i = effectiveWin.start; i < effectiveWin.end; i += 1) {
+    const entry = items[i];
+    const key = itemKeys[i];
+    mounted.push(html`
+      <div key=${key} class="vlist-item" data-vlist-index=${i} data-vlist-key=${key}>
+        ${renderRow(entry, i, items)}
+      </div>
+    `);
+  }
+
+  return html`
+    <${FileNameList} className="list vlist" lines=${lines} containerRef=${listRef}>
+      <div
+        key="__vlist_top"
+        ref=${topSpacerRef}
+        class="vlist-spacer"
+        data-empty=${effectiveWin.topPad === 0 ? 'true' : 'false'}
+        aria-hidden="true"
+      />
+      ${mounted}
+      <div
+        key="__vlist_bottom"
+        ref=${bottomSpacerRef}
+        class="vlist-spacer"
+        data-empty=${effectiveWin.bottomPad === 0 ? 'true' : 'false'}
+        aria-hidden="true"
+      />
+    <//>
+  `;
+}
+
+function measureGridGeometry(gridEl) {
+  if (!gridEl || !window.getComputedStyle) return null;
+  const cs = window.getComputedStyle(gridEl);
+  const tracks = (cs.gridTemplateColumns || '').trim().split(/\s+/).filter(Boolean);
+  const columns = Math.max(1, tracks.length || 3);
+  const rowGap = parseFloat(cs.rowGap) || 0;
+  const colGap = parseFloat(cs.columnGap) || rowGap;
+  const firstCell = gridEl.querySelector('.cell');
+  let rowHeight = firstCell ? firstCell.getBoundingClientRect().height : 0;
+  if (!(rowHeight > 1)) {
+    const gridW = gridEl.clientWidth || gridEl.getBoundingClientRect().width || 0;
+    if (gridW > 1) {
+      rowHeight = Math.max(24, (gridW - Math.max(0, columns - 1) * colGap) / columns);
+    }
+  }
+  return rowHeight > 1 ? { columns, rowHeight, rowGap } : null;
+}
+
+function VirtualFileGrid({
+  items,
+  renderCell,
+  resetKey,
+  onNearEnd = null,
+  returnTarget = null,
+  onReturnHandled = null,
+  lines = 3,
+}) {
+  const gridRef = useRef(null);
+  const topSpacerRef = useRef(null);
+  const bottomSpacerRef = useRef(null);
+  const geomRef = useRef({ columns: 3, rowHeight: 124, rowGap: 3 });
+  const nearEndForCountRef = useRef(-1);
+  const handledReturnTokenRef = useRef(0);
+  const onNearEndRef = useRef(onNearEnd);
+  onNearEndRef.current = onNearEnd;
+
+  const total = items.length;
+  const totalRef = useRef(total);
+  totalRef.current = total;
+  const lastGridWidthRef = useRef(0);
+  const virtualized = total > VIRTUAL_GRID_MIN_ITEMS;
+
+  const [win, setWin] = useState(() =>
+    computeVirtualGridWindow({
+      total,
+      columns: 3,
+      rowHeight: 124,
+      rowGap: 3,
+      scrollOffset: 0,
+      viewportHeight: typeof window !== 'undefined' ? window.innerHeight || 720 : 720,
+      overscanRows: 4,
+    }),
+  );
+
+  const winRef = useRef(win);
+  winRef.current = win;
+
+  const computeFromDom = useCallback(() => {
+    const gridEl = gridRef.current;
+    const count = totalRef.current;
+    if (!gridEl || count <= VIRTUAL_GRID_MIN_ITEMS) return;
+    const geom = measureGridGeometry(gridEl) || geomRef.current;
+    geomRef.current = geom;
+    const m = readViewportMetrics(gridEl);
+    const next = computeVirtualGridWindow({
+      total: count,
+      columns: geom.columns,
+      rowHeight: geom.rowHeight,
+      rowGap: geom.rowGap,
+      scrollOffset: m.scrollOffset,
+      viewportHeight: m.viewportHeight,
+      overscanRows: 4,
+    });
+
+    if (typeof onNearEndRef.current === 'function' && count > 0) {
+      const preloadMargin = Math.max(400, Math.round(m.viewportHeight * 0.75));
+      if (m.scrollOffset + m.viewportHeight + preloadMargin >= next.totalHeight) {
+        if (nearEndForCountRef.current !== count) {
+          nearEndForCountRef.current = count;
+          onNearEndRef.current();
+        }
+      }
+    }
+
+    const cur = winRef.current;
+    if (
+      next.startIndex !== cur.startIndex ||
+      next.endIndex !== cur.endIndex ||
+      next.topPad !== cur.topPad ||
+      next.bottomPad !== cur.bottomPad
+    ) {
+      winRef.current = next;
+      setWin(next);
+    }
+  }, []);
+
+  useEffect(() => {
+    nearEndForCountRef.current = -1;
+  }, [resetKey]);
+
+  const startIndex = virtualized ? Math.min(win.startIndex, total) : 0;
+  const endIndex = virtualized ? Math.max(startIndex, Math.min(win.endIndex, total)) : total;
+
+  useLayoutEffect(() => {
+    if (!virtualized) return;
+    setSpacerHeight(topSpacerRef.current, win.topPad);
+    setSpacerHeight(bottomSpacerRef.current, win.bottomPad);
+  }, [virtualized, win.topPad, win.bottomPad, startIndex, endIndex]);
+
+  useEffect(() => {
+    const gridEl = gridRef.current;
+    if (!virtualized || !gridEl) return undefined;
+    const scroller = findScrollParent(gridEl);
+    const isDoc =
+      !scroller || scroller === document.documentElement || scroller === document.body;
+    const scrollTarget = isDoc ? window : scroller;
+
+    const onUpdate = () => computeFromDom();
+    scrollTarget.addEventListener('scroll', onUpdate, { passive: true });
+    window.addEventListener('resize', onUpdate, { passive: true });
+    let ro = null;
+    if (typeof ResizeObserver === 'function') {
+      ro = new ResizeObserver((entries) => {
+        let relevant = false;
+        for (const entry of entries) {
+          if (entry.target === scroller) {
+            relevant = true;
+          } else if (entry.target === gridEl) {
+            const w = entry.contentRect?.width ?? gridEl.clientWidth;
+            if (Math.abs(w - lastGridWidthRef.current) > 0.5) {
+              lastGridWidthRef.current = w;
+              relevant = true;
+            }
+          }
+        }
+        if (relevant) onUpdate();
+      });
+      if (scroller) ro.observe(scroller);
+      if (scroller !== gridEl) ro.observe(gridEl);
+    }
+    computeFromDom();
+    return () => {
+      scrollTarget.removeEventListener('scroll', onUpdate);
+      window.removeEventListener('resize', onUpdate);
+      if (ro) ro.disconnect();
+    };
+  }, [virtualized, resetKey, computeFromDom]);
+
+  useEffect(() => {
+    if (!virtualized) return;
+    computeFromDom();
+  }, [virtualized, total, computeFromDom]);
+
+  useEffect(() => {
+    if (!returnTarget || !returnTarget.path || returnTarget.token <= handledReturnTokenRef.current) {
+      return;
+    }
+    const gridEl = gridRef.current;
+    if (!gridEl) return;
+    const idx = items.findIndex((e) => e?.path === returnTarget.path);
+    if (idx < 0) return;
+    handledReturnTokenRef.current = returnTarget.token;
+    if (typeof onReturnHandled === 'function') {
+      onReturnHandled(returnTarget.token);
+    }
+    if (!virtualized) {
+      const cell = gridEl.children[idx];
+      if (cell && typeof cell.scrollIntoView === 'function' && !returnTarget.onlyIfOffscreen) {
+        cell.scrollIntoView({ block: 'center', behavior: 'auto' });
+      }
+      return;
+    }
+    const geom = measureGridGeometry(gridEl) || geomRef.current;
+    const m = readViewportMetrics(gridEl);
+    const row = Math.floor(idx / geom.columns);
+    const pitch = geom.rowHeight + geom.rowGap;
+    const itemTop = m.listTop + row * pitch;
+    const itemBottom = itemTop + geom.rowHeight;
+    const topEdge = m.scrollTop + m.padTop + m.stickyTop;
+    const bottomEdge = m.scrollTop + Math.max(1, m.viewportHeight - m.padBottom);
+    if (returnTarget.onlyIfOffscreen && itemTop >= topEdge - 1 && itemBottom <= bottomEdge + 1) {
+      return;
+    }
+    const usable = Math.max(1, m.viewportHeight - m.padTop - m.stickyTop - m.padBottom);
+    const targetTop = Math.max(0, Math.round(itemTop - m.padTop - m.stickyTop - Math.max(0, (usable - geom.rowHeight) / 2)));
+    if (m.isDoc) window.scrollTo(0, targetTop);
+    else m.scroller.scrollTop = targetTop;
+    computeFromDom();
+  }, [returnTarget, items, virtualized, computeFromDom]);
+
+  if (!virtualized) {
+    return html`
+      <${FileNameList} className="grid" lines=${lines} containerRef=${gridRef}>
+        ${items.map((entry, idx) => renderCell(entry, idx, items))}
+      <//>
+    `;
+  }
+
+  const cells = [];
+  for (let i = startIndex; i < endIndex; i += 1) {
+    cells.push(renderCell(items[i], i, items));
+  }
+
+  return html`
+    <${FileNameList} className="grid vgrid" lines=${lines} containerRef=${gridRef}>
+      <div
+        key="__vgrid_top"
+        ref=${topSpacerRef}
+        class="vgrid-spacer"
+        data-empty=${win.topPad === 0 ? 'true' : 'false'}
+        aria-hidden="true"
+      />
+      ${cells}
+      <div
+        key="__vgrid_bottom"
+        ref=${bottomSpacerRef}
+        class="vgrid-spacer"
+        data-empty=${win.bottomPad === 0 ? 'true' : 'false'}
+        aria-hidden="true"
+      />
+    <//>
+  `;
+}
 
 function useItemLongPress(onTrigger, { disabled = false } = {}) {
   const timerRef = useRef(null);
@@ -295,7 +1217,7 @@ function useBatchedThumbs({
   useEffect(() => {
     const map = new Map();
     for (const e of entries || []) {
-      if (e?.path) map.set(e.path, e);
+      if (e?.path && isThumbEligible(e, { allowAudio: true })) map.set(e.path, e);
     }
     entryMapRef.current = map;
   }, [entries]);
@@ -339,7 +1261,9 @@ function useBatchedThumbs({
   useEffect(() => {
     if (!enabled || !machine || !Array.isArray(entries)) return;
     let count = 0;
-    for (const e of entries) {
+    const scanLimit = Math.min(entries.length, 60);
+    for (let i = 0; i < scanLimit; i += 1) {
+      const e = entries[i];
       if (count >= 24) break;
       if (isThumbEligible(e, { allowAudio })) {
         requestPath(e);
@@ -382,7 +1306,16 @@ function useBatchedThumbs({
 
   const observeEl = useCallback((el) => {
     if (!el) return;
-    observedElsRef.current.add(el);
+    const observed = observedElsRef.current;
+    if (observed.size > 120) {
+      for (const prev of observed) {
+        if (!prev.isConnected) {
+          observerRef.current?.unobserve(prev);
+          observed.delete(prev);
+        }
+      }
+    }
+    observed.add(el);
     if (observerRef.current) {
       observerRef.current.observe(el);
     }
@@ -471,8 +1404,14 @@ function EntryThumb({ entry, thumbUrl, observeEl }) {
       </span>
     `;
   }
+  const canThumb = isThumbEligible(entry, { allowAudio: true });
   return html`
-    <span class="thumb" ref=${observeEl} data-thumb-path=${entry.path} aria-hidden="true">
+    <span
+      class="thumb"
+      ref=${canThumb ? observeEl : null}
+      data-thumb-path=${canThumb ? entry.path : undefined}
+      aria-hidden="true"
+    >
       ${thumbUrl
         ? html`<img src=${thumbUrl} alt="" loading="lazy" decoding="async" />`
         : html`<${Icon} name=${entryIconName(entry)} />`}
@@ -826,6 +1765,8 @@ export function FolderBrowser({
   wide = false,
   hideWideChrome = false,
   reloadToken = 0,
+  returnTarget = null,
+  onReturnHandled = null,
 }) {
   const [resolvedPath, setResolvedPath] = useState(path || '~');
   const [rawEntries, setRawEntries] = useState([]);
@@ -1157,7 +2098,8 @@ export function FolderBrowser({
         setServerFilteredKind(cached.serverFilteredKind);
         setHasMorePages(cached.hasMorePages);
         setOldTruncated(cached.oldTruncated);
-        setRenderLimit(RENDER_STEP);
+        const cachedCount = (cached.rawEntries || []).length;
+        setRenderLimit(cachedCount > PAGE_SIZE ? cachedCount : RENDER_STEP);
         setError(null);
         setLoading(false);
         offsetRef.current = (cached.rawEntries || []).length;
@@ -1261,7 +2203,7 @@ export function FolderBrowser({
       path: resolvedPath,
       depth: 1,
       hidden: showHidden,
-      limit: PAGE_SIZE,
+      limit: NEXT_PAGE_SIZE,
       offset: offsetRef.current,
     };
     if (caps?.hasListSort) {
@@ -1283,23 +2225,45 @@ export function FolderBrowser({
     nextPromise
       .then((res) => {
         const more = Array.isArray(res?.entries) ? res.entries : [];
+        let mergedList = null;
         setRawEntries((prev) => {
           const seen = new Set(prev.map((e) => e.path));
           const merged = [...prev];
           for (const e of more) {
             if (!seen.has(e.path)) merged.push(e);
           }
+          mergedList = merged;
           return merged;
         });
         offsetRef.current += more.length;
-        setHasMorePages(Boolean(res?.truncated && more.length > 0));
-        setRenderLimit((n) => n + RENDER_STEP);
+        const nextHasMore = Boolean(res?.truncated && more.length > 0);
+        setHasMorePages(nextHasMore);
+        setRenderLimit((n) =>
+          Math.max(n + RENDER_STEP, mergedList ? mergedList.length : 0, offsetRef.current),
+        );
         setLoadingMore(false);
+        if (folderChanges && mergedList) {
+          const prevSnap =
+            folderChanges.getCached(machine, resolvedPath) ||
+            folderChanges.getCached(machine, path || '~');
+          if (prevSnap) {
+            const updatedSnap = {
+              ...prevSnap,
+              rawEntries: mergedList,
+              hasMorePages: nextHasMore,
+            };
+            folderChanges.setCached(machine, resolvedPath, updatedSnap);
+            const reqPath = path || '~';
+            if (resolvedPath !== reqPath) {
+              folderChanges.setCached(machine, reqPath, updatedSnap);
+            }
+          }
+        }
       })
       .catch(() => {
         setLoadingMore(false);
       });
-  }, [loadingMore, hasMorePages, caps?.hasListOffset, caps?.hasListSort, caps?.hasListCategories, resolvedPath, showHidden, sortPref.sort, sortPref.order, kindFilter, capsStore, link, machine]);
+  }, [loadingMore, hasMorePages, caps?.hasListOffset, caps?.hasListSort, caps?.hasListCategories, resolvedPath, path, showHidden, sortPref.sort, sortPref.order, kindFilter, capsStore, folderChanges, link, machine]);
 
   // Client-side filter & sort guarantees consistent behavior on older nodes too.
   const entries = useMemo(() => {
@@ -1336,10 +2300,39 @@ export function FolderBrowser({
   const visibleEntries = useMemo(() => entries.slice(0, renderLimit), [entries, renderLimit]);
   const hasMoreToRender = visibleEntries.length < entries.length;
 
+  const activeReturnTarget = useMemo(() => {
+    if (!returnTarget || !returnTarget.path) return null;
+    if (returnTarget.machine && returnTarget.machine !== machine) return null;
+    return returnTarget;
+  }, [returnTarget, machine]);
+
+  // If returning to an entry that is already loaded in `entries` beyond `renderLimit`, reveal it
+  // immediately so the virtual list can scroll straight to it.
+  useEffect(() => {
+    if (!activeReturnTarget?.path || entries.length === 0) return;
+    const idx = entries.findIndex((e) => e?.path === activeReturnTarget.path);
+    if (idx >= renderLimit) {
+      setRenderLimit((n) => Math.max(n, idx + 1));
+    }
+  }, [activeReturnTarget, entries, renderLimit]);
+
+  const handleNearEnd = useCallback(() => {
+    if (hasMoreToRender) {
+      setRenderLimit((n) => Math.max(n + RENDER_STEP, entries.length));
+    } else if (hasMorePages) {
+      loadNextPage();
+    }
+  }, [hasMoreToRender, hasMorePages, entries.length, loadNextPage]);
+
   // Auto-advance incremental slice or fetch next offset page when sentinel scrolls into view.
   useEffect(() => {
     const el = pagerRef.current;
     if (!el || typeof IntersectionObserver === 'undefined') return undefined;
+    const scroller = findScrollParent(el);
+    const root =
+      scroller && scroller !== document.documentElement && scroller !== document.body
+        ? scroller
+        : null;
     const obs = new IntersectionObserver(
       (hits) => {
         if (!hits.some((h) => h.isIntersecting)) return;
@@ -1349,7 +2342,7 @@ export function FolderBrowser({
           loadNextPage();
         }
       },
-      { rootMargin: '300px 0px' },
+      { root, rootMargin: '360px 0px' },
     );
     obs.observe(el);
     return () => obs.disconnect();
@@ -1509,6 +2502,84 @@ export function FolderBrowser({
     `;
   }
 
+  const listResetKey = `${machine}\0${resolvedPath}\0${sortPref.sort}\0${sortPref.order}\0${kindFilter || ''}\0${showHidden ? '1' : '0'}`;
+
+  function renderGridCell(entry, idx, list) {
+    const picked = selecting && selectedPaths.has(entry.path);
+    const starred = caps?.hasFav && favPathSet.has(entry.path);
+    const thumbUrl = getThumbUrl(entry);
+    const isDir = entry.kind === 'dir';
+    const beforeName = idx > 0 ? list[idx - 1].name : null;
+    const afterName = idx + 1 < list.length ? list[idx + 1].name : null;
+    const href = isDir
+      ? routeHref({ section: 'files', view: 'folder', machine, path: entry.path })
+      : routeHref({
+          section: 'files',
+          view: 'folder',
+          machine,
+          path: resolvedPath,
+          viewer: { machine, path: entry.path },
+        });
+    const cls = [
+      'cell',
+      isDir ? 'folder' : '',
+      picked ? 'picked' : '',
+      justAddedPaths.has(entry.path) ? 'just-added' : '',
+    ]
+      .filter(Boolean)
+      .join(' ');
+    return html`
+      <a
+        key=${entry.path}
+        class=${cls}
+        href=${href}
+        aria-label=${entry.name}
+        title=${entry.name}
+        ref=${!isDir ? observeThumb : null}
+        data-thumb-path=${!isDir ? entry.path : undefined}
+        onPointerDown=${(e) => entryLongPress.start(e, entry)}
+        onPointerMove=${entryLongPress.move}
+        onPointerUp=${entryLongPress.cancel}
+        onPointerCancel=${entryLongPress.cancel}
+        onContextMenu=${(e) => entryLongPress.contextMenu(e, entry)}
+        onClick=${(e) => handleEntryTap(e, entry)}
+      >
+        ${isDir
+          ? html`
+              <${Icon} name="files" />
+              <${FileName}
+                className="cell-name"
+                name=${entry.name}
+                before=${beforeName}
+                after=${afterName}
+                lines=${3}
+                titleOnHover=${false}
+              />
+            `
+          : thumbUrl
+            ? html`<img src=${thumbUrl} alt=${entry.name} loading="lazy" decoding="async" />`
+            : html`
+                <span class="cell-icon">
+                  <${Icon} name=${entryIconName(entry)} />
+                  <${FileName}
+                    className="cell-name"
+                    name=${entry.name}
+                    before=${beforeName}
+                    after=${afterName}
+                    lines=${3}
+                    titleOnHover=${false}
+                  />
+                </span>
+              `}
+        ${entry.duration_s != null
+          ? html`<span class="len">${formatElapsed(entry.duration_s)}</span>`
+          : null}
+        ${starred && !selecting ? html`<span class="cell-star" aria-label="Favourite">★</span>` : null}
+        ${selecting ? html`<span class="cell-check" aria-hidden="true"></span>` : null}
+      </a>
+    `;
+  }
+
   function renderGrid() {
     const gridItems = [];
     const otherItems = [];
@@ -1525,92 +2596,30 @@ export function FolderBrowser({
       <div>
         ${gridItems.length > 0
           ? html`
-              <${FileNameList} className="grid" lines=${3}>
-                ${gridItems.map((entry, idx) => {
-                  const picked = selecting && selectedPaths.has(entry.path);
-                  const starred = caps?.hasFav && favPathSet.has(entry.path);
-                  const thumbUrl = getThumbUrl(entry);
-                  const isDir = entry.kind === 'dir';
-                  const beforeName = idx > 0 ? gridItems[idx - 1].name : null;
-                  const afterName = idx + 1 < gridItems.length ? gridItems[idx + 1].name : null;
-                  const href = isDir
-                    ? routeHref({ section: 'files', view: 'folder', machine, path: entry.path })
-                    : routeHref({
-                        section: 'files',
-                        view: 'folder',
-                        machine,
-                        path: resolvedPath,
-                        viewer: { machine, path: entry.path },
-                      });
-                  const cls = [
-                    'cell',
-                    isDir ? 'folder' : '',
-                    picked ? 'picked' : '',
-                    justAddedPaths.has(entry.path) ? 'just-added' : '',
-                  ]
-                    .filter(Boolean)
-                    .join(' ');
-                  return html`
-                    <a
-                      key=${entry.path}
-                      class=${cls}
-                      href=${href}
-                      aria-label=${entry.name}
-                      title=${entry.name}
-                      ref=${!isDir ? observeThumb : null}
-                      data-thumb-path=${!isDir ? entry.path : undefined}
-                      onPointerDown=${(e) => entryLongPress.start(e, entry)}
-                      onPointerMove=${entryLongPress.move}
-                      onPointerUp=${entryLongPress.cancel}
-                      onPointerCancel=${entryLongPress.cancel}
-                      onContextMenu=${(e) => entryLongPress.contextMenu(e, entry)}
-                      onClick=${(e) => handleEntryTap(e, entry)}
-                    >
-                      ${isDir
-                        ? html`
-                            <${Icon} name="files" />
-                            <${FileName}
-                              className="cell-name"
-                              name=${entry.name}
-                              before=${beforeName}
-                              after=${afterName}
-                              lines=${3}
-                              titleOnHover=${false}
-                            />
-                          `
-                        : thumbUrl
-                          ? html`<img src=${thumbUrl} alt=${entry.name} loading="lazy" decoding="async" />`
-                          : html`
-                              <span class="cell-icon">
-                                <${Icon} name=${entryIconName(entry)} />
-                                <${FileName}
-                                  className="cell-name"
-                                  name=${entry.name}
-                                  before=${beforeName}
-                                  after=${afterName}
-                                  lines=${3}
-                                  titleOnHover=${false}
-                                />
-                              </span>
-                            `}
-                      ${entry.duration_s != null
-                        ? html`<span class="len">${formatElapsed(entry.duration_s)}</span>`
-                        : null}
-                      ${starred && !selecting ? html`<span class="cell-star" aria-label="Favourite">★</span>` : null}
-                      ${selecting ? html`<span class="cell-check" aria-hidden="true"></span>` : null}
-                    </a>
-                  `;
-                })}
-              <//>
+              <${VirtualFileGrid}
+                items=${gridItems}
+                renderCell=${renderGridCell}
+                resetKey=${listResetKey}
+                onNearEnd=${otherItems.length === 0 ? handleNearEnd : null}
+                returnTarget=${activeReturnTarget}
+                onReturnHandled=${onReturnHandled}
+                lines=${3}
+              />
             `
           : null}
 
         ${otherItems.length > 0
           ? html`
               <p class="label">Other files</p>
-              <${FileNameList} className="list" lines=${2}>
-                ${otherItems.map((entry, idx) => renderListRow(entry, idx, otherItems))}
-              <//>
+              <${VirtualFileList}
+                items=${otherItems}
+                renderRow=${renderListRow}
+                resetKey=${`${listResetKey}\0other`}
+                onNearEnd=${handleNearEnd}
+                returnTarget=${activeReturnTarget}
+                onReturnHandled=${onReturnHandled}
+                lines=${2}
+              />
             `
           : null}
       </div>
@@ -1806,9 +2815,15 @@ export function FolderBrowser({
             : effectiveMode === 'grid'
               ? renderGrid()
               : html`
-                  <${FileNameList} className="list" lines=${2}>
-                    ${visibleEntries.map((entry, idx) => renderListRow(entry, idx, visibleEntries))}
-                  <//>
+                  <${VirtualFileList}
+                    items=${visibleEntries}
+                    renderRow=${renderListRow}
+                    resetKey=${listResetKey}
+                    onNearEnd=${handleNearEnd}
+                    returnTarget=${activeReturnTarget}
+                    onReturnHandled=${onReturnHandled}
+                    lines=${2}
+                  />
                 `}
 
       ${oldTruncated
@@ -2857,6 +3872,74 @@ export function FilesView({
   const [reloadToken, setReloadToken] = useState(0);
   const [viewerEntryCache, setViewerEntryCache] = useState(null);
   const migratedFavNodeRef = useRef(null);
+  const [returnTarget, setReturnTarget] = useState(null);
+  const returnTokenRef = useRef(0);
+  const viewerTrackRef = useRef({ machine: null, openedPath: null, currentPath: null });
+  const prevFolderRef = useRef({ machine: null, path: null });
+
+  // Track viewer open/sibling-swipe/close so closing the viewer scrolls back to the file we ended
+  // on (even when swiping far down a virtualized folder list).
+  useEffect(() => {
+    const prev = viewerTrackRef.current;
+    if (route.viewer) {
+      if (!prev.currentPath || prev.machine !== route.viewer.machine) {
+        viewerTrackRef.current = {
+          machine: route.viewer.machine,
+          openedPath: route.viewer.path,
+          currentPath: route.viewer.path,
+        };
+      } else {
+        viewerTrackRef.current = {
+          ...prev,
+          currentPath: route.viewer.path,
+        };
+      }
+      return;
+    }
+    if (prev.currentPath) {
+      const closed = prev;
+      viewerTrackRef.current = { machine: null, openedPath: null, currentPath: null };
+      if (closed.machine && closed.machine === activeFolderMachine) {
+        const swipedToOther = closed.currentPath !== closed.openedPath;
+        returnTokenRef.current += 1;
+        setReturnTarget({
+          machine: closed.machine,
+          path: closed.currentPath,
+          onlyIfOffscreen: !swipedToOther,
+          token: returnTokenRef.current,
+        });
+      }
+    }
+  }, [route.viewer?.machine, route.viewer?.path, activeFolderMachine]);
+
+  // Returning from a subfolder (`dir/Sub` -> `dir`) scrolls `dir/Sub` into view if off-screen.
+  useEffect(() => {
+    const prev = prevFolderRef.current;
+    const curMachine = activeFolderMachine || null;
+    const curPath = activeFolderPath || null;
+    prevFolderRef.current = { machine: curMachine, path: curPath };
+    if (
+      prev.machine &&
+      curMachine === prev.machine &&
+      prev.path &&
+      curPath &&
+      prev.path !== curPath
+    ) {
+      const parentOfPrev = parentFilePath(prev.path);
+      if (
+        parentOfPrev &&
+        (parentOfPrev === curPath || (curPath === '~' && parentOfPrev === resolvedFolderPath))
+      ) {
+        returnTokenRef.current += 1;
+        setReturnTarget({
+          machine: curMachine,
+          path: prev.path,
+          onlyIfOffscreen: true,
+          token: returnTokenRef.current,
+        });
+      }
+    }
+  }, [activeFolderMachine, activeFolderPath, resolvedFolderPath]);
 
   useEffect(() => {
     setResolvedFolderPath(activeFolderPath || '~');
@@ -3245,6 +4328,16 @@ export function FilesView({
     [filesActions],
   );
 
+  const handleReturnHandled = useCallback((token) => {
+    setReturnTarget((cur) => (cur && cur.token === token ? null : cur));
+  }, []);
+
+  // Clear any stale return target when toggling view mode, sort, or filter so switching views
+  // never unexpectedly re-scrolls to a previously viewed file.
+  useEffect(() => {
+    setReturnTarget(null);
+  }, [filesState.viewModeOverride, filesState.sortPref.sort, filesState.sortPref.order, filesState.kindFilter]);
+
   const folderViewEl = activeFolderMachine
     ? html`
         <${FolderBrowser}
@@ -3317,6 +4410,8 @@ export function FilesView({
           wide=${wide}
           hideWideChrome=${wide}
           reloadToken=${reloadToken}
+          returnTarget=${returnTarget}
+          onReturnHandled=${handleReturnHandled}
         />
       `
     : null;
