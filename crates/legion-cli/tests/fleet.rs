@@ -2423,7 +2423,7 @@ fn node_name_mismatch_detected_in_ping_list_doctor_and_device_forwards() {
     // 4. Forwarded `device.invite` refuses a mismatched machine BEFORE touching its `authorized_keys`.
     let inv = tower.run(&[
         "device.invite",
-        "name=pixel",
+        "name=handset",
         "role=observer",
         "--on",
         studio_fleet_name,
@@ -2826,7 +2826,7 @@ fn duplicate_fleet_entries_report_ambiguous_and_relayed_invite_prechecks_older_r
     //    before ever sending `device.invite` or writing `authorized_keys`.
     let inv = tower.run(&[
         "device.invite",
-        "name=pixel",
+        "name=handset",
         "role=observer",
         "--on",
         "behind",

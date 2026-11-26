@@ -123,7 +123,7 @@ test('formatErrorForDisplay produces the exact plain sentences and hides reasons
 test('plainErrorMessage strips technical hints and jargon in plain mode and preserves raw text in technical mode', () => {
   const err = {
     code: 'denied',
-    message: 'Principal "device:pixel" (role "observer") is not allowed to call `fs.write`.',
+    message: 'Principal "device:phone" (role "observer") is not allowed to call `fs.write`.',
     hint: 'Edit policy.toml on studio.',
     machine: 'studio',
   };
@@ -133,7 +133,7 @@ test('plainErrorMessage strips technical hints and jargon in plain mode and pres
   );
   assert.equal(
     plainErrorMessage(err, 'Fallback.', { technical: true, deviceNoun: 'phone' }),
-    'studio: Principal "device:pixel" (role "observer") is not allowed to call `fs.write`.',
+    'studio: Principal "device:phone" (role "observer") is not allowed to call `fs.write`.',
   );
 
   assert.equal(isTerminalHint('Run `legion fleet.sync` to refresh.'), true);

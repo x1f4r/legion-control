@@ -1435,7 +1435,7 @@ mod tests {
             }
         );
 
-        let nvidia = parse_nvidia_gpus("NVIDIA GeForce RTX 5080, 16303, 9120, 69, 68, 245.50\n");
+        let nvidia = parse_nvidia_gpus("NVIDIA GeForce RTX 4070, 12282, 9120, 69, 68, 245.50\n");
         let merged = merge_gpus(nvidia, drm);
         // NVIDIA card from DRM was deduplicated, keeping nvidia-smi + AMD + Intel.
         assert_eq!(merged.len(), 3);
@@ -1449,11 +1449,11 @@ mod tests {
     #[test]
     fn nvidia_parsers_handle_na_garbage_and_multi_gpu_process_memory() {
         let gpus = parse_nvidia_gpus(
-            "NVIDIA GeForce RTX 5080, 16303, 1024, 7, 42, 31.25\n\
+            "NVIDIA GeForce RTX 4070, 12282, 1024, 7, 42, 31.25\n\
              NVIDIA A2, [N/A], 0, [N/A], [Not Supported], [N/A]\n\
-             NVIDIA GeForce RTX 5080, 16303, 1024, 7\n\
+             NVIDIA GeForce RTX 4070, 12282, 1024, 7\n\
              Failed to initialize NVML, driver error, please check, logs, code, 99\n\
-             NVIDIA GeForce RTX 5080, 16303, 1024, 7, 42, 31.25, extra\n\
+             NVIDIA GeForce RTX 4070, 12282, 1024, 7, 42, 31.25, extra\n\
              garbage\n",
         );
         assert_eq!(gpus.len(), 2);

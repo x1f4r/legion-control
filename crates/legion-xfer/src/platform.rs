@@ -87,7 +87,6 @@ pub(crate) fn symlink_file_identity(path: &Path) -> io::Result<FileIdentity> {
 }
 
 /// Returns the filesystem identity `(dev, ino, nlink)` of an open [`File`].
-#[allow(dead_code)]
 pub(crate) fn open_file_identity(file: &File) -> io::Result<FileIdentity> {
     file_identity_from_file(file)
 }

@@ -962,7 +962,7 @@ mod tests {
         let wake_as_agent = || {
             let mut call = Call::new(Door::Ssh, "power.wake", json!({"machine": "tower"}));
             call.as_principal = Some("agent:test".to_owned());
-            call.device = Some("pixel".to_owned());
+            call.device = Some("handset".to_owned());
             fixture.node.call(call)
         };
         let config = fixture.dir.path().join("config");
@@ -994,7 +994,7 @@ mod tests {
                 .all(|entry| entry["principal"] == json!("agent:test"))
         );
         assert!(
-            wol.iter().all(|entry| entry["device"] == json!("pixel")),
+            wol.iter().all(|entry| entry["device"] == json!("handset")),
             "nested power.wol audit entries must preserve device: {audit}"
         );
         assert_eq!(wol[0]["outcome"], json!("denied"), "{audit}");

@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   classifyHorizontalSwipe,
-  classifyPullRefresh,
   classifyRowSwipe,
   hasNativeEdgeBack,
   stepTab,
@@ -24,13 +23,6 @@ test('classifyHorizontalSwipe distinguishes prev, next, edge-back, and ignores v
   assert.equal(classifyHorizontalSwipe({ dx: 60, dy: 55, elapsedMs: 180, startX: 100 }), null);
   // Tiny drag ignored.
   assert.equal(classifyHorizontalSwipe({ dx: 20, dy: 2, elapsedMs: 200, startX: 100 }), null);
-});
-
-test('classifyPullRefresh triggers only from top of list on downward pull', () => {
-  assert.equal(classifyPullRefresh({ dx: 5, dy: 72, scrollTop: 0 }), true);
-  assert.equal(classifyPullRefresh({ dx: 5, dy: 72, scrollTop: 20 }), false);
-  assert.equal(classifyPullRefresh({ dx: 50, dy: 72, scrollTop: 0 }), false);
-  assert.equal(classifyPullRefresh({ dx: 0, dy: 40, scrollTop: 0 }), false);
 });
 
 test('classifyRowSwipe reveals and closes row actions without interfering with scroll', () => {

@@ -6227,7 +6227,7 @@ mod tests {
             nodes: vec![NodeLink::ssh(
                 "tower",
                 tower_target.clone(),
-                Some("device:pixel".to_owned()),
+                Some("device:phone".to_owned()),
             )],
             ..LinkConfig::default()
         };
@@ -6500,8 +6500,8 @@ mod tests {
         let cfg = LinkConfig {
             device_key: Some("dummy".to_owned()),
             nodes: vec![
-                NodeLink::ssh("tower", target_a, Some("device:pixel".to_owned())),
-                NodeLink::learned("pi", target_b, Some("device:pixel".to_owned()), "tower"),
+                NodeLink::ssh("tower", target_a, Some("device:phone".to_owned())),
+                NodeLink::learned("pi", target_b, Some("device:phone".to_owned()), "tower"),
             ],
             ..LinkConfig::default()
         };
@@ -6833,7 +6833,7 @@ mod tests {
                         user: "me".to_owned(),
                         host_keys: vec![test_host_key(10)],
                     },
-                    Some("device:pixel".to_owned()),
+                    Some("device:phone".to_owned()),
                 ),
                 NodeLink::learned(
                     "pi",
@@ -6843,7 +6843,7 @@ mod tests {
                         user: "me".to_owned(),
                         host_keys: vec![test_host_key(11)],
                     },
-                    Some("device:pixel".to_owned()),
+                    Some("device:phone".to_owned()),
                     "tower",
                 ),
             ],
@@ -6952,7 +6952,7 @@ mod tests {
                         user: "me".to_owned(),
                         host_keys: vec![test_host_key(10)],
                     },
-                    Some("device:pixel".to_owned()),
+                    Some("device:phone".to_owned()),
                 ),
                 NodeLink::learned(
                     "m",
@@ -7092,7 +7092,7 @@ mod tests {
                         user: "me".to_owned(),
                         host_keys: vec![key_tower],
                     },
-                    Some("device:pixel".to_owned()),
+                    Some("device:phone".to_owned()),
                 ),
                 NodeLink::ssh(
                     "pi",
@@ -7102,7 +7102,7 @@ mod tests {
                         user: "me".to_owned(),
                         host_keys: vec![key_pi],
                     },
-                    Some("device:pixel".to_owned()),
+                    Some("device:phone".to_owned()),
                 ),
             ],
             ..LinkConfig::default()
@@ -7275,7 +7275,7 @@ mod tests {
                     user: "me".to_owned(),
                     host_keys: vec![key_tower.clone()],
                 },
-                Some("device:pixel".to_owned()),
+                Some("device:phone".to_owned()),
             )],
             ..LinkConfig::default()
         };
@@ -7458,7 +7458,7 @@ mod tests {
                         user: "me".to_owned(),
                         host_keys: vec![key_tower],
                     },
-                    Some("device:pixel".to_owned()),
+                    Some("device:phone".to_owned()),
                 ),
                 NodeLink::learned(
                     "pi",
@@ -7582,7 +7582,7 @@ mod tests {
                         user: "me".to_owned(),
                         host_keys: vec![key_tower.clone()],
                     },
-                    Some("device:pixel".to_owned()),
+                    Some("device:phone".to_owned()),
                 ),
                 NodeLink::ssh(
                     "studio",
@@ -7592,7 +7592,7 @@ mod tests {
                         user: "me".to_owned(),
                         host_keys: vec![key_studio.clone()],
                     },
-                    Some("device:pixel".to_owned()),
+                    Some("device:phone".to_owned()),
                 ),
                 NodeLink::learned(
                     "pi",
@@ -8164,7 +8164,7 @@ mod tests {
                             user: "me".to_owned(),
                             host_keys: vec![key_tower],
                         },
-                        Some("device:pixel".to_owned()),
+                        Some("device:phone".to_owned()),
                     ),
                     NodeLink::ssh(
                         "pi",
@@ -8174,7 +8174,7 @@ mod tests {
                             user: "me".to_owned(),
                             host_keys: vec![key_pi],
                         },
-                        Some("device:pixel".to_owned()),
+                        Some("device:phone".to_owned()),
                     ),
                 ],
                 forgotten_nodes: Vec::new(),
@@ -8283,7 +8283,7 @@ mod tests {
                         user: "me".to_owned(),
                         host_keys: vec![key_tower.clone()],
                     },
-                    Some("device:pixel".to_owned()),
+                    Some("device:phone".to_owned()),
                 )],
                 forgotten_nodes: Vec::new(),
             },
@@ -8850,7 +8850,7 @@ mod tests {
                         user: "me".to_owned(),
                         host_keys: vec![test_host_key(198)],
                     },
-                    Some("device:pixel".to_owned()),
+                    Some("device:phone".to_owned()),
                 )],
                 forgotten_nodes: Vec::new(),
             },
@@ -9158,7 +9158,7 @@ mod tests {
                     user: "me".to_owned(),
                     host_keys: vec![test_host_key(202)],
                 },
-                Some("device:pixel".to_owned()),
+                Some("device:phone".to_owned()),
             );
             studio.origin = NodeOrigin::Learned;
             studio.learned_from = Some("tower".to_owned());
@@ -9174,7 +9174,7 @@ mod tests {
                                 user: "me".to_owned(),
                                 host_keys: vec![test_host_key(201)],
                             },
-                            Some("device:pixel".to_owned()),
+                            Some("device:phone".to_owned()),
                         ),
                         studio,
                     ],
@@ -9491,7 +9491,7 @@ mod tests {
                             user: "me".to_owned(),
                             host_keys: vec!["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITowerPinKey000000000000000000000000000000000".to_owned()],
                         },
-                        Some("device:pixel".to_owned()),
+                        Some("device:phone".to_owned()),
                     ),
                     NodeLink::ssh(
                         "other-hub",
@@ -9501,7 +9501,7 @@ mod tests {
                             user: "me".to_owned(),
                             host_keys: vec!["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOtherPinKey000000000000000000000000000000000".to_owned()],
                         },
-                        Some("device:pixel".to_owned()),
+                        Some("device:phone".to_owned()),
                     ),
                 ],
                 ..LinkConfig::default()
@@ -9566,7 +9566,7 @@ mod tests {
                 user: "me".to_owned(),
                 host_keys: vec!["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIStudioPinKey00000000000000000000000000000000".to_owned()],
             },
-            Some("device:pixel".to_owned()),
+            Some("device:phone".to_owned()),
         );
         learned.origin = NodeOrigin::Learned;
         learned.learned_from = Some("tower".to_owned());

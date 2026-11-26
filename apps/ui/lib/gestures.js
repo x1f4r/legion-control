@@ -37,15 +37,6 @@ export function classifyHorizontalSwipe({
 }
 
 /**
- * Decides whether a vertical drag starting at scrollTop <= 0 should trigger pull-to-refresh.
- */
-export function classifyPullRefresh({ dx, dy, scrollTop = 0 }) {
-  if (scrollTop > 2) return false;
-  if (dy < PULL_REFRESH_PX) return false;
-  return dy > Math.abs(dx) * SWIPE_AXIS_RATIO;
-}
-
-/**
  * Classifies a horizontal swipe on a single list row: 'reveal' (swipe left), 'close' (swipe right), or null.
  */
 export function classifyRowSwipe({ dx, dy, currentlyOpen = false }) {
@@ -89,14 +80,6 @@ export function shouldIgnoreSwipeTarget(target, boundaryEl = null) {
  */
 export function hasNativeEdgeBack(win = typeof window !== 'undefined' ? window : null) {
   return Boolean(win && win.__LEGION_ANDROID__);
-}
-
-export function prefersReducedMotion(win = typeof window !== 'undefined' ? window : null) {
-  try {
-    return Boolean(win?.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches);
-  } catch {
-    return false;
-  }
 }
 
 /**

@@ -53,7 +53,7 @@ test('createAppLink uses origin-scoped Android bridge for deviceModel and local 
   let invokedDeviceName = 0;
   globalThis.window = {
     __LEGION_ANDROID__: {
-      deviceModel: () => 'Pixel 10',
+      deviceModel: () => 'My phone',
       hasLocalNetwork: () => false,
       requestLocalNetwork: () => {
         requested += 1;
@@ -72,10 +72,10 @@ test('createAppLink uses origin-scoped Android bridge for deviceModel and local 
 
   try {
     const link = createAppLink();
-    assert.equal(await link.deviceName(), 'Pixel 10');
+    assert.equal(await link.deviceName(), 'My phone');
     assert.equal(invokedDeviceName, 0);
 
-    await assert.rejects(() => link.pair('legion-invite-1:abc', 'Pixel 10'), {
+    await assert.rejects(() => link.pair('legion-invite-1:abc', 'My phone'), {
       code: 'denied',
     });
     assert.equal(requested, 1);
@@ -93,7 +93,7 @@ test('createAppLink exposes learn, acceptIdentityChange, and preserves last_pair
   const prevWindow = globalThis.window;
   const lastPaired = {
     node: 'tower',
-    device: 'Pixel 10',
+    device: 'My phone',
     role: 'operator',
     synced: ['pi'],
     not_synced: [],
@@ -106,19 +106,19 @@ test('createAppLink exposes learn, acceptIdentityChange, and preserves last_pair
           if (command === 'pair') {
             return Promise.resolve({
               ready: true,
-              nodes: [{ node: 'tower', principal: 'device:pixel', role: 'operator', via: 'ssh' }],
+              nodes: [{ node: 'tower', principal: 'device:my-phone', role: 'operator', via: 'ssh' }],
               last_paired: lastPaired,
             });
           }
           if (command === 'state') {
             return Promise.resolve({
               ready: true,
-              nodes: [{ node: 'tower', principal: 'device:pixel', role: 'operator', via: 'ssh' }],
+              nodes: [{ node: 'tower', principal: 'device:my-phone', role: 'operator', via: 'ssh' }],
               routes: { tower: { kind: 'direct' } },
             });
           }
           if (command === 'call' && payload.tool === 'meta.whoami') {
-            return Promise.resolve({ node: 'tower', principal: 'device:pixel', role: 'operator', tools: [] });
+            return Promise.resolve({ node: 'tower', principal: 'device:my-phone', role: 'operator', tools: [] });
           }
           if (command === 'call' && payload.tool === 'meta.version') {
             return Promise.resolve({ version: '0.1.0', protocol: 1 });
@@ -148,7 +148,7 @@ test('createAppLink exposes learn, acceptIdentityChange, and preserves last_pair
 
   try {
     const link = createAppLink();
-    const pairedState = await link.pair('legion-invite-1:abc', 'Pixel 10');
+    const pairedState = await link.pair('legion-invite-1:abc', 'My phone');
     assert.deepEqual(pairedState.last_paired, lastPaired);
 
     const learned = await link.learn();
@@ -197,14 +197,14 @@ test('createAppLink state() keeps selected node unreachable with last known role
               nodes: [
                 {
                   node: 'tower',
-                  principal: 'device:pixel',
+                  principal: 'device:my-phone',
                   role: 'operator',
                   role_checked_at: checkedAt,
                   via: 'ssh',
                 },
                 {
                   node: 'pi',
-                  principal: 'device:pixel',
+                  principal: 'device:my-phone',
                   role: 'observer',
                   via: 'ssh',
                 },

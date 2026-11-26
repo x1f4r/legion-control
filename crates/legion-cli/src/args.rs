@@ -1648,7 +1648,7 @@ mod tests {
                 "--as",
                 "agent:example",
                 "--device",
-                "pixel",
+                "handset",
                 "--pairing",
                 "0123456789abcdef0123456789abcdef",
                 "--account",
@@ -1658,7 +1658,7 @@ mod tests {
             ]),
             Ok(Command::Gate(GateCommand::As {
                 pinned: "agent:example".into(),
-                device: Some("pixel".into()),
+                device: Some("handset".into()),
                 pairing: Some("0123456789abcdef0123456789abcdef".into()),
                 account: Some("me".into()),
                 home: GateHome::Root(abs_home.clone()),
@@ -1670,7 +1670,7 @@ mod tests {
                 "--as",
                 "agent:example",
                 "--device",
-                "pixel",
+                "handset",
                 "--pairing",
                 "fedcba9876543210fedcba9876543210",
                 "--config-dir",
@@ -1680,7 +1680,7 @@ mod tests {
             ]),
             Ok(Command::Gate(GateCommand::As {
                 pinned: "agent:example".into(),
-                device: Some("pixel".into()),
+                device: Some("handset".into()),
                 pairing: Some("fedcba9876543210fedcba9876543210".into()),
                 account: None,
                 home: GateHome::Split {
@@ -1739,7 +1739,7 @@ mod tests {
                 &abs_state_str,
             ],
             &["gate", "--as", "phone", "--device", "../escape"],
-            &["gate", "--as", "phone", "--device", "pixel"],
+            &["gate", "--as", "phone", "--device", "handset"],
             &[
                 "gate",
                 "--as",
@@ -1752,7 +1752,7 @@ mod tests {
                 "--as",
                 "phone",
                 "--device",
-                "pixel",
+                "handset",
                 "--pairing",
                 "bad/id",
             ],
@@ -1763,7 +1763,7 @@ mod tests {
                 "--enrol",
                 "0123456789abcdef0123456789abcdef",
                 "--device",
-                "pixel",
+                "handset",
             ],
             &["gate", "--enrol", "bad/id"],
             &["gate", "--enrol"],
@@ -1788,11 +1788,11 @@ mod tests {
             }))
         );
         assert_eq!(
-            run(&["pair", "--name", "pixel", "--role", "observer"]),
+            run(&["pair", "--name", "handset", "--role", "observer"]),
             Ok(Command::Pair(PairCommand {
                 principal: None,
                 role: Some("observer".into()),
-                name: Some("pixel".into()),
+                name: Some("handset".into()),
                 valid_minutes: None,
                 hosts: Vec::new(),
                 port: None,
@@ -1861,7 +1861,7 @@ mod tests {
         for bad_pair in [
             &["pair", "phone"][..],
             &["pair", "--as", "phone", "--role", "observer"],
-            &["pair", "--as", "phone", "--name", "pixel"],
+            &["pair", "--as", "phone", "--name", "handset"],
             &["pair", "--name", "   "],
             &["pair", "--as", "phone", "--valid", "0m"],
             &["pair", "--as", "phone", "--valid", "25h"],
