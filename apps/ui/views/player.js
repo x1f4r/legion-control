@@ -546,8 +546,8 @@ export function VideoPlayer({
       );
       wasPlayingBeforeTeardownRef.current = false;
       wantPlayAfterSwapRef.current = carryPlay;
-      pendingPlayIntentRef.current = carryPlay;
-      setPendingPlayIntent(carryPlay);
+      pendingPlayIntentRef.current = carryPlay ? true : null;
+      setPendingPlayIntent(carryPlay ? true : null);
       prevIdentityRef.current = identityRef.current;
     } else {
       prevIdentityRef.current = identityRef.current;
@@ -600,6 +600,9 @@ export function VideoPlayer({
   // When a newly minted mediaUrl arrives for the current file, clear error and enter loading until metadata arrives.
   useEffect(() => {
     if (!mediaUrl) {
+      controller.setLoading(true);
+    } else if (controller.getState().error) {
+      controller.setError(false);
       controller.setLoading(true);
     }
   }, [mediaUrl, controller]);
@@ -1478,6 +1481,7 @@ export function VideoPlayer({
             }
           }
           controller.setLoading(false);
+          const pendingIntent = pendingPlayIntentRef.current;
           const wantPlay = wantPlayAfterSwapRef.current;
           wantPlayAfterSwapRef.current = false;
           pendingPlayIntentRef.current = null;
@@ -1488,7 +1492,7 @@ export function VideoPlayer({
               v.play().catch(() => {
                 controller.setPlaying(false);
               });
-            } else {
+            } else if (pendingIntent === false) {
               if (!v.paused) {
                 try {
                   v.pause();
@@ -1497,6 +1501,9 @@ export function VideoPlayer({
                 }
               }
               controller.setPlaying(false);
+            } else {
+              // Preserve playback that already started before the queued loadedmetadata event fired.
+              controller.setPlaying(!v.paused && !v.ended);
             }
           }
         }}

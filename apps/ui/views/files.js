@@ -1404,7 +1404,8 @@ export function FolderBrowser({
     `;
   }
 
-  const crumbs = splitFileCrumbs(machine, resolvedPath, { technical });
+  const homePath = folderChanges?.getHome?.(machine) || null;
+  const crumbs = splitFileCrumbs(machine, resolvedPath, { technical, homePath });
 
   function handleEntryTap(e, entry) {
     e.preventDefault();
@@ -1617,8 +1618,9 @@ export function FolderBrowser({
   }
 
   const inlineTools = wide && !selecting && !hideWideChrome;
-  const atMachineFilesRoot = !path || path === '~' || isMachineFilesRoot(resolvedPath);
-  const wideFolderHeading = folderDisplayName(resolvedPath, { technical });
+  const atMachineFilesRoot =
+    !path || path === '~' || (homePath && resolvedPath === homePath) || isMachineFilesRoot(resolvedPath);
+  const wideFolderHeading = folderDisplayName(resolvedPath, { technical, homePath });
 
   return html`
     <div data-no-swipe="true">
@@ -1641,8 +1643,8 @@ export function FolderBrowser({
               <input
                 class="input plain"
                 type="search"
-                placeholder=${`Search in ${folderDisplayName(resolvedPath, { technical })}`}
-                aria-label=${`Search in ${folderDisplayName(resolvedPath, { technical })}`}
+                placeholder=${`Search in ${folderDisplayName(resolvedPath, { technical, homePath })}`}
+                aria-label=${`Search in ${folderDisplayName(resolvedPath, { technical, homePath })}`}
                 onKeyDown=${(e) => {
                   if (e.key === 'Enter') {
                     e.preventDefault();
@@ -3536,9 +3538,13 @@ export function FilesView({
     if (route.view === 'home' && !activeFolderMachine) {
       rightEmpty = 'Choose a place on the left.';
     } else if (showingFolder) {
-      const folderName = folderDisplayName(resolvedFolderPath, { technical });
+      const activeHomePath = folderChanges?.getHome?.(activeFolderMachine) || null;
+      const folderName = folderDisplayName(resolvedFolderPath, { technical, homePath: activeHomePath });
       const isReachable = activeMachineObj ? activeMachineObj.reachable : true;
-      const crumbs = splitFileCrumbs(activeFolderMachine, resolvedFolderPath, { technical });
+      const crumbs = splitFileCrumbs(activeFolderMachine, resolvedFolderPath, {
+        technical,
+        homePath: activeHomePath,
+      });
       rightTitle = folderName;
       rightFact =
         isReachable && folderSummary.totalCount != null && folderSummary.totalCount > 0

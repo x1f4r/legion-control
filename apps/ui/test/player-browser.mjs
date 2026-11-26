@@ -9,159 +9,101 @@
 // - Picture hidden-bars calls immersive(true/false); reduced-motion disables transitions
 
 import assert from 'node:assert/strict';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
-import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import readline from 'node:readline';
-import test from 'node:test';
-import { fileURLToPath } from 'node:url';
 import zlib from 'node:zlib';
-import { chromium } from 'playwright-core';
 import { SAMPLE_VIDEO_WEBM_BASE64 } from '../link/mock-media.js';
+import {
+  browserTest,
+  launchBrowser,
+  LEGION_BIN,
+  startLegionServer,
+  startStaticUiServer,
+  waitForLayoutSettled,
+  waitForMediaReady,
+} from './browser-helpers.mjs';
 
-const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
-const UI_ROOT = path.resolve(TEST_DIR, '..');
-const REPO_ROOT = path.resolve(TEST_DIR, '..', '..', '..');
-const LEGION_BIN =
-  process.env.LEGION_BIN ||
-  path.join(REPO_ROOT, 'target', 'release', process.platform === 'win32' ? 'legion.exe' : 'legion');
+browserTest(
+  'Player: video controls, viewer Fullscreen API, controlled-clock timing, single-seek drag, queue, keys, resume, and picture immersive',
+  { timeout: 120_000 },
+  async (_t, tracker) => {
+    const server = await startStaticUiServer();
+    const browser = await launchBrowser({ autoplay: true });
+    const consoleErrors = [];
+    const pageErrors = [];
 
-const MOCK_TEST_CSP =
-  "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self' blob: data:; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+    try {
+      const context = await browser.newContext({
+        viewport: { width: 1100, height: 720 },
+        colorScheme: 'dark',
+      });
 
-const MIME_BY_EXT = {
-  '.html': 'text/html; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.svg': 'image/svg+xml',
-  '.png': 'image/png',
-  '.json': 'application/json; charset=utf-8',
-  '.webmanifest': 'application/manifest+json; charset=utf-8',
-};
-
-function findBrowser() {
-  if (process.env.LEGION_CHROME && fs.existsSync(process.env.LEGION_CHROME)) {
-    return process.env.LEGION_CHROME;
-  }
-  const candidates = [
-    '/usr/bin/chromium',
-    '/usr/bin/chromium-browser',
-    '/usr/bin/google-chrome',
-    '/usr/bin/google-chrome-stable',
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-  ];
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) return candidate;
-  }
-  throw new Error('No Chromium or Chrome binary found; set LEGION_CHROME.');
-}
-
-async function startStaticUiServer() {
-  const server = http.createServer((req, res) => {
-    const parsed = new URL(req.url || '/', 'http://127.0.0.1');
-    let rel = decodeURIComponent(parsed.pathname);
-    if (rel === '/') rel = '/index.html';
-    const full = path.resolve(UI_ROOT, `.${rel}`);
-    if (!full.startsWith(UI_ROOT) || !fs.existsSync(full) || fs.statSync(full).isDirectory()) {
-      res.writeHead(404);
-      res.end('Not found');
-      return;
-    }
-    const ext = path.extname(full).toLowerCase();
-    const headers = {
-      'Content-Type': MIME_BY_EXT[ext] || 'application/octet-stream',
-      'X-Content-Type-Options': 'nosniff',
-    };
-    if (ext === '.html') {
-      headers['Content-Security-Policy'] = MOCK_TEST_CSP;
-    }
-    res.writeHead(200, headers);
-    fs.createReadStream(full).pipe(res);
-  });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const addr = server.address();
-  return {
-    url: `http://127.0.0.1:${addr.port}`,
-    stop: () => new Promise((resolve) => server.close(resolve)),
-  };
-}
-
-test('Player: video controls, viewer Fullscreen API, controlled-clock timing, single-seek drag, queue, keys, resume, and picture immersive', async () => {
-  const server = await startStaticUiServer();
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu', '--autoplay-policy=no-user-gesture-required'],
-  });
-  const consoleErrors = [];
-  const pageErrors = [];
-
-  try {
-    const context = await browser.newContext({
-      viewport: { width: 1100, height: 720 },
-      colorScheme: 'dark',
-    });
-
-    // Inject a deterministic test clock for player timers before page scripts run.
-    await context.addInitScript(() => {
-      let now = 1_000_000;
-      let nextId = 1;
-      const timers = new Map();
-      window.__LEGION_TEST_PLAYER_CLOCK__ = {
-        now: () => now,
-        setTimeout(fn, ms) {
-          const id = nextId++;
-          timers.set(id, { at: now + Math.max(0, ms), fn });
-          return id;
-        },
-        clearTimeout(id) {
-          timers.delete(id);
-        },
-        advance(ms) {
-          const target = now + ms;
-          while (true) {
-            let soonestId = null;
-            let soonest = null;
-            for (const [id, item] of timers.entries()) {
-              if (item.at <= target && (!soonest || item.at < soonest.at)) {
-                soonest = item;
-                soonestId = id;
+      // Inject a deterministic test clock for player timers before page scripts run.
+      await context.addInitScript(() => {
+        let now = 1_000_000;
+        let nextId = 1;
+        const timers = new Map();
+        window.__LEGION_TEST_PLAYER_CLOCK__ = {
+          now: () => now,
+          setTimeout(fn, ms) {
+            const id = nextId++;
+            timers.set(id, { at: now + Math.max(0, ms), fn });
+            return id;
+          },
+          clearTimeout(id) {
+            timers.delete(id);
+          },
+          advance(ms) {
+            const target = now + ms;
+            let guard = 0;
+            while (guard < 10_000) {
+              guard += 1;
+              let soonestId = null;
+              let soonest = null;
+              for (const [id, item] of timers.entries()) {
+                if (item.at <= target && (!soonest || item.at < soonest.at)) {
+                  soonest = item;
+                  soonestId = id;
+                }
               }
+              if (!soonest) break;
+              timers.delete(soonestId);
+              now = soonest.at;
+              soonest.fn();
             }
-            if (!soonest) break;
-            timers.delete(soonestId);
-            now = soonest.at;
-            soonest.fn();
-          }
-          now = target;
+            now = target;
+          },
+        };
+      });
+
+      const page = tracker.attach(await context.newPage(), {
+        label: 'video-controls',
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
+
+      tracker.setStep('open Arrival.mp4');
+      await page.goto(`${server.url}/?mock=browser-fs#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
+        waitUntil: 'domcontentloaded',
+      });
+      await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').waitFor();
+
+      // Open first video (`Arrival.mp4`).
+      await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').click();
+      const videoEl = page.locator('.viewer video.viewer-video[src]');
+      await tracker.waitForLocator(videoEl, 'Arrival.mp4 video[src]');
+      await waitForMediaReady(videoEl, 'Arrival.mp4 metadata', { tracker, minReadyState: 1 });
+      await tracker.waitForFn(
+        page,
+        () => {
+          const v = document.querySelector('.viewer video.viewer-video');
+          return v && v.readyState >= 1 && Number.isFinite(v.duration) && v.duration > 1;
         },
-      };
-    });
-
-    const page = await context.newPage();
-    page.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
-    });
-    page.on('pageerror', (err) => pageErrors.push(String(err)));
-
-    await page.goto(`${server.url}/?mock=browser-fs#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
-      waitUntil: 'domcontentloaded',
-    });
-    await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').waitFor();
-
-    // Open first video (`Arrival.mp4`).
-    await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').click();
-    await page.locator('.viewer video.viewer-video').waitFor();
-    await page.waitForFunction(
-      () => {
-        const v = document.querySelector('.viewer video.viewer-video');
-        return v && v.readyState >= 1 && Number.isFinite(v.duration) && v.duration > 1;
-      },
-      null,
-      { timeout: 10_000 },
-    );
+        null,
+        'Arrival.mp4 duration > 1s',
+      );
 
     // 1. Rules: NO native `controls` attribute, NO `[disabled]` control anywhere, every control is a named button,
     // slider has spoken aria-valuetext, every control is >= 44x44 CSS px, times use sans tabular-nums with U+2212,
@@ -228,11 +170,13 @@ test('Player: video controls, viewer Fullscreen API, controlled-clock timing, si
     assert.equal(await page.locator('.viewer button[aria-label="Previous video"]').count(), 0);
 
     // 2. Full screen via Browser Fullscreen API: `.viewer` is `document.fullscreenElement`, NOT `<video>`.
+    tracker.setStep('Browser Fullscreen API on .viewer');
     await page.locator('.viewer button[aria-label="Full screen"]').click();
-    await page.waitForFunction(
+    await tracker.waitForFn(
+      page,
       () => document.fullscreenElement === document.querySelector('.viewer'),
       null,
-      { timeout: 5000 },
+      'fullscreenElement === .viewer',
     );
     const fsTag = await page.evaluate(() => ({
       isViewer: document.fullscreenElement === document.querySelector('.viewer'),
@@ -243,7 +187,7 @@ test('Player: video controls, viewer Fullscreen API, controlled-clock timing, si
 
     // `F` leaves fullscreen while keeping the viewer open.
     await page.keyboard.press('f');
-    await page.waitForFunction(() => document.fullscreenElement === null, null, { timeout: 5000 });
+    await tracker.waitForFn(page, () => document.fullscreenElement === null, null, 'exit fullscreen via F');
     assert.equal(await page.locator('.viewer').isVisible(), true);
 
     // 3. Controlled-clock timing: play -> stays visible at 2999 ms -> hides + inert + cursor-hidden at 3000 ms.
@@ -385,17 +329,19 @@ test('Player: video controls, viewer Fullscreen API, controlled-clock timing, si
     );
 
     // 6. `N` moves to next video (`Beach.mp4`) in folder order and revokes the previous content URL.
+    tracker.setStep('next video Beach.mp4 and URL revocation');
     const firstVideoUrl = await page.evaluate(() => document.querySelector('.viewer video.viewer-video')?.getAttribute('src') || '');
     assert.ok(firstVideoUrl.length > 0);
     await page.keyboard.press('n');
     await page.locator('.player-top .name', { hasText: 'Beach.mp4' }).waitFor();
-    await page.waitForFunction(
+    await tracker.waitForFn(
+      page,
       (prev) => {
         const cur = document.querySelector('.viewer video.viewer-video')?.getAttribute('src') || '';
         return Boolean(cur && cur !== prev && window.__LEGION_MOCK_REVOKED_URLS__?.includes(prev));
       },
       firstVideoUrl,
-      { timeout: 5000 },
+      'next video src swap and previous URL revoke',
     );
     const nextVideoUrl = await page.evaluate(() => document.querySelector('.viewer video.viewer-video')?.getAttribute('src') || '');
     assert.notEqual(nextVideoUrl, firstVideoUrl);
@@ -407,10 +353,11 @@ test('Player: video controls, viewer Fullscreen API, controlled-clock timing, si
     await page.locator('.viewer').waitFor({ state: 'hidden' });
     const bgInertAfterClose = await page.evaluate(() => Boolean(document.querySelector('.grid')?.closest('[inert]')));
     assert.equal(bgInertAfterClose, false);
-    await page.waitForFunction(
+    await tracker.waitForFn(
+      page,
       (u) => Array.isArray(window.__LEGION_MOCK_REVOKED_URLS__) && window.__LEGION_MOCK_REVOKED_URLS__.includes(u),
       nextVideoUrl,
-      { timeout: 5000 },
+      'revocation of Beach.mp4 URL on close',
     );
 
     // 6b. Resume chip ("Resumed at ... · Start over") appears when a >= 10 min file has a saved position, and Start over resets it.
@@ -508,12 +455,13 @@ test('Player: video controls, viewer Fullscreen API, controlled-clock timing, si
       stage.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerId: 3, button: 0, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 }));
       stage.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerId: 3, button: 0, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 }));
     });
-    await page.waitForFunction(
+    await tracker.waitForFn(
+      page,
       () =>
         document.querySelector('.viewer')?.classList.contains('chrome-hidden') &&
         window.__LEGION_MOCK_IMMERSIVE_CALLS__.some((c) => c.on === true && c.orientation === 'none'),
       null,
-      { timeout: 3000 },
+      'picture chrome-hidden and immersive(true)',
     );
     await page.keyboard.press('Escape');
     await page.locator('.viewer').waitFor({ state: 'hidden' });
@@ -529,23 +477,22 @@ test('Player: video controls, viewer Fullscreen API, controlled-clock timing, si
   }
 });
 
-test('Player: instance and full screen survive file changes (next, prev, song end, Back, and keys during loading)', async () => {
-  const server = await startStaticUiServer();
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu', '--autoplay-policy=no-user-gesture-required'],
-  });
-  const consoleErrors = [];
-  const pageErrors = [];
+browserTest(
+  'Player: instance and full screen survive file changes (next, prev, song end, Back, and keys during loading)',
+  { timeout: 120_000 },
+  async (_t, tracker) => {
+    const server = await startStaticUiServer();
+    const browser = await launchBrowser({ autoplay: true });
+    const consoleErrors = [];
+    const pageErrors = [];
 
-  try {
-    const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
-    const page = await context.newPage();
-    page.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
-    });
-    page.on('pageerror', (err) => pageErrors.push(String(err)));
+    try {
+      const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
+      const page = tracker.attach(await context.newPage(), {
+        label: 'instance-survival',
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
 
     // 1. Video full screen survives N and P: one immersive(true), zero immersive(false) in between,
     // same player DOM node stays mounted, Back leaves full screen on the CURRENT file, second Back closes.
@@ -593,30 +540,48 @@ test('Player: instance and full screen survive file changes (next, prev, song en
     await page.evaluate(() => window.history.back());
     await page.locator('.viewer').waitFor({ state: 'hidden', timeout: 5000 });
 
-    // 2. Keys pressed while the next file is still loading (slow contentUrl mint) are not lost.
+    // 2. Keys pressed while the next file is still loading (gated contentUrl mint) are not lost.
+    tracker.setStep('keys pressed while next video URL is minting');
     await page.goto(`${server.url}/?mock=slow-content#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
       waitUntil: 'domcontentloaded',
     });
     await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').click();
-    await page.locator('.viewer video.viewer-video[src]').waitFor({ timeout: 5000 });
+    await tracker.waitForLocator(page.locator('.viewer video.viewer-video[src]'), 'initial Arrival.mp4 src');
     await page.evaluate(() => {
       window.__LEGION_MOCK_IMMERSIVE_CALLS__.length = 0;
     });
     await page.locator('.viewer button[aria-label="Full screen"]').click();
     await page.locator('.viewer button[aria-label="Exit full screen"]').waitFor();
 
-    // Press N -> Beach.mp4 starts minting (src absent, loading spinner visible) -> immediately press P -> back to Arrival.mp4!
-    await page.keyboard.press('n');
-    await page.locator('.player-top .name', { hasText: 'Beach.mp4' }).waitFor();
-    const whileLoading = await page.evaluate(() => ({
-      hasSrc: document.querySelector('.viewer video.viewer-video')?.hasAttribute('src'),
-      hasSpinner: Boolean(document.querySelector('.player-spinner')),
-    }));
-    assert.equal(whileLoading.hasSrc, false);
-    assert.equal(whileLoading.hasSpinner, true);
-    await page.keyboard.press('p');
+    // Hold Beach.mp4 contentUrl behind a deterministic gate so N -> P never races the mock timer.
+    await page.evaluate(() => {
+      let release = () => {};
+      const promise = new Promise((r) => {
+        release = r;
+      });
+      window.__TEST_CONTENT_GATE_RELEASE__ = release;
+      window.__LEGION_MOCK_CONTENT_GATE__ = ({ path: p }) =>
+        String(p || '').includes('Beach.mp4') ? promise : null;
+    });
+    try {
+      await page.keyboard.press('n');
+      await page.locator('.player-top .name', { hasText: 'Beach.mp4' }).waitFor();
+      const whileLoading = await page.evaluate(() => ({
+        hasSrc: document.querySelector('.viewer video.viewer-video')?.hasAttribute('src'),
+        hasSpinner: Boolean(document.querySelector('.player-spinner')),
+      }));
+      assert.equal(whileLoading.hasSrc, false);
+      assert.equal(whileLoading.hasSpinner, true);
+      await page.keyboard.press('p');
+    } finally {
+      await page.evaluate(() => {
+        window.__TEST_CONTENT_GATE_RELEASE__?.();
+        delete window.__TEST_CONTENT_GATE_RELEASE__;
+        delete window.__LEGION_MOCK_CONTENT_GATE__;
+      });
+    }
     await page.locator('.player-top .name', { hasText: 'Arrival.mp4' }).waitFor();
-    await page.locator('.viewer video.viewer-video[src]').waitFor({ timeout: 5000 });
+    await tracker.waitForLocator(page.locator('.viewer video.viewer-video[src]'), 'Arrival.mp4 src after P');
     const afterSlowSkip = await page.evaluate(() => ({
       immersiveCalls: window.__LEGION_MOCK_IMMERSIVE_CALLS__.map((c) => c.on),
       stillFullscreen: Boolean(document.querySelector('.viewer button[aria-label="Exit full screen"]')),
@@ -625,26 +590,49 @@ test('Player: instance and full screen survive file changes (next, prev, song en
     assert.equal(afterSlowSkip.stillFullscreen, true);
 
     // 3. Music player keeps the exact same DOM instance across song end, next, and previous.
+    tracker.setStep('music player DOM survival and Escape during audio URL mint');
     await page.goto(`${server.url}/?mock=slow-content#/files/tower/%2Fhome%2Fme%2FMusic%2FAlbum`, {
       waitUntil: 'domcontentloaded',
     });
     await page.locator('.list a.row', { hasText: '01 - Morning Light.flac' }).click();
     await page.locator('.music-screen').waitFor();
-    await page.locator('audio[data-legion-music-audio][src]').waitFor({ state: 'attached', timeout: 5000 });
+    await tracker.waitForLocator(
+      page.locator('audio[data-legion-music-audio][src]'),
+      'first track audio[src]',
+      { state: 'attached' },
+    );
     await page.evaluate(() => {
       window.__LEGION_MUSIC_NODE_REF__ = document.querySelector('.music-screen');
       document.querySelector('audio[data-legion-music-audio]').dispatchEvent(new Event('ended'));
     });
-    await page.locator('.music-title', { hasText: 'Rain on Glass' }).waitFor({ timeout: 5000 });
+    await page.locator('.music-title', { hasText: 'Rain on Glass' }).waitFor();
     const sameMusicNode = await page.evaluate(
       () => document.querySelector('.music-screen') === window.__LEGION_MUSIC_NODE_REF__,
     );
     assert.equal(sameMusicNode, true);
 
-    // Key pressed while audio URL is still minting is not lost (press Escape to close during load).
-    await page.keyboard.press('n');
-    await page.keyboard.press('Escape');
-    await page.locator('.viewer').waitFor({ state: 'hidden', timeout: 5000 });
+    // Hold the next track's audio URL mint so Escape definitely arrives mid-load.
+    await page.evaluate(() => {
+      let release = () => {};
+      const promise = new Promise((r) => {
+        release = r;
+      });
+      window.__TEST_CONTENT_GATE_RELEASE__ = release;
+      window.__LEGION_MOCK_CONTENT_GATE__ = () => promise;
+    });
+    try {
+      await page.keyboard.press('n');
+      await page.keyboard.press('Escape');
+      await tracker.waitForLocator(page.locator('.viewer'), 'viewer hidden after Escape during audio load', {
+        state: 'hidden',
+      });
+    } finally {
+      await page.evaluate(() => {
+        window.__TEST_CONTENT_GATE_RELEASE__?.();
+        delete window.__TEST_CONTENT_GATE_RELEASE__;
+        delete window.__LEGION_MOCK_CONTENT_GATE__;
+      });
+    }
 
     assert.deepEqual(consoleErrors, [], `Console errors: ${consoleErrors.join('; ')}`);
     assert.deepEqual(pageErrors, [], `Page errors: ${pageErrors.join('; ')}`);
@@ -655,23 +643,22 @@ test('Player: instance and full screen survive file changes (next, prev, song en
   }
 });
 
-test('Player: single full-screen owner keeps Rename and Delete from full screen in sync', async () => {
-  const server = await startStaticUiServer();
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu', '--autoplay-policy=no-user-gesture-required'],
-  });
-  const consoleErrors = [];
-  const pageErrors = [];
+browserTest(
+  'Player: single full-screen owner keeps Rename and Delete from full screen in sync',
+  { timeout: 90_000 },
+  async (_t, tracker) => {
+    const server = await startStaticUiServer();
+    const browser = await launchBrowser({ autoplay: true });
+    const consoleErrors = [];
+    const pageErrors = [];
 
-  try {
-    const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
-    const page = await context.newPage();
-    page.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
-    });
-    page.on('pageerror', (err) => pageErrors.push(String(err)));
+    try {
+      const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
+      const page = tracker.attach(await context.newPage(), {
+        label: 'fs-owner',
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
 
     // 1. Page boot calls immersive(false) and keepScreenOn(false) once to clear any stale native hold.
     await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
@@ -720,10 +707,11 @@ test('Player: single full-screen owner keeps Rename and Delete from full screen 
 
     await page.locator('.viewer').waitFor({ state: 'hidden', timeout: 5000 });
     await page.locator('.sheet').waitFor({ state: 'hidden', timeout: 5000 });
-    await page.waitForFunction(
+    await tracker.waitForFn(
+      page,
       () => !document.querySelector('.grid a.cell[aria-label="Beach.mp4"]'),
       null,
-      { timeout: 5000 },
+      'Beach.mp4 removed from grid after delete',
     );
 
     assert.deepEqual(consoleErrors, [], `Console errors: ${consoleErrors.join('; ')}`);
@@ -735,26 +723,25 @@ test('Player: single full-screen owner keeps Rename and Delete from full screen 
   }
 });
 
-test('Player: music screen, tags, covers in listing, MediaSession, auto-advance, large library, and reduced motion', async () => {
-  const server = await startStaticUiServer();
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu', '--autoplay-policy=no-user-gesture-required'],
-  });
-  const consoleErrors = [];
-  const pageErrors = [];
+browserTest(
+  'Player: music screen, tags, covers in listing, MediaSession, auto-advance, large library, and reduced motion',
+  { timeout: 120_000 },
+  async (_t, tracker) => {
+    const server = await startStaticUiServer();
+    const browser = await launchBrowser({ autoplay: true });
+    const consoleErrors = [];
+    const pageErrors = [];
 
-  try {
-    const context = await browser.newContext({
-      viewport: { width: 1100, height: 720 },
-      colorScheme: 'dark',
-    });
-    const page = await context.newPage();
-    page.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
-    });
-    page.on('pageerror', (err) => pageErrors.push(String(err)));
+    try {
+      const context = await browser.newContext({
+        viewport: { width: 1100, height: 720 },
+        colorScheme: 'dark',
+      });
+      const page = tracker.attach(await context.newPage(), {
+        label: 'music-screen',
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
 
     // 1. Folder listing shows covers for songs with embedded/folder art.
     await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FMusic%2FAlbum`, {
@@ -821,24 +808,27 @@ test('Player: music screen, tags, covers in listing, MediaSession, auto-advance,
     }
 
     // Speed lives in More sheet.
+    tracker.setStep('music speed 1.25x in More sheet');
     await page.locator('.music-top button[aria-label="More options"]').click();
     await page.locator('.sheet .music-speed-chips button', { hasText: '1.25×' }).click();
-    await page.waitForFunction(
+    await tracker.waitForFn(
+      page,
       () => document.querySelector('audio[data-legion-music-audio]')?.playbackRate === 1.25,
       null,
-      { timeout: 3000 },
+      'audio playbackRate === 1.25',
     );
     await page.keyboard.press('Escape');
     await page.locator('.sheet').waitFor({ state: 'hidden' });
 
     // Ending a song auto-advances to the next track (`02 - Rain on Glass.mp3`), revokes the previous URL,
     // and keeps the Play button at the exact same horizontal position.
+    tracker.setStep('music auto-advance on ended');
     const firstSongUrl = await page.evaluate(() => document.querySelector('audio[data-legion-music-audio]')?.getAttribute('src') || '');
     assert.ok(firstSongUrl.length > 0);
     await page.evaluate(() => {
       document.querySelector('audio[data-legion-music-audio]').dispatchEvent(new Event('ended'));
     });
-    await page.locator('.music-title', { hasText: 'Rain on Glass' }).waitFor({ timeout: 5000 });
+    await page.locator('.music-title', { hasText: 'Rain on Glass' }).waitFor();
     const midPlayX = await page.evaluate(() => document.querySelector('.music-play-btn').getBoundingClientRect().x);
     assert.ok(Math.abs(midPlayX - firstPlayBox.x) < 0.5, `Play button shifted: ${firstPlayBox.x} -> ${midPlayX}`);
     const afterAutoNext = await page.evaluate((prev) => ({
@@ -850,18 +840,20 @@ test('Player: music screen, tags, covers in listing, MediaSession, auto-advance,
 
     // Ensure track is playing -> MediaSession stays "playing" after leaving the song screen
     // (small player takes over), and clears metadata to null / playbackState to "none" on dismiss.
+    tracker.setStep('MediaSession playing state');
     const playBtnLabel = await page.locator('.music-play-btn').getAttribute('aria-label');
     if (playBtnLabel === 'Play') {
       await page.locator('.music-play-btn').click();
     }
-    await page.waitForFunction(
+    await tracker.waitForFn(
+      page,
       () => navigator.mediaSession?.playbackState === 'playing',
       null,
-      { timeout: 5000 },
+      'MediaSession playbackState === playing',
     );
     await page.locator('.music-top button[aria-label="Close"]').click();
-    await page.locator('.viewer').waitFor({ state: 'hidden' });
-    await page.locator('.mini-player').waitFor();
+    await tracker.waitForLocator(page.locator('.viewer'), 'music screen closed to small player', { state: 'hidden' });
+    await tracker.waitForLocator(page.locator('.mini-player'), 'small player active after closing song screen');
     const activeInMini = await page.evaluate(() => ({
       title: navigator.mediaSession?.metadata?.title || '',
       playbackState: navigator.mediaSession?.playbackState || '',
@@ -874,7 +866,9 @@ test('Player: music screen, tags, covers in listing, MediaSession, auto-advance,
     await page.mouse.down();
     await page.mouse.move(miniRect.x + miniRect.width / 2, miniRect.y + 56, { steps: 6 });
     await page.mouse.up();
-    await page.locator('.mini-player').waitFor({ state: 'detached' });
+    await tracker.waitForLocator(page.locator('.mini-player'), 'small player dismissed after swipe', {
+      state: 'detached',
+    });
     const clearedSession = await page.evaluate(() => ({
       metadata: navigator.mediaSession?.metadata ?? null,
       playbackState: navigator.mediaSession?.playbackState || '',
@@ -940,22 +934,40 @@ test('Player: music screen, tags, covers in listing, MediaSession, auto-advance,
     );
     await page.setViewportSize({ width: 1100, height: 720 });
 
-    // 3. Large library (300 songs) with slow covers: title appears BEFORE cover loads.
+    // 3. Large library (300 songs) with gated covers: title appears BEFORE cover loads.
+    tracker.setStep('300-song library title before slow cover');
     await page.goto(`${server.url}/?mock=big-music,slow-cover#/files/tower/%2Fhome%2Fme%2FMusic%2FLibrary300`, {
       waitUntil: 'domcontentloaded',
     });
     await page.locator('.list a.row', { hasText: 'Track-001.mp3' }).waitFor();
-    await page.locator('.list a.row', { hasText: 'Track-001.mp3' }).click();
-    await page.locator('.music-title').waitFor();
-    const immediateCheck = await page.evaluate(() => ({
-      title: document.querySelector('.music-title')?.textContent?.trim() || '',
-      hasCoverAlready: Boolean(document.querySelector('img.music-cover')),
-    }));
-    assert.ok(immediateCheck.title.startsWith('Track'), `Expected title immediately, got "${immediateCheck.title}"`);
-    assert.equal(immediateCheck.hasCoverAlready, false, 'Expected title to render before slow cover resolves');
-    await page.locator('img.music-cover').waitFor({ timeout: 5000 });
+    await page.evaluate(() => {
+      let release = () => {};
+      const promise = new Promise((r) => {
+        release = r;
+      });
+      window.__TEST_COVER_GATE_RELEASE__ = release;
+      window.__LEGION_MOCK_COVER_GATE__ = () => promise;
+    });
+    try {
+      await page.locator('.list a.row', { hasText: 'Track-001.mp3' }).click();
+      await page.locator('.music-title').waitFor();
+      const immediateCheck = await page.evaluate(() => ({
+        title: document.querySelector('.music-title')?.textContent?.trim() || '',
+        hasCoverAlready: Boolean(document.querySelector('img.music-cover')),
+      }));
+      assert.ok(immediateCheck.title.startsWith('Track'), `Expected title immediately, got "${immediateCheck.title}"`);
+      assert.equal(immediateCheck.hasCoverAlready, false, 'Expected title to render before slow cover resolves');
+    } finally {
+      await page.evaluate(() => {
+        window.__TEST_COVER_GATE_RELEASE__?.();
+        delete window.__TEST_COVER_GATE_RELEASE__;
+        delete window.__LEGION_MOCK_COVER_GATE__;
+      });
+    }
+    await tracker.waitForLocator(page.locator('img.music-cover'), 'Track-001 cover image after gate release');
 
     // 4. Reduced motion disables overlay transitions.
+    tracker.setStep('reduced motion overlay transition check');
     await page.emulateMedia({ reducedMotion: 'reduce' });
     await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
       waitUntil: 'domcontentloaded',
@@ -976,142 +988,115 @@ test('Player: music screen, tags, covers in listing, MediaSession, auto-advance,
   }
 });
 
-test('Player: real legion serve HTTP door enters Fullscreen API on viewer element with zero disabled controls', async (t) => {
-  if (!fs.existsSync(LEGION_BIN)) {
-    t.skip(`Release binary not found at ${LEGION_BIN}`);
-    return;
-  }
-  const cacheBase = path.join(os.homedir(), '.cache', 'legion-ui-test');
-  fs.mkdirSync(cacheBase, { recursive: true });
-  const root = fs.mkdtempSync(path.join(cacheBase, 'player-http-'));
-  const legionHome = path.join(root, 'legion');
-  const userHome = path.join(root, 'home');
-  const mediaDir = path.join(userHome, 'Clips');
-  fs.mkdirSync(path.join(legionHome, 'config'), { recursive: true });
-  fs.mkdirSync(path.join(legionHome, 'state'), { recursive: true });
-  fs.mkdirSync(mediaDir, { recursive: true });
-  fs.writeFileSync(path.join(mediaDir, 'clip.webm'), Buffer.from(SAMPLE_VIDEO_WEBM_BASE64, 'base64'));
-  fs.writeFileSync(
-    path.join(legionHome, 'config', 'node.toml'),
-    'name = "tower"\nsystem = "linux"\nbusy = "none"\n',
-  );
-  fs.writeFileSync(
-    path.join(legionHome, 'config', 'policy.toml'),
-    '[roles.operator]\nallow = ["effect:read", "effect:write"]\n\n[principals.ui]\nrole = "operator"\n',
-  );
-  fs.writeFileSync(
-    path.join(legionHome, 'config', 'fleet.toml'),
-    '[machines.tower]\nssh = "tower.example"\n',
-  );
-
-  const env = { ...process.env, LEGION_HOME: legionHome, HOME: userHome, USERPROFILE: userHome };
-  delete env.XDG_CONFIG_HOME;
-  delete env.XDG_STATE_HOME;
-  const tokenOut = JSON.parse(
-    execFileSync(LEGION_BIN, ['token.add', 'name=ui', 'principal=ui', '--json'], { env, encoding: 'utf8' }),
-  );
-
-  const child = spawn(LEGION_BIN, ['serve', '--listen', '127.0.0.1:0'], {
-    env,
-    stdio: ['ignore', 'ignore', 'pipe'],
-  });
-  let stderr = '';
-  const url = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`legion serve timeout:\n${stderr}`)), 15_000);
-    const rl = readline.createInterface({ input: child.stderr });
-    rl.on('line', (line) => {
-      stderr += `${line}\n`;
-      const prefix = 'legion serve: listening on ';
-      if (line.startsWith(prefix)) {
-        clearTimeout(timer);
-        resolve(line.slice(prefix.length).trim());
-      }
-    });
-    child.once('exit', (code) => {
-      clearTimeout(timer);
-      reject(new Error(`legion serve exited (${code}):\n${stderr}`));
-    });
-  });
-
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu', '--autoplay-policy=no-user-gesture-required'],
-  });
-  const consoleErrors = [];
-  const pageErrors = [];
-
-  try {
-    const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
-    const page = await context.newPage();
-    page.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
-    });
-    page.on('pageerror', (err) => pageErrors.push(String(err)));
-
-    await page.goto(`${url}/#token=${encodeURIComponent(tokenOut.token)}`, { waitUntil: 'domcontentloaded' });
-    await page.locator('.nav a[href="#/files"]').waitFor({ timeout: 10_000 });
-    await page.goto(`${url}/#/files/tower/${encodeURIComponent(mediaDir)}`, { waitUntil: 'domcontentloaded' });
-    const clipEntry = page.locator('a.row:has-text("clip.webm"), a.cell[aria-label="clip.webm"]');
-    await clipEntry.waitFor({ timeout: 10_000 });
-    await clipEntry.click();
-    await page.locator('.viewer video.viewer-video').waitFor({ timeout: 10_000 });
-
-    // Real HTTP door (`http.js`): Fullscreen API targets `.viewer` (not `<video>`) and no control is disabled.
-    assert.equal(await page.locator('.viewer [disabled]').count(), 0);
-    assert.equal(await page.locator('.viewer video[controls]').count(), 0);
-    await page.locator('.viewer button[aria-label="Full screen"]').click();
-    await page.waitForFunction(
-      () => document.fullscreenElement === document.querySelector('.viewer'),
-      null,
-      { timeout: 5000 },
+browserTest(
+  'Player: real legion serve HTTP door enters Fullscreen API on viewer element with zero disabled controls',
+  { timeout: 90_000 },
+  async (t, tracker) => {
+    if (!fs.existsSync(LEGION_BIN)) {
+      t.skip(`Release binary not found at ${LEGION_BIN}`);
+      return;
+    }
+    const cacheBase = path.join(os.homedir(), '.cache', 'legion-ui-test');
+    fs.mkdirSync(cacheBase, { recursive: true });
+    const root = fs.mkdtempSync(path.join(cacheBase, 'player-http-'));
+    const legionHome = path.join(root, 'legion');
+    const userHome = path.join(root, 'home');
+    const mediaDir = path.join(userHome, 'Clips');
+    fs.mkdirSync(path.join(legionHome, 'config'), { recursive: true });
+    fs.mkdirSync(path.join(legionHome, 'state'), { recursive: true });
+    fs.mkdirSync(mediaDir, { recursive: true });
+    fs.writeFileSync(path.join(mediaDir, 'clip.webm'), Buffer.from(SAMPLE_VIDEO_WEBM_BASE64, 'base64'));
+    fs.writeFileSync(
+      path.join(legionHome, 'config', 'node.toml'),
+      'name = "tower"\nsystem = "linux"\nbusy = "none"\n',
     );
-    const fsInfo = await page.evaluate(() => ({
-      isViewer: document.fullscreenElement === document.querySelector('.viewer'),
-      isVideo: document.fullscreenElement === document.querySelector('.viewer video'),
-    }));
-    assert.equal(fsInfo.isViewer, true);
-    assert.equal(fsInfo.isVideo, false);
+    fs.writeFileSync(
+      path.join(legionHome, 'config', 'policy.toml'),
+      '[roles.operator]\nallow = ["effect:read", "effect:write"]\n\n[principals.ui]\nrole = "operator"\n',
+    );
+    fs.writeFileSync(
+      path.join(legionHome, 'config', 'fleet.toml'),
+      '[machines.tower]\nssh = "tower.example"\n',
+    );
 
-    await page.locator('.viewer button[aria-label="Exit full screen"]').click();
-    await page.waitForFunction(() => document.fullscreenElement === null, null, { timeout: 5000 });
-    assert.deepEqual(consoleErrors, [], `Console errors: ${consoleErrors.join('; ')}`);
-    assert.deepEqual(pageErrors, [], `Page errors: ${pageErrors.join('; ')}`);
-    await context.close();
-  } finally {
-    await browser.close();
-    child.kill('SIGTERM');
-    await new Promise((resolve) => {
-      const t = setTimeout(() => {
-        child.kill('SIGKILL');
-        resolve();
-      }, 5000);
-      child.once('exit', () => {
-        clearTimeout(t);
-        resolve();
+    const env = { ...process.env, LEGION_HOME: legionHome, HOME: userHome, USERPROFILE: userHome };
+    delete env.XDG_CONFIG_HOME;
+    delete env.XDG_STATE_HOME;
+    const tokenOut = JSON.parse(
+      execFileSync(LEGION_BIN, ['token.add', 'name=ui', 'principal=ui', '--json'], { env, encoding: 'utf8' }),
+    );
+
+    const server = await startLegionServer(legionHome, userHome);
+    tracker.setServerStderr(server.getStderr);
+    const url = server.url;
+
+    const browser = await launchBrowser({ autoplay: true });
+    const consoleErrors = [];
+    const pageErrors = [];
+
+    try {
+      const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
+      const page = tracker.attach(await context.newPage(), {
+        label: 'real-http-player',
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
       });
-    });
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
 
-test('Player: hiding the desktop window pauses video and music in place and leaves full screen', async () => {
-  const server = await startStaticUiServer();
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu', '--autoplay-policy=no-user-gesture-required'],
-  });
-  const consoleErrors = [];
-  const pageErrors = [];
+      tracker.setStep('open clip.webm on real HTTP door');
+      await page.goto(`${url}/#token=${encodeURIComponent(tokenOut.token)}`, { waitUntil: 'domcontentloaded' });
+      await page.locator('.nav a[href="#/files"]').waitFor();
+      await page.goto(`${url}/#/files/tower/${encodeURIComponent(mediaDir)}`, { waitUntil: 'domcontentloaded' });
+      const clipEntry = page.locator('a.row:has-text("clip.webm"), a.cell[aria-label="clip.webm"]');
+      await clipEntry.waitFor();
+      await clipEntry.click();
+      await tracker.waitForLocator(page.locator('.viewer video.viewer-video[src]'), 'clip.webm video[src]');
 
-  try {
-    const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
-    const page = await context.newPage();
-    page.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
-    });
-    page.on('pageerror', (err) => pageErrors.push(String(err)));
+      // Real HTTP door (`http.js`): Fullscreen API targets `.viewer` (not `<video>`) and no control is disabled.
+      assert.equal(await page.locator('.viewer [disabled]').count(), 0);
+      assert.equal(await page.locator('.viewer video[controls]').count(), 0);
+      await page.locator('.viewer button[aria-label="Full screen"]').click();
+      await tracker.waitForFn(
+        page,
+        () => document.fullscreenElement === document.querySelector('.viewer'),
+        null,
+        'fullscreenElement === .viewer on real HTTP door',
+      );
+      const fsInfo = await page.evaluate(() => ({
+        isViewer: document.fullscreenElement === document.querySelector('.viewer'),
+        isVideo: document.fullscreenElement === document.querySelector('.viewer video'),
+      }));
+      assert.equal(fsInfo.isViewer, true);
+      assert.equal(fsInfo.isVideo, false);
+
+      await page.locator('.viewer button[aria-label="Exit full screen"]').click();
+      await tracker.waitForFn(page, () => document.fullscreenElement === null, null, 'exit fullscreen on real HTTP door');
+      assert.deepEqual(consoleErrors, [], `Console errors: ${consoleErrors.join('; ')}`);
+      assert.deepEqual(pageErrors, [], `Page errors: ${pageErrors.join('; ')}`);
+      await context.close();
+    } finally {
+      await browser.close();
+      await server.stop();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+browserTest(
+  'Player: hiding the desktop window pauses video and music in place and leaves full screen',
+  { timeout: 90_000 },
+  async (_t, tracker) => {
+    const server = await startStaticUiServer();
+    const browser = await launchBrowser({ autoplay: true });
+    const consoleErrors = [];
+    const pageErrors = [];
+
+    try {
+      const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
+      const page = tracker.attach(await context.newPage(), {
+        label: 'window-hidden',
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
 
     // 1. Video playing in full screen -> window hides -> paused right where it was, no longer in full screen.
     await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
@@ -1119,16 +1104,17 @@ test('Player: hiding the desktop window pauses video and music in place and leav
     });
     await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').click();
     await page.locator('.viewer video.viewer-video[src]').waitFor({ timeout: 5000 });
-    await page.waitForFunction(
+    await tracker.waitForFn(
+      page,
       () => {
         const v = document.querySelector('.viewer video');
         return v && v.readyState >= 1 && Number.isFinite(v.duration) && v.duration > 0;
       },
       null,
-      { timeout: 5000 },
+      'Arrival.mp4 metadata before hide',
     );
     await page.locator('.viewer button[aria-label="Full screen"]').click();
-    await page.locator('.viewer button[aria-label="Exit full screen"]').waitFor({ timeout: 3000 });
+    await page.locator('.viewer button[aria-label="Exit full screen"]').waitFor();
     const targetVideoTime = await page.evaluate(async () => {
       const v = document.querySelector('.viewer video');
       const t = Math.min(0.4, Math.max(0.1, v.duration * 0.35));
@@ -1136,17 +1122,18 @@ test('Player: hiding the desktop window pauses video and music in place and leav
       await v.play();
       return t;
     });
-    await page.waitForFunction(
+    await tracker.waitForFn(
+      page,
       () => {
         const v = document.querySelector('.viewer video');
         return v && !v.paused;
       },
       null,
-      { timeout: 3000 },
+      'video playing before window hide',
     );
 
     await page.evaluate(() => window.__LEGION_MOCK_TRIGGER_WINDOW_HIDDEN__());
-    await page.locator('.viewer button[aria-label="Full screen"]').waitFor({ timeout: 3000 });
+    await page.locator('.viewer button[aria-label="Full screen"]').waitFor();
     assert.equal(await page.locator('.viewer button[aria-label="Exit full screen"]').count(), 0);
     const videoAfterHide = await page.evaluate(() => {
       const v = document.querySelector('.viewer video');
@@ -1165,18 +1152,24 @@ test('Player: hiding the desktop window pauses video and music in place and leav
     assert.equal(videoAfterHide.lastKeepScreenOn, false);
 
     // 2. Music playing -> window hides -> paused in place with Play button shown.
+    tracker.setStep('music pauses in place on window hide');
     await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FMusic%2FAlbum`, {
       waitUntil: 'domcontentloaded',
     });
     await page.locator('.list a.row', { hasText: '01 - Morning Light.flac' }).click();
-    await page.locator('audio[data-legion-music-audio][src]').waitFor({ state: 'attached', timeout: 5000 });
-    await page.waitForFunction(
+    await tracker.waitForLocator(
+      page.locator('audio[data-legion-music-audio][src]'),
+      'music audio[src]',
+      { state: 'attached' },
+    );
+    await tracker.waitForFn(
+      page,
       () => {
         const a = document.querySelector('audio[data-legion-music-audio]');
         return a && a.readyState >= 1 && Number.isFinite(a.duration) && a.duration > 0;
       },
       null,
-      { timeout: 5000 },
+      'music metadata before hide',
     );
     const targetAudioTime = await page.evaluate(async () => {
       const a = document.querySelector('audio[data-legion-music-audio]');
@@ -1185,16 +1178,17 @@ test('Player: hiding the desktop window pauses video and music in place and leav
       await a.play();
       return t;
     });
-    await page.waitForFunction(
+    await tracker.waitForFn(
+      page,
       () => {
         const a = document.querySelector('audio[data-legion-music-audio]');
         return a && !a.paused;
       },
       null,
-      { timeout: 3000 },
+      'audio playing before window hide',
     );
     await page.evaluate(() => window.__LEGION_MOCK_TRIGGER_WINDOW_HIDDEN__());
-    await page.locator('.music-play-btn[aria-label="Play"]').waitFor({ timeout: 3000 });
+    await page.locator('.music-play-btn[aria-label="Play"]').waitFor();
     const audioAfterHide = await page.evaluate(() => {
       const a = document.querySelector('audio[data-legion-music-audio]');
       return { paused: a?.paused, currentTime: a?.currentTime ?? 0 };
@@ -1214,137 +1208,262 @@ test('Player: hiding the desktop window pauses video and music in place and leav
   }
 });
 
-test('Player: Space play/pause intent pressed while next file loads applies once ready', async () => {
-  const server = await startStaticUiServer();
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu', '--autoplay-policy=no-user-gesture-required'],
-  });
-  const consoleErrors = [];
-  const pageErrors = [];
+browserTest(
+  'Player: Space play/pause intent pressed while next file loads applies once ready',
+  { timeout: 120_000 },
+  async (_t, tracker) => {
+    const server = await startStaticUiServer();
+    const browser = await launchBrowser({ autoplay: true });
+    const consoleErrors = [];
+    const pageErrors = [];
 
-  try {
-    const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
-    const page = await context.newPage();
-    page.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
-    });
-    page.on('pageerror', (err) => pageErrors.push(String(err)));
+    try {
+      const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
+      const page = tracker.attach(await context.newPage(), {
+        label: 'space-intent',
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
 
-    // 1. Video paused -> N -> press Space while Beach.mp4 is still minting (no src) -> auto-plays when ready!
-    await page.goto(`${server.url}/?mock=slow-content#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
-      waitUntil: 'domcontentloaded',
-    });
-    await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').click();
-    await page.locator('.viewer video.viewer-video[src]').waitFor({ timeout: 5000 });
-    await page.waitForFunction(
-      () => {
+      const withContentGate = async (matchSubstr, fn) => {
+        await page.evaluate((needle) => {
+          let release = () => {};
+          const promise = new Promise((r) => {
+            release = r;
+          });
+          window.__TEST_CONTENT_GATE_RELEASE__ = release;
+          window.__LEGION_MOCK_CONTENT_GATE__ = ({ path: p }) =>
+            !needle || String(p || '').includes(needle) ? promise : null;
+        }, matchSubstr);
+        try {
+          await fn();
+        } finally {
+          await page.evaluate(() => {
+            window.__TEST_CONTENT_GATE_RELEASE__?.();
+            delete window.__TEST_CONTENT_GATE_RELEASE__;
+            delete window.__LEGION_MOCK_CONTENT_GATE__;
+          });
+        }
+      };
+
+      // 1. Video paused -> N -> press Space while Beach.mp4 is still minting (no src) -> auto-plays when ready!
+      tracker.setStep('video Space play intent during gated load');
+      await page.goto(`${server.url}/?mock=slow-content#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
+        waitUntil: 'domcontentloaded',
+      });
+      await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').click();
+      await tracker.waitForLocator(page.locator('.viewer video.viewer-video[src]'), 'Arrival.mp4 video[src]');
+      await tracker.waitForFn(
+        page,
+        () => {
+          const v = document.querySelector('.viewer video');
+          return v && v.readyState >= 1 && v.paused;
+        },
+        null,
+        'Arrival.mp4 ready and paused',
+      );
+
+      await withContentGate('Beach.mp4', async () => {
+        await page.keyboard.press('n');
+        await page.locator('.player-top .name', { hasText: 'Beach.mp4' }).waitFor();
+        assert.equal(
+          await page.evaluate(() => document.querySelector('.viewer video')?.hasAttribute('src')),
+          false,
+        );
+        await page.keyboard.press('Space');
+      });
+      await tracker.waitForLocator(page.locator('.viewer video.viewer-video[src]'), 'Beach.mp4 video[src]');
+      await tracker.waitForFn(
+        page,
+        () => {
+          const v = document.querySelector('.viewer video');
+          return v && v.readyState >= 1 && !v.paused;
+        },
+        null,
+        'Beach.mp4 playing after Space-during-load',
+      );
+
+      // 2. Video playing -> P back to Arrival.mp4 -> press Space while loading to PAUSE -> stays paused when ready!
+      tracker.setStep('video Space pause intent during gated load');
+      await withContentGate('Arrival.mp4', async () => {
+        await page.keyboard.press('p');
+        await page.locator('.player-top .name', { hasText: 'Arrival.mp4' }).waitFor();
+        assert.equal(
+          await page.evaluate(() => document.querySelector('.viewer video')?.hasAttribute('src')),
+          false,
+        );
+        await page.keyboard.press('Space');
+      });
+      await tracker.waitForLocator(page.locator('.viewer video.viewer-video[src]'), 'Arrival.mp4 video[src] after P');
+      await tracker.waitForFn(
+        page,
+        () => {
+          const v = document.querySelector('.viewer video');
+          return v && v.readyState >= 1;
+        },
+        null,
+        'Arrival.mp4 readyState >= 1 after P',
+      );
+      await tracker.waitForLocator(page.locator('.player-spinner'), 'loading spinner detached after Arrival.mp4 metadata', {
+        state: 'detached',
+      });
+      await waitForLayoutSettled(page, 2);
+      assert.equal(
+        await page.evaluate(() => document.querySelector('.viewer video')?.paused),
+        true,
+        'Space pressed during load while playing must pause once next video loads',
+      );
+
+      // 3. Music paused -> N -> press Space while next track URL is minting -> auto-plays when ready!
+      tracker.setStep('music Space play intent during gated load');
+      await page.goto(`${server.url}/?mock=slow-content#/files/tower/%2Fhome%2Fme%2FMusic%2FAlbum`, {
+        waitUntil: 'domcontentloaded',
+      });
+      await page.locator('.list a.row', { hasText: '01 - Morning Light.flac' }).click();
+      await tracker.waitForLocator(
+        page.locator('audio[data-legion-music-audio][src]'),
+        'first track audio[src]',
+        { state: 'attached' },
+      );
+      await tracker.waitForFn(
+        page,
+        () => {
+          const a = document.querySelector('audio[data-legion-music-audio]');
+          return a && a.readyState >= 1 && a.paused;
+        },
+        null,
+        'first track ready and paused',
+      );
+      await withContentGate('Rain on Glass', async () => {
+        await page.keyboard.press('n');
+        await page.locator('.music-title', { hasText: 'Rain on Glass' }).waitFor();
+        assert.equal(
+          await page.evaluate(() => document.querySelector('audio[data-legion-music-audio]')?.hasAttribute('src')),
+          false,
+        );
+        await page.keyboard.press('Space');
+      });
+      await tracker.waitForLocator(
+        page.locator('audio[data-legion-music-audio][src]'),
+        'Rain on Glass audio[src]',
+        { state: 'attached' },
+      );
+      await tracker.waitForFn(
+        page,
+        () => {
+          const a = document.querySelector('audio[data-legion-music-audio]');
+          return a && a.readyState >= 1 && !a.paused;
+        },
+        null,
+        'Rain on Glass playing after Space-during-load',
+      );
+
+      assert.deepEqual(consoleErrors, [], `Console errors: ${consoleErrors.join('; ')}`);
+      assert.deepEqual(pageErrors, [], `Page errors: ${pageErrors.join('; ')}`);
+      await context.close();
+    } finally {
+      await browser.close();
+      await server.stop();
+    }
+  },
+);
+
+browserTest(
+  'Player: playback started before loadedmetadata fires is not paused by VideoPlayer or MusicPlayer',
+  { timeout: 90_000 },
+  async (_t, tracker) => {
+    const server = await startStaticUiServer();
+    const browser = await launchBrowser({ autoplay: true });
+    const consoleErrors = [];
+    const pageErrors = [];
+
+    try {
+      const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
+      const page = tracker.attach(await context.newPage(), {
+        label: 'late-loadedmetadata',
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
+
+      // 1. VideoPlayer: playback started before a delayed loadedmetadata event must keep playing.
+      tracker.setStep('VideoPlayer preserves active playback when loadedmetadata fires late');
+      await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
+        waitUntil: 'domcontentloaded',
+      });
+      await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').click();
+      await tracker.waitForLocator(page.locator('.viewer video.viewer-video[src]'), 'Arrival.mp4 video[src]');
+      await waitForMediaReady(page.locator('.viewer video.viewer-video[src]'), 'Arrival.mp4 ready', {
+        tracker,
+        minReadyState: 1,
+      });
+      await page.evaluate(async () => {
         const v = document.querySelector('.viewer video');
-        return v && v.readyState >= 1 && v.paused;
-      },
-      null,
-      { timeout: 5000 },
-    );
+        await v.play();
+        // Simulate a queued loadedmetadata event firing on the main thread after play() has started.
+        v.dispatchEvent(new Event('loadedmetadata'));
+      });
+      await waitForLayoutSettled(page, 2);
+      const videoState = await page.evaluate(() => ({
+        paused: document.querySelector('.viewer video')?.paused,
+        hasPauseBtn: Boolean(document.querySelector('.viewer button[aria-label="Pause"]')),
+      }));
+      assert.equal(videoState.paused, false, 'VideoPlayer.onLoadedMetadata must not pause started playback');
+      assert.equal(videoState.hasPauseBtn, true, 'VideoPlayer UI must reflect playing state after late loadedmetadata');
 
-    await page.keyboard.press('n');
-    await page.locator('.player-top .name', { hasText: 'Beach.mp4' }).waitFor({ timeout: 3000 });
-    assert.equal(
-      await page.evaluate(() => document.querySelector('.viewer video')?.hasAttribute('src')),
-      false,
-    );
-    await page.keyboard.press('Space');
-    await page.locator('.viewer video.viewer-video[src]').waitFor({ timeout: 5000 });
-    await page.waitForFunction(
-      () => {
-        const v = document.querySelector('.viewer video');
-        return v && v.readyState >= 1 && !v.paused;
-      },
-      null,
-      { timeout: 5000 },
-    );
-
-    // 2. Video playing -> P back to Arrival.mp4 -> press Space while loading to PAUSE -> stays paused when ready!
-    await page.keyboard.press('p');
-    await page.locator('.player-top .name', { hasText: 'Arrival.mp4' }).waitFor({ timeout: 3000 });
-    assert.equal(
-      await page.evaluate(() => document.querySelector('.viewer video')?.hasAttribute('src')),
-      false,
-    );
-    await page.keyboard.press('Space');
-    await page.locator('.viewer video.viewer-video[src]').waitFor({ timeout: 5000 });
-    await page.waitForFunction(
-      () => {
-        const v = document.querySelector('.viewer video');
-        return v && v.readyState >= 1;
-      },
-      null,
-      { timeout: 5000 },
-    );
-    await page.waitForTimeout(200);
-    assert.equal(
-      await page.evaluate(() => document.querySelector('.viewer video')?.paused),
-      true,
-      'Space pressed during load while playing must pause once next video loads',
-    );
-
-    // 3. Music paused -> N -> press Space while next track URL is minting -> auto-plays when ready!
-    await page.goto(`${server.url}/?mock=slow-content#/files/tower/%2Fhome%2Fme%2FMusic%2FAlbum`, {
-      waitUntil: 'domcontentloaded',
-    });
-    await page.locator('.list a.row', { hasText: '01 - Morning Light.flac' }).click();
-    await page.locator('audio[data-legion-music-audio][src]').waitFor({ state: 'attached', timeout: 5000 });
-    await page.waitForFunction(
-      () => {
+      // 2. MusicPlayer: playback started before a delayed loadedmetadata event must keep playing.
+      tracker.setStep('MusicPlayer preserves active playback when loadedmetadata fires late');
+      await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FMusic%2FAlbum`, {
+        waitUntil: 'domcontentloaded',
+      });
+      await page.locator('.list a.row', { hasText: '01 - Morning Light.flac' }).click();
+      await tracker.waitForLocator(
+        page.locator('audio[data-legion-music-audio][src]'),
+        'Morning Light audio[src]',
+        { state: 'attached' },
+      );
+      await waitForMediaReady(page.locator('audio[data-legion-music-audio][src]'), 'Morning Light ready', {
+        tracker,
+        minReadyState: 1,
+      });
+      await page.evaluate(async () => {
         const a = document.querySelector('audio[data-legion-music-audio]');
-        return a && a.readyState >= 1 && a.paused;
-      },
-      null,
-      { timeout: 5000 },
-    );
-    await page.keyboard.press('n');
-    await page.locator('.music-title', { hasText: 'Rain on Glass' }).waitFor({ timeout: 5000 });
-    assert.equal(
-      await page.evaluate(() => document.querySelector('audio[data-legion-music-audio]')?.hasAttribute('src')),
-      false,
-    );
-    await page.keyboard.press('Space');
-    await page.locator('audio[data-legion-music-audio][src]').waitFor({ state: 'attached', timeout: 5000 });
-    await page.waitForFunction(
-      () => {
-        const a = document.querySelector('audio[data-legion-music-audio]');
-        return a && a.readyState >= 1 && !a.paused;
-      },
-      null,
-      { timeout: 5000 },
-    );
+        await a.play();
+        a.dispatchEvent(new Event('loadedmetadata'));
+      });
+      await waitForLayoutSettled(page, 2);
+      const audioState = await page.evaluate(() => ({
+        paused: document.querySelector('audio[data-legion-music-audio]')?.paused,
+        hasPauseBtn: Boolean(document.querySelector('.music-play-btn[aria-label="Pause"]')),
+      }));
+      assert.equal(audioState.paused, false, 'MusicPlayer.onLoadedMetadata must not pause started playback');
+      assert.equal(audioState.hasPauseBtn, true, 'MusicPlayer UI must reflect playing state after late loadedmetadata');
 
-    assert.deepEqual(consoleErrors, [], `Console errors: ${consoleErrors.join('; ')}`);
-    assert.deepEqual(pageErrors, [], `Page errors: ${pageErrors.join('; ')}`);
-    await context.close();
-  } finally {
-    await browser.close();
-    await server.stop();
-  }
-});
+      assert.deepEqual(consoleErrors, [], `Console errors: ${consoleErrors.join('; ')}`);
+      assert.deepEqual(pageErrors, [], `Page errors: ${pageErrors.join('; ')}`);
+      await context.close();
+    } finally {
+      await browser.close();
+      await server.stop();
+    }
+  },
+);
 
-test('Player: reaching an unplayable file in full screen keeps top bar, exit full screen, and N/P queue keys working', async () => {
-  const server = await startStaticUiServer();
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu', '--autoplay-policy=no-user-gesture-required'],
-  });
-  const consoleErrors = [];
-  const pageErrors = [];
+browserTest(
+  'Player: reaching an unplayable file in full screen keeps top bar, exit full screen, and N/P queue keys working',
+  { timeout: 90_000 },
+  async (_t, tracker) => {
+    const server = await startStaticUiServer();
+    const browser = await launchBrowser({ autoplay: true });
+    const consoleErrors = [];
+    const pageErrors = [];
 
-  try {
-    const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
-    const page = await context.newPage();
-    page.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
-    });
-    page.on('pageerror', (err) => pageErrors.push(String(err)));
+    try {
+      const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
+      const page = tracker.attach(await context.newPage(), {
+        label: 'unplayable-fs',
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
 
     await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
       waitUntil: 'domcontentloaded',
@@ -1402,440 +1521,483 @@ test('Player: reaching an unplayable file in full screen keeps top bar, exit ful
 });
 
 
-test('Player: deleting a picture, full-screen video, music track, or deep-linked file from the viewer leaves no history entry for it', async () => {
-  const server = await startStaticUiServer();
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu', '--autoplay-policy=no-user-gesture-required'],
-  });
-  const consoleErrors = [];
-  const pageErrors = [];
+browserTest(
+  'Player: deleting a picture, full-screen video, music track, or deep-linked file from the viewer leaves no history entry for it',
+  { timeout: 120_000 },
+  async (_t, tracker) => {
+    const server = await startStaticUiServer();
+    const browser = await launchBrowser({ autoplay: true });
+    const consoleErrors = [];
+    const pageErrors = [];
 
-  try {
-    // 1. Folder -> Picture -> More -> Delete -> Confirm -> system Back leaves folder (never reopens deleted picture).
-    {
-      const context = await browser.newContext({ viewport: { width: 390, height: 844 }, colorScheme: 'dark' });
-      const page = await context.newPage();
-      page.on('console', (msg) => {
-        if (msg.type() === 'error') consoleErrors.push(msg.text());
-      });
-      page.on('pageerror', (err) => pageErrors.push(String(err)));
+    try {
+      // 1. Folder -> Picture -> More -> Delete -> Confirm -> system Back leaves folder (never reopens deleted picture).
+      {
+        tracker.setStep('delete picture from viewer and check Back history');
+        const context = await browser.newContext({ viewport: { width: 390, height: 844 }, colorScheme: 'dark' });
+        const page = tracker.attach(await context.newPage(), {
+          label: 'delete-picture',
+          collectConsole: consoleErrors,
+          collectPage: pageErrors,
+        });
 
-      await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme`, { waitUntil: 'domcontentloaded' });
-      await page.locator('a.row', { hasText: 'Videos' }).first().click();
-      await page.locator('a.row', { hasText: 'Holiday' }).first().click();
-      await page.locator('.grid a.cell[aria-label="IMG_2041.jpg"]').waitFor({ timeout: 5000 });
-      const holidayHash = await page.evaluate(() => window.location.hash);
+        await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme`, { waitUntil: 'domcontentloaded' });
+        await page.locator('a.row', { hasText: 'Videos' }).first().click();
+        await page.locator('a.row', { hasText: 'Holiday' }).first().click();
+        await page.locator('.grid a.cell[aria-label="IMG_2041.jpg"]').waitFor();
+        const holidayHash = await page.evaluate(() => window.location.hash);
 
-      await page.locator('.grid a.cell[aria-label="IMG_2041.jpg"]').click();
-      await page.locator('.viewer').waitFor({ timeout: 5000 });
-      await page.locator('.viewer button[aria-label="More options"]').click();
-      await page.locator('.sheet button', { hasText: 'Delete' }).click();
-      await page.locator('.sheet button.danger', { hasText: 'Delete' }).click();
-      await page.locator('.viewer').waitFor({ state: 'detached', timeout: 5000 });
-      await page.waitForTimeout(150);
+        await page.locator('.grid a.cell[aria-label="IMG_2041.jpg"]').click();
+        await page.locator('.viewer').waitFor();
+        await page.locator('.viewer button[aria-label="More options"]').click();
+        await page.locator('.sheet button', { hasText: 'Delete' }).click();
+        await page.locator('.sheet button.danger', { hasText: 'Delete' }).click();
+        await tracker.waitForLocator(page.locator('.viewer'), 'viewer detached after picture delete', {
+          state: 'detached',
+        });
+        await tracker.waitForFn(
+          page,
+          (expected) => window.location.hash === expected && !document.querySelector('.grid a.cell[aria-label="IMG_2041.jpg"]'),
+          holidayHash,
+          'hash restored and IMG_2041.jpg detached',
+        );
 
-      assert.equal(await page.evaluate(() => window.location.hash), holidayHash);
-      assert.equal(await page.locator('.grid a.cell[aria-label="IMG_2041.jpg"]').count(), 0);
+        assert.equal(await page.evaluate(() => window.location.hash), holidayHash);
+        assert.equal(await page.locator('.grid a.cell[aria-label="IMG_2041.jpg"]').count(), 0);
 
-      // System Back must go from Holiday to Videos, never reopening the viewer on the deleted file.
-      await page.evaluate(() => window.history.back());
-      await page.waitForFunction(
-        () => decodeURIComponent(window.location.hash).endsWith('/home/me/Videos'),
-        null,
-        { timeout: 5000 },
-      );
-      assert.equal(await page.locator('.viewer').count(), 0);
+        // System Back must go from Holiday to Videos, never reopening the viewer on the deleted file.
+        await page.evaluate(() => window.history.back());
+        await tracker.waitForFn(
+          page,
+          () => decodeURIComponent(window.location.hash).endsWith('/home/me/Videos'),
+          null,
+          'Back to /home/me/Videos after picture delete',
+        );
+        assert.equal(await page.locator('.viewer').count(), 0);
 
-      // Another Back leaves Videos cleanly for /home/me.
-      await page.evaluate(() => window.history.back());
-      await page.waitForFunction(
-        () => decodeURIComponent(window.location.hash).endsWith('/home/me'),
-        null,
-        { timeout: 5000 },
-      );
-      assert.equal(await page.locator('.viewer').count(), 0);
-      await context.close();
-    }
-
-    // 2. Folder -> Video -> Full screen -> Next sibling -> More -> Delete -> Confirm -> system Back leaves folder.
-    {
-      const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
-      const page = await context.newPage();
-      page.on('console', (msg) => {
-        if (msg.type() === 'error') consoleErrors.push(msg.text());
-      });
-      page.on('pageerror', (err) => pageErrors.push(String(err)));
-
-      await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FVideos`, { waitUntil: 'domcontentloaded' });
-      await page.locator('a.row', { hasText: 'Holiday' }).first().click();
-      await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').waitFor({ timeout: 5000 });
-      const holidayHash = await page.evaluate(() => window.location.hash);
-
-      await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').click();
-      await page.locator('.viewer video.viewer-video[src]').waitFor({ timeout: 5000 });
-      await page.locator('.viewer button[aria-label="Full screen"]').click();
-      await page.locator('.viewer button[aria-label="Exit full screen"]').waitFor({ timeout: 3000 });
-
-      // Step to Beach.mp4 while in full screen, then delete it via More -> Delete.
-      await page.keyboard.press('n');
-      await page.locator('.player-top .name', { hasText: 'Beach.mp4' }).waitFor({ timeout: 5000 });
-      await page.locator('.viewer button[aria-label="More options"]').click();
-      await page.locator('.sheet button', { hasText: 'Delete' }).click();
-      await page.locator('.sheet button.danger', { hasText: 'Delete' }).click();
-      await page.locator('.viewer').waitFor({ state: 'detached', timeout: 5000 });
-      await page.waitForTimeout(150);
-
-      assert.equal(await page.evaluate(() => window.location.hash), holidayHash);
-      assert.equal(await page.locator('.grid a.cell[aria-label="Beach.mp4"]').count(), 0);
-
-      await page.evaluate(() => window.history.back());
-      await page.waitForFunction(
-        () => decodeURIComponent(window.location.hash).endsWith('/home/me/Videos'),
-        null,
-        { timeout: 5000 },
-      );
-      assert.equal(await page.locator('.viewer').count(), 0);
-      await context.close();
-    }
-
-    // 3. Folder -> Music -> More -> Delete -> Confirm -> system Back leaves folder.
-    {
-      const context = await browser.newContext({ viewport: { width: 390, height: 844 }, colorScheme: 'dark' });
-      const page = await context.newPage();
-      page.on('console', (msg) => {
-        if (msg.type() === 'error') consoleErrors.push(msg.text());
-      });
-      page.on('pageerror', (err) => pageErrors.push(String(err)));
-
-      await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FMusic`, { waitUntil: 'domcontentloaded' });
-      await page.locator('a.row', { hasText: 'Album' }).first().click();
-      await page.locator('a.row', { hasText: '01 - Morning Light.flac' }).waitFor({ timeout: 5000 });
-      const albumHash = await page.evaluate(() => window.location.hash);
-
-      await page.locator('a.row', { hasText: '01 - Morning Light.flac' }).click();
-      await page.locator('audio[data-legion-music-audio][src]').waitFor({ state: 'attached', timeout: 5000 });
-      await page.locator('.viewer button[aria-label="More options"]').click();
-      await page.locator('.sheet button', { hasText: 'Delete' }).click();
-      await page.locator('.sheet button.danger', { hasText: 'Delete' }).click();
-      await page.locator('.viewer').waitFor({ state: 'detached', timeout: 5000 });
-      await page.waitForTimeout(150);
-
-      assert.equal(await page.evaluate(() => window.location.hash), albumHash);
-      assert.equal(await page.locator('a.row', { hasText: '01 - Morning Light.flac' }).count(), 0);
-
-      await page.evaluate(() => window.history.back());
-      await page.waitForFunction(
-        () => decodeURIComponent(window.location.hash).endsWith('/home/me/Music'),
-        null,
-        { timeout: 5000 },
-      );
-      assert.equal(await page.locator('.viewer').count(), 0);
-      await context.close();
-    }
-
-    // 4. Deep-linked viewer -> Delete -> Confirm -> viewer replaced in place with folder; Back goes to prior page.
-    {
-      const context = await browser.newContext({ viewport: { width: 390, height: 844 }, colorScheme: 'dark' });
-      const page = await context.newPage();
-      page.on('console', (msg) => {
-        if (msg.type() === 'error') consoleErrors.push(msg.text());
-      });
-      page.on('pageerror', (err) => pageErrors.push(String(err)));
-
-      await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FVideos`, { waitUntil: 'domcontentloaded' });
-      await page.locator('a.row', { hasText: 'Holiday' }).waitFor({ timeout: 5000 });
-      await page.goto(
-        `${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday?view=${encodeURIComponent('/home/me/Videos/Holiday/IMG_2042.jpg')}`,
-        { waitUntil: 'domcontentloaded' },
-      );
-      await page.locator('.viewer').waitFor({ timeout: 5000 });
-      await page.locator('.viewer button[aria-label="More options"]').click();
-      await page.locator('.sheet button', { hasText: 'Delete' }).click();
-      await page.locator('.sheet button.danger', { hasText: 'Delete' }).click();
-      await page.locator('.viewer').waitFor({ state: 'detached', timeout: 5000 });
-      await page.waitForTimeout(150);
-
-      assert.equal(
-        decodeURIComponent(await page.evaluate(() => window.location.hash)),
-        '#/files/tower//home/me/Videos/Holiday',
-      );
-      assert.equal(await page.locator('.grid a.cell[aria-label="IMG_2042.jpg"]').count(), 0);
-
-      await page.evaluate(() => window.history.back());
-      await page.waitForFunction(
-        () => decodeURIComponent(window.location.hash).endsWith('/home/me/Videos'),
-        null,
-        { timeout: 5000 },
-      );
-      assert.equal(await page.locator('.viewer').count(), 0);
-      await context.close();
-    }
-
-    assert.deepEqual(consoleErrors, [], `Console errors: ${consoleErrors.join('; ')}`);
-    assert.deepEqual(pageErrors, [], `Page errors: ${pageErrors.join('; ')}`);
-  } finally {
-    await browser.close();
-    await server.stop();
-  }
-});
-
-
-test('Player: window-hidden pause stays resumable across loopback teardown, mints one fresh URL on play, and never loops on a dead URL', async () => {
-  const sampleVideoBuf = Buffer.from(SAMPLE_VIDEO_WEBM_BASE64, 'base64');
-  let activeGeneration = 1;
-  let deadGeneration = 0;
-  let serveBrokenFresh = false;
-  const ticketHits = new Map();
-
-  // Serve UI plus a controllable `/test-media/<gen>/clip.webm` loopback endpoint so we can
-  // simulate a loopback listener teardown that kills generation 1 while keeping generation 2 alive.
-  const server = http.createServer((req, res) => {
-    const parsed = new URL(req.url || '/', 'http://127.0.0.1');
-    const mediaMatch = /^\/test-media\/(\d+)\/clip\.webm$/.exec(parsed.pathname);
-    if (mediaMatch) {
-      const gen = Number(mediaMatch[1]);
-      ticketHits.set(gen, (ticketHits.get(gen) || 0) + 1);
-      if (gen <= deadGeneration || (serveBrokenFresh && gen >= 2)) {
-        res.writeHead(410, { 'Content-Type': 'text/plain' });
-        res.end('Gone');
-        return;
+        // Another Back leaves Videos cleanly for /home/me.
+        await page.evaluate(() => window.history.back());
+        await tracker.waitForFn(
+          page,
+          () => decodeURIComponent(window.location.hash).endsWith('/home/me'),
+          null,
+          'Back to /home/me after picture delete',
+        );
+        assert.equal(await page.locator('.viewer').count(), 0);
+        await context.close();
       }
-      const range = req.headers.range;
-      if (range) {
-        const m = /^bytes=(\d+)-(\d*)$/.exec(range);
-        const start = m ? Number(m[1]) : 0;
-        const end = m && m[2] ? Math.min(Number(m[2]), sampleVideoBuf.length - 1) : sampleVideoBuf.length - 1;
-        const slice = sampleVideoBuf.subarray(start, end + 1);
-        res.writeHead(206, {
+
+      // 2. Folder -> Video -> Full screen -> Next sibling -> More -> Delete -> Confirm -> system Back leaves folder.
+      {
+        tracker.setStep('delete fullscreen video from viewer and check Back history');
+        const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
+        const page = tracker.attach(await context.newPage(), {
+          label: 'delete-video',
+          collectConsole: consoleErrors,
+          collectPage: pageErrors,
+        });
+
+        await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FVideos`, { waitUntil: 'domcontentloaded' });
+        await page.locator('a.row', { hasText: 'Holiday' }).first().click();
+        await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').waitFor();
+        const holidayHash = await page.evaluate(() => window.location.hash);
+
+        await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').click();
+        await page.locator('.viewer video.viewer-video[src]').waitFor();
+        await page.locator('.viewer button[aria-label="Full screen"]').click();
+        await page.locator('.viewer button[aria-label="Exit full screen"]').waitFor();
+
+        // Step to Beach.mp4 while in full screen, then delete it via More -> Delete.
+        await page.keyboard.press('n');
+        await page.locator('.player-top .name', { hasText: 'Beach.mp4' }).waitFor();
+        await page.locator('.viewer button[aria-label="More options"]').click();
+        await page.locator('.sheet button', { hasText: 'Delete' }).click();
+        await page.locator('.sheet button.danger', { hasText: 'Delete' }).click();
+        await tracker.waitForLocator(page.locator('.viewer'), 'viewer detached after video delete', {
+          state: 'detached',
+        });
+        await tracker.waitForFn(
+          page,
+          (expected) => window.location.hash === expected && !document.querySelector('.grid a.cell[aria-label="Beach.mp4"]'),
+          holidayHash,
+          'hash restored and Beach.mp4 detached',
+        );
+
+        assert.equal(await page.evaluate(() => window.location.hash), holidayHash);
+        assert.equal(await page.locator('.grid a.cell[aria-label="Beach.mp4"]').count(), 0);
+
+        await page.evaluate(() => window.history.back());
+        await tracker.waitForFn(
+          page,
+          () => decodeURIComponent(window.location.hash).endsWith('/home/me/Videos'),
+          null,
+          'Back to /home/me/Videos after video delete',
+        );
+        assert.equal(await page.locator('.viewer').count(), 0);
+        await context.close();
+      }
+
+      // 3. Folder -> Music -> More -> Delete -> Confirm -> system Back leaves folder.
+      {
+        tracker.setStep('delete music track from viewer and check Back history');
+        const context = await browser.newContext({ viewport: { width: 390, height: 844 }, colorScheme: 'dark' });
+        const page = tracker.attach(await context.newPage(), {
+          label: 'delete-music',
+          collectConsole: consoleErrors,
+          collectPage: pageErrors,
+        });
+
+        await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FMusic`, { waitUntil: 'domcontentloaded' });
+        await page.locator('a.row', { hasText: 'Album' }).first().click();
+        await page.locator('a.row', { hasText: '01 - Morning Light.flac' }).waitFor();
+        const albumHash = await page.evaluate(() => window.location.hash);
+
+        await page.locator('a.row', { hasText: '01 - Morning Light.flac' }).click();
+        await tracker.waitForLocator(
+          page.locator('audio[data-legion-music-audio][src]'),
+          'delete music track audio[src]',
+          { state: 'attached' },
+        );
+        await page.locator('.viewer button[aria-label="More options"]').click();
+        await page.locator('.sheet button', { hasText: 'Delete' }).click();
+        await page.locator('.sheet button.danger', { hasText: 'Delete' }).click();
+        await tracker.waitForLocator(page.locator('.viewer'), 'viewer detached after music delete', {
+          state: 'detached',
+        });
+        await tracker.waitForFn(
+          page,
+          (expected) =>
+            window.location.hash === expected &&
+            ![...document.querySelectorAll('a.row')].some((r) => r.textContent?.includes('01 - Morning Light.flac')),
+          albumHash,
+          'hash restored and 01 - Morning Light.flac detached',
+        );
+
+        assert.equal(await page.evaluate(() => window.location.hash), albumHash);
+        assert.equal(await page.locator('a.row', { hasText: '01 - Morning Light.flac' }).count(), 0);
+
+        await page.evaluate(() => window.history.back());
+        await tracker.waitForFn(
+          page,
+          () => decodeURIComponent(window.location.hash).endsWith('/home/me/Music'),
+          null,
+          'Back to /home/me/Music after track delete',
+        );
+        assert.equal(await page.locator('.viewer').count(), 0);
+        await context.close();
+      }
+
+      // 4. Deep-linked viewer -> Delete -> Confirm -> viewer replaced in place with folder; Back goes to prior page.
+      {
+        tracker.setStep('delete deep-linked file from viewer and check Back history');
+        const context = await browser.newContext({ viewport: { width: 390, height: 844 }, colorScheme: 'dark' });
+        const page = tracker.attach(await context.newPage(), {
+          label: 'delete-deeplink',
+          collectConsole: consoleErrors,
+          collectPage: pageErrors,
+        });
+
+        await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FVideos`, { waitUntil: 'domcontentloaded' });
+        await page.locator('a.row', { hasText: 'Holiday' }).waitFor();
+        await page.goto(
+          `${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday?view=${encodeURIComponent('/home/me/Videos/Holiday/IMG_2042.jpg')}`,
+          { waitUntil: 'domcontentloaded' },
+        );
+        await page.locator('.viewer').waitFor();
+        await page.locator('.viewer button[aria-label="More options"]').click();
+        await page.locator('.sheet button', { hasText: 'Delete' }).click();
+        await page.locator('.sheet button.danger', { hasText: 'Delete' }).click();
+        await tracker.waitForLocator(page.locator('.viewer'), 'viewer detached after deep-link delete', {
+          state: 'detached',
+        });
+        await tracker.waitForFn(
+          page,
+          () =>
+            decodeURIComponent(window.location.hash) === '#/files/tower//home/me/Videos/Holiday' &&
+            !document.querySelector('.grid a.cell[aria-label="IMG_2042.jpg"]'),
+          null,
+          'deep-link hash replaced with Holiday folder and IMG_2042.jpg detached',
+        );
+
+        assert.equal(
+          decodeURIComponent(await page.evaluate(() => window.location.hash)),
+          '#/files/tower//home/me/Videos/Holiday',
+        );
+        assert.equal(await page.locator('.grid a.cell[aria-label="IMG_2042.jpg"]').count(), 0);
+
+        await page.evaluate(() => window.history.back());
+        await tracker.waitForFn(
+          page,
+          () => decodeURIComponent(window.location.hash).endsWith('/home/me/Videos'),
+          null,
+          'Back to /home/me/Videos after deep-link delete',
+        );
+        assert.equal(await page.locator('.viewer').count(), 0);
+        await context.close();
+      }
+
+      assert.deepEqual(consoleErrors, [], `Console errors: ${consoleErrors.join('; ')}`);
+      assert.deepEqual(pageErrors, [], `Page errors: ${pageErrors.join('; ')}`);
+    } finally {
+      await browser.close();
+      await server.stop();
+    }
+  },
+);
+
+browserTest(
+  'Player: window-hidden pause stays resumable across loopback teardown, mints one fresh URL on play, and never loops on a dead URL',
+  { timeout: 120_000 },
+  async (_t, tracker) => {
+    const sampleVideoBuf = Buffer.from(SAMPLE_VIDEO_WEBM_BASE64, 'base64');
+    let deadGeneration = 0;
+    let serveBrokenFresh = false;
+    const ticketHits = new Map();
+
+    // Serve UI plus a controllable `/test-media/<gen>/clip.webm` loopback endpoint so we can
+    // simulate a loopback listener teardown that kills generation 1 while keeping generation 2 alive.
+    const server = await startStaticUiServer({
+      extraHandler: (req, res) => {
+        const parsed = new URL(req.url || '/', 'http://127.0.0.1');
+        const mediaMatch = /^\/test-media\/(\d+)\/clip\.webm$/.exec(parsed.pathname);
+        if (!mediaMatch) return false;
+        const gen = Number(mediaMatch[1]);
+        ticketHits.set(gen, (ticketHits.get(gen) || 0) + 1);
+        if (gen <= deadGeneration || (serveBrokenFresh && gen >= 2)) {
+          res.writeHead(410, { 'Content-Type': 'text/plain' });
+          res.end('Gone');
+          return true;
+        }
+        const range = req.headers.range;
+        if (range) {
+          const m = /^bytes=(\d+)-(\d*)$/.exec(range);
+          const start = m ? Number(m[1]) : 0;
+          const end = m && m[2] ? Math.min(Number(m[2]), sampleVideoBuf.length - 1) : sampleVideoBuf.length - 1;
+          const slice = sampleVideoBuf.subarray(start, end + 1);
+          res.writeHead(206, {
+            'Content-Type': 'video/webm',
+            'Accept-Ranges': 'bytes',
+            'Content-Range': `bytes ${start}-${end}/${sampleVideoBuf.length}`,
+            'Content-Length': String(slice.length),
+          });
+          if (req.method === 'HEAD') res.end();
+          else res.end(slice);
+          return true;
+        }
+        res.writeHead(200, {
           'Content-Type': 'video/webm',
           'Accept-Ranges': 'bytes',
-          'Content-Range': `bytes ${start}-${end}/${sampleVideoBuf.length}`,
-          'Content-Length': String(slice.length),
+          'Content-Length': String(sampleVideoBuf.length),
         });
         if (req.method === 'HEAD') res.end();
-        else res.end(slice);
-        return;
-      }
-      res.writeHead(200, {
-        'Content-Type': 'video/webm',
-        'Accept-Ranges': 'bytes',
-        'Content-Length': String(sampleVideoBuf.length),
-      });
-      if (req.method === 'HEAD') res.end();
-      else res.end(sampleVideoBuf);
-      return;
-    }
-
-    let rel = decodeURIComponent(parsed.pathname);
-    if (rel === '/') rel = '/index.html';
-    const full = path.resolve(UI_ROOT, `.${rel}`);
-    if (!full.startsWith(UI_ROOT) || !fs.existsSync(full) || fs.statSync(full).isDirectory()) {
-      res.writeHead(404);
-      res.end('Not found');
-      return;
-    }
-    const ext = path.extname(full).toLowerCase();
-    const headers = {
-      'Content-Type': MIME_BY_EXT[ext] || 'application/octet-stream',
-      'X-Content-Type-Options': 'nosniff',
-    };
-    if (ext === '.html') {
-      headers['Content-Security-Policy'] = MOCK_TEST_CSP;
-    }
-    res.writeHead(200, headers);
-    fs.createReadStream(full).pipe(res);
-  });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const baseUrl = `http://127.0.0.1:${server.address().port}`;
-
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu', '--autoplay-policy=no-user-gesture-required'],
-  });
-  const consoleErrors = [];
-  const pageErrors = [];
-
-  try {
-    // 1. Playing video -> desktop window hides -> loopback tears down old URL -> stays paused
-    //    without retrying while hidden -> pressing Play mints one fresh URL and resumes playing.
-    {
-      const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
-      await context.addInitScript((origin) => {
-        window.__TEST_MINTS__ = [];
-        window.__TEST_REVOKES__ = [];
-        window.__TEST_GEN__ = 1;
-        window.__LEGION_MOCK_OVERRIDE_CONTENT_URL__ = async ({ path: p }) => {
-          if (String(p || '').endsWith('.mp4')) {
-            const gen = window.__TEST_GEN__++;
-            const url = `${origin}/test-media/${gen}/clip.webm`;
-            window.__TEST_MINTS__.push(url);
-            return { url, expires_in: 120 };
-          }
-          return null;
-        };
-        window.__LEGION_MOCK_ON_REVOKE_CONTENT_URL__ = (url) => {
-          window.__TEST_REVOKES__.push(url);
-        };
-      }, baseUrl);
-
-      const page = await context.newPage();
-      page.on('console', (msg) => {
-        if (msg.type() === 'error') consoleErrors.push(msg.text());
-      });
-      page.on('pageerror', (err) => pageErrors.push(String(err)));
-
-      await page.goto(`${baseUrl}/?mock#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
-        waitUntil: 'domcontentloaded',
-      });
-      await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').click();
-      await page.locator('.viewer video.viewer-video[src]').waitFor({ timeout: 5000 });
-      await page.waitForFunction(() => {
-        const v = document.querySelector('.viewer video');
-        return Boolean(v && v.readyState >= 1);
-      });
-
-      // Play to ~1.2 s so we verify position preservation across teardown + fresh mint.
-      await page.evaluate(async () => {
-        const v = document.querySelector('.viewer video');
-        v.currentTime = 1.2;
-        await v.play();
-      });
-      await page.waitForFunction(() => {
-        const v = document.querySelector('.viewer video');
-        return Boolean(v && !v.paused && v.currentTime >= 1.1);
-      });
-      assert.equal(await page.evaluate(() => window.__TEST_MINTS__.length), 1);
-
-      // Hide desktop window -> pauses in place, then simulate loopback teardown killing gen 1
-      // and firing an aborted-stream error on the paused video element.
-      await page.evaluate(() => window.__LEGION_MOCK_TRIGGER_WINDOW_HIDDEN__?.());
-      deadGeneration = 1;
-      await page.evaluate(() => {
-        const v = document.querySelector('.viewer video');
-        v.dispatchEvent(new Event('error'));
-      });
-      await page.waitForTimeout(300);
-
-      // Must NOT auto-mint while hidden/paused and must NOT unmount into an error screen.
-      assert.equal(await page.evaluate(() => window.__TEST_MINTS__.length), 1);
-      assert.equal(await page.locator('.viewer video.viewer-video').count(), 1);
-      assert.equal(await page.locator('.viewer-stage .said').count(), 0);
-      assert.equal(await page.evaluate(() => document.querySelector('.viewer video')?.paused), true);
-
-      // User returns and presses Space (Play) -> mints ONE fresh URL (gen 2), revokes gen 1,
-      // seeks back near 1.2 s, and resumes playback.
-      await page.keyboard.press('Space');
-      await page.waitForFunction(
-        () => {
-          const v = document.querySelector('.viewer video');
-          return Boolean(
-            v &&
-              v.getAttribute('src')?.includes('/test-media/2/clip.webm') &&
-              v.readyState >= 1 &&
-              !v.paused,
-          );
-        },
-        null,
-        { timeout: 5000 },
-      );
-      const stateAfterResume = await page.evaluate(() => {
-        const v = document.querySelector('.viewer video');
-        return {
-          mints: window.__TEST_MINTS__.length,
-          revokes: window.__TEST_REVOKES__,
-          currentTime: v?.currentTime ?? 0,
-          paused: v?.paused ?? true,
-        };
-      });
-      assert.equal(stateAfterResume.mints, 2);
-      assert.ok(
-        stateAfterResume.revokes.some((u) => u.includes('/test-media/1/clip.webm')),
-        `Expected dead URL gen 1 to be revoked, got ${JSON.stringify(stateAfterResume.revokes)}`,
-      );
-      assert.ok(stateAfterResume.currentTime >= 1.0, `Expected resumed time near 1.2s, got ${stateAfterResume.currentTime}`);
-      assert.equal(stateAfterResume.paused, false);
-      await context.close();
-    }
-
-    // 2. If the freshly minted URL after teardown ALSO fails (e.g. server still down), stop after
-    //    ONE fresh mint and never retry a dead URL in a loop.
-    {
-      deadGeneration = 0;
-      serveBrokenFresh = false;
-      const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
-      await context.addInitScript((origin) => {
-        window.__TEST_MINTS__ = [];
-        window.__TEST_GEN__ = 1;
-        window.__LEGION_MOCK_OVERRIDE_CONTENT_URL__ = async ({ path: p }) => {
-          if (String(p || '').endsWith('.mp4')) {
-            const gen = window.__TEST_GEN__++;
-            const url = `${origin}/test-media/${gen}/clip.webm`;
-            window.__TEST_MINTS__.push(url);
-            return { url, expires_in: 120 };
-          }
-          return null;
-        };
-      }, baseUrl);
-
-      const page = await context.newPage();
-      page.on('pageerror', (err) => pageErrors.push(String(err)));
-
-      await page.goto(`${baseUrl}/?mock#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
-        waitUntil: 'domcontentloaded',
-      });
-      await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').click();
-      await page.locator('.viewer video.viewer-video[src]').waitFor({ timeout: 5000 });
-      await page.waitForFunction(() => {
-        const v = document.querySelector('.viewer video');
-        return Boolean(v && v.readyState >= 1);
-      });
-
-      await page.evaluate(() => window.__LEGION_MOCK_TRIGGER_WINDOW_HIDDEN__?.());
-      deadGeneration = 1;
-      serveBrokenFresh = true;
-      await page.evaluate(() => {
-        const v = document.querySelector('.viewer video');
-        v.dispatchEvent(new Event('error'));
-      });
-      await page.waitForTimeout(200);
-      assert.equal(await page.evaluate(() => window.__TEST_MINTS__.length), 1);
-
-      // Press Play -> mints exactly ONE fresh URL (gen 2), which returns 410 -> settles on honest
-      // error screen without ever minting gen 3 or looping.
-      await page.keyboard.press('Space');
-      await page.locator('.viewer-stage .said').waitFor({ timeout: 5000 });
-      await page.waitForTimeout(300);
-      assert.equal(await page.evaluate(() => window.__TEST_MINTS__.length), 2);
-      await context.close();
-    }
-
-    assert.deepEqual(pageErrors, [], `Page errors: ${pageErrors.join('; ')}`);
-  } finally {
-    await browser.close();
-    await new Promise((resolve) => server.close(resolve));
-  }
-});
-
-test('Player: wide 1440x900 two-pane split layout isolates inert panes and rail, restores opener focus in either pane, and handles full screen and window hide', async () => {
-  const server = await startStaticUiServer();
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu', '--autoplay-policy=no-user-gesture-required'],
-  });
-  const consoleErrors = [];
-  const pageErrors = [];
-
-  try {
-    const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, colorScheme: 'dark' });
-    const page = await context.newPage();
-    page.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
+        else res.end(sampleVideoBuf);
+        return true;
+      },
     });
-    page.on('pageerror', (err) => pageErrors.push(String(err)));
+    const baseUrl = server.url;
+
+    const browser = await launchBrowser({ autoplay: true });
+    const consoleErrors = [];
+    const pageErrors = [];
+
+    try {
+      // 1. Playing video -> desktop window hides -> loopback tears down old URL -> stays paused
+      //    without retrying while hidden -> pressing Play mints one fresh URL and resumes playing.
+      {
+        tracker.setStep('loopback teardown while hidden resumes with one fresh URL');
+        const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
+        await context.addInitScript((origin) => {
+          window.__TEST_MINTS__ = [];
+          window.__TEST_REVOKES__ = [];
+          window.__TEST_GEN__ = 1;
+          window.__LEGION_MOCK_OVERRIDE_CONTENT_URL__ = async ({ path: p }) => {
+            if (String(p || '').endsWith('.mp4')) {
+              const gen = window.__TEST_GEN__++;
+              const url = `${origin}/test-media/${gen}/clip.webm`;
+              window.__TEST_MINTS__.push(url);
+              return { url, expires_in: 120 };
+            }
+            return null;
+          };
+          window.__LEGION_MOCK_ON_REVOKE_CONTENT_URL__ = (url) => {
+            window.__TEST_REVOKES__.push(url);
+          };
+        }, baseUrl);
+
+        const page = tracker.attach(await context.newPage(), {
+          label: 'teardown-resume',
+          collectConsole: consoleErrors,
+          collectPage: pageErrors,
+        });
+
+        await page.goto(`${baseUrl}/?mock#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
+          waitUntil: 'domcontentloaded',
+        });
+        await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').click();
+        await tracker.waitForLocator(page.locator('.viewer video.viewer-video[src]'), 'gen 1 video[src]');
+        await tracker.waitForFn(
+          page,
+          () => {
+            const v = document.querySelector('.viewer video');
+            return Boolean(v && v.readyState >= 1);
+          },
+          null,
+          'gen 1 video readyState >= 1',
+        );
+
+        // Play to ~1.2 s so we verify position preservation across teardown + fresh mint.
+        await page.evaluate(async () => {
+          const v = document.querySelector('.viewer video');
+          v.currentTime = 1.2;
+          await v.play();
+        });
+        await tracker.waitForFn(
+          page,
+          () => {
+            const v = document.querySelector('.viewer video');
+            return Boolean(v && !v.paused && v.currentTime >= 1.1);
+          },
+          null,
+          'gen 1 playing past 1.1s',
+        );
+        assert.equal(await page.evaluate(() => window.__TEST_MINTS__.length), 1);
+
+        // Hide desktop window -> pauses in place, then simulate loopback teardown killing gen 1
+        // and firing an aborted-stream error on the paused video element.
+        await page.evaluate(() => window.__LEGION_MOCK_TRIGGER_WINDOW_HIDDEN__?.());
+        deadGeneration = 1;
+        await page.evaluate(() => {
+          const v = document.querySelector('.viewer video');
+          v.dispatchEvent(new Event('error'));
+        });
+        await waitForLayoutSettled(page, 4);
+
+        // Must NOT auto-mint while hidden/paused and must NOT unmount into an error screen.
+        assert.equal(await page.evaluate(() => window.__TEST_MINTS__.length), 1);
+        assert.equal(await page.locator('.viewer video.viewer-video').count(), 1);
+        assert.equal(await page.locator('.viewer-stage .said').count(), 0);
+        assert.equal(await page.evaluate(() => document.querySelector('.viewer video')?.paused), true);
+
+        // User returns and presses Space (Play) -> mints ONE fresh URL (gen 2), revokes gen 1,
+        // seeks back near 1.2 s, and resumes playback.
+        await page.keyboard.press('Space');
+        await tracker.waitForFn(
+          page,
+          () => {
+            const v = document.querySelector('.viewer video');
+            return Boolean(
+              v &&
+                v.getAttribute('src')?.includes('/test-media/2/clip.webm') &&
+                v.readyState >= 1 &&
+                !v.paused,
+            );
+          },
+          null,
+          'gen 2 video playing after Space resume',
+        );
+        const stateAfterResume = await page.evaluate(() => {
+          const v = document.querySelector('.viewer video');
+          return {
+            mints: window.__TEST_MINTS__.length,
+            revokes: window.__TEST_REVOKES__,
+            currentTime: v?.currentTime ?? 0,
+            paused: v?.paused ?? true,
+          };
+        });
+        assert.equal(stateAfterResume.mints, 2);
+        assert.ok(
+          stateAfterResume.revokes.some((u) => u.includes('/test-media/1/clip.webm')),
+          `Expected dead URL gen 1 to be revoked, got ${JSON.stringify(stateAfterResume.revokes)}`,
+        );
+        assert.ok(stateAfterResume.currentTime >= 1.0, `Expected resumed time near 1.2s, got ${stateAfterResume.currentTime}`);
+        assert.equal(stateAfterResume.paused, false);
+        await context.close();
+      }
+
+      // 2. If the freshly minted URL after teardown ALSO fails (e.g. server still down), stop after
+      //    ONE fresh mint and never retry a dead URL in a loop.
+      {
+        tracker.setStep('broken fresh URL settles after single retry');
+        deadGeneration = 0;
+        serveBrokenFresh = false;
+        const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
+        await context.addInitScript((origin) => {
+          window.__TEST_MINTS__ = [];
+          window.__TEST_GEN__ = 1;
+          window.__LEGION_MOCK_OVERRIDE_CONTENT_URL__ = async ({ path: p }) => {
+            if (String(p || '').endsWith('.mp4')) {
+              const gen = window.__TEST_GEN__++;
+              const url = `${origin}/test-media/${gen}/clip.webm`;
+              window.__TEST_MINTS__.push(url);
+              return { url, expires_in: 120 };
+            }
+            return null;
+          };
+        }, baseUrl);
+
+        const page = tracker.attach(await context.newPage(), {
+          label: 'teardown-broken-fresh',
+          collectPage: pageErrors,
+        });
+
+        await page.goto(`${baseUrl}/?mock#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
+          waitUntil: 'domcontentloaded',
+        });
+        await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').click();
+        await tracker.waitForLocator(page.locator('.viewer video.viewer-video[src]'), 'gen 1 video[src] (part 2)');
+        await tracker.waitForFn(
+          page,
+          () => {
+            const v = document.querySelector('.viewer video');
+            return Boolean(v && v.readyState >= 1);
+          },
+          null,
+          'gen 1 readyState >= 1 (part 2)',
+        );
+
+        await page.evaluate(() => window.__LEGION_MOCK_TRIGGER_WINDOW_HIDDEN__?.());
+        deadGeneration = 1;
+        serveBrokenFresh = true;
+        await page.evaluate(() => {
+          const v = document.querySelector('.viewer video');
+          v.dispatchEvent(new Event('error'));
+        });
+        await waitForLayoutSettled(page, 4);
+        assert.equal(await page.evaluate(() => window.__TEST_MINTS__.length), 1);
+
+        // Press Play -> mints exactly ONE fresh URL (gen 2), which returns 410 -> settles on honest
+        // error screen without ever minting gen 3 or looping.
+        await page.keyboard.press('Space');
+        await tracker.waitForLocator(page.locator('.viewer-stage .said'), 'honest error screen after broken gen 2');
+        await waitForLayoutSettled(page, 4);
+        assert.equal(await page.evaluate(() => window.__TEST_MINTS__.length), 2);
+        await context.close();
+      }
+
+      assert.deepEqual(pageErrors, [], `Page errors: ${pageErrors.join('; ')}`);
+    } finally {
+      await browser.close();
+      await server.stop();
+    }
+  },
+);
+
+browserTest(
+  'Player: wide 1440x900 two-pane split layout isolates inert panes and rail, restores opener focus in either pane, and handles full screen and window hide',
+  { timeout: 120_000 },
+  async (_t, tracker) => {
+    const server = await startStaticUiServer();
+    const browser = await launchBrowser({ autoplay: true });
+    const consoleErrors = [];
+    const pageErrors = [];
+
+    try {
+      const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, colorScheme: 'dark' });
+      const page = tracker.attach(await context.newPage(), {
+        label: 'wide-1440-split',
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
 
     await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
       waitUntil: 'domcontentloaded',
@@ -1907,10 +2069,15 @@ test('Player: wide 1440x900 two-pane split layout isolates inert panes and rail,
     await rightCell.focus();
     await rightCell.click();
     await page.locator('.viewer video.viewer-video[src]').waitFor({ timeout: 5000 });
-    await page.waitForFunction(() => {
-      const v = document.querySelector('.viewer video');
-      return Boolean(v && v.readyState >= 1);
-    });
+    await tracker.waitForFn(
+      page,
+      () => {
+        const v = document.querySelector('.viewer video');
+        return Boolean(v && v.readyState >= 1);
+      },
+      null,
+      'wide split right-pane video readyState >= 1',
+    );
     await assertShellInert(true);
 
     await page.evaluate(() => {
@@ -1918,13 +2085,13 @@ test('Player: wide 1440x900 two-pane split layout isolates inert panes and rail,
       window.__LEGION_MOCK_KEEP_SCREEN_ON_CALLS__.length = 0;
     });
     await page.locator('.viewer button[aria-label="Full screen"]').click();
-    await page.locator('.viewer button[aria-label="Exit full screen"]').waitFor({ timeout: 3000 });
+    await page.locator('.viewer button[aria-label="Exit full screen"]').waitFor();
     assert.deepEqual(
       await page.evaluate(() => window.__LEGION_MOCK_IMMERSIVE_CALLS__.map((c) => c.on)),
       [true],
     );
     await page.locator('.viewer button[aria-label="Exit full screen"]').click();
-    await page.locator('.viewer button[aria-label="Full screen"]').waitFor({ timeout: 3000 });
+    await page.locator('.viewer button[aria-label="Full screen"]').waitFor();
     assert.deepEqual(
       await page.evaluate(() => window.__LEGION_MOCK_IMMERSIVE_CALLS__.map((c) => c.on)),
       [true, false],
@@ -1933,18 +2100,23 @@ test('Player: wide 1440x900 two-pane split layout isolates inert panes and rail,
     // Re-enter full screen, start playing, then trigger desktop window-hidden -> pauses in place,
     // leaves full screen, releases keepScreenOn, and keeps the viewer open.
     await page.locator('.viewer button[aria-label="Full screen"]').click();
-    await page.locator('.viewer button[aria-label="Exit full screen"]').waitFor({ timeout: 3000 });
+    await page.locator('.viewer button[aria-label="Exit full screen"]').waitFor();
     await page.evaluate(async () => {
       const v = document.querySelector('.viewer video');
       await v.play();
     });
-    await page.waitForFunction(() => {
-      const v = document.querySelector('.viewer video');
-      return Boolean(v && !v.paused);
-    });
+    await tracker.waitForFn(
+      page,
+      () => {
+        const v = document.querySelector('.viewer video');
+        return Boolean(v && !v.paused);
+      },
+      null,
+      'wide split video playing before window hide',
+    );
 
     await page.evaluate(() => window.__LEGION_MOCK_TRIGGER_WINDOW_HIDDEN__?.());
-    await page.locator('.viewer button[aria-label="Full screen"]').waitFor({ timeout: 3000 });
+    await page.locator('.viewer button[aria-label="Full screen"]').waitFor();
     const afterHideVideo = await page.evaluate(() => ({
       paused: document.querySelector('.viewer video')?.paused ?? false,
       keepScreenOnLast: window.__LEGION_MOCK_KEEP_SCREEN_ON_CALLS__.at(-1)?.on,
@@ -1957,7 +2129,7 @@ test('Player: wide 1440x900 two-pane split layout isolates inert panes and rail,
     assert.equal(afterHideVideo.viewerStillOpen, true);
 
     await page.keyboard.press('Escape');
-    await page.locator('.viewer').waitFor({ state: 'detached', timeout: 5000 });
+    await page.locator('.viewer').waitFor({ state: 'detached' });
     await assertShellInert(false);
     const rightFocusAfterClose = await page.evaluate(() => ({
       inRight: Boolean(document.activeElement?.closest('.split-right')),
@@ -1968,26 +2140,39 @@ test('Player: wide 1440x900 two-pane split layout isolates inert panes and rail,
 
     // 3. Open music row from the right pane -> both panes and rail inert, window-hidden pauses
     //    audio in place, and close returns focus to that exact right-pane music row.
+    tracker.setStep('wide split right-pane music playback and window hide');
     await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FMusic%2FAlbum`, {
       waitUntil: 'domcontentloaded',
     });
     const musicRow = page.locator('.split-right a.row', { hasText: '01 - Morning Light.flac' });
-    await musicRow.waitFor({ timeout: 5000 });
+    await musicRow.waitFor();
     await musicRow.focus();
     await musicRow.click();
-    await page.locator('audio[data-legion-music-audio][src]').waitFor({ state: 'attached', timeout: 5000 });
+    await tracker.waitForLocator(
+      page.locator('audio[data-legion-music-audio][src]'),
+      'wide split music audio[src]',
+      { state: 'attached' },
+    );
     await assertShellInert(true);
 
-    await page.locator('.music-play-btn').click();
-    await page.waitForFunction(() => {
+    await page.evaluate(async () => {
       const a = document.querySelector('audio[data-legion-music-audio]');
-      return Boolean(a && !a.paused);
+      await a.play();
     });
+    await tracker.waitForFn(
+      page,
+      () => {
+        const a = document.querySelector('audio[data-legion-music-audio]');
+        return Boolean(a && !a.paused);
+      },
+      null,
+      'wide split music playing before window hide',
+    );
     await page.evaluate(() => window.__LEGION_MOCK_TRIGGER_WINDOW_HIDDEN__?.());
     assert.equal(await page.evaluate(() => document.querySelector('audio[data-legion-music-audio]')?.paused), true);
 
     await page.keyboard.press('Escape');
-    await page.locator('.viewer').waitFor({ state: 'detached', timeout: 5000 });
+    await page.locator('.viewer').waitFor({ state: 'detached' });
     await assertShellInert(false);
     const musicFocusAfterClose = await page.evaluate(() => ({
       inRight: Boolean(document.activeElement?.closest('.split-right')),
@@ -2136,819 +2321,940 @@ function makePlayerWav({ title = null, artist = null, album = null, coverPng = n
   return Buffer.concat([riff, waveBody]);
 }
 
-test('Player: real legion serve music screen reads title, artist, album, and cover from real fs.tags and fs.thumb', async (t) => {
-  if (!fs.existsSync(LEGION_BIN)) {
-    t.skip(`Release binary not found at ${LEGION_BIN}`);
-    return;
-  }
-  const cacheBase = path.join(os.homedir(), '.cache', 'legion-ui-test');
-  fs.mkdirSync(cacheBase, { recursive: true });
-  const root = fs.mkdtempSync(path.join(cacheBase, 'player-music-real-'));
-  const legionHome = path.join(root, 'legion');
-  const userHome = path.join(root, 'home');
-  const musicDir = path.join(userHome, 'Music');
-  const folderCoverDir = path.join(userHome, 'FolderCover');
-  fs.mkdirSync(path.join(legionHome, 'config'), { recursive: true });
-  fs.mkdirSync(path.join(legionHome, 'state'), { recursive: true });
-  fs.mkdirSync(musicDir, { recursive: true });
-  fs.mkdirSync(folderCoverDir, { recursive: true });
+browserTest(
+  'Player: real legion serve music screen reads title, artist, album, and cover from real fs.tags and fs.thumb',
+  { timeout: 120_000 },
+  async (t, tracker) => {
+    if (!fs.existsSync(LEGION_BIN)) {
+      t.skip(`Release binary not found at ${LEGION_BIN}`);
+      return;
+    }
+    const cacheBase = path.join(os.homedir(), '.cache', 'legion-ui-test');
+    fs.mkdirSync(cacheBase, { recursive: true });
+    const root = fs.mkdtempSync(path.join(cacheBase, 'player-music-real-'));
+    const legionHome = path.join(root, 'legion');
+    const userHome = path.join(root, 'home');
+    const musicDir = path.join(userHome, 'Music');
+    const folderCoverDir = path.join(userHome, 'FolderCover');
+    fs.mkdirSync(path.join(legionHome, 'config'), { recursive: true });
+    fs.mkdirSync(path.join(legionHome, 'state'), { recursive: true });
+    fs.mkdirSync(musicDir, { recursive: true });
+    fs.mkdirSync(folderCoverDir, { recursive: true });
 
-  const taggedPath = path.join(musicDir, '01 - harbor_file.wav');
-  const untaggedPath = path.join(musicDir, '02 - plain_recording.wav');
-  const folderTrackPath = path.join(folderCoverDir, '01 - dusk_demo.wav');
+    const taggedPath = path.join(musicDir, '01 - harbor_file.wav');
+    const untaggedPath = path.join(musicDir, '02 - plain_recording.wav');
+    const folderTrackPath = path.join(folderCoverDir, '01 - dusk_demo.wav');
 
-  fs.writeFileSync(
-    taggedPath,
-    makePlayerWav({
-      title: 'Harbor Fog',
-      artist: 'Maren',
-      album: 'North Coast',
-      coverPng: makePlayerSolidPng(180, 180, 42, 130, 195),
-      durationSecs: 2,
-    }),
-  );
-  fs.writeFileSync(untaggedPath, makePlayerWav({ durationSecs: 2 }));
-  fs.writeFileSync(folderTrackPath, makePlayerWav({ durationSecs: 2 }));
-  fs.writeFileSync(path.join(folderCoverDir, 'cover.png'), makePlayerSolidPng(160, 160, 210, 120, 45));
+    fs.writeFileSync(
+      taggedPath,
+      makePlayerWav({
+        title: 'Harbor Fog',
+        artist: 'Maren',
+        album: 'North Coast',
+        coverPng: makePlayerSolidPng(180, 180, 42, 130, 195),
+        durationSecs: 2,
+      }),
+    );
+    fs.writeFileSync(untaggedPath, makePlayerWav({ durationSecs: 2 }));
+    fs.writeFileSync(folderTrackPath, makePlayerWav({ durationSecs: 2 }));
+    fs.writeFileSync(path.join(folderCoverDir, 'cover.png'), makePlayerSolidPng(160, 160, 210, 120, 45));
 
-  fs.writeFileSync(
-    path.join(legionHome, 'config', 'node.toml'),
-    'name = "tower"\nsystem = "linux"\nbusy = "none"\n',
-  );
-  fs.writeFileSync(
-    path.join(legionHome, 'config', 'policy.toml'),
-    '[roles.operator]\nallow = ["effect:read", "effect:write"]\n\n[principals.ui]\nrole = "operator"\n',
-  );
-  fs.writeFileSync(
-    path.join(legionHome, 'config', 'fleet.toml'),
-    '[machines.tower]\nssh = "tower.example"\n',
-  );
-
-  const env = { ...process.env, LEGION_HOME: legionHome, HOME: userHome, USERPROFILE: userHome };
-  delete env.XDG_CONFIG_HOME;
-  delete env.XDG_STATE_HOME;
-  const tokenOut = JSON.parse(
-    execFileSync(LEGION_BIN, ['token.add', 'name=ui', 'principal=ui', '--json'], { env, encoding: 'utf8' }),
-  );
-
-  const child = spawn(LEGION_BIN, ['serve', '--listen', '127.0.0.1:0'], {
-    env,
-    stdio: ['ignore', 'ignore', 'pipe'],
-  });
-  let stderr = '';
-  const url = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`legion serve timeout:\n${stderr}`)), 15_000);
-    const rl = readline.createInterface({ input: child.stderr });
-    rl.on('line', (line) => {
-      stderr += `${line}\n`;
-      const prefix = 'legion serve: listening on ';
-      if (line.startsWith(prefix)) {
-        clearTimeout(timer);
-        resolve(line.slice(prefix.length).trim());
-      }
-    });
-    child.once('exit', (code) => {
-      clearTimeout(timer);
-      reject(new Error(`legion serve exited (${code}):\n${stderr}`));
-    });
-  });
-
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu', '--autoplay-policy=no-user-gesture-required'],
-  });
-  const consoleErrors = [];
-  const pageErrors = [];
-  const toolResponses = [];
-
-  try {
-    const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
-    const page = await context.newPage();
-    page.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
-    });
-    page.on('pageerror', (err) => pageErrors.push(String(err)));
-    page.on('response', async (resp) => {
-      if (!resp.url().includes('/v1/call') || resp.request().method() !== 'POST') return;
-      try {
-        const reqBody = JSON.parse(resp.request().postData() || '{}');
-        if (reqBody.tool === 'fs.tags' || reqBody.tool === 'fs.thumb') {
-          const json = await resp.json();
-          toolResponses.push({ tool: reqBody.tool, args: reqBody.args, status: resp.status(), body: json });
-        }
-      } catch {
-        // Ignore aborted or non-JSON responses during teardown.
-      }
-    });
-
-    await page.goto(`${url}/#token=${encodeURIComponent(tokenOut.token)}`, { waitUntil: 'domcontentloaded' });
-    await page.locator('.nav a[href="#/files"]').waitFor({ timeout: 10_000 });
-
-    // 1. Folder listing renders the real embedded cover via real `fs.thumb` (`size: 128`).
-    await page.goto(`${url}/#/files/tower/${encodeURIComponent(musicDir)}`, { waitUntil: 'domcontentloaded' });
-    const taggedRow = page.locator('a.row', { hasText: '01 - harbor_file.wav' });
-    await taggedRow.waitFor({ timeout: 10_000 });
-    await taggedRow.locator('.thumb img').waitFor({ timeout: 10_000 });
-    await page.waitForFunction(
-      () => {
-        const rows = [...document.querySelectorAll('a.row')];
-        const row = rows.find((r) => r.textContent?.includes('01 - harbor_file.wav'));
-        const img = row?.querySelector('.thumb img');
-        return Boolean(img && img.complete && img.naturalWidth > 0 && img.naturalHeight > 0);
-      },
-      null,
-      { timeout: 10_000 },
+    fs.writeFileSync(
+      path.join(legionHome, 'config', 'node.toml'),
+      'name = "tower"\nsystem = "linux"\nbusy = "none"\n',
+    );
+    fs.writeFileSync(
+      path.join(legionHome, 'config', 'policy.toml'),
+      '[roles.operator]\nallow = ["effect:read", "effect:write"]\n\n[principals.ui]\nrole = "operator"\n',
+    );
+    fs.writeFileSync(
+      path.join(legionHome, 'config', 'fleet.toml'),
+      '[machines.tower]\nssh = "tower.example"\n',
     );
 
-    // 2. Open tagged track -> title, artist, album, and high-res cover come from real `fs.tags` + `fs.thumb`.
-    const taggedTagsRespPromise = page.waitForResponse(async (resp) => {
-      if (!resp.url().includes('/v1/call') || resp.request().method() !== 'POST') return false;
-      try {
-        const body = JSON.parse(resp.request().postData() || '{}');
-        return body.tool === 'fs.tags' && Array.isArray(body.args?.paths) && body.args.paths.includes(taggedPath);
-      } catch {
-        return false;
-      }
-    });
-    const taggedHighResRespPromise = page.waitForResponse(async (resp) => {
-      if (!resp.url().includes('/v1/call') || resp.request().method() !== 'POST') return false;
-      try {
-        const body = JSON.parse(resp.request().postData() || '{}');
-        return (
-          body.tool === 'fs.thumb' &&
-          body.args?.size === 1024 &&
-          Array.isArray(body.args?.paths) &&
-          body.args.paths.includes(taggedPath)
-        );
-      } catch {
-        return false;
-      }
-    });
-    await taggedRow.click();
-    await page.locator('.music-screen').waitFor({ timeout: 10_000 });
-    await page.locator('.music-title', { hasText: 'Harbor Fog' }).waitFor({ timeout: 10_000 });
-    await page.locator('.music-subtitle', { hasText: 'Maren · North Coast' }).waitFor({ timeout: 10_000 });
-    const taggedTagsResp = await taggedTagsRespPromise;
-    const taggedHighResResp = await taggedHighResRespPromise;
-    assert.equal(taggedTagsResp.status(), 200);
-    const taggedTagsJson = await taggedTagsResp.json();
-    const taggedResult = taggedTagsJson?.results?.find((item) => item.path === taggedPath)?.ok;
-    assert.equal(taggedResult?.title, 'Harbor Fog');
-    assert.equal(taggedResult?.artist, 'Maren');
-    assert.equal(taggedResult?.album, 'North Coast');
-    assert.equal(taggedResult?.cover, true);
-
-    assert.equal(taggedHighResResp.status(), 200);
-    const taggedHighResJson = await taggedHighResResp.json();
-    const highResOk = taggedHighResJson?.results?.find((item) => item.path === taggedPath)?.ok;
-    assert.ok(highResOk?.mime?.startsWith('image/') && highResOk?.content, 'Expected decoded image payload from real fs.thumb');
-    const expectedCoverSrc = `data:${highResOk.mime};base64,${highResOk.content}`;
-    await page.waitForFunction(
-      (expected) => {
-        const img = document.querySelector('img.music-cover');
-        return Boolean(img && img.getAttribute('src') === expected && img.complete && img.naturalWidth > 0 && img.naturalHeight > 0);
-      },
-      expectedCoverSrc,
-      { timeout: 10_000 },
-    );
-    const taggedDom = await page.evaluate(() => ({
-      coverSrc: document.querySelector('img.music-cover')?.getAttribute('src') || '',
-      backdropSrc: document.querySelector('.music-backdrop img')?.getAttribute('src') || '',
-      mediaSessionTitle: navigator.mediaSession?.metadata?.title || '',
-      mediaSessionArtist: navigator.mediaSession?.metadata?.artist || '',
-      mediaSessionAlbum: navigator.mediaSession?.metadata?.album || '',
-    }));
-    assert.equal(taggedDom.coverSrc, expectedCoverSrc);
-    assert.equal(taggedDom.backdropSrc, expectedCoverSrc);
-    assert.equal(taggedDom.mediaSessionTitle, 'Harbor Fog');
-    assert.equal(taggedDom.mediaSessionArtist, 'Maren');
-    assert.equal(taggedDom.mediaSessionAlbum, 'North Coast');
-
-    // Real WAV audio stream plays from `/v1/content/`.
-    await page.waitForFunction(
-      () => {
-        const a = document.querySelector('audio[data-legion-music-audio]');
-        return Boolean(a && a.readyState >= 1 && Number.isFinite(a.duration) && a.duration > 0);
-      },
-      null,
-      { timeout: 10_000 },
-    );
-    await page.locator('.music-play-btn').click();
-    await page.waitForFunction(
-      () => {
-        const a = document.querySelector('audio[data-legion-music-audio]');
-        return Boolean(a && !a.paused);
-      },
-      null,
-      { timeout: 10_000 },
-    );
-    await page.locator('.music-play-btn').click();
-
-    // 3. Advance to untagged track -> real `fs.tags` reports `cover: false`, filename shown without extension,
-    //    no subtitle, no "Unknown artist", placeholder tile, and no `fs.thumb` (size 1024) call.
-    const untaggedTagsRespPromise = page.waitForResponse(async (resp) => {
-      if (!resp.url().includes('/v1/call') || resp.request().method() !== 'POST') return false;
-      try {
-        const body = JSON.parse(resp.request().postData() || '{}');
-        return body.tool === 'fs.tags' && Array.isArray(body.args?.paths) && body.args.paths.includes(untaggedPath);
-      } catch {
-        return false;
-      }
-    });
-    await page.locator('.music-screen button[aria-label="Next track"]').click();
-    await page.locator('.music-title', { hasText: '02 - plain_recording' }).waitFor({ timeout: 10_000 });
-    const untaggedTagsResp = await untaggedTagsRespPromise;
-    await page.waitForFunction(
-      () => Boolean(document.querySelector('.music-cover-tile')) && !document.querySelector('img.music-cover'),
-      null,
-      { timeout: 10_000 },
-    );
-    assert.equal(await page.locator('.music-subtitle').count(), 0);
-    assert.equal(await page.locator('.music-backdrop').count(), 0);
-    assert.equal((await page.locator('.viewer').innerText()).includes('Unknown artist'), false);
-
-    const untaggedTagsJson = await untaggedTagsResp.json();
-    const untaggedOk = untaggedTagsJson?.results?.find((item) => item.path === untaggedPath)?.ok;
-    assert.equal(untaggedOk?.cover, false);
-    assert.equal(untaggedOk?.title, undefined);
-    const untaggedHighResCall = toolResponses.find(
-      (r) =>
-        r.tool === 'fs.thumb' &&
-        r.args?.size === 1024 &&
-        Array.isArray(r.args?.paths) &&
-        r.args.paths.includes(untaggedPath),
-    );
-    assert.equal(untaggedHighResCall, undefined, 'Should skip high-res fs.thumb when real fs.tags reports cover: false');
-
-    // 4. Folder-cover fallback: untagged track next to `cover.png` gets `cover: true` from real `fs.tags`
-    //    and loads the decoded folder cover from real `fs.thumb`.
-    await page.goto(`${url}/#/files/tower/${encodeURIComponent(folderCoverDir)}`, { waitUntil: 'domcontentloaded' });
-    const folderRow = page.locator('a.row', { hasText: '01 - dusk_demo.wav' });
-    await folderRow.waitFor({ timeout: 10_000 });
-    const folderTagsRespPromise = page.waitForResponse(async (resp) => {
-      if (!resp.url().includes('/v1/call') || resp.request().method() !== 'POST') return false;
-      try {
-        const body = JSON.parse(resp.request().postData() || '{}');
-        return body.tool === 'fs.tags' && Array.isArray(body.args?.paths) && body.args.paths.includes(folderTrackPath);
-      } catch {
-        return false;
-      }
-    });
-    const folderHighResRespPromise = page.waitForResponse(async (resp) => {
-      if (!resp.url().includes('/v1/call') || resp.request().method() !== 'POST') return false;
-      try {
-        const body = JSON.parse(resp.request().postData() || '{}');
-        return (
-          body.tool === 'fs.thumb' &&
-          body.args?.size === 1024 &&
-          Array.isArray(body.args?.paths) &&
-          body.args.paths.includes(folderTrackPath)
-        );
-      } catch {
-        return false;
-      }
-    });
-    await folderRow.click();
-    await page.locator('.music-title', { hasText: '01 - dusk_demo' }).waitFor({ timeout: 10_000 });
-    const folderTagsResp = await folderTagsRespPromise;
-    const folderTagsJson = await folderTagsResp.json();
-    assert.equal(folderTagsJson?.results?.find((item) => item.path === folderTrackPath)?.ok?.cover, true);
-    const folderHighResResp = await folderHighResRespPromise;
-    assert.equal(folderHighResResp.status(), 200);
-    const folderCoverJson = await folderHighResResp.json();
-    const folderCoverOk = folderCoverJson?.results?.find((item) => item.path === folderTrackPath)?.ok;
-    assert.ok(folderCoverOk?.mime?.startsWith('image/') && folderCoverOk?.content);
-    const expectedFolderCoverSrc = `data:${folderCoverOk.mime};base64,${folderCoverOk.content}`;
-    await page.waitForFunction(
-      (expected) => {
-        const img = document.querySelector('img.music-cover');
-        return Boolean(img && img.getAttribute('src') === expected && img.complete && img.naturalWidth > 0 && img.naturalHeight > 0);
-      },
-      expectedFolderCoverSrc,
-      { timeout: 10_000 },
+    const env = { ...process.env, LEGION_HOME: legionHome, HOME: userHome, USERPROFILE: userHome };
+    delete env.XDG_CONFIG_HOME;
+    delete env.XDG_STATE_HOME;
+    const tokenOut = JSON.parse(
+      execFileSync(LEGION_BIN, ['token.add', 'name=ui', 'principal=ui', '--json'], { env, encoding: 'utf8' }),
     );
 
-    assert.deepEqual(consoleErrors, [], `Console errors: ${consoleErrors.join('; ')}`);
-    assert.deepEqual(pageErrors, [], `Page errors: ${pageErrors.join('; ')}`);
-    await context.close();
-  } finally {
-    await browser.close();
-    child.kill('SIGTERM');
-    await new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        child.kill('SIGKILL');
-        resolve();
-      }, 5000);
-      child.once('exit', () => {
-        clearTimeout(timer);
-        resolve();
+    const server = await startLegionServer(legionHome, userHome);
+    tracker.setServerStderr(server.getStderr);
+    const url = server.url;
+
+    const browser = await launchBrowser({ autoplay: true });
+    const consoleErrors = [];
+    const pageErrors = [];
+    const toolResponses = [];
+
+    try {
+      const context = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
+      const page = tracker.attach(await context.newPage(), {
+        label: 'real-music',
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
       });
-    });
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test('Player: zoom to fill, hold for 2x, scrub anywhere, and haptics work end-to-end', async () => {
-  const server = await startStaticUiServer();
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu', '--autoplay-policy=no-user-gesture-required'],
-  });
-  const consoleErrors = [];
-  const pageErrors = [];
-
-  try {
-    const context = await browser.newContext({
-      viewport: { width: 1000, height: 600 },
-      colorScheme: 'dark',
-    });
-
-    await context.addInitScript(() => {
-      let now = 1_000_000;
-      let nextId = 1;
-      const timers = new Map();
-      window.__LEGION_TEST_PLAYER_CLOCK__ = {
-        now: () => now,
-        setTimeout(fn, ms) {
-          const id = nextId++;
-          timers.set(id, { at: now + Math.max(0, ms), fn });
-          return id;
-        },
-        clearTimeout(id) {
-          timers.delete(id);
-        },
-        advance(ms) {
-          const target = now + ms;
-          while (true) {
-            let soonestId = null;
-            let soonest = null;
-            for (const [id, item] of timers.entries()) {
-              if (item.at <= target && (!soonest || item.at < soonest.at)) {
-                soonest = item;
-                soonestId = id;
-              }
-            }
-            if (!soonest) break;
-            timers.delete(soonestId);
-            now = soonest.at;
-            soonest.fn();
+      page.on('response', async (resp) => {
+        if (!resp.url().includes('/v1/call') || resp.request().method() !== 'POST') return;
+        try {
+          const reqBody = JSON.parse(resp.request().postData() || '{}');
+          if (reqBody.tool === 'fs.tags' || reqBody.tool === 'fs.thumb') {
+            const json = await resp.json();
+            toolResponses.push({ tool: reqBody.tool, args: reqBody.args, status: resp.status(), body: json });
           }
-          now = target;
-        },
-      };
-    });
-
-    const page = await context.newPage();
-    page.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
-    });
-    page.on('pageerror', (err) => pageErrors.push(String(err)));
-
-    await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
-      waitUntil: 'domcontentloaded',
-    });
-    await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').click();
-    await page.locator('.viewer video.viewer-video').waitFor();
-    await page.waitForFunction(
-      () => {
-        const v = document.querySelector('.viewer video.viewer-video');
-        return v && v.readyState >= 1 && Number.isFinite(v.duration) && v.duration > 1 && v.videoWidth > 0;
-      },
-      null,
-      { timeout: 5000 },
-    );
-
-    // Check touch-action: none on picture surface.
-    const touchAction = await page.evaluate(() => getComputedStyle(document.querySelector('.player-stage-hit')).touchAction);
-    assert.equal(touchAction, 'none');
-
-    // Read intrinsic video aspect ratio and set a viewport where fill differs by ~12% (available and <= 15% crop).
-    const dims = await page.evaluate(() => {
-      const v = document.querySelector('.viewer video.viewer-video');
-      return { w: v.videoWidth, h: v.videoHeight };
-    });
-    const videoAspect = dims.w / dims.h;
-    const moderateWidth = Math.round(600 * videoAspect * 1.12);
-    await page.setViewportSize({ width: moderateWidth, height: 600 });
-    await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
-
-    // 1. Zoom to fill does NOT exist outside full screen (`Z` and More do nothing / omit it).
-    await page.keyboard.press('z');
-    assert.equal(await page.locator('.viewer video').getAttribute('data-zoom-mode'), 'fit');
-    await page.locator('.viewer button[aria-label="More options"]').click();
-    await page.locator('.sheet').waitFor();
-    await page.waitForFunction(() => document.activeElement?.classList?.contains('sheet'));
-    assert.equal(await page.locator('.sheet button', { hasText: /Zoom to fill|Fit to screen/ }).count(), 0);
-    await page.keyboard.press('Escape');
-    await page.locator('.sheet').waitFor({ state: 'hidden' });
-
-    // Enter full screen -> `Z` toggles to fill, shows "Zoomed to fill" for 1.2 s, fires haptic tick, remembers choice.
-    await page.locator('.viewer button[aria-label="Full screen"]').click();
-    await page.locator('.viewer button[aria-label="Exit full screen"]').waitFor();
-    await page.evaluate(() => {
-      window.__LEGION_MOCK_HAPTIC_CALLS__.length = 0;
-    });
-    await page.keyboard.press('z');
-    await page.locator('.player-zoom-chip', { hasText: 'Zoomed to fill' }).waitFor();
-    const afterZFill = await page.evaluate(() => ({
-      mode: document.querySelector('.viewer video').getAttribute('data-zoom-mode'),
-      scale: Number(document.querySelector('.viewer video').getAttribute('data-zoom-scale')),
-      stored: localStorage.getItem('legion.player.zoom.v1'),
-      haptics: window.__LEGION_MOCK_HAPTIC_CALLS__.map((h) => h.kind),
-    }));
-    assert.equal(afterZFill.mode, 'fill');
-    assert.ok(afterZFill.scale > 1.08);
-    assert.equal(afterZFill.stored, 'fill');
-    assert.deepEqual(afterZFill.haptics, ['tick']);
-
-    // Chip hides after 1200 ms.
-    await page.evaluate(async () => {
-      window.__LEGION_TEST_PLAYER_CLOCK__.advance(1200);
-      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-    });
-    assert.equal(await page.locator('.player-zoom-chip').count(), 0);
-
-    // More sheet offers "Fit to screen" while zoomed, clicking toggles back to "Original".
-    await page.locator('.viewer button[aria-label="More options"]').click();
-    await page.locator('.sheet button', { hasText: 'Fit to screen' }).click();
-    await page.locator('.player-zoom-chip', { hasText: 'Original' }).waitFor();
-    assert.equal(await page.locator('.viewer video').getAttribute('data-zoom-mode'), 'fit');
-
-    // Pinch outward settles on fill, fires haptic tick, remembers fill.
-    await page.evaluate(async () => {
-      window.__LEGION_MOCK_HAPTIC_CALLS__.length = 0;
-      const stage = document.querySelector('.player-stage-hit');
-      const fire = (type, id, x, y) =>
-        stage.dispatchEvent(new PointerEvent(type, { pointerId: id, pointerType: 'touch', clientX: x, clientY: y, bubbles: true }));
-      fire('pointerdown', 11, 260, 300);
-      fire('pointerdown', 12, 340, 300);
-      window.__LEGION_TEST_PLAYER_CLOCK__.advance(60);
-      fire('pointermove', 11, 220, 300);
-      fire('pointermove', 12, 380, 300);
-      fire('pointerup', 12, 380, 300);
-      fire('pointerup', 11, 220, 300);
-      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-    });
-    assert.equal(await page.locator('.viewer video').getAttribute('data-zoom-mode'), 'fill');
-    assert.deepEqual(
-      await page.evaluate(() => window.__LEGION_MOCK_HAPTIC_CALLS__.map((h) => h.kind)),
-      ['tick'],
-    );
-
-    // Leave full screen -> resets to fit; re-enter full screen with <= 15% crop -> auto-applies remembered fill.
-    await page.keyboard.press('f');
-    await page.locator('.viewer button[aria-label="Full screen"]').waitFor();
-    assert.equal(await page.locator('.viewer video').getAttribute('data-zoom-mode'), 'fit');
-    await page.keyboard.press('f');
-    await page.locator('.viewer button[aria-label="Exit full screen"]').waitFor();
-    assert.equal(await page.locator('.viewer video').getAttribute('data-zoom-mode'), 'fill');
-
-    // Resize so fill would crop > 15% (like 4:3 on a tall phone) -> re-entering full screen starts whole ('fit').
-    await page.keyboard.press('f');
-    await page.locator('.viewer button[aria-label="Full screen"]').waitFor();
-    await page.setViewportSize({ width: Math.round(600 * videoAspect * 1.45), height: 600 });
-    await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
-    await page.keyboard.press('f');
-    await page.locator('.viewer button[aria-label="Exit full screen"]').waitFor();
-    assert.equal(await page.locator('.viewer video').getAttribute('data-zoom-mode'), 'fit');
-
-    // Resize within 3% of video aspect -> zoom is absent (Z and More offer nothing).
-    await page.setViewportSize({ width: Math.round(600 * videoAspect * 1.02), height: 600 });
-    await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
-    await page.keyboard.press('z');
-    assert.equal(await page.locator('.viewer video').getAttribute('data-zoom-mode'), 'fit');
-    await page.locator('.viewer button[aria-label="More options"]').click();
-    await page.locator('.sheet').waitFor();
-    await page.waitForFunction(() => document.activeElement?.classList?.contains('sheet'));
-    assert.equal(await page.locator('.sheet button', { hasText: /Zoom to fill|Fit to screen/ }).count(), 0);
-    await page.keyboard.press('Escape');
-    await page.locator('.sheet').waitFor({ state: 'hidden' });
-
-    // Restore roomy landscape viewport for hold and scrub tests.
-    await page.setViewportSize({ width: 1000, height: 600 });
-    await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
-
-    // 2. Hold for 2x: choose 1.5x, play, hide overlay -> pointer hold 350 ms engages 2x, pill shown,
-    //    overlay stays hidden, release restores 1.5x (not 1x) and fades pill in 120 ms.
-    await page.locator('.player-speed-btn').click();
-    await page.locator('.player-speed-menu button', { hasText: '1.5×' }).click();
-    await page.locator('.viewer button[aria-label="Play"]').click();
-    await page.locator('.viewer button[aria-label="Pause"]').waitFor();
-    // Hide overlay via single tap on stage center.
-    await page.evaluate(async () => {
-      const stage = document.querySelector('.player-stage-hit');
-      stage.dispatchEvent(new PointerEvent('pointerdown', { pointerId: 21, pointerType: 'touch', clientX: 500, clientY: 300, bubbles: true }));
-      window.__LEGION_TEST_PLAYER_CLOCK__.advance(40);
-      stage.dispatchEvent(new PointerEvent('pointerup', { pointerId: 21, pointerType: 'touch', clientX: 500, clientY: 300, bubbles: true }));
-      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-    });
-    assert.equal(await page.evaluate(() => document.querySelector('.player-overlay').classList.contains('hidden')), true);
-
-    await page.evaluate(async () => {
-      window.__LEGION_MOCK_HAPTIC_CALLS__.length = 0;
-      const stage = document.querySelector('.player-stage-hit');
-      stage.dispatchEvent(new PointerEvent('pointerdown', { pointerId: 22, pointerType: 'touch', clientX: 500, clientY: 300, bubbles: true }));
-      window.__LEGION_TEST_PLAYER_CLOCK__.advance(350);
-      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-    });
-    const duringHold = await page.evaluate(() => ({
-      rate: document.querySelector('.viewer video').playbackRate,
-      pillText: document.querySelector('.player-hold-pill')?.textContent?.trim() || '',
-      pillHasSvg: Boolean(document.querySelector('.player-hold-pill svg')),
-      overlayHidden: document.querySelector('.player-overlay').classList.contains('hidden'),
-      haptics: window.__LEGION_MOCK_HAPTIC_CALLS__.map((h) => h.kind),
-    }));
-    assert.equal(duringHold.rate, 2);
-    assert.equal(duringHold.pillText, '2×');
-    assert.equal(duringHold.pillHasSvg, true);
-    assert.equal(duringHold.overlayHidden, true, 'Hold for 2x must keep hidden layer hidden');
-    assert.deepEqual(duringHold.haptics, ['tick']);
-
-    await page.evaluate(async () => {
-      const stage = document.querySelector('.player-stage-hit');
-      stage.dispatchEvent(new PointerEvent('pointerup', { pointerId: 22, pointerType: 'touch', clientX: 500, clientY: 300, bubbles: true }));
-      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-    });
-    assert.equal(await page.evaluate(() => document.querySelector('.viewer video').playbackRate), 1.5);
-    assert.equal(await page.evaluate(() => document.querySelector('.player-overlay').classList.contains('hidden')), true);
-    await page.evaluate(async () => {
-      window.__LEGION_TEST_PLAYER_CLOCK__.advance(120);
-      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-    });
-    assert.equal(await page.locator('.player-hold-pill').count(), 0);
-
-    // Desktop Space hold (>350 ms) engages 2x and release restores 1.5x without pausing; short Space pauses.
-    await page.evaluate(async () => {
-      window.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true }));
-      window.__LEGION_TEST_PLAYER_CLOCK__.advance(350);
-      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-    });
-    assert.equal(await page.evaluate(() => document.querySelector('.viewer video').playbackRate), 2);
-    assert.equal(await page.locator('.player-hold-pill').count(), 1);
-    await page.evaluate(async () => {
-      window.dispatchEvent(new KeyboardEvent('keyup', { key: ' ', bubbles: true, cancelable: true }));
-      window.__LEGION_TEST_PLAYER_CLOCK__.advance(120);
-      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-    });
-    const afterSpaceHold = await page.evaluate(() => ({
-      rate: document.querySelector('.viewer video').playbackRate,
-      paused: document.querySelector('.viewer video').paused,
-    }));
-    assert.equal(afterSpaceHold.rate, 1.5);
-    assert.equal(afterSpaceHold.paused, false);
-
-    // Short Space press pauses video, and holding while paused does NOT show 2x pill.
-    await page.keyboard.press('Space');
-    await page.locator('.viewer button[aria-label="Play"]').waitFor();
-    await page.evaluate(async () => {
-      const stage = document.querySelector('.player-stage-hit');
-      stage.dispatchEvent(new PointerEvent('pointerdown', { pointerId: 23, pointerType: 'touch', clientX: 500, clientY: 300, bubbles: true }));
-      window.__LEGION_TEST_PLAYER_CLOCK__.advance(400);
-      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-    });
-    assert.equal(await page.locator('.player-hold-pill').count(), 0);
-    await page.evaluate(() => {
-      document.querySelector('.player-stage-hit').dispatchEvent(
-        new PointerEvent('pointerup', { pointerId: 23, pointerType: 'touch', clientX: 500, clientY: 300, bubbles: true }),
-      );
-    });
-
-    // 3. Scrub anywhere: with layer visible, sideways drag shows centre HUD, hides centre buttons,
-    //    applies Half / Quarter / Fine rates with haptics, commits ONE seek on release, cancels within 12 px,
-    //    and a second finger during scrub drops the scrub without changing position.
-    const scrubResult = await page.evaluate(async () => {
-      const v = document.querySelector('.viewer video');
-      let seekCount = 0;
-      const origDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'currentTime');
-      let lastSeekTo = null;
-      Object.defineProperty(v, 'currentTime', {
-        configurable: true,
-        get() {
-          return origDesc.get.call(this);
-        },
-        set(val) {
-          seekCount += 1;
-          lastSeekTo = val;
-          return origDesc.set.call(this, val);
-        },
+        } catch {
+          // Ignore aborted or non-JSON responses during teardown.
+        }
       });
-      window.__LEGION_MOCK_HAPTIC_CALLS__.length = 0;
-      const stage = document.querySelector('.player-stage-hit');
-      const fire = (type, id, x, y) =>
-        stage.dispatchEvent(new PointerEvent(type, { pointerId: id, pointerType: 'touch', clientX: x, clientY: y, bubbles: true }));
 
-      fire('pointerdown', 31, 300, 150);
-      fire('pointermove', 31, 380, 150);
-      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-      const hudNormal = {
-        time: document.querySelector('.player-scrub-hud-time')?.textContent || '',
-        delta: document.querySelector('.player-scrub-hud-delta')?.textContent || '',
-        rate: document.querySelector('.player-scrub-hud-rate')?.textContent || null,
-        centerHidden: document.querySelector('.player-center').classList.contains('scrubbing-hidden'),
-        seekCountMidDrag: seekCount,
-      };
+      tracker.setStep('real music folder listing embedded cover');
+      await page.goto(`${url}/#token=${encodeURIComponent(tokenOut.token)}`, { waitUntil: 'domcontentloaded' });
+      await page.locator('.nav a[href="#/files"]').waitFor();
 
-      // Pull down > 80 px -> Half speed, > 160 px -> Quarter speed, > 240 px -> Fine, back to normal.
-      fire('pointermove', 31, 380, 240);
-      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-      const rateHalf = document.querySelector('.player-scrub-hud-rate')?.textContent || null;
-      fire('pointermove', 31, 380, 320);
-      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-      const rateQuarter = document.querySelector('.player-scrub-hud-rate')?.textContent || null;
-      fire('pointermove', 31, 380, 400);
-      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-      const rateFine = document.querySelector('.player-scrub-hud-rate')?.textContent || null;
-      fire('pointermove', 31, 380, 150);
-      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-      const rateBack = document.querySelector('.player-scrub-hud-rate')?.textContent || null;
+      // 1. Folder listing renders the real embedded cover via real `fs.thumb` (`size: 128`).
+      await page.goto(`${url}/#/files/tower/${encodeURIComponent(musicDir)}`, { waitUntil: 'domcontentloaded' });
+      const taggedRow = page.locator('a.row', { hasText: '01 - harbor_file.wav' });
+      await taggedRow.waitFor();
+      await taggedRow.locator('.thumb img').waitFor();
+      await tracker.waitForFn(
+        page,
+        () => {
+          const rows = [...document.querySelectorAll('a.row')];
+          const row = rows.find((r) => r.textContent?.includes('01 - harbor_file.wav'));
+          const img = row?.querySelector('.thumb img');
+          return Boolean(img && img.complete && img.naturalWidth > 0 && img.naturalHeight > 0);
+        },
+        null,
+        'harbor_file.wav folder listing cover decoded',
+      );
 
-      // Release -> commits ONE seek.
-      fire('pointerup', 31, 380, 150);
-      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-      const afterRelease = {
-        seekCount,
-        lastSeekTo,
-        hudGone: !document.querySelector('.player-scrub-hud'),
-        hapticsCount: window.__LEGION_MOCK_HAPTIC_CALLS__.length,
-      };
+      // 2. Open tagged track -> title, artist, album, and high-res cover come from real `fs.tags` + `fs.thumb`.
+      tracker.setStep('open real tagged track Harbor Fog');
+      const taggedTagsRespPromise = tracker.waitForResponse(
+        page,
+        async (resp) => {
+          if (!resp.url().includes('/v1/call') || resp.request().method() !== 'POST') return false;
+          try {
+            const body = JSON.parse(resp.request().postData() || '{}');
+            return body.tool === 'fs.tags' && Array.isArray(body.args?.paths) && body.args.paths.includes(taggedPath);
+          } catch {
+            return false;
+          }
+        },
+        'real fs.tags for harbor_file.wav',
+      );
+      const taggedHighResRespPromise = tracker.waitForResponse(
+        page,
+        async (resp) => {
+          if (!resp.url().includes('/v1/call') || resp.request().method() !== 'POST') return false;
+          try {
+            const body = JSON.parse(resp.request().postData() || '{}');
+            return (
+              body.tool === 'fs.thumb' &&
+              body.args?.size === 1024 &&
+              Array.isArray(body.args?.paths) &&
+              body.args.paths.includes(taggedPath)
+            );
+          } catch {
+            return false;
+          }
+        },
+        'real fs.thumb (1024) for harbor_file.wav',
+      );
+      await taggedRow.click();
+      await page.locator('.music-screen').waitFor();
+      await page.locator('.music-title', { hasText: 'Harbor Fog' }).waitFor();
+      await page.locator('.music-subtitle', { hasText: 'Maren · North Coast' }).waitFor();
+      const taggedTagsResp = await taggedTagsRespPromise;
+      const taggedHighResResp = await taggedHighResRespPromise;
+      assert.equal(taggedTagsResp.status(), 200);
+      const taggedTagsJson = await taggedTagsResp.json();
+      const taggedResult = taggedTagsJson?.results?.find((item) => item.path === taggedPath)?.ok;
+      assert.equal(taggedResult?.title, 'Harbor Fog');
+      assert.equal(taggedResult?.artist, 'Maren');
+      assert.equal(taggedResult?.album, 'North Coast');
+      assert.equal(taggedResult?.cover, true);
 
-      // Second scrub that returns within 12 px of origin commits ZERO seeks.
-      const beforeCancelSeek = seekCount;
-      fire('pointerdown', 32, 300, 150);
-      fire('pointermove', 32, 390, 150);
-      fire('pointermove', 32, 310, 150);
-      fire('pointerup', 32, 310, 150);
-      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-      const seeksAfterCancel = seekCount - beforeCancelSeek;
+      assert.equal(taggedHighResResp.status(), 200);
+      const taggedHighResJson = await taggedHighResResp.json();
+      const highResOk = taggedHighResJson?.results?.find((item) => item.path === taggedPath)?.ok;
+      assert.ok(highResOk?.mime?.startsWith('image/') && highResOk?.content, 'Expected decoded image payload from real fs.thumb');
+      const expectedCoverSrc = `data:${highResOk.mime};base64,${highResOk.content}`;
+      await tracker.waitForFn(
+        page,
+        (expected) => {
+          const img = document.querySelector('img.music-cover');
+          return Boolean(img && img.getAttribute('src') === expected && img.complete && img.naturalWidth > 0 && img.naturalHeight > 0);
+        },
+        expectedCoverSrc,
+        'Harbor Fog high-res cover image decoded',
+      );
+      const taggedDom = await page.evaluate(() => ({
+        coverSrc: document.querySelector('img.music-cover')?.getAttribute('src') || '',
+        backdropSrc: document.querySelector('.music-backdrop img')?.getAttribute('src') || '',
+        mediaSessionTitle: navigator.mediaSession?.metadata?.title || '',
+        mediaSessionArtist: navigator.mediaSession?.metadata?.artist || '',
+        mediaSessionAlbum: navigator.mediaSession?.metadata?.album || '',
+      }));
+      assert.equal(taggedDom.coverSrc, expectedCoverSrc);
+      assert.equal(taggedDom.backdropSrc, expectedCoverSrc);
+      assert.equal(taggedDom.mediaSessionTitle, 'Harbor Fog');
+      assert.equal(taggedDom.mediaSessionArtist, 'Maren');
+      assert.equal(taggedDom.mediaSessionAlbum, 'North Coast');
 
-      // Third scrub interrupted by second finger (pinch) commits ZERO seeks.
-      const beforePinchSeek = seekCount;
-      fire('pointerdown', 33, 300, 150);
-      fire('pointermove', 33, 420, 150);
-      fire('pointerdown', 34, 520, 150);
-      fire('pointerup', 34, 520, 150);
-      fire('pointerup', 33, 420, 150);
-      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-      const seeksAfterPinch = seekCount - beforePinchSeek;
+      // Real WAV audio stream plays from `/v1/content/`.
+      tracker.setStep('play real WAV from /v1/content/');
+      await tracker.waitForFn(
+        page,
+        () => {
+          const a = document.querySelector('audio[data-legion-music-audio]');
+          return Boolean(a && a.readyState >= 1 && Number.isFinite(a.duration) && a.duration > 0);
+        },
+        null,
+        'real WAV audio metadata',
+      );
+      await page.locator('.music-play-btn').click();
+      await tracker.waitForFn(
+        page,
+        () => {
+          const a = document.querySelector('audio[data-legion-music-audio]');
+          return Boolean(a && !a.paused);
+        },
+        null,
+        'real WAV audio playing',
+      );
+      await page.locator('.music-play-btn').click();
 
-      delete v.currentTime;
-      return { hudNormal, rateHalf, rateQuarter, rateFine, rateBack, afterRelease, seeksAfterCancel, seeksAfterPinch };
-    });
+      // 3. Advance to untagged track -> real `fs.tags` reports `cover: false`, filename shown without extension,
+      //    no subtitle, no "Unknown artist", placeholder tile, and no `fs.thumb` (size 1024) call.
+      tracker.setStep('advance to untagged track plain_recording.wav');
+      const untaggedTagsRespPromise = tracker.waitForResponse(
+        page,
+        async (resp) => {
+          if (!resp.url().includes('/v1/call') || resp.request().method() !== 'POST') return false;
+          try {
+            const body = JSON.parse(resp.request().postData() || '{}');
+            return body.tool === 'fs.tags' && Array.isArray(body.args?.paths) && body.args.paths.includes(untaggedPath);
+          } catch {
+            return false;
+          }
+        },
+        'real fs.tags for plain_recording.wav',
+      );
+      await page.locator('.music-screen button[aria-label="Next track"]').click();
+      await page.locator('.music-title', { hasText: '02 - plain_recording' }).waitFor();
+      const untaggedTagsResp = await untaggedTagsRespPromise;
+      await tracker.waitForFn(
+        page,
+        () => Boolean(document.querySelector('.music-cover-tile')) && !document.querySelector('img.music-cover'),
+        null,
+        'untagged track placeholder tile',
+      );
+      assert.equal(await page.locator('.music-subtitle').count(), 0);
+      assert.equal(await page.locator('.music-backdrop').count(), 0);
+      assert.equal((await page.locator('.viewer').innerText()).includes('Unknown artist'), false);
 
-    assert.equal(scrubResult.hudNormal.centerHidden, true);
-    assert.equal(scrubResult.hudNormal.seekCountMidDrag, 0);
-    assert.match(scrubResult.hudNormal.delta, /^\+/);
-    assert.equal(scrubResult.hudNormal.rate, null);
-    assert.equal(scrubResult.rateHalf, 'Half speed');
-    assert.equal(scrubResult.rateQuarter, 'Quarter speed');
-    assert.equal(scrubResult.rateFine, 'Fine');
-    assert.equal(scrubResult.rateBack, null);
-    assert.equal(scrubResult.afterRelease.seekCount, 1);
-    assert.equal(scrubResult.afterRelease.hudGone, true);
-    assert.equal(scrubResult.afterRelease.hapticsCount, 4);
-    assert.equal(scrubResult.seeksAfterCancel, 0);
-    assert.equal(scrubResult.seeksAfterPinch, 0);
+      const untaggedTagsJson = await untaggedTagsResp.json();
+      const untaggedOk = untaggedTagsJson?.results?.find((item) => item.path === untaggedPath)?.ok;
+      assert.equal(untaggedOk?.cover, false);
+      assert.equal(untaggedOk?.title, undefined);
+      const untaggedHighResCall = toolResponses.find(
+        (r) =>
+          r.tool === 'fs.thumb' &&
+          r.args?.size === 1024 &&
+          Array.isArray(r.args?.paths) &&
+          r.args.paths.includes(untaggedPath),
+      );
+      assert.equal(untaggedHighResCall, undefined, 'Should skip high-res fs.thumb when real fs.tags reports cover: false');
 
-    assert.deepEqual(consoleErrors, [], `Console errors: ${consoleErrors.join('; ')}`);
-    assert.deepEqual(pageErrors, [], `Page errors: ${pageErrors.join('; ')}`);
-    await context.close();
-  } finally {
-    await browser.close();
-    await server.stop();
-  }
-});
+      // 4. Folder-cover fallback: untagged track next to `cover.png` gets `cover: true` from real `fs.tags`
+      //    and loads the decoded folder cover from real `fs.thumb`.
+      tracker.setStep('folder-cover fallback for dusk_demo.wav');
+      await page.goto(`${url}/#/files/tower/${encodeURIComponent(folderCoverDir)}`, { waitUntil: 'domcontentloaded' });
+      const folderRow = page.locator('a.row', { hasText: '01 - dusk_demo.wav' });
+      await folderRow.waitFor();
+      const folderTagsRespPromise = tracker.waitForResponse(
+        page,
+        async (resp) => {
+          if (!resp.url().includes('/v1/call') || resp.request().method() !== 'POST') return false;
+          try {
+            const body = JSON.parse(resp.request().postData() || '{}');
+            return body.tool === 'fs.tags' && Array.isArray(body.args?.paths) && body.args.paths.includes(folderTrackPath);
+          } catch {
+            return false;
+          }
+        },
+        'real fs.tags for dusk_demo.wav',
+      );
+      const folderHighResRespPromise = tracker.waitForResponse(
+        page,
+        async (resp) => {
+          if (!resp.url().includes('/v1/call') || resp.request().method() !== 'POST') return false;
+          try {
+            const body = JSON.parse(resp.request().postData() || '{}');
+            return (
+              body.tool === 'fs.thumb' &&
+              body.args?.size === 1024 &&
+              Array.isArray(body.args?.paths) &&
+              body.args.paths.includes(folderTrackPath)
+            );
+          } catch {
+            return false;
+          }
+        },
+        'real fs.thumb (1024) for dusk_demo.wav',
+      );
+      await folderRow.click();
+      await page.locator('.music-title', { hasText: '01 - dusk_demo' }).waitFor();
+      const folderTagsResp = await folderTagsRespPromise;
+      const folderTagsJson = await folderTagsResp.json();
+      assert.equal(folderTagsJson?.results?.find((item) => item.path === folderTrackPath)?.ok?.cover, true);
+      const folderHighResResp = await folderHighResRespPromise;
+      assert.equal(folderHighResResp.status(), 200);
+      const folderCoverJson = await folderHighResResp.json();
+      const folderCoverOk = folderCoverJson?.results?.find((item) => item.path === folderTrackPath)?.ok;
+      assert.ok(folderCoverOk?.mime?.startsWith('image/') && folderCoverOk?.content);
+      const expectedFolderCoverSrc = `data:${folderCoverOk.mime};base64,${folderCoverOk.content}`;
+      await tracker.waitForFn(
+        page,
+        (expected) => {
+          const img = document.querySelector('img.music-cover');
+          return Boolean(img && img.getAttribute('src') === expected && img.complete && img.naturalWidth > 0 && img.naturalHeight > 0);
+        },
+        expectedFolderCoverSrc,
+        'dusk_demo.wav folder cover image decoded',
+      );
 
-test('Player: 10-second seek icon digits are centred inside their circles within 0.5 px at DPR 1, 2, and 3', async () => {
-  const server = await startStaticUiServer();
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu'],
-  });
+      assert.deepEqual(consoleErrors, [], `Console errors: ${consoleErrors.join('; ')}`);
+      assert.deepEqual(pageErrors, [], `Page errors: ${pageErrors.join('; ')}`);
+      await context.close();
+    } finally {
+      await browser.close();
+      await server.stop();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
 
-  try {
-    for (const dpr of [1, 2, 3]) {
+browserTest(
+  'Player: zoom to fill, hold for 2x, scrub anywhere, and haptics work end-to-end',
+  { timeout: 120_000 },
+  async (_t, tracker) => {
+    const server = await startStaticUiServer();
+    const browser = await launchBrowser({ autoplay: true });
+    const consoleErrors = [];
+    const pageErrors = [];
+
+    try {
       const context = await browser.newContext({
-        viewport: { width: 900, height: 640 },
-        deviceScaleFactor: dpr,
+        viewport: { width: 1000, height: 600 },
         colorScheme: 'dark',
       });
-      const page = await context.newPage();
+
+      await context.addInitScript(() => {
+        let now = 1_000_000;
+        let nextId = 1;
+        const timers = new Map();
+        window.__LEGION_TEST_PLAYER_CLOCK__ = {
+          now: () => now,
+          setTimeout(fn, ms) {
+            const id = nextId++;
+            timers.set(id, { at: now + Math.max(0, ms), fn });
+            return id;
+          },
+          clearTimeout(id) {
+            timers.delete(id);
+          },
+          advance(ms) {
+            const target = now + ms;
+            let guard = 0;
+            while (guard < 10_000) {
+              guard += 1;
+              let soonestId = null;
+              let soonest = null;
+              for (const [id, item] of timers.entries()) {
+                if (item.at <= target && (!soonest || item.at < soonest.at)) {
+                  soonest = item;
+                  soonestId = id;
+                }
+              }
+              if (!soonest) break;
+              timers.delete(soonestId);
+              now = soonest.at;
+              soonest.fn();
+            }
+            now = target;
+          },
+        };
+      });
+
+      const page = tracker.attach(await context.newPage(), {
+        label: 'player-gestures',
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
+
+      async function resizeAndSettle(width, height, stepLabel) {
+        tracker.setStep(stepLabel);
+        await page.setViewportSize({ width, height });
+        await tracker.waitForFn(
+          page,
+          ({ w, h }) => window.innerWidth === w && window.innerHeight === h,
+          { w: width, h: height },
+          `viewport ${width}x${height} (${stepLabel})`,
+        );
+        await waitForLayoutSettled(page, 2);
+      }
+
+      tracker.setStep('open Arrival.mp4 for gestures');
       await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
         waitUntil: 'domcontentloaded',
       });
-      await page.locator('.grid a.cell[aria-label="Arrival.mp4"]').click();
-      await page.locator('.viewer button[aria-label="Back 10 seconds"]').waitFor();
-      await page.locator('.viewer button[aria-label="Forward 10 seconds"]').waitFor();
+      const arrivalCell = page.locator('.grid a.cell[aria-label="Arrival.mp4"]');
+      await tracker.waitForLocator(arrivalCell, 'Arrival.mp4 grid cell');
+      await arrivalCell.click();
 
-      const measurements = await page.evaluate(async (scaleFactor) => {
-        const targets = [
-          { label: 'Back 10 seconds', symbolId: 'i-skip-back-10' },
-          { label: 'Forward 10 seconds', symbolId: 'i-skip-fwd-10' },
-        ];
+      const videoEl = page.locator('.viewer video.viewer-video[src]');
+      await tracker.waitForLocator(videoEl, 'Arrival.mp4 video[src]');
+      await waitForMediaReady(videoEl, 'Arrival.mp4 metadata', { tracker, minReadyState: 1 });
+      await tracker.waitForFn(
+        page,
+        () => {
+          const v = document.querySelector('.viewer video.viewer-video');
+          return Boolean(v && v.readyState >= 1 && Number.isFinite(v.duration) && v.duration > 1 && v.videoWidth > 0);
+        },
+        null,
+        'Arrival.mp4 dimensions and duration',
+      );
 
-        async function rasterBBox(svgMarkup, cssW, cssH, dprVal) {
-          const pxW = Math.round(cssW * dprVal);
-          const pxH = Math.round(cssH * dprVal);
-          const img = new Image();
-          img.width = pxW;
-          img.height = pxH;
-          const url = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgMarkup)}`;
-          await new Promise((resolve, reject) => {
-            img.onload = resolve;
-            img.onerror = reject;
-            img.src = url;
+      // Check touch-action: none on picture surface.
+      const touchAction = await page.evaluate(() => getComputedStyle(document.querySelector('.player-stage-hit')).touchAction);
+      assert.equal(touchAction, 'none');
+
+      // Read intrinsic video aspect ratio and set a viewport where fill differs by ~12% (available and <= 15% crop).
+      const dims = await page.evaluate(() => {
+        const v = document.querySelector('.viewer video.viewer-video');
+        return { w: v.videoWidth, h: v.videoHeight };
+      });
+      const videoAspect = dims.w / dims.h;
+      const moderateWidth = Math.round(600 * videoAspect * 1.12);
+      await resizeAndSettle(moderateWidth, 600, 'moderate crop viewport');
+
+      // 1. Zoom to fill does NOT exist outside full screen (`Z` and More do nothing / omit it).
+      tracker.setStep('zoom unavailable outside full screen');
+      await page.keyboard.press('z');
+      assert.equal(await page.locator('.viewer video').getAttribute('data-zoom-mode'), 'fit');
+      await page.locator('.viewer button[aria-label="More options"]').click();
+      await tracker.waitForLocator(page.locator('.sheet'), 'More sheet outside full screen');
+      await tracker.waitForFn(
+        page,
+        () => document.activeElement?.classList?.contains('sheet'),
+        null,
+        'More sheet focused',
+      );
+      assert.equal(await page.locator('.sheet button', { hasText: /Zoom to fill|Fit to screen/ }).count(), 0);
+      await page.keyboard.press('Escape');
+      await tracker.waitForLocator(page.locator('.sheet'), 'More sheet closed', { state: 'hidden' });
+
+      // Enter full screen -> `Z` toggles to fill, shows "Zoomed to fill" for 1.2 s, fires haptic tick, remembers choice.
+      tracker.setStep('enter full screen and toggle zoom with Z');
+      await page.locator('.viewer button[aria-label="Full screen"]').click();
+      await tracker.waitForLocator(page.locator('.viewer button[aria-label="Exit full screen"]'), 'Exit full screen button');
+      await page.evaluate(() => {
+        window.__LEGION_MOCK_HAPTIC_CALLS__.length = 0;
+      });
+      await page.keyboard.press('z');
+      await tracker.waitForLocator(
+        page.locator('.player-zoom-chip', { hasText: 'Zoomed to fill' }),
+        'Zoomed to fill chip',
+      );
+      const afterZFill = await page.evaluate(() => ({
+        mode: document.querySelector('.viewer video').getAttribute('data-zoom-mode'),
+        scale: Number(document.querySelector('.viewer video').getAttribute('data-zoom-scale')),
+        stored: localStorage.getItem('legion.player.zoom.v1'),
+        haptics: window.__LEGION_MOCK_HAPTIC_CALLS__.map((h) => h.kind),
+      }));
+      assert.equal(afterZFill.mode, 'fill');
+      assert.ok(afterZFill.scale > 1.08);
+      assert.equal(afterZFill.stored, 'fill');
+      assert.deepEqual(afterZFill.haptics, ['tick']);
+
+      // Chip hides after 1200 ms.
+      tracker.setStep('zoom chip hides after 1200ms');
+      await page.evaluate(() => {
+        window.__LEGION_TEST_PLAYER_CLOCK__.advance(1200);
+      });
+      await tracker.waitForLocator(page.locator('.player-zoom-chip'), 'zoom chip hidden after 1200ms', {
+        state: 'hidden',
+      });
+
+      // More sheet offers "Fit to screen" while zoomed, clicking toggles back to "Original".
+      tracker.setStep('More sheet Fit to screen');
+      await page.locator('.viewer button[aria-label="More options"]').click();
+      const fitBtn = page.locator('.sheet button', { hasText: 'Fit to screen' });
+      await tracker.waitForLocator(fitBtn, 'Fit to screen button');
+      await fitBtn.click();
+      await tracker.waitForLocator(page.locator('.player-zoom-chip', { hasText: 'Original' }), 'Original zoom chip');
+      assert.equal(await page.locator('.viewer video').getAttribute('data-zoom-mode'), 'fit');
+
+      // Pinch outward settles on fill, fires haptic tick, remembers fill.
+      tracker.setStep('pinch outward zooms to fill');
+      await page.evaluate(() => {
+        window.__LEGION_MOCK_HAPTIC_CALLS__.length = 0;
+        const stage = document.querySelector('.player-stage-hit');
+        const fire = (type, id, x, y) =>
+          stage.dispatchEvent(
+            new PointerEvent(type, { pointerId: id, pointerType: 'touch', clientX: x, clientY: y, bubbles: true }),
+          );
+        fire('pointerdown', 11, 260, 300);
+        fire('pointerdown', 12, 340, 300);
+        window.__LEGION_TEST_PLAYER_CLOCK__.advance(60);
+        fire('pointermove', 11, 220, 300);
+        fire('pointermove', 12, 380, 300);
+        fire('pointerup', 12, 380, 300);
+        fire('pointerup', 11, 220, 300);
+      });
+      await tracker.waitForFn(
+        page,
+        () => document.querySelector('.viewer video')?.getAttribute('data-zoom-mode') === 'fill',
+        null,
+        'video zoom mode fill after pinch',
+      );
+      assert.deepEqual(
+        await page.evaluate(() => window.__LEGION_MOCK_HAPTIC_CALLS__.map((h) => h.kind)),
+        ['tick'],
+      );
+
+      // Leave full screen -> resets to fit; re-enter full screen with <= 15% crop -> auto-applies remembered fill.
+      tracker.setStep('remembered fill re-applies on full screen');
+      await page.keyboard.press('f');
+      await tracker.waitForLocator(page.locator('.viewer button[aria-label="Full screen"]'), 'Full screen button after exit');
+      assert.equal(await page.locator('.viewer video').getAttribute('data-zoom-mode'), 'fit');
+      await page.keyboard.press('f');
+      await tracker.waitForLocator(page.locator('.viewer button[aria-label="Exit full screen"]'), 'Exit full screen button re-entry');
+      assert.equal(await page.locator('.viewer video').getAttribute('data-zoom-mode'), 'fill');
+
+      // Resize so fill would crop > 15% (like 4:3 on a tall phone) -> re-entering full screen starts whole ('fit').
+      await page.keyboard.press('f');
+      await tracker.waitForLocator(page.locator('.viewer button[aria-label="Full screen"]'), 'Full screen button before >15% crop');
+      await resizeAndSettle(Math.round(600 * videoAspect * 1.45), 600, '>15% crop viewport');
+      await page.keyboard.press('f');
+      await tracker.waitForLocator(page.locator('.viewer button[aria-label="Exit full screen"]'), 'Exit full screen on >15% crop');
+      assert.equal(await page.locator('.viewer video').getAttribute('data-zoom-mode'), 'fit');
+
+      // Resize within 3% of video aspect -> zoom is absent (Z and More offer nothing).
+      await resizeAndSettle(Math.round(600 * videoAspect * 1.02), 600, 'within 3% aspect viewport');
+      await page.keyboard.press('z');
+      assert.equal(await page.locator('.viewer video').getAttribute('data-zoom-mode'), 'fit');
+      await page.locator('.viewer button[aria-label="More options"]').click();
+      await tracker.waitForLocator(page.locator('.sheet'), 'More sheet within 3% aspect');
+      await tracker.waitForFn(
+        page,
+        () => document.activeElement?.classList?.contains('sheet'),
+        null,
+        'More sheet focused within 3% aspect',
+      );
+      assert.equal(await page.locator('.sheet button', { hasText: /Zoom to fill|Fit to screen/ }).count(), 0);
+      await page.keyboard.press('Escape');
+      await tracker.waitForLocator(page.locator('.sheet'), 'More sheet hidden within 3% aspect', { state: 'hidden' });
+
+      // Restore roomy landscape viewport for hold and scrub tests.
+      await resizeAndSettle(1000, 600, 'restore landscape viewport');
+
+      // 2. Hold for 2x: choose 1.5x, play, hide overlay -> pointer hold 350 ms engages 2x, pill shown,
+      //    overlay stays hidden, release restores 1.5x (not 1x) and fades pill in 120 ms.
+      tracker.setStep('hold for 2x while playing');
+      await page.locator('.player-speed-btn').click();
+      await tracker.waitForLocator(page.locator('.player-speed-menu button', { hasText: '1.5×' }), '1.5x speed menu item');
+      await page.locator('.player-speed-menu button', { hasText: '1.5×' }).click();
+      await page.locator('.viewer button[aria-label="Play"]').click();
+      await tracker.waitForLocator(page.locator('.viewer button[aria-label="Pause"]'), 'Pause button after Play');
+
+      // Hide overlay via single tap on stage center.
+      await page.evaluate(() => {
+        const stage = document.querySelector('.player-stage-hit');
+        stage.dispatchEvent(
+          new PointerEvent('pointerdown', { pointerId: 21, pointerType: 'touch', clientX: 500, clientY: 300, bubbles: true }),
+        );
+        window.__LEGION_TEST_PLAYER_CLOCK__.advance(40);
+        stage.dispatchEvent(
+          new PointerEvent('pointerup', { pointerId: 21, pointerType: 'touch', clientX: 500, clientY: 300, bubbles: true }),
+        );
+      });
+      await tracker.waitForFn(
+        page,
+        () => document.querySelector('.player-overlay')?.classList.contains('hidden'),
+        null,
+        'overlay hidden after tap',
+      );
+
+      await page.evaluate(() => {
+        window.__LEGION_MOCK_HAPTIC_CALLS__.length = 0;
+        const stage = document.querySelector('.player-stage-hit');
+        stage.dispatchEvent(
+          new PointerEvent('pointerdown', { pointerId: 22, pointerType: 'touch', clientX: 500, clientY: 300, bubbles: true }),
+        );
+        window.__LEGION_TEST_PLAYER_CLOCK__.advance(350);
+      });
+      await tracker.waitForLocator(page.locator('.player-hold-pill'), '2x hold pill visible');
+      const duringHold = await page.evaluate(() => ({
+        rate: document.querySelector('.viewer video').playbackRate,
+        pillText: document.querySelector('.player-hold-pill')?.textContent?.trim() || '',
+        pillHasSvg: Boolean(document.querySelector('.player-hold-pill svg')),
+        overlayHidden: document.querySelector('.player-overlay').classList.contains('hidden'),
+        haptics: window.__LEGION_MOCK_HAPTIC_CALLS__.map((h) => h.kind),
+      }));
+      assert.equal(duringHold.rate, 2);
+      assert.equal(duringHold.pillText, '2×');
+      assert.equal(duringHold.pillHasSvg, true);
+      assert.equal(duringHold.overlayHidden, true, 'Hold for 2x must keep hidden layer hidden');
+      assert.deepEqual(duringHold.haptics, ['tick']);
+
+      await page.evaluate(() => {
+        const stage = document.querySelector('.player-stage-hit');
+        stage.dispatchEvent(
+          new PointerEvent('pointerup', { pointerId: 22, pointerType: 'touch', clientX: 500, clientY: 300, bubbles: true }),
+        );
+      });
+      await tracker.waitForFn(
+        page,
+        () => document.querySelector('.viewer video')?.playbackRate === 1.5,
+        null,
+        'playbackRate restored to 1.5x after pointer release',
+      );
+      assert.equal(await page.evaluate(() => document.querySelector('.player-overlay').classList.contains('hidden')), true);
+      await page.evaluate(() => {
+        window.__LEGION_TEST_PLAYER_CLOCK__.advance(120);
+      });
+      await tracker.waitForLocator(page.locator('.player-hold-pill'), '2x hold pill gone after 120ms', {
+        state: 'hidden',
+      });
+
+      // Desktop Space hold (>350 ms) engages 2x and release restores 1.5x without pausing; short Space pauses.
+      tracker.setStep('Space hold for 2x and short Space pause');
+      await page.evaluate(() => {
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true }));
+        window.__LEGION_TEST_PLAYER_CLOCK__.advance(350);
+      });
+      await tracker.waitForLocator(page.locator('.player-hold-pill'), '2x pill during Space hold');
+      assert.equal(await page.evaluate(() => document.querySelector('.viewer video').playbackRate), 2);
+      await page.evaluate(() => {
+        window.dispatchEvent(new KeyboardEvent('keyup', { key: ' ', bubbles: true, cancelable: true }));
+        window.__LEGION_TEST_PLAYER_CLOCK__.advance(120);
+      });
+      await tracker.waitForLocator(page.locator('.player-hold-pill'), '2x pill gone after Space keyup', {
+        state: 'hidden',
+      });
+      const afterSpaceHold = await page.evaluate(() => ({
+        rate: document.querySelector('.viewer video').playbackRate,
+        paused: document.querySelector('.viewer video').paused,
+      }));
+      assert.equal(afterSpaceHold.rate, 1.5);
+      assert.equal(afterSpaceHold.paused, false);
+
+      // Short Space press pauses video, and holding while paused does NOT show 2x pill.
+      await page.keyboard.press('Space');
+      await tracker.waitForLocator(page.locator('.viewer button[aria-label="Play"]'), 'Play button after short Space pause');
+      await page.evaluate(() => {
+        const stage = document.querySelector('.player-stage-hit');
+        stage.dispatchEvent(
+          new PointerEvent('pointerdown', { pointerId: 23, pointerType: 'touch', clientX: 500, clientY: 300, bubbles: true }),
+        );
+        window.__LEGION_TEST_PLAYER_CLOCK__.advance(400);
+      });
+      await waitForLayoutSettled(page, 2);
+      assert.equal(await page.locator('.player-hold-pill').count(), 0);
+      await page.evaluate(() => {
+        document.querySelector('.player-stage-hit').dispatchEvent(
+          new PointerEvent('pointerup', { pointerId: 23, pointerType: 'touch', clientX: 500, clientY: 300, bubbles: true }),
+        );
+      });
+
+      // 3. Scrub anywhere: with layer visible, sideways drag shows centre HUD, hides centre buttons,
+      //    applies Half / Quarter / Fine rates with haptics, commits ONE seek on release, cancels within 12 px,
+      //    and a second finger during scrub drops the scrub without changing position.
+      tracker.setStep('scrub anywhere gesture and precision bands');
+      const scrubResult = await page.evaluate(async () => {
+        const settleFrames = (count = 2) =>
+          new Promise((resolve) => {
+            let done = false;
+            const finish = () => {
+              if (done) return;
+              done = true;
+              clearTimeout(timer);
+              resolve();
+            };
+            const timer = setTimeout(finish, 2000);
+            let remaining = Math.max(1, count);
+            const tick = () => {
+              remaining -= 1;
+              if (remaining <= 0) finish();
+              else requestAnimationFrame(tick);
+            };
+            requestAnimationFrame(tick);
           });
-          const canvas = document.createElement('canvas');
-          canvas.width = pxW;
-          canvas.height = pxH;
-          const ctx = canvas.getContext('2d');
-          ctx.drawImage(img, 0, 0, pxW, pxH);
-          const data = ctx.getImageData(0, 0, pxW, pxH).data;
-          let minX = pxW;
-          let minY = pxH;
-          let maxX = -1;
-          let maxY = -1;
-          for (let y = 0; y < pxH; y += 1) {
-            for (let x = 0; x < pxW; x += 1) {
-              const alpha = data[(y * pxW + x) * 4 + 3];
-              if (alpha > 8) {
-                if (x < minX) minX = x;
-                if (x > maxX) maxX = x;
-                if (y < minY) minY = y;
-                if (y > maxY) maxY = y;
+
+        const v = document.querySelector('.viewer video');
+        let seekCount = 0;
+        const origDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'currentTime');
+        let lastSeekTo = null;
+        Object.defineProperty(v, 'currentTime', {
+          configurable: true,
+          get() {
+            return origDesc.get.call(this);
+          },
+          set(val) {
+            seekCount += 1;
+            lastSeekTo = val;
+            return origDesc.set.call(this, val);
+          },
+        });
+        window.__LEGION_MOCK_HAPTIC_CALLS__.length = 0;
+        const stage = document.querySelector('.player-stage-hit');
+        const fire = (type, id, x, y) =>
+          stage.dispatchEvent(
+            new PointerEvent(type, { pointerId: id, pointerType: 'touch', clientX: x, clientY: y, bubbles: true }),
+          );
+
+        fire('pointerdown', 31, 300, 150);
+        fire('pointermove', 31, 380, 150);
+        await settleFrames(2);
+        const hudNormal = {
+          time: document.querySelector('.player-scrub-hud-time')?.textContent || '',
+          delta: document.querySelector('.player-scrub-hud-delta')?.textContent || '',
+          rate: document.querySelector('.player-scrub-hud-rate')?.textContent || null,
+          centerHidden: document.querySelector('.player-center').classList.contains('scrubbing-hidden'),
+          seekCountMidDrag: seekCount,
+        };
+
+        // Pull down > 80 px -> Half speed, > 160 px -> Quarter speed, > 240 px -> Fine, back to normal.
+        fire('pointermove', 31, 380, 240);
+        await settleFrames(2);
+        const rateHalf = document.querySelector('.player-scrub-hud-rate')?.textContent || null;
+        fire('pointermove', 31, 380, 320);
+        await settleFrames(2);
+        const rateQuarter = document.querySelector('.player-scrub-hud-rate')?.textContent || null;
+        fire('pointermove', 31, 380, 400);
+        await settleFrames(2);
+        const rateFine = document.querySelector('.player-scrub-hud-rate')?.textContent || null;
+        fire('pointermove', 31, 380, 150);
+        await settleFrames(2);
+        const rateBack = document.querySelector('.player-scrub-hud-rate')?.textContent || null;
+
+        // Release -> commits ONE seek.
+        fire('pointerup', 31, 380, 150);
+        await settleFrames(2);
+        const afterRelease = {
+          seekCount,
+          lastSeekTo,
+          hudGone: !document.querySelector('.player-scrub-hud'),
+          hapticsCount: window.__LEGION_MOCK_HAPTIC_CALLS__.length,
+        };
+
+        // Second scrub that returns within 12 px of origin commits ZERO seeks.
+        const beforeCancelSeek = seekCount;
+        fire('pointerdown', 32, 300, 150);
+        fire('pointermove', 32, 390, 150);
+        fire('pointermove', 32, 310, 150);
+        fire('pointerup', 32, 310, 150);
+        await settleFrames(2);
+        const seeksAfterCancel = seekCount - beforeCancelSeek;
+
+        // Third scrub interrupted by second finger (pinch) commits ZERO seeks.
+        const beforePinchSeek = seekCount;
+        fire('pointerdown', 33, 300, 150);
+        fire('pointermove', 33, 420, 150);
+        fire('pointerdown', 34, 520, 150);
+        fire('pointerup', 34, 520, 150);
+        fire('pointerup', 33, 420, 150);
+        await settleFrames(2);
+        const seeksAfterPinch = seekCount - beforePinchSeek;
+
+        delete v.currentTime;
+        return { hudNormal, rateHalf, rateQuarter, rateFine, rateBack, afterRelease, seeksAfterCancel, seeksAfterPinch };
+      });
+
+      assert.equal(scrubResult.hudNormal.centerHidden, true);
+      assert.equal(scrubResult.hudNormal.seekCountMidDrag, 0);
+      assert.match(scrubResult.hudNormal.delta, /^\+/);
+      assert.equal(scrubResult.hudNormal.rate, null);
+      assert.equal(scrubResult.rateHalf, 'Half speed');
+      assert.equal(scrubResult.rateQuarter, 'Quarter speed');
+      assert.equal(scrubResult.rateFine, 'Fine');
+      assert.equal(scrubResult.rateBack, null);
+      assert.equal(scrubResult.afterRelease.seekCount, 1);
+      assert.equal(scrubResult.afterRelease.hudGone, true);
+      assert.equal(scrubResult.afterRelease.hapticsCount, 4);
+      assert.equal(scrubResult.seeksAfterCancel, 0);
+      assert.equal(scrubResult.seeksAfterPinch, 0);
+
+      assert.deepEqual(consoleErrors, [], `Console errors: ${consoleErrors.join('; ')}`);
+      assert.deepEqual(pageErrors, [], `Page errors: ${pageErrors.join('; ')}`);
+      await context.close();
+    } finally {
+      await browser.close();
+      await server.stop();
+    }
+  },
+);
+
+browserTest(
+  'Player: 10-second seek icon digits are centred inside their circles within 0.5 px at DPR 1, 2, and 3',
+  { timeout: 90_000 },
+  async (_t, tracker) => {
+    const server = await startStaticUiServer();
+    const browser = await launchBrowser();
+    const consoleErrors = [];
+    const pageErrors = [];
+
+    try {
+      for (const dpr of [1, 2, 3]) {
+        const context = await browser.newContext({
+          viewport: { width: 900, height: 640 },
+          deviceScaleFactor: dpr,
+          colorScheme: 'dark',
+        });
+        const page = tracker.attach(await context.newPage(), {
+          label: `seek-icon-dpr-${dpr}`,
+          collectConsole: consoleErrors,
+          collectPage: pageErrors,
+        });
+        tracker.setStep(`measure 10s seek icons at DPR ${dpr}`);
+        await page.goto(`${server.url}/?mock#/files/tower/%2Fhome%2Fme%2FVideos%2FHoliday`, {
+          waitUntil: 'domcontentloaded',
+        });
+        const arrivalCell = page.locator('.grid a.cell[aria-label="Arrival.mp4"]');
+        await tracker.waitForLocator(arrivalCell, `Arrival.mp4 grid cell (DPR ${dpr})`);
+        await arrivalCell.click();
+        await tracker.waitForLocator(
+          page.locator('.viewer button[aria-label="Back 10 seconds"]'),
+          `Back 10 seconds button (DPR ${dpr})`,
+        );
+        await tracker.waitForLocator(
+          page.locator('.viewer button[aria-label="Forward 10 seconds"]'),
+          `Forward 10 seconds button (DPR ${dpr})`,
+        );
+        await waitForLayoutSettled(page, 2);
+
+        const measurements = await page.evaluate(async (scaleFactor) => {
+          const targets = [
+            { label: 'Back 10 seconds', symbolId: 'i-skip-back-10' },
+            { label: 'Forward 10 seconds', symbolId: 'i-skip-fwd-10' },
+          ];
+
+          async function rasterBBox(svgMarkup, cssW, cssH, dprVal) {
+            const pxW = Math.round(cssW * dprVal);
+            const pxH = Math.round(cssH * dprVal);
+            const img = new Image();
+            img.width = pxW;
+            img.height = pxH;
+            const url = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgMarkup)}`;
+            await new Promise((resolve, reject) => {
+              let settled = false;
+              const finish = (ok, err) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                if (ok) resolve();
+                else reject(err);
+              };
+              const timer = setTimeout(() => finish(false, new Error('Timed out rasterizing SVG icon')), 10_000);
+              img.onload = () => finish(true);
+              img.onerror = (err) => finish(false, err instanceof Error ? err : new Error('Failed to load SVG icon'));
+              img.src = url;
+            });
+            const canvas = document.createElement('canvas');
+            canvas.width = pxW;
+            canvas.height = pxH;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0, pxW, pxH);
+            const data = ctx.getImageData(0, 0, pxW, pxH).data;
+            let minX = pxW;
+            let minY = pxH;
+            let maxX = -1;
+            let maxY = -1;
+            for (let y = 0; y < pxH; y += 1) {
+              for (let x = 0; x < pxW; x += 1) {
+                const alpha = data[(y * pxW + x) * 4 + 3];
+                if (alpha > 8) {
+                  if (x < minX) minX = x;
+                  if (x > maxX) maxX = x;
+                  if (y < minY) minY = y;
+                  if (y > maxY) maxY = y;
+                }
               }
             }
+            return {
+              cx: (minX + maxX + 1) / 2 / dprVal,
+              cy: (minY + maxY + 1) / 2 / dprVal,
+            };
           }
-          return {
-            cx: (minX + maxX + 1) / 2 / dprVal,
-            cy: (minY + maxY + 1) / 2 / dprVal,
-          };
+
+          const out = [];
+          for (const t of targets) {
+            const btn = document.querySelector(`.viewer button[aria-label="${t.label}"]`);
+            const svg = btn.querySelector('svg');
+            const rect = svg.getBoundingClientRect();
+            const style = getComputedStyle(svg);
+            const sym = document.getElementById(t.symbolId);
+            const viewBox = sym.getAttribute('viewBox') || '0 0 24 24';
+            const [, , vbW, vbH] = viewBox.split(/\s+/).map(Number);
+
+            // 1. Exact SVG vector geometry centre mapped into the live button's CSS pixel size.
+            const probe = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+            probe.setAttribute('viewBox', viewBox);
+            probe.setAttribute('width', String(rect.width));
+            probe.setAttribute('height', String(rect.height));
+            probe.style.position = 'fixed';
+            probe.style.left = '-9999px';
+            probe.innerHTML = sym.innerHTML;
+            document.body.appendChild(probe);
+            const circleBox = probe.querySelector('[data-part="circle"]').getBBox();
+            const digitsBox = probe.querySelector('[data-part="digits"]').getBBox();
+            probe.remove();
+
+            const sx = rect.width / vbW;
+            const sy = rect.height / vbH;
+            const geomDx = ((digitsBox.x + digitsBox.width / 2) - (circleBox.x + circleBox.width / 2)) * sx;
+            const geomDy = ((digitsBox.y + digitsBox.height / 2) - (circleBox.y + circleBox.height / 2)) * sy;
+
+            // 2. Actual rasterized pixel ink bounding box at live CSS size * DPR.
+            const baseAttrs = `xmlns="http://www.w3.org/2000/svg" viewBox="${viewBox}" width="${rect.width}" height="${rect.height}" fill="none" stroke="#ffffff" stroke-width="${style.strokeWidth}" stroke-linecap="${style.strokeLinecap}" stroke-linejoin="${style.strokeLinejoin}"`;
+            const circleHtml = sym.querySelector('[data-part="circle"]').outerHTML;
+            const digitsHtml = sym.querySelector('[data-part="digits"]').outerHTML;
+            const circlePx = await rasterBBox(`<svg ${baseAttrs}>${circleHtml}</svg>`, rect.width, rect.height, scaleFactor);
+            const digitsPx = await rasterBBox(`<svg ${baseAttrs}>${digitsHtml}</svg>`, rect.width, rect.height, scaleFactor);
+
+            out.push({
+              label: t.label,
+              dpr: scaleFactor,
+              geomDx,
+              geomDy,
+              pixelDx: digitsPx.cx - circlePx.cx,
+              pixelDy: digitsPx.cy - circlePx.cy,
+            });
+          }
+          return out;
+        }, dpr);
+
+        for (const m of measurements) {
+          assert.ok(
+            Math.abs(m.geomDx) <= 0.5 && Math.abs(m.geomDy) <= 0.5,
+            `${m.label} @${dpr}x vector offset too large: dx=${m.geomDx.toFixed(3)}, dy=${m.geomDy.toFixed(3)}`,
+          );
+          assert.ok(
+            Math.abs(m.pixelDx) <= 0.5 && Math.abs(m.pixelDy) <= 0.5,
+            `${m.label} @${dpr}x pixel offset too large: dx=${m.pixelDx.toFixed(3)}, dy=${m.pixelDy.toFixed(3)}`,
+          );
         }
-
-        const out = [];
-        for (const t of targets) {
-          const btn = document.querySelector(`.viewer button[aria-label="${t.label}"]`);
-          const svg = btn.querySelector('svg');
-          const rect = svg.getBoundingClientRect();
-          const style = getComputedStyle(svg);
-          const sym = document.getElementById(t.symbolId);
-          const viewBox = sym.getAttribute('viewBox') || '0 0 24 24';
-          const [, , vbW, vbH] = viewBox.split(/\s+/).map(Number);
-
-          // 1. Exact SVG vector geometry centre mapped into the live button's CSS pixel size.
-          const probe = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-          probe.setAttribute('viewBox', viewBox);
-          probe.setAttribute('width', String(rect.width));
-          probe.setAttribute('height', String(rect.height));
-          probe.style.position = 'fixed';
-          probe.style.left = '-9999px';
-          probe.innerHTML = sym.innerHTML;
-          document.body.appendChild(probe);
-          const circleBox = probe.querySelector('[data-part="circle"]').getBBox();
-          const digitsBox = probe.querySelector('[data-part="digits"]').getBBox();
-          probe.remove();
-
-          const sx = rect.width / vbW;
-          const sy = rect.height / vbH;
-          const geomDx = ((digitsBox.x + digitsBox.width / 2) - (circleBox.x + circleBox.width / 2)) * sx;
-          const geomDy = ((digitsBox.y + digitsBox.height / 2) - (circleBox.y + circleBox.height / 2)) * sy;
-
-          // 2. Actual rasterized pixel ink bounding box at live CSS size * DPR.
-          const baseAttrs = `xmlns="http://www.w3.org/2000/svg" viewBox="${viewBox}" width="${rect.width}" height="${rect.height}" fill="none" stroke="#ffffff" stroke-width="${style.strokeWidth}" stroke-linecap="${style.strokeLinecap}" stroke-linejoin="${style.strokeLinejoin}"`;
-          const circleHtml = sym.querySelector('[data-part="circle"]').outerHTML;
-          const digitsHtml = sym.querySelector('[data-part="digits"]').outerHTML;
-          const circlePx = await rasterBBox(`<svg ${baseAttrs}>${circleHtml}</svg>`, rect.width, rect.height, scaleFactor);
-          const digitsPx = await rasterBBox(`<svg ${baseAttrs}>${digitsHtml}</svg>`, rect.width, rect.height, scaleFactor);
-
-          out.push({
-            label: t.label,
-            dpr: scaleFactor,
-            geomDx,
-            geomDy,
-            pixelDx: digitsPx.cx - circlePx.cx,
-            pixelDy: digitsPx.cy - circlePx.cy,
-          });
-        }
-        return out;
-      }, dpr);
-
-      for (const m of measurements) {
-        assert.ok(
-          Math.abs(m.geomDx) <= 0.5 && Math.abs(m.geomDy) <= 0.5,
-          `${m.label} @${dpr}x vector offset too large: dx=${m.geomDx.toFixed(3)}, dy=${m.geomDy.toFixed(3)}`,
-        );
-        assert.ok(
-          Math.abs(m.pixelDx) <= 0.5 && Math.abs(m.pixelDy) <= 0.5,
-          `${m.label} @${dpr}x pixel offset too large: dx=${m.pixelDx.toFixed(3)}, dy=${m.pixelDy.toFixed(3)}`,
-        );
+        await context.close();
       }
-      await context.close();
+      assert.deepEqual(consoleErrors, [], `Console errors: ${consoleErrors.join('; ')}`);
+      assert.deepEqual(pageErrors, [], `Page errors: ${pageErrors.join('; ')}`);
+    } finally {
+      await browser.close();
+      await server.stop();
     }
-  } finally {
-    await browser.close();
-    await server.stop();
-  }
-});
+  },
+);

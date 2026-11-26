@@ -3,84 +3,20 @@
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import http from 'node:http';
 import path from 'node:path';
-import test from 'node:test';
-import { fileURLToPath } from 'node:url';
-import { chromium } from 'playwright-core';
 import { SAMPLE_PNG_BASE64, SAMPLE_VIDEO_WEBM_BASE64 } from '../link/mock-media.js';
+import {
+  browserTest,
+  launchBrowser,
+  seekAndWait,
+  setTheme,
+  startStaticUiServer,
+  waitForLayoutSettled,
+  waitForMediaReady,
+} from './browser-helpers.mjs';
 
-const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
-const UI_ROOT = path.resolve(TEST_DIR, '..');
 const FILES_SHOTS_DIR = process.env.LEGION_FILES_SHOTS_DIR || '';
 const OLD_SHOTS_DIR = process.env.LEGION_OLD_SHOTS_DIR || '';
-
-// Same strict CSP as the HTTP door plus `media-src 'self' blob: data:` for mock sample video/audio.
-const MOCK_TEST_CSP =
-  "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self' blob: data:; connect-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
-
-const MIME_BY_EXT = {
-  '.html': 'text/html; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.svg': 'image/svg+xml',
-  '.png': 'image/png',
-  '.webmanifest': 'application/manifest+json; charset=utf-8',
-};
-
-function findBrowser() {
-  if (process.env.LEGION_CHROME && fs.existsSync(process.env.LEGION_CHROME)) {
-    return process.env.LEGION_CHROME;
-  }
-  const candidates = [
-    '/usr/bin/chromium',
-    '/usr/bin/chromium-browser',
-    '/usr/bin/google-chrome',
-    '/usr/bin/google-chrome-stable',
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-  ];
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) return candidate;
-  }
-  throw new Error('No Chromium or Chrome binary found; set LEGION_CHROME.');
-}
-
-async function startStaticUiServer() {
-  const server = http.createServer((req, res) => {
-    const urlPath = (req.url || '/').split('?')[0];
-    const rel = urlPath === '/' ? 'index.html' : urlPath.replace(/^\/+/, '');
-    const full = path.resolve(UI_ROOT, rel);
-    if (!full.startsWith(UI_ROOT) || !fs.existsSync(full) || fs.statSync(full).isDirectory()) {
-      res.writeHead(404);
-      res.end('Not found');
-      return;
-    }
-    const ext = path.extname(full).toLowerCase();
-    res.writeHead(200, {
-      'Content-Type': MIME_BY_EXT[ext] || 'application/octet-stream',
-      'Content-Security-Policy': MOCK_TEST_CSP,
-      'Cache-Control': 'no-store',
-    });
-    fs.createReadStream(full).pipe(res);
-  });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const { port } = server.address();
-  return {
-    url: `http://127.0.0.1:${port}`,
-    stop: () => new Promise((resolve) => server.close(resolve)),
-  };
-}
-
-async function setTheme(page, theme) {
-  await page.evaluate((t) => {
-    const raw = localStorage.getItem('legion.settings.v1');
-    const obj = raw ? JSON.parse(raw) : {};
-    obj.theme = t;
-    localStorage.setItem('legion.settings.v1', JSON.stringify(obj));
-    document.documentElement.dataset.theme = t;
-  }, theme);
-  await page.waitForTimeout(80);
-}
 
 async function maybeFilesShot(page, name, { alsoLight = false } = {}) {
   if (!FILES_SHOTS_DIR) return;
@@ -115,7 +51,7 @@ async function dispatchSwipe(page, selector, { startX, startY, endX, endY }) {
       },
       { sx: startX, sy: startY, ex: endX, ey: endY },
     );
-  await page.waitForTimeout(140);
+  await waitForLayoutSettled(page, 2);
 }
 
 const CATALOG_TOOL_RE =
@@ -127,26 +63,25 @@ async function assertNoToolNames(page, label) {
   assert.deepEqual(matches, [], `Tool name(s) leaked in plain mode (${label}): ${matches.join(', ')}`);
 }
 
-test('Files tab: history back, deep reload, viewer & video seek, selection & Send to, search, star/pin, sync, and transfers', async () => {
-  const server = await startStaticUiServer();
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu', '--autoplay-policy=no-user-gesture-required'],
-  });
-  const consoleErrors = [];
-  const pageErrors = [];
+browserTest(
+  'Files tab: history back, deep reload, viewer & video seek, selection & Send to, search, star/pin, sync, and transfers',
+  { timeout: 120_000 },
+  async (_t, tracker) => {
+    const server = await startStaticUiServer();
+    const browser = await launchBrowser({ autoplay: true });
+    const consoleErrors = [];
+    const pageErrors = [];
 
-  try {
-    const ctx = await browser.newContext({
-      viewport: { width: 390, height: 844 },
-      colorScheme: 'dark',
-    });
-    const page = await ctx.newPage();
-    page.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
-    });
-    page.on('pageerror', (err) => pageErrors.push(String(err)));
+    try {
+      const ctx = await browser.newContext({
+        viewport: { width: 390, height: 844 },
+        colorScheme: 'dark',
+      });
+      const page = tracker.attach(await ctx.newPage(), {
+        label: 'phone',
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
 
     // 1. Start on Machines, open Files 4th tab, inspect Files first screen.
     await page.goto(`${server.url}/?mock#/machines`, { waitUntil: 'domcontentloaded' });
@@ -220,29 +155,23 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
     await page.locator('header.top h1', { hasText: 'Holiday' }).waitFor();
 
     // 7. Play the sample video and seek.
+    tracker.setStep('open Arrival.mp4 and seek');
     await page.locator('.list a.row', { hasText: 'Arrival.mp4' }).click();
-    const videoEl = page.locator('.viewer video.viewer-video');
-    await videoEl.waitFor();
-    await page.waitForFunction(
+    const videoEl = page.locator('.viewer video.viewer-video[src]');
+    await tracker.waitForLocator(videoEl, 'Arrival.mp4 video element with src');
+    await waitForMediaReady(videoEl, 'Arrival.mp4 video metadata', { tracker, minReadyState: 1 });
+    await tracker.waitForFn(
+      page,
       () => {
         const v = document.querySelector('.viewer video.viewer-video');
         return v && v.readyState >= 1 && Number.isFinite(v.duration) && v.duration > 1;
       },
       null,
-      { timeout: 10_000 },
+      'Arrival.mp4 duration > 1s',
     );
-    const seekedTime = await page.evaluate(async () => {
-      const v = document.querySelector('.viewer video.viewer-video');
-      await v.play().catch(() => {});
-      v.currentTime = 1.5;
-      await new Promise((r) => {
-        const done = () => r();
-        v.addEventListener('seeked', done, { once: true });
-        setTimeout(done, 1200);
-      });
-      v.pause();
-      return { currentTime: v.currentTime, duration: v.duration, err: v.error };
-    });
+    await videoEl.evaluate((v) => v.play().catch(() => {}));
+    const seekedTime = await seekAndWait(videoEl, 1.5, 'Arrival.mp4 seek to 1.5s', { tracker });
+    await videoEl.evaluate((v) => v.pause());
     assert.equal(seekedTime.err, null);
     assert.ok(seekedTime.duration > 1, `Expected sample video duration > 1s, got ${seekedTime.duration}`);
     assert.ok(seekedTime.currentTime >= 1.0, `Expected video seek >= 1.0s, got ${seekedTime.currentTime}`);
@@ -251,8 +180,12 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
     await page.locator('.viewer').waitFor({ state: 'hidden' });
 
     // 8. Unplayable H.264 video hits the player's real error (not extension) and shows two actions.
+    tracker.setStep('verify unplayable H.264 video error');
     await page.locator('.list a.row', { hasText: 'Concert (H.264).mp4' }).click();
-    await page.locator('.viewer').getByText("This phone can't play this kind of video").waitFor({ timeout: 8000 });
+    await tracker.waitForLocator(
+      page.locator('.viewer').getByText("This phone can't play this kind of video"),
+      'unplayable video message',
+    );
     await page.locator('.viewer').getByRole('button', { name: 'Open in another app' }).waitFor();
     await page.locator('.viewer').getByRole('button', { name: 'Download to this phone' }).waitFor();
     await maybeFilesShot(page, '06-viewer-unsupported', { alsoLight: true });
@@ -260,6 +193,7 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
     await page.locator('.viewer').waitFor({ state: 'hidden' });
 
     // 8b. PDF is treated as an "everything else" file (no inline iframe/embed/object).
+    tracker.setStep('verify PDF non-inline view');
     await page.locator('.list a.row', { hasText: 'Tickets.pdf' }).click();
     await page.locator('.viewer .said strong', { hasText: 'Tickets.pdf' }).waitFor();
     await page.locator('.viewer .said', { hasText: 'Document · 310 KB' }).waitFor();
@@ -270,34 +204,43 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
     await page.locator('.viewer').waitFor({ state: 'hidden' });
 
     // 9. Royalty-free Opus Ogg audio playback loads cleanly in the music player.
+    tracker.setStep('open Voice note.ogg in music player');
     await page.locator('.list a.row', { hasText: 'Voice note.ogg' }).click();
     await page.locator('.viewer .music-screen').waitFor();
-    await page.locator('audio[data-legion-music-audio][src]').waitFor({ state: 'attached' });
-    await page.waitForFunction(
+    await tracker.waitForLocator(
+      page.locator('audio[data-legion-music-audio][src]'),
+      'Voice note.ogg audio[src]',
+      { state: 'attached' },
+    );
+    await tracker.waitForFn(
+      page,
       () => {
         const a = document.querySelector('audio[data-legion-music-audio]');
         return a && a.readyState >= 1 && Number.isFinite(a.duration) && a.duration > 0.5;
       },
       null,
-      { timeout: 10_000 },
+      'Voice note.ogg metadata',
     );
     await page.locator('.viewer-top button[aria-label="Close"]').click();
-    await page.locator('.viewer').waitFor({ state: 'hidden' });
+    await tracker.waitForLocator(page.locator('.viewer'), 'Voice note viewer closed', { state: 'hidden' });
     // Dismiss the small player bar via swipe down before continuing.
+    await tracker.waitForLocator(page.locator('.mini-player'), 'Voice note small player bar');
     const miniBox = await page.locator('.mini-player').boundingBox();
     if (miniBox) {
       await page.mouse.move(miniBox.x + miniBox.width / 2, miniBox.y + 12);
       await page.mouse.down();
       await page.mouse.move(miniBox.x + miniBox.width / 2, miniBox.y + 56, { steps: 6 });
       await page.mouse.up();
-      await page.locator('.mini-player').waitFor({ state: 'detached' });
+      await tracker.waitForLocator(page.locator('.mini-player'), 'small player dismissed after swipe', {
+        state: 'detached',
+      });
     }
 
     // 9b. 123-char no-spaces filename fits cleanly with zero horizontal overflow in list, viewer, and Send to.
     const longNamePrefix = 'quarterly_photogrammetry_orthomosaic';
     const longRow = page.locator(`.list a.row[aria-label^="${longNamePrefix}"]`);
     await longRow.scrollIntoViewIfNeeded();
-    await longRow.locator('.fn-slot[data-fn-ready="1"]').waitFor({ timeout: 5000 });
+    await tracker.waitForLocator(longRow.locator('.fn-slot[data-fn-ready="1"]'), '123-char long row fitted name');
     const listOverflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
     assert.ok(listOverflow <= 1, `List horizontal overflow with 123-char name: ${listOverflow}px`);
     const longRowDrawn = await longRow.locator('.fn-slot').evaluate((slot) =>
@@ -315,9 +258,15 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
     assert.ok(viewerBox.overflow <= 1, `Viewer overflow with long name: ${viewerBox.overflow}px`);
     assert.ok(viewerBox.moreRight <= viewerBox.vw + 1, `Viewer More button pushed off screen: ${viewerBox.moreRight} > ${viewerBox.vw}`);
     // Open Send to from viewer for the 123-char file and verify sheet stacks above viewer with zero overflow.
+    tracker.setStep('Send to sheet with 123-char filename');
     await page.locator('.viewer-bar button', { hasText: 'Send to' }).click();
     await page.locator('.sheet').waitFor();
-    await page.waitForFunction(() => document.activeElement?.classList?.contains('sheet'), null, { timeout: 3000 });
+    await tracker.waitForFn(
+      page,
+      () => document.activeElement?.classList?.contains('sheet'),
+      null,
+      'Send to sheet focus',
+    );
     const sheetOverflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
     assert.ok(sheetOverflow <= 1, `Send to sheet overflow with long name: ${sheetOverflow}px`);
     await page.keyboard.press('Escape');
@@ -362,11 +311,11 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
     await wakePrompt.getByText('Then: send 2 items to laptop').waitFor();
     await wakePrompt.getByRole('button', { name: 'Wake it and continue' }).click();
     const wakingSheet = page.locator('.sheet', { hasText: 'Waking laptop…' });
-    await wakingSheet.waitFor();
-    await wakingSheet.waitFor({ state: 'hidden', timeout: 8000 });
+    await tracker.waitForLocator(wakingSheet, 'Waking laptop sheet visible');
+    await tracker.waitForLocator(wakingSheet, 'Waking laptop sheet to finish', { state: 'hidden' });
     // Send to sheet is still open; laptop transitions to a selected radio button once awake!
     const laptopRadio = sendSheet.locator('button[role="radio"]', { hasText: 'laptop' });
-    await laptopRadio.waitFor({ timeout: 5000 });
+    await tracker.waitForLocator(laptopRadio, 'laptop selected radio button after wake');
     assert.equal(await laptopRadio.getAttribute('aria-checked'), 'true');
 
     // Send to sheet offers only Copy when sending to another machine (no Move button).
@@ -480,10 +429,11 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
     await loadMoreBtn.waitFor();
     const lenBefore = await page.locator('.viewer pre.viewer-text').evaluate((el) => el.textContent.length);
     await loadMoreBtn.click();
-    await page.waitForFunction(
+    await tracker.waitForFn(
+      page,
       (prevLen) => (document.querySelector('.viewer pre.viewer-text')?.textContent?.length || 0) > prevLen,
       lenBefore,
-      { timeout: 5000 },
+      'text viewer Load more append',
     );
     await page.locator('.viewer-top button[aria-label="Close"]').click();
     // Reopen and verify Wrap lines preference was remembered.
@@ -531,15 +481,20 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
     // Close immediately (even while loading) and verify scroll position comes back.
     await page.locator('.viewer-top button[aria-label="Close"]').click();
     await page.locator('.viewer').waitFor({ state: 'hidden' });
-    await page.waitForFunction(
+    await tracker.waitForFn(
+      page,
       () => (document.querySelector('main.main')?.scrollTop || 0) >= 700,
       null,
-      { timeout: 3000 },
+      'Archive5000 scroll position restoration',
     );
 
     // 16b. Retryable `fs.thumb` error (`busy`) retries quietly with backoff and fills thumbnail.
+    tracker.setStep('thumb-retry backoff');
     await page.goto(`${server.url}/?mock=thumb-retry#/files/tower//home/me/Videos/Holiday`, { waitUntil: 'domcontentloaded' });
-    await page.locator('.list a.row:has-text("IMG_2042.jpg") img, .grid a.cell[aria-label="IMG_2042.jpg"] img').first().waitFor({ timeout: 5000 });
+    await tracker.waitForLocator(
+      page.locator('.list a.row:has-text("IMG_2042.jpg") img, .grid a.cell[aria-label="IMG_2042.jpg"] img').first(),
+      'retried IMG_2042.jpg thumbnail',
+    );
 
     // 17. Kept in sync section hidden when sync.list does not exist (`?mock=nosync`).
     await page.goto(`${server.url}/?mock=nosync#/files`, { waitUntil: 'domcontentloaded' });
@@ -549,21 +504,22 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
     await ctx.close();
 
     // 18. Wide desktop layout (1100x720) screenshots and assertions.
+    tracker.setStep('wide desktop Files layout');
     const wideCtx = await browser.newContext({
       viewport: { width: 1100, height: 720 },
       colorScheme: 'dark',
     });
-    const widePage = await wideCtx.newPage();
-    widePage.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    const widePage = tracker.attach(await wideCtx.newPage(), {
+      label: 'wide',
+      collectConsole: consoleErrors,
+      collectPage: pageErrors,
     });
-    widePage.on('pageerror', (err) => pageErrors.push(String(err)));
 
     await widePage.goto(`${server.url}/?mock#/files/tower//home/me/Videos/Holiday`, { waitUntil: 'domcontentloaded' });
     await widePage.locator('.split').waitFor();
     await widePage.locator('nav.nav a', { hasText: 'Files' }).waitFor();
     await widePage.locator('.grid .cell').first().waitFor();
-    await widePage.locator('.grid .cell img').first().waitFor({ timeout: 5000 });
+    await tracker.waitForLocator(widePage.locator('.grid .cell img').first(), 'wide grid first thumbnail');
     await maybeFilesShot(widePage, '13-wide-grid');
 
     await widePage.locator('.files-wide-tools button[aria-label="Show as list"]').click();
@@ -584,26 +540,25 @@ test('Files tab: history back, deep reload, viewer & video seek, selection & Sen
   }
 });
 
-test('Files tab degrades cleanly against an old node with none of the new tools (?mock=old)', async () => {
-  const server = await startStaticUiServer();
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu'],
-  });
-  const consoleErrors = [];
-  const pageErrors = [];
+browserTest(
+  'Files tab degrades cleanly against an old node with none of the new tools (?mock=old)',
+  { timeout: 90_000 },
+  async (_t, tracker) => {
+    const server = await startStaticUiServer();
+    const browser = await launchBrowser();
+    const consoleErrors = [];
+    const pageErrors = [];
 
-  try {
-    const ctx = await browser.newContext({
-      viewport: { width: 390, height: 844 },
-      colorScheme: 'dark',
-    });
-    const page = await ctx.newPage();
-    page.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
-    });
-    page.on('pageerror', (err) => pageErrors.push(String(err)));
+    try {
+      const ctx = await browser.newContext({
+        viewport: { width: 390, height: 844 },
+        colorScheme: 'dark',
+      });
+      const page = tracker.attach(await ctx.newPage(), {
+        label: 'old-node',
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
 
     // 1. Start on Machines -> tap Files -> no Pinned, no Kept in sync, no Favourites.
     await page.goto(`${server.url}/?mock=old#/machines`, { waitUntil: 'domcontentloaded' });
@@ -714,11 +669,23 @@ async function assertToastDoesNotCoverFirstRow(page, label) {
         let prev = null;
         let frames = 0;
         let overlapFrame = null;
+        let done = false;
+        const finish = (val) => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          resolve(val);
+        };
+        const timer = setTimeout(() => {
+          const cur = readBoxes();
+          finish({ settled: false, timedOut: true, frames, toast: cur.toast, row: cur.row, overlapFrame });
+        }, 5_000);
         const step = () => {
+          if (done) return;
           frames += 1;
           const cur = readBoxes();
           if (!cur.toast || !cur.row) {
-            resolve({
+            finish({
               settled: false,
               missing: !cur.toast ? 'toast' : 'row',
               frames,
@@ -730,12 +697,12 @@ async function assertToastDoesNotCoverFirstRow(page, label) {
             overlapFrame = { frame: frames, toast: cur.toast, row: cur.row };
           }
           if (prev && same(prev.toast, cur.toast) && same(prev.row, cur.row)) {
-            resolve({ settled: true, frames, toast: cur.toast, row: cur.row, overlapFrame });
+            finish({ settled: true, frames, toast: cur.toast, row: cur.row, overlapFrame });
             return;
           }
           prev = cur;
           if (frames >= 30) {
-            resolve({ settled: false, frames, toast: cur.toast, row: cur.row, overlapFrame });
+            finish({ settled: false, frames, toast: cur.toast, row: cur.row, overlapFrame });
             return;
           }
           requestAnimationFrame(step);
@@ -758,212 +725,269 @@ async function assertToastDoesNotCoverFirstRow(page, label) {
   );
 }
 
-test('Transfer toast rules: Files vs Activity, never covers rows, auto-dismisses on finish or failure', async () => {
-  const server = await startStaticUiServer();
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu'],
-  });
-  const consoleErrors = [];
-  const pageErrors = [];
+browserTest(
+  'Transfer toast rules: Files vs Activity, never covers rows, auto-dismisses on finish or failure',
+  { timeout: 90_000 },
+  async (_t, tracker) => {
+    const server = await startStaticUiServer();
+    const browser = await launchBrowser();
+    const consoleErrors = [];
+    const pageErrors = [];
 
-  try {
-    const ctx = await browser.newContext({
-      viewport: { width: 390, height: 844 },
-      colorScheme: 'dark',
-    });
-    const page = await ctx.newPage();
-    page.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
-    });
-    page.on('pageerror', (err) => pageErrors.push(String(err)));
+    try {
+      const ctx = await browser.newContext({
+        viewport: { width: 390, height: 844 },
+        colorScheme: 'dark',
+      });
+      const page = tracker.attach(await ctx.newPage(), {
+        label: 'phone-toast',
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
 
-    // Case 1: Started from Files -> dash-free wording, never overlaps the top row,
-    // and its Activity button navigates to Activity and clears the banner.
-    await page.goto(`${server.url}/?mock#/files/tower//home/me/Documents`, { waitUntil: 'domcontentloaded' });
-    await page.locator('.list a.row', { hasText: 'README.md' }).waitFor();
+      const withPausedTransferPump = async (p, fn) => {
+        await p.evaluate(() => {
+          window.__LEGION_MOCK_PAUSE_TRANSFER_PUMP__ = true;
+        });
+        try {
+          await fn();
+        } finally {
+          await p.evaluate(() => {
+            window.__LEGION_MOCK_PAUSE_TRANSFER_PUMP__ = false;
+          });
+        }
+      };
 
-    await page.locator('.dock button[aria-label="More"]').click();
-    await page.locator('.sheet button.row', { hasText: /Add from this/ }).click();
+      // Case 1: Started from Files -> dash-free wording, never overlaps the top row,
+      // and its Activity button navigates to Activity and clears the banner.
+      tracker.setStep('Case 1: upload toast from Files');
+      await page.goto(`${server.url}/?mock#/files/tower//home/me/Documents`, { waitUntil: 'domcontentloaded' });
+      await page.locator('.list a.row', { hasText: 'README.md' }).waitFor();
 
-    const uploadToast = page.locator('.toast-banner');
-    await uploadToast.waitFor();
-    const uploadText = await uploadToast.innerText();
-    assert.ok(
-      uploadText.includes('Uploading to tower. Watch progress in Activity.'),
-      `Unexpected upload toast text: ${uploadText}`,
-    );
-    assert.ok(!uploadText.includes('—'), `Upload toast must not contain an em-dash: ${uploadText}`);
-    await assertToastDoesNotCoverFirstRow(page, 'narrow upload toast');
+      await withPausedTransferPump(page, async () => {
+        await page.locator('.dock button[aria-label="More"]').click();
+        await page.locator('.sheet button.row', { hasText: /Add from this/ }).click();
 
-    await uploadToast.locator('a', { hasText: 'Activity' }).click();
-    await page.locator('header.top h1', { hasText: 'Activity' }).waitFor();
-    assert.equal(await page.locator('.toast-banner').count(), 0, 'Toast must dismiss when opening Activity');
-    await page.locator('.row', { hasText: /Upload-\d+\.jpg/ }).first().waitFor();
+        const uploadToast = page.locator('.toast-banner');
+        await tracker.waitForLocator(uploadToast, 'upload toast banner');
+        const uploadText = await uploadToast.innerText();
+        assert.ok(
+          uploadText.includes('Uploading to tower. Watch progress in Activity.'),
+          `Unexpected upload toast text: ${uploadText}`,
+        );
+        assert.ok(!uploadText.includes('—'), `Upload toast must not contain an em-dash: ${uploadText}`);
+        await assertToastDoesNotCoverFirstRow(page, 'narrow upload toast');
 
-    // Download wording (no em-dash) + navigating via bottom nav Activity tab also clears the banner.
-    // Pick Passport.pdf (540 KB, ~1s mock download) rather than 412-byte README.md (which completes
-    // on the first 350ms pump tick) so the toast stays active across the layout check and nav click.
-    await page.goto(`${server.url}/?mock#/files/tower//home/me/Documents`, { waitUntil: 'domcontentloaded' });
-    await page.locator('.list a.row', { hasText: 'Passport.pdf' }).waitFor();
-    await dispatchSwipe(page, '.swipe-row:has-text("Passport.pdf")', {
-      startX: 310,
-      startY: 220,
-      endX: 140,
-      endY: 222,
-    });
-    await page.locator('.swipe-row:has-text("Passport.pdf") .swipe-action', { hasText: 'Send to' }).click();
-    const dlSheet = page.locator('.sheet');
-    await dlSheet.locator('button[role="radio"]', { hasText: 'This phone' }).click();
-    await dlSheet.getByRole('button', { name: /Download to this phone/ }).click();
-    await dlSheet.waitFor({ state: 'hidden' });
+        await uploadToast.locator('a', { hasText: 'Activity' }).click();
+        await page.locator('header.top h1', { hasText: 'Activity' }).waitFor();
+        assert.equal(await page.locator('.toast-banner').count(), 0, 'Toast must dismiss when opening Activity');
+        await page.locator('.row', { hasText: /Upload-\d+\.jpg/ }).first().waitFor();
+      });
 
-    const dlToast = page.locator('.toast-banner');
-    await dlToast.waitFor();
-    const dlText = await dlToast.innerText();
-    assert.ok(
-      dlText.includes('Downloading Passport.pdf. Watch progress in Activity.'),
-      `Unexpected download toast text: ${dlText}`,
-    );
-    assert.ok(!dlText.includes('—'), `Download toast must not contain an em-dash: ${dlText}`);
-    await assertToastDoesNotCoverFirstRow(page, 'narrow download toast');
+      // Download wording (no em-dash) + navigating via bottom nav Activity tab also clears the banner.
+      tracker.setStep('Case 1b: download toast from Files');
+      await page.goto(`${server.url}/?mock#/files/tower//home/me/Documents`, { waitUntil: 'domcontentloaded' });
+      await page.locator('.list a.row', { hasText: 'Passport.pdf' }).waitFor();
+      await withPausedTransferPump(page, async () => {
+        await dispatchSwipe(page, '.swipe-row:has-text("Passport.pdf")', {
+          startX: 310,
+          startY: 220,
+          endX: 140,
+          endY: 222,
+        });
+        await page.locator('.swipe-row:has-text("Passport.pdf") .swipe-action', { hasText: 'Send to' }).click();
+        const dlSheet = page.locator('.sheet');
+        await dlSheet.locator('button[role="radio"]', { hasText: 'This phone' }).click();
+        await dlSheet.getByRole('button', { name: /Download to this phone/ }).click();
+        await dlSheet.waitFor({ state: 'hidden' });
 
-    await page.locator('nav.nav a', { hasText: 'Activity' }).click();
-    await page.locator('header.top h1', { hasText: 'Activity' }).waitFor();
-    assert.equal(
-      await page.locator('.toast-banner').count(),
-      0,
-      'Transfer-started toast must dismiss when switching to Activity via nav',
-    );
+        const dlToast = page.locator('.toast-banner');
+        await tracker.waitForLocator(dlToast, 'download toast banner');
+        const dlText = await dlToast.innerText();
+        assert.ok(
+          dlText.includes('Downloading Passport.pdf. Watch progress in Activity.'),
+          `Unexpected download toast text: ${dlText}`,
+        );
+        assert.ok(!dlText.includes('—'), `Download toast must not contain an em-dash: ${dlText}`);
+        await assertToastDoesNotCoverFirstRow(page, 'narrow download toast');
 
-    // Send-to another machine at phone width also keeps the toast clear of the first row.
-    await page.goto(`${server.url}/?mock#/files/tower//home/me/Documents`, { waitUntil: 'domcontentloaded' });
-    await page.locator('.list a.row', { hasText: 'Passport.pdf' }).waitFor();
-    await dispatchSwipe(page, '.swipe-row:has-text("Passport.pdf")', {
-      startX: 310,
-      startY: 220,
-      endX: 140,
-      endY: 222,
-    });
-    await page.locator('.swipe-row:has-text("Passport.pdf") .swipe-action', { hasText: 'Send to' }).click();
-    const sendSheet = page.locator('.sheet');
-    await sendSheet.locator('button[role="radio"]', { hasText: 'pi' }).click();
-    await sendSheet.getByRole('button', { name: 'Copy to pi' }).click();
-    await sendSheet.waitFor({ state: 'hidden' });
-    const sendToast = page.locator('.toast-banner', {
-      hasText: 'Copying Passport.pdf to pi. Watch progress in Activity.',
-    });
-    await sendToast.waitFor();
-    await assertToastDoesNotCoverFirstRow(page, 'narrow send-to toast');
+        await page.locator('nav.nav a', { hasText: 'Activity' }).click();
+        await page.locator('header.top h1', { hasText: 'Activity' }).waitFor();
+        assert.equal(
+          await page.locator('.toast-banner').count(),
+          0,
+          'Transfer-started toast must dismiss when switching to Activity via nav',
+        );
+      });
 
-    // Case 2: Started while already on Activity -> no transfer-started toast is shown.
-    await page.goto(`${server.url}/?mock=slow-upload#/files/tower//home/me/Documents`, {
-      waitUntil: 'domcontentloaded',
-    });
-    await page.locator('.list a.row', { hasText: 'README.md' }).waitFor();
-    await page.locator('.dock button[aria-label="More"]').click();
-    await page.locator('.sheet button.row', { hasText: /Add from this/ }).click();
-    // Switch to Activity before the async upload picker finishes queuing the transfer.
-    await page.locator('nav.nav a', { hasText: 'Activity' }).click();
-    await page.locator('header.top h1', { hasText: 'Activity' }).waitFor();
-    await page.locator('.row', { hasText: /Upload-\d+\.jpg/ }).first().waitFor({ timeout: 5000 });
-    await page.waitForTimeout(200);
-    assert.equal(
-      await page.locator('.toast-banner').count(),
-      0,
-      'Transfer-started toast must not be shown when already on Activity',
-    );
+      // Send-to another machine at phone width also keeps the toast clear of the first row.
+      tracker.setStep('Case 1c: send-to toast from Files');
+      await page.goto(`${server.url}/?mock#/files/tower//home/me/Documents`, { waitUntil: 'domcontentloaded' });
+      await page.locator('.list a.row', { hasText: 'Passport.pdf' }).waitFor();
+      await withPausedTransferPump(page, async () => {
+        await dispatchSwipe(page, '.swipe-row:has-text("Passport.pdf")', {
+          startX: 310,
+          startY: 220,
+          endX: 140,
+          endY: 222,
+        });
+        await page.locator('.swipe-row:has-text("Passport.pdf") .swipe-action', { hasText: 'Send to' }).click();
+        const sendSheet = page.locator('.sheet');
+        await sendSheet.locator('button[role="radio"]', { hasText: 'pi' }).click();
+        await sendSheet.getByRole('button', { name: 'Copy to pi' }).click();
+        await sendSheet.waitFor({ state: 'hidden' });
+        const sendToast = page.locator('.toast-banner', {
+          hasText: 'Copying Passport.pdf to pi. Watch progress in Activity.',
+        });
+        await tracker.waitForLocator(sendToast, 'send-to toast banner');
+        await assertToastDoesNotCoverFirstRow(page, 'narrow send-to toast');
+      });
 
-    // Resuming a failed transfer on Activity also shows no started toast.
-    await page.goto(`${server.url}/?mock=transfers#/activity`, { waitUntil: 'domcontentloaded' });
-    const failedRow = page.locator('.row', { hasText: 'photos-backup.zip' });
-    await failedRow.getByRole('button', { name: 'Resume' }).click();
-    await failedRow.locator('.state.running').waitFor();
-    assert.equal(await page.locator('.toast-banner').count(), 0);
+      // Case 2: Started while already on Activity -> no transfer-started toast is shown.
+      // Hold the mock upload picker with a deterministic gate until Activity is mounted so heavy
+      // CPU load can never race the slow-upload timer.
+      tracker.setStep('Case 2: slow upload resolves while already on Activity');
+      await page.goto(`${server.url}/?mock=slow-upload#/files/tower//home/me/Documents`, {
+        waitUntil: 'domcontentloaded',
+      });
+      await page.locator('.list a.row', { hasText: 'README.md' }).waitFor();
+      await page.evaluate(() => {
+        let release = () => {};
+        const promise = new Promise((r) => {
+          release = r;
+        });
+        window.__TEST_UPLOAD_GATE_RELEASE__ = release;
+        window.__LEGION_MOCK_UPLOAD_GATE__ = () => promise;
+      });
+      try {
+        await page.locator('.dock button[aria-label="More"]').click();
+        await page.locator('.sheet button.row', { hasText: /Add from this/ }).click();
+        // Switch to Activity before releasing the async upload picker.
+        await page.locator('nav.nav a', { hasText: 'Activity' }).click();
+        await page.locator('header.top h1', { hasText: 'Activity' }).waitFor();
+      } finally {
+        await page.evaluate(() => {
+          window.__TEST_UPLOAD_GATE_RELEASE__?.();
+          delete window.__TEST_UPLOAD_GATE_RELEASE__;
+          delete window.__LEGION_MOCK_UPLOAD_GATE__;
+        });
+      }
+      await tracker.waitForLocator(
+        page.locator('.row', { hasText: /Upload-\d+\.jpg/ }).first(),
+        'gated upload row on Activity',
+      );
+      await waitForLayoutSettled(page, 2);
+      assert.equal(
+        await page.locator('.toast-banner').count(),
+        0,
+        'Transfer-started toast must not be shown when already on Activity',
+      );
 
-    // Case 3: Transfer finishes on its own -> toast goes away by itself without clicking Dismiss,
-    // well before the 8s fallback timeout.
-    await page.goto(`${server.url}/?mock#/files/tower//home/me/Documents`, { waitUntil: 'domcontentloaded' });
-    await page.locator('.list a.row', { hasText: 'README.md' }).waitFor();
-    const startedAt = Date.now();
-    await page.locator('.dock button[aria-label="More"]').click();
-    await page.locator('.sheet button.row', { hasText: /Add from this/ }).click();
-    await page.locator('.toast-banner', { hasText: 'Uploading to tower. Watch progress in Activity.' }).waitFor();
-    await page.locator('.toast-banner').waitFor({ state: 'hidden', timeout: 5000 });
-    const elapsedMs = Date.now() - startedAt;
-    assert.ok(
-      elapsedMs < 5500,
-      `Expected toast to auto-dismiss as soon as transfer finished (~2.1s), took ${elapsedMs}ms`,
-    );
+      // Resuming a failed transfer on Activity also shows no started toast.
+      tracker.setStep('Case 2b: resume failed transfer on Activity');
+      await page.goto(`${server.url}/?mock=transfers#/activity`, { waitUntil: 'domcontentloaded' });
+      const failedRow = page.locator('.row', { hasText: 'photos-backup.zip' });
+      await failedRow.getByRole('button', { name: 'Resume' }).click();
+      await failedRow.locator('.state.running').waitFor();
+      assert.equal(await page.locator('.toast-banner').count(), 0);
 
-    // Case 3b: Transfer fails -> started toast goes away and is replaced by its own failure message.
-    await page.goto(`${server.url}/?mock=fail-upload#/files/tower//home/me/Documents`, {
-      waitUntil: 'domcontentloaded',
-    });
-    await page.locator('.list a.row', { hasText: 'README.md' }).waitFor();
-    await page.locator('.dock button[aria-label="More"]').click();
-    await page.locator('.sheet button.row', { hasText: /Add from this/ }).click();
-    await page.locator('.toast-banner', { hasText: 'Uploading to tower. Watch progress in Activity.' }).waitFor();
-    const failToast = page.locator('.toast-banner.error', {
-      hasText: /Upload of Upload-\d+\.jpg failed\. Can't reach tower right now\./,
-    });
-    await failToast.waitFor({ timeout: 5000 });
-    await assertToastDoesNotCoverFirstRow(page, 'narrow failure toast');
+      // Case 3: Transfer finishes on its own -> toast goes away by itself without clicking Dismiss,
+      // strictly before the 8s fallback timeout.
+      tracker.setStep('Case 3: toast auto-dismisses on transfer completion');
+      await page.goto(`${server.url}/?mock#/files/tower//home/me/Documents`, { waitUntil: 'domcontentloaded' });
+      await page.locator('.list a.row', { hasText: 'README.md' }).waitFor();
+      await page.locator('.dock button[aria-label="More"]').click();
+      await page.locator('.sheet button.row', { hasText: /Add from this/ }).click();
+      await tracker.waitForLocator(
+        page.locator('.toast-banner', { hasText: 'Uploading to tower. Watch progress in Activity.' }),
+        'upload started toast',
+      );
+      const toastShownAt = Date.now();
+      await tracker.waitForLocator(page.locator('.toast-banner'), 'upload toast to auto-dismiss on finish', {
+        state: 'hidden',
+        timeout: 7_500,
+      });
+      const elapsedMs = Date.now() - toastShownAt;
+      assert.ok(
+        elapsedMs < 7_500,
+        `Expected toast to auto-dismiss on transfer finish (before 8s fallback TTL), took ${elapsedMs}ms`,
+      );
 
-    await ctx.close();
+      // Case 3b: Transfer fails -> started toast goes away and is replaced by its own failure message.
+      tracker.setStep('Case 3b: toast replaced by failure banner');
+      await page.goto(`${server.url}/?mock=fail-upload#/files/tower//home/me/Documents`, {
+        waitUntil: 'domcontentloaded',
+      });
+      await page.locator('.list a.row', { hasText: 'README.md' }).waitFor();
+      await page.locator('.dock button[aria-label="More"]').click();
+      await page.locator('.sheet button.row', { hasText: /Add from this/ }).click();
+      await tracker.waitForLocator(
+        page.locator('.toast-banner', { hasText: 'Uploading to tower. Watch progress in Activity.' }),
+        'failing upload started toast',
+      );
+      const failToast = page.locator('.toast-banner.error', {
+        hasText: /Upload of Upload-\d+\.jpg failed\. Can't reach tower right now\./,
+      });
+      await tracker.waitForLocator(failToast, 'upload failure toast');
+      await assertToastDoesNotCoverFirstRow(page, 'narrow failure toast');
 
-    // Wide desktop check: toast sits in its own row above main and never overlaps the first row.
-    const wideCtx = await browser.newContext({
-      viewport: { width: 1100, height: 720 },
-      colorScheme: 'dark',
-    });
-    const widePage = await wideCtx.newPage();
-    widePage.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
-    });
-    widePage.on('pageerror', (err) => pageErrors.push(String(err)));
+      await ctx.close();
 
-    await widePage.goto(`${server.url}/?mock#/files/tower//home/me/Documents`, {
-      waitUntil: 'domcontentloaded',
-    });
-    await widePage.locator('.list a.row', { hasText: 'README.md' }).waitFor();
-    await widePage.locator('.files-wide-tools button[aria-label="More"]').click();
-    await widePage.locator('.sheet button.row', { hasText: /Add from this/ }).click();
-    await widePage
-      .locator('.toast-banner', { hasText: 'Uploading to tower. Watch progress in Activity.' })
-      .waitFor();
-    await assertToastDoesNotCoverFirstRow(widePage, 'wide upload toast');
-    await wideCtx.close();
+      // Wide desktop check: toast sits in its own row above main and never overlaps the first row.
+      tracker.setStep('Case 4: wide desktop upload toast layout');
+      const wideCtx = await browser.newContext({
+        viewport: { width: 1100, height: 720 },
+        colorScheme: 'dark',
+      });
+      const widePage = tracker.attach(await wideCtx.newPage(), {
+        label: 'wide-toast',
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
 
-    assert.deepEqual(pageErrors, [], `Uncaught page errors (toast rules): ${pageErrors.join('\n')}`);
-    assert.deepEqual(consoleErrors, [], `Console/CSP errors (toast rules): ${consoleErrors.join('\n')}`);
-  } finally {
-    await browser.close();
-    await server.stop();
-  }
-});
+      await widePage.goto(`${server.url}/?mock#/files/tower//home/me/Documents`, {
+        waitUntil: 'domcontentloaded',
+      });
+      await widePage.locator('.list a.row', { hasText: 'README.md' }).waitFor();
+      await withPausedTransferPump(widePage, async () => {
+        await widePage.locator('.files-wide-tools button[aria-label="More"]').click();
+        await widePage.locator('.sheet button.row', { hasText: /Add from this/ }).click();
+        await tracker.waitForLocator(
+          widePage.locator('.toast-banner', { hasText: 'Uploading to tower. Watch progress in Activity.' }),
+          'wide upload toast banner',
+        );
+        await assertToastDoesNotCoverFirstRow(widePage, 'wide upload toast');
+      });
+      await wideCtx.close();
 
-test('Files viewer: honest media errors, in-place Open in another app progress/cancel/no-handler, refused-type gating, machine previews, and extensionless text', async () => {
-  const server = await startStaticUiServer();
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu'],
-  });
-  const consoleErrors = [];
-  const pageErrors = [];
+      assert.deepEqual(pageErrors, [], `Uncaught page errors (toast rules): ${pageErrors.join('\n')}`);
+      assert.deepEqual(consoleErrors, [], `Console/CSP errors (toast rules): ${consoleErrors.join('\n')}`);
+    } finally {
+      await browser.close();
+      await server.stop();
+    }
+  },
+);
 
-  try {
-    const ctx = await browser.newContext({
-      viewport: { width: 390, height: 844 },
-      colorScheme: 'dark',
-    });
-    const page = await ctx.newPage();
-    page.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
-    });
-    page.on('pageerror', (err) => pageErrors.push(String(err)));
+browserTest(
+  'Files viewer: honest media errors, in-place Open in another app progress/cancel/no-handler, refused-type gating, machine previews, and extensionless text',
+  { timeout: 90_000 },
+  async (_t, tracker) => {
+    const server = await startStaticUiServer();
+    const browser = await launchBrowser();
+    const consoleErrors = [];
+    const pageErrors = [];
+
+    try {
+      const ctx = await browser.newContext({
+        viewport: { width: 390, height: 844 },
+        colorScheme: 'dark',
+      });
+      const page = tracker.attach(await ctx.newPage(), {
+        label: 'formats',
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
 
     await page.goto(`${server.url}/?mock=formats#/files/tower//home/me/Formats`, {
       waitUntil: 'domcontentloaded',
@@ -1090,14 +1114,16 @@ test('Files viewer: honest media errors, in-place Open in another app progress/c
     await banner.getByRole('button', { name: 'Cancel' }).click();
     await banner.waitFor({ state: 'hidden' });
     await page.locator('.music-top button[aria-label="Close"]').click();
-    await page.locator('.viewer').waitFor({ state: 'hidden' });
-    await page.locator('.mini-player').waitFor();
+    await tracker.waitForLocator(page.locator('.viewer'), 'FLAC viewer closed', { state: 'hidden' });
+    await tracker.waitForLocator(page.locator('.mini-player'), 'FLAC small player bar');
     const miniRect = await page.locator('.mini-player').boundingBox();
     await page.mouse.move(miniRect.x + miniRect.width / 2, miniRect.y + 12);
     await page.mouse.down();
     await page.mouse.move(miniRect.x + miniRect.width / 2, miniRect.y + 56, { steps: 6 });
     await page.mouse.up();
-    await page.locator('.mini-player').waitFor({ state: 'detached' });
+    await tracker.waitForLocator(page.locator('.mini-player'), 'FLAC small player dismissed', {
+      state: 'detached',
+    });
     const revokedAfterClose = await page.evaluate(() => window.__LEGION_MOCK_REVOKED_URLS__ || []);
     assert.ok(
       revokedAfterClose.includes(flacUrl),
@@ -1116,12 +1142,14 @@ test('Files viewer: honest media errors, in-place Open in another app progress/c
     assert.ok(firstPicUrl, 'expected first picture URL');
     await page.keyboard.press('ArrowRight');
     await page.locator('.viewer-top .name', { hasText: 'IMG_2042.jpg' }).waitFor();
-    await page.waitForFunction(
+    await tracker.waitForFn(
+      page,
       (prev) => {
         const cur = document.querySelector('.viewer img.viewer-img')?.getAttribute('src');
         return Boolean(cur && cur !== prev);
       },
       firstPicUrl,
+      'next picture src after ArrowRight',
     );
     const secondPicUrl = await imgEl.getAttribute('src');
     const revokedAfterSwitch = await page.evaluate(() => window.__LEGION_MOCK_REVOKED_URLS__ || []);
@@ -1139,13 +1167,17 @@ test('Files viewer: honest media errors, in-place Open in another app progress/c
 
     // 7. When no app handles the file type (?mock=formats,no-handler), viewer shows an honest
     // message in place and offers Download instead of silently doing nothing.
+    tracker.setStep('no-handler fallback message');
     await page.goto(`${server.url}/?mock=formats,no-handler#/files/tower//home/me/Formats`, {
       waitUntil: 'domcontentloaded',
     });
     await page.locator('.list a.row', { hasText: 'legacy-track.wma' }).click();
     await page.locator('.viewer').getByRole('button', { name: 'Open in another app' }).click();
     await page.locator('.viewer').getByText(/Getting it ready…/).waitFor();
-    await page.locator('.viewer').getByText('No app on this phone can open this file type.').waitFor({ timeout: 6000 });
+    await tracker.waitForLocator(
+      page.locator('.viewer').getByText('No app on this phone can open this file type.'),
+      'no-handler error message',
+    );
     await page.locator('.viewer').getByRole('button', { name: 'Download to this phone' }).waitFor();
 
     await ctx.close();
@@ -1185,26 +1217,25 @@ async function assertNoProtocolErrors(page, label) {
   assert.deepEqual(bad, [], `Unexpected invalid_args/unknown_tool errors (${label}): ${JSON.stringify(bad)}`);
 }
 
-test('Old machine (05ba1ef fixture) at 412x915: quiet note, bottom dock in machine > Files, client sort/filter, 500-cap, search, viewer & download', async () => {
-  const server = await startStaticUiServer();
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu'],
-  });
-  const consoleErrors = [];
-  const pageErrors = [];
+browserTest(
+  'Old machine (05ba1ef fixture) at 412x915: quiet note, bottom dock in machine > Files, client sort/filter, 500-cap, search, viewer & download',
+  { timeout: 90_000 },
+  async (_t, tracker) => {
+    const server = await startStaticUiServer();
+    const browser = await launchBrowser();
+    const consoleErrors = [];
+    const pageErrors = [];
 
-  try {
-    const ctx = await browser.newContext({
-      viewport: { width: 412, height: 915 },
-      colorScheme: 'dark',
-    });
-    const page = await ctx.newPage();
-    page.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
-    });
-    page.on('pageerror', (err) => pageErrors.push(String(err)));
+    try {
+      const ctx = await browser.newContext({
+        viewport: { width: 412, height: 915 },
+        colorScheme: 'dark',
+      });
+      const page = tracker.attach(await ctx.newPage(), {
+        label: 'old-machine',
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
 
     // 1. Open studio from Machines list -> Overview shows the quiet one-line note once, with no button.
     await page.goto(`${server.url}/?mock=multi,mixed#/machines`, { waitUntil: 'domcontentloaded' });
@@ -1231,7 +1262,7 @@ test('Old machine (05ba1ef fixture) at 412x915: quiet note, bottom dock in machi
       0,
       'Old machine Overview must omit "Using it now" when sys.procs lacks group',
     );
-    await page.waitForTimeout(250);
+    await waitForLayoutSettled(page, 2);
     await assertNoProtocolErrors(page, 'studio overview');
     await assertNoPlainLeaks(page, 'studio overview');
     await maybeOldShot(page, '01-old-machine-overview');
@@ -1398,26 +1429,25 @@ test('Old machine (05ba1ef fixture) at 412x915: quiet note, bottom dock in machi
   }
 });
 
-test('Mixed-version fleet side by side (?mock=multi,mixed): current tower + old studio, cross-machine search, and Send to both ways', async () => {
-  const server = await startStaticUiServer();
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu'],
-  });
-  const consoleErrors = [];
-  const pageErrors = [];
+browserTest(
+  'Mixed-version fleet side by side (?mock=multi,mixed): current tower + old studio, cross-machine search, and Send to both ways',
+  { timeout: 90_000 },
+  async (_t, tracker) => {
+    const server = await startStaticUiServer();
+    const browser = await launchBrowser();
+    const consoleErrors = [];
+    const pageErrors = [];
 
-  try {
-    const ctx = await browser.newContext({
-      viewport: { width: 412, height: 915 },
-      colorScheme: 'dark',
-    });
-    const page = await ctx.newPage();
-    page.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
-    });
-    page.on('pageerror', (err) => pageErrors.push(String(err)));
+    try {
+      const ctx = await browser.newContext({
+        viewport: { width: 412, height: 915 },
+        colorScheme: 'dark',
+      });
+      const page = tracker.attach(await ctx.newPage(), {
+        label: 'mixed-fleet',
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
 
     // 1. Current machine (tower) keeps full features (Pinned, thumbnails, stars, no older-note).
     await page.goto(`${server.url}/?mock=multi,mixed#/files`, { waitUntil: 'domcontentloaded' });
@@ -1497,52 +1527,40 @@ test('Mixed-version fleet side by side (?mock=multi,mixed): current tower + old 
   }
 });
 
-test('desktop split view opens picture and video on This computer and remote machine and revokes every URL on close', async () => {
-  const pngBytes = Buffer.from(SAMPLE_PNG_BASE64, 'base64');
-  const webmBytes = Buffer.from(SAMPLE_VIDEO_WEBM_BASE64, 'base64');
-  const mediaServer = http.createServer((req, res) => {
-    const urlPath = (req.url || '/').split('?')[0];
-    if (urlPath.startsWith('/v1/content/')) {
-      const isVideo = urlPath.endsWith('.webm');
-      const body = isVideo ? webmBytes : pngBytes;
-      res.writeHead(200, {
-        'Content-Type': isVideo ? 'video/webm' : 'image/png',
-        'Content-Length': String(body.length),
-        'Accept-Ranges': 'bytes',
-        'Cache-Control': 'no-store',
-      });
-      res.end(body);
-      return;
-    }
-    const rel = urlPath === '/' ? 'index.html' : urlPath.replace(/^\/+/, '');
-    const full = path.resolve(UI_ROOT, rel);
-    if (!full.startsWith(UI_ROOT) || !fs.existsSync(full) || fs.statSync(full).isDirectory()) {
-      res.writeHead(404);
-      res.end('Not found');
-      return;
-    }
-    const ext = path.extname(full).toLowerCase();
-    res.writeHead(200, {
-      'Content-Type': MIME_BY_EXT[ext] || 'application/octet-stream',
-      'Content-Security-Policy': MOCK_TEST_CSP,
-      'Cache-Control': 'no-store',
+browserTest(
+  'desktop split view opens picture and video on This computer and remote machine and revokes every URL on close',
+  { timeout: 90_000 },
+  async (_t, tracker) => {
+    const pngBytes = Buffer.from(SAMPLE_PNG_BASE64, 'base64');
+    const webmBytes = Buffer.from(SAMPLE_VIDEO_WEBM_BASE64, 'base64');
+    const mediaServer = await startStaticUiServer({
+      extraHandler: (req, res) => {
+        const urlPath = (req.url || '/').split('?')[0];
+        if (!urlPath.startsWith('/v1/content/')) return false;
+        const isVideo = urlPath.endsWith('.webm');
+        const body = isVideo ? webmBytes : pngBytes;
+        res.writeHead(200, {
+          'Content-Type': isVideo ? 'video/webm' : 'image/png',
+          'Content-Length': String(body.length),
+          'Accept-Ranges': 'bytes',
+          'Cache-Control': 'no-store',
+        });
+        res.end(body);
+        return true;
+      },
     });
-    fs.createReadStream(full).pipe(res);
-  });
-  await new Promise((resolve) => mediaServer.listen(0, '127.0.0.1', resolve));
-  const { port } = mediaServer.address();
-  const baseUrl = `http://127.0.0.1:${port}`;
-  const browser = await chromium.launch({ executablePath: findBrowser(), headless: true });
+    const baseUrl = mediaServer.url;
+    const browser = await launchBrowser();
 
-  try {
-    const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
-    const page = await ctx.newPage();
-    const pageErrors = [];
-    const consoleErrors = [];
-    page.on('pageerror', (err) => pageErrors.push(err.message));
-    page.on('console', (msg) => {
-      if (msg.type() === 'error') consoleErrors.push(msg.text());
-    });
+    try {
+      const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+      const pageErrors = [];
+      const consoleErrors = [];
+      const page = tracker.attach(await ctx.newPage(), {
+        label: 'desktop-split',
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
 
     await page.addInitScript((origin) => {
       const minted = [];
@@ -1753,6 +1771,6 @@ test('desktop split view opens picture and video on This computer and remote mac
     assert.deepEqual(consoleErrors, [], `Console/CSP errors (desktop split): ${consoleErrors.join('\n')}`);
   } finally {
     await browser.close();
-    await new Promise((resolve) => mediaServer.close(resolve));
+    await mediaServer.stop();
   }
 });

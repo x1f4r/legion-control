@@ -7,39 +7,21 @@
 //   desktop hover tooltips, pinned strip, and 5,000-entry lazy on-screen measurement benchmark.
 
 import assert from 'node:assert/strict';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import readline from 'node:readline';
-import test from 'node:test';
-import { fileURLToPath } from 'node:url';
-import { chromium } from 'playwright-core';
 import { findDigitRuns, isNaturalBreak, toGraphemes } from '../lib/file-name.js';
+import {
+  browserTest,
+  launchBrowser,
+  LEGION_BIN,
+  setTheme,
+  startLegionServer,
+  waitForLayoutSettled,
+} from './browser-helpers.mjs';
 
-const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = path.resolve(TEST_DIR, '..', '..', '..');
-const LEGION_BIN =
-  process.env.LEGION_BIN ||
-  path.join(REPO_ROOT, 'target', 'release', process.platform === 'win32' ? 'legion.exe' : 'legion');
 const SHOTS_DIR = process.env.LEGION_LONG_NAMES_SHOTS_DIR || '';
-
-function findBrowser() {
-  if (process.env.LEGION_CHROME && fs.existsSync(process.env.LEGION_CHROME)) {
-    return process.env.LEGION_CHROME;
-  }
-  const candidates = [
-    '/usr/bin/chromium',
-    '/usr/bin/chromium-browser',
-    '/usr/bin/google-chrome',
-    '/usr/bin/google-chrome-stable',
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-  ];
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) return candidate;
-  }
-  throw new Error('No Chromium or Chrome binary found; set LEGION_CHROME.');
-}
 
 function makeWorkRoot() {
   const base =
@@ -56,52 +38,6 @@ function runLegion(args, legionHome, userHome) {
   delete env.XDG_CONFIG_HOME;
   delete env.XDG_STATE_HOME;
   return execFileSync(LEGION_BIN, args, { env, encoding: 'utf8' });
-}
-
-async function startServer(legionHome, userHome) {
-  const env = { ...process.env, LEGION_HOME: legionHome, HOME: userHome, USERPROFILE: userHome };
-  delete env.XDG_CONFIG_HOME;
-  delete env.XDG_STATE_HOME;
-  const child = spawn(LEGION_BIN, ['serve', '--listen', '127.0.0.1:0'], {
-    env,
-    stdio: ['ignore', 'ignore', 'pipe'],
-  });
-  let stderr = '';
-  const url = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new Error(`legion serve did not announce its port. stderr:\n${stderr}`));
-    }, 15_000);
-    const rl = readline.createInterface({ input: child.stderr });
-    rl.on('line', (line) => {
-      stderr += `${line}\n`;
-      const prefix = 'legion serve: listening on ';
-      if (line.startsWith(prefix)) {
-        clearTimeout(timer);
-        resolve(line.slice(prefix.length).trim());
-      }
-    });
-    child.once('exit', (code) => {
-      clearTimeout(timer);
-      reject(new Error(`legion serve exited early (${code}). stderr:\n${stderr}`));
-    });
-  });
-
-  async function stop() {
-    if (child.exitCode !== null) return;
-    child.kill('SIGTERM');
-    await new Promise((resolve) => {
-      const t = setTimeout(() => {
-        child.kill('SIGKILL');
-        resolve();
-      }, 8000);
-      child.once('exit', () => {
-        clearTimeout(t);
-        resolve();
-      });
-    });
-  }
-
-  return { url, stop };
 }
 
 function buildCapturesFixture(folder) {
@@ -148,52 +84,65 @@ function buildFiveThousandFixture(folder) {
   }
 }
 
-async function setTheme(page, theme) {
-  await page.evaluate((t) => {
-    const raw = localStorage.getItem('legion.settings.v1');
-    const obj = raw ? JSON.parse(raw) : {};
-    obj.theme = t;
-    localStorage.setItem('legion.settings.v1', JSON.stringify(obj));
-    document.documentElement.dataset.theme = t;
-  }, theme);
-  await page.waitForTimeout(100);
-}
-
 async function maybeShot(page, name) {
   if (!SHOTS_DIR) return;
   fs.mkdirSync(SHOTS_DIR, { recursive: true });
   await page.screenshot({ path: path.join(SHOTS_DIR, `${name}.png`) });
 }
 
-async function waitForVisibleFitted(page, selector, containerSelector = null) {
-  await page.locator(selector).first().waitFor({ timeout: 10_000 });
-  await page.waitForFunction(
-    ({ sel, cSel }) => {
-      const els = [...document.querySelectorAll(sel)];
-      if (els.length === 0) return false;
-      const boxEl = cSel ? document.querySelector(cSel) : null;
-      const bounds = boxEl
-        ? boxEl.getBoundingClientRect()
-        : { top: 0, bottom: window.innerHeight };
-      const onScreen = els.filter((el) => {
-        const r = el.getBoundingClientRect();
-        return r.height > 0 && r.bottom > bounds.top + 1 && r.top < bounds.bottom - 1;
-      });
-      if (onScreen.length === 0) return false;
-      return onScreen.every((el) => el.getAttribute('data-fn-ready') === '1');
-    },
-    { sel: selector, cSel: containerSelector },
-    { timeout: 10_000 },
-  );
-  await page.waitForTimeout(40);
+async function waitForVisibleFitted(page, selector, containerSelector = null, tracker = null) {
+  const step = `fitted names for ${selector}`;
+  if (tracker) {
+    await tracker.waitForLocator(page.locator(selector).first(), `${selector} slot`);
+    await tracker.waitForFn(
+      page,
+      ({ sel, cSel }) => {
+        const els = [...document.querySelectorAll(sel)];
+        if (els.length === 0) return false;
+        const boxEl = cSel ? document.querySelector(cSel) : null;
+        const bounds = boxEl
+          ? boxEl.getBoundingClientRect()
+          : { top: 0, bottom: window.innerHeight };
+        const onScreen = els.filter((el) => {
+          const r = el.getBoundingClientRect();
+          return r.height > 0 && r.bottom > bounds.top + 1 && r.top < bounds.bottom - 1;
+        });
+        if (onScreen.length === 0) return false;
+        return onScreen.every((el) => el.getAttribute('data-fn-ready') === '1');
+      },
+      { sel: selector, cSel: containerSelector },
+      step,
+    );
+  } else {
+    await page.locator(selector).first().waitFor();
+    await page.waitForFunction(
+      ({ sel, cSel }) => {
+        const els = [...document.querySelectorAll(sel)];
+        if (els.length === 0) return false;
+        const boxEl = cSel ? document.querySelector(cSel) : null;
+        const bounds = boxEl
+          ? boxEl.getBoundingClientRect()
+          : { top: 0, bottom: window.innerHeight };
+        const onScreen = els.filter((el) => {
+          const r = el.getBoundingClientRect();
+          return r.height > 0 && r.bottom > bounds.top + 1 && r.top < bounds.bottom - 1;
+        });
+        if (onScreen.length === 0) return false;
+        return onScreen.every((el) => el.getAttribute('data-fn-ready') === '1');
+      },
+      { sel: selector, cSel: containerSelector },
+    );
+  }
+  await waitForLayoutSettled(page, 2);
 }
 
-async function connectPage(page, url, token) {
+async function connectPage(page, url, token, tracker) {
+  tracker.setStep(`connect page to ${url}`);
   await page.goto(url, { waitUntil: 'domcontentloaded' });
-  await page.locator('input').first().waitFor({ timeout: 10_000 });
+  await tracker.waitForLocator(page.locator('input').first(), 'token input');
   await page.locator('input').first().fill(token);
   await page.getByRole('button', { name: 'Connect' }).click();
-  await page.locator('nav.nav a', { hasText: 'Files' }).waitFor({ timeout: 10_000 });
+  await tracker.waitForLocator(page.locator('nav.nav a', { hasText: 'Files' }), 'Files nav link');
 }
 
 function extractDigitRunStrings(text) {
@@ -286,7 +235,7 @@ function assertSeparatorEmphasis(row, { expectedDim, expectedStrong, expectedDim
   }
 }
 
-async function collectAllScrolledRows(page, scrollSelector, rowSelector, slotSelector) {
+async function collectAllScrolledRows(page, scrollSelector, rowSelector, slotSelector, tracker) {
   const seen = new Map();
   let lastTop = -1;
 
@@ -338,7 +287,7 @@ async function collectAllScrolledRows(page, scrollSelector, rowSelector, slotSel
     );
 
   for (let step = 0; step < 30; step += 1) {
-    await waitForVisibleFitted(page, slotSelector, scrollSelector);
+    await waitForVisibleFitted(page, slotSelector, scrollSelector, tracker);
     for (const item of await readVisibleSnapshot()) {
       seen.set(item.ariaLabel, item);
     }
@@ -352,7 +301,7 @@ async function collectAllScrolledRows(page, scrollSelector, rowSelector, slotSel
     }, scrollSelector);
 
     if (Math.abs(pos.top - lastTop) < 2 || pos.top >= pos.max - 2) {
-      await waitForVisibleFitted(page, slotSelector, scrollSelector);
+      await waitForVisibleFitted(page, slotSelector, scrollSelector, tracker);
       for (const item of await readVisibleSnapshot()) {
         seen.set(item.ariaLabel, item);
       }
@@ -364,7 +313,10 @@ async function collectAllScrolledRows(page, scrollSelector, rowSelector, slotSel
   return Array.from(seen.values());
 }
 
-test('long file names: real legion serve on phone & desktop, list & grid, dark & light, item sheet, hover, search, and 5,000-entry scroll', async () => {
+browserTest(
+  'long file names: real legion serve on phone & desktop, list & grid, dark & light, item sheet, hover, search, and 5,000-entry scroll',
+  { timeout: 180_000 },
+  async (_t, tracker) => {
   assert.ok(fs.existsSync(LEGION_BIN), `Release binary not found at ${LEGION_BIN}`);
   const root = makeWorkRoot();
   const towerHome = path.join(root, 'tower-legion');
@@ -423,12 +375,9 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
     towerUser,
   );
 
-  const server = await startServer(towerHome, towerUser);
-  const browser = await chromium.launch({
-    executablePath: findBrowser(),
-    headless: true,
-    args: ['--no-sandbox', '--disable-gpu'],
-  });
+  const server = await startLegionServer(towerHome, towerUser);
+  tracker.setServerStderr(server.getStderr);
+  const browser = await launchBrowser();
 
   const consoleErrors = [];
   const pageErrors = [];
@@ -440,17 +389,17 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
       colorScheme: 'dark',
       permissions: ['clipboard-read', 'clipboard-write'],
     });
-    const phone = await phoneCtx.newPage();
-    phone.on('console', (m) => {
-      if (m.type() === 'error') consoleErrors.push(`phone: ${m.text()}`);
+    const phone = tracker.attach(await phoneCtx.newPage(), {
+      label: 'phone',
+      collectConsole: consoleErrors,
+      collectPage: pageErrors,
     });
-    phone.on('pageerror', (e) => pageErrors.push(`phone: ${String(e)}`));
 
-    await connectPage(phone, server.url, tokenOut.token);
+    await connectPage(phone, server.url, tokenOut.token, tracker);
 
     // Check Pinned strip on Files home (2-line tiles, unique visible texts, full aria-label).
     await phone.locator('nav.nav a', { hasText: 'Files' }).click();
-    await waitForVisibleFitted(phone, '.tiles .tile .fn-slot');
+    await waitForVisibleFitted(phone, '.tiles .tile .fn-slot', null, tracker);
     const pinnedSnap = await phone.evaluate(() =>
       [...document.querySelectorAll('.tiles a.tile')].map((tile) => {
         const slot = tile.querySelector('.fn-slot');
@@ -492,7 +441,7 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
 
     // Check Favourites view on phone (uses FileNameList + full accessible names + distinct visible text).
     await phone.locator('a.row[href="#/files/@favourites"]').click();
-    await waitForVisibleFitted(phone, '.list a.row .fn-slot');
+    await waitForVisibleFitted(phone, '.list a.row .fn-slot', null, tracker);
     const favSnap = await phone.evaluate(() =>
       [...document.querySelectorAll('.list a.row')].map((row) => ({
         ariaLabel: row.getAttribute('aria-label') || '',
@@ -509,14 +458,17 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
     // Open Captures folder on phone.
     const capturesHref = `${server.url}/#/files/tower/${encodeURIComponent(capturesDir)}`;
     await phone.goto(capturesHref, { waitUntil: 'domcontentloaded' });
-    await phone.locator('.grid a.cell, .list a.row').first().waitFor({ timeout: 10_000 });
+    await tracker.waitForLocator(
+      phone.locator('.grid a.cell[aria-label="IMG_20261125_140311.jpg"], .list a.row[aria-label="IMG_20261125_140311.jpg"]'),
+      'Captures folder entries on phone',
+    );
 
     // Switch to List view first and check dark + light + capture list primary/dim colour tokens.
     const showListBtn = phone.locator('.dock button[aria-label="Show as list"]');
     if (await showListBtn.count()) {
       await showListBtn.click();
     }
-    await waitForVisibleFitted(phone, '.list a.row .fn-slot');
+    await waitForVisibleFitted(phone, '.list a.row .fn-slot', null, tracker);
 
     const readNameColors = async (page, slotSelector) =>
       page.evaluate((sel) => {
@@ -531,33 +483,33 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
         };
       }, slotSelector);
 
-    await setTheme(phone, 'dark');
+    await setTheme(phone, 'dark', tracker);
     const phoneListColorsDark = await readNameColors(phone, '.list a.row .title.fn-title');
     assert.ok(phoneListColorsDark, 'Expected dimmed list row in dark theme');
     assert.notEqual(phoneListColorsDark.primary, phoneListColorsDark.dim);
     await maybeShot(phone, 'after-phone-list-top-dark');
-    await setTheme(phone, 'light');
+    await setTheme(phone, 'light', tracker);
     const phoneListColorsLight = await readNameColors(phone, '.list a.row .title.fn-title');
     assert.ok(phoneListColorsLight, 'Expected dimmed list row in light theme');
     assert.notEqual(phoneListColorsLight.primary, phoneListColorsLight.dim);
     await maybeShot(phone, 'after-phone-list-top-light');
-    await setTheme(phone, 'dark');
+    await setTheme(phone, 'dark', tracker);
 
     // Scroll to Screen Recording section for direct before/after comparison shots.
     const firstRecRow = phone.locator('.list a.row[aria-label="Screen Recording 2026-11-25 at 14.01.12.mov"]');
     await firstRecRow.scrollIntoViewIfNeeded();
-    await waitForVisibleFitted(phone, '.list a.row .fn-slot');
+    await waitForVisibleFitted(phone, '.list a.row .fn-slot', null, tracker);
     await maybeShot(phone, 'after-phone-list-recordings-dark');
-    await setTheme(phone, 'light');
+    await setTheme(phone, 'light', tracker);
     await maybeShot(phone, 'after-phone-list-recordings-light');
-    await setTheme(phone, 'dark');
+    await setTheme(phone, 'dark', tracker);
 
     // Scroll back to top and scan ALL 60 rows in list view on phone.
     await phone.evaluate(() => {
       const m = document.querySelector('main.main');
       if (m) m.scrollTop = 0;
     });
-    const phoneListRows = await collectAllScrolledRows(phone, 'main.main', '.list a.row', '.fn-slot');
+    const phoneListRows = await collectAllScrolledRows(phone, 'main.main', '.list a.row', '.fn-slot', tracker);
     assert.equal(phoneListRows.length, expectedCaptures.length, `Expected all ${expectedCaptures.length} rows on phone list`);
 
     const phoneDrawnSet = new Set(phoneListRows.map((r) => r.drawn));
@@ -637,31 +589,33 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
     // Test phone long-press -> item sheet shows full name + working Copy name button.
     const recBox = await recLink.boundingBox();
     assert.ok(recBox, 'Recording row bounding box missing');
+    const itemSheet = phone.locator('.sheet');
     await phone.mouse.move(recBox.x + recBox.width / 2, recBox.y + recBox.height / 2);
     await phone.mouse.down();
-    await phone.waitForTimeout(550);
-    await phone.mouse.up();
+    try {
+      await tracker.waitForLocator(itemSheet, 'long-press item sheet');
+    } finally {
+      await phone.mouse.up();
+    }
 
-    const itemSheet = phone.locator('.sheet');
-    await itemSheet.waitFor({ timeout: 5000 });
     assert.equal(
       await itemSheet.locator('#sheet-title').textContent(),
       targetRec,
       'Item sheet title must carry the full untruncated name',
     );
     const copyNameBtn = itemSheet.getByRole('button', { name: 'Copy name', exact: true });
-    await copyNameBtn.waitFor();
+    await tracker.waitForLocator(copyNameBtn, 'Copy name button in item sheet');
     await maybeShot(phone, 'after-phone-item-sheet-dark');
-    await setTheme(phone, 'light');
+    await setTheme(phone, 'light', tracker);
     await maybeShot(phone, 'after-phone-item-sheet-light');
-    await setTheme(phone, 'dark');
+    await setTheme(phone, 'dark', tracker);
 
     await copyNameBtn.click();
-    await itemSheet.getByRole('button', { name: 'Copied', exact: true }).waitFor({ timeout: 3000 });
+    await tracker.waitForLocator(itemSheet.getByRole('button', { name: 'Copied', exact: true }), 'Copied button confirmation');
     const copiedText = await phone.evaluate(() => navigator.clipboard.readText());
     assert.equal(copiedText, targetRec, 'Copy name must write exact full name to clipboard');
     await phone.keyboard.press('Escape');
-    await itemSheet.waitFor({ state: 'hidden' });
+    await tracker.waitForLocator(itemSheet, 'item sheet hidden after Escape', { state: 'hidden' });
 
     // Open a report in Viewer -> viewer title follows rule 2 (no trailing ellipsis, ending intact)
     // and viewer More sheet also carries full name + Copy name.
@@ -669,8 +623,8 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
     const reportLink = phone.getByRole('link', { name: reportName, exact: true });
     await reportLink.scrollIntoViewIfNeeded();
     await reportLink.click();
-    await phone.locator('.viewer').waitFor({ timeout: 5000 });
-    await waitForVisibleFitted(phone, '.viewer-top .name .fn-slot');
+    await tracker.waitForLocator(phone.locator('.viewer'), 'report viewer');
+    await waitForVisibleFitted(phone, '.viewer-top .name .fn-slot', null, tracker);
     const viewerTitleInfo = await phone.evaluate(() => {
       const nameEl = document.querySelector('.viewer-top .name');
       const slot = nameEl?.querySelector('.fn-slot');
@@ -706,12 +660,20 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
     await maybeShot(phone, 'after-phone-viewer-dark');
 
     await phone.locator('.viewer-top button[aria-label="More options"]').click();
-    await phone.locator('.sheet').getByRole('button', { name: 'Copy name', exact: true }).waitFor();
-    await phone.waitForFunction(() => document.activeElement?.classList?.contains('sheet'), null, { timeout: 3000 });
+    await tracker.waitForLocator(
+      phone.locator('.sheet').getByRole('button', { name: 'Copy name', exact: true }),
+      'viewer More sheet Copy name button',
+    );
+    await tracker.waitForFn(
+      phone,
+      () => document.activeElement?.classList?.contains('sheet'),
+      null,
+      'viewer More sheet focus',
+    );
     await phone.keyboard.press('Escape');
-    await phone.locator('.sheet').waitFor({ state: 'hidden' });
+    await tracker.waitForLocator(phone.locator('.sheet'), 'viewer More sheet hidden', { state: 'hidden' });
     await phone.locator('.viewer-top button[aria-label="Close"]').click();
-    await phone.locator('.viewer').waitFor({ state: 'hidden' });
+    await tracker.waitForLocator(phone.locator('.viewer'), 'viewer hidden', { state: 'hidden' });
 
     // Switch to Grid view on phone (dark + light): check up to 3 lines, all visible cells distinct.
     await phone.locator('.dock button[aria-label="Show as grid"]').click();
@@ -719,8 +681,8 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
       const m = document.querySelector('main.main');
       if (m) m.scrollTop = 0;
     });
-    await waitForVisibleFitted(phone, '.grid a.cell .fn-slot');
-    await setTheme(phone, 'dark');
+    await waitForVisibleFitted(phone, '.grid a.cell .fn-slot', null, tracker);
+    await setTheme(phone, 'dark', tracker);
     const phoneGridColorsDark = await readNameColors(phone, '.grid a.cell .cell-name');
     assert.ok(phoneGridColorsDark, 'Expected dimmed grid cell in dark theme');
     assert.equal(
@@ -734,7 +696,7 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
       'Grid cell dimmed text must match list secondary token (--dim) in dark theme',
     );
     await maybeShot(phone, 'after-phone-grid-dark');
-    await setTheme(phone, 'light');
+    await setTheme(phone, 'light', tracker);
     const phoneGridColorsLight = await readNameColors(phone, '.grid a.cell .cell-name');
     assert.ok(phoneGridColorsLight, 'Expected dimmed grid cell in light theme');
     assert.equal(
@@ -748,9 +710,9 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
       'Grid cell dimmed text must match list secondary token (--dim) in light theme',
     );
     await maybeShot(phone, 'after-phone-grid-light');
-    await setTheme(phone, 'dark');
+    await setTheme(phone, 'dark', tracker);
 
-    const phoneGridCells = await collectAllScrolledRows(phone, 'main.main', '.grid a.cell', '.fn-slot');
+    const phoneGridCells = await collectAllScrolledRows(phone, 'main.main', '.grid a.cell', '.fn-slot', tracker);
     assert.equal(phoneGridCells.length, 52, 'Expected 52 media cells (40 jpg + 12 mov) in grid view');
     assert.equal(
       new Set(phoneGridCells.map((c) => c.drawn)).size,
@@ -766,7 +728,13 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
       `${server.url}/#/files/@search?m=tower&p=${encodeURIComponent(capturesDir)}&q=${encodeURIComponent('Quarterly')}`,
       { waitUntil: 'domcontentloaded' },
     );
-    await waitForVisibleFitted(phone, '.list a.row .fn-slot');
+    await tracker.waitForFn(
+      phone,
+      () => location.hash.startsWith('#/files/@search') && document.querySelectorAll('.list .fn-match').length >= 4,
+      null,
+      'Quarterly search results on phone',
+    );
+    await waitForVisibleFitted(phone, '.list a.row .fn-slot', null, tracker);
     const searchInfo = await phone.evaluate(() => {
       const rows = [...document.querySelectorAll('.list a.row')];
       return {
@@ -789,20 +757,39 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
 
     // Recent view on phone carries the opened report with full accessible name and fitted text.
     await phone.goto(`${server.url}/#/files/@recent`, { waitUntil: 'domcontentloaded' });
-    await waitForVisibleFitted(phone, '.list a.row .fn-slot');
+    await tracker.waitForFn(
+      phone,
+      () =>
+        location.hash === '#/files/@recent' &&
+        document.querySelectorAll('.list .fn-match').length === 0 &&
+        document.querySelectorAll('.list a.row').length >= 1,
+      null,
+      'Recent view entries on phone',
+    );
+    await waitForVisibleFitted(phone, '.list a.row .fn-slot', null, tracker);
     const recentRow = phone.getByRole('link', { name: reportName, exact: true });
     assert.equal(await recentRow.count(), 1, 'Recent view must expose full accessible name');
 
     // Text-size change recomputes cleanly without overflow.
     await phone.goto(capturesHref, { waitUntil: 'domcontentloaded' });
+    await tracker.waitForLocator(
+      phone.locator('.grid a.cell[aria-label="IMG_20261125_140311.jpg"], .list a.row[aria-label="IMG_20261125_140311.jpg"]'),
+      'Captures folder entries before text-size check',
+    );
     const showListBtn2 = phone.locator('.dock button[aria-label="Show as list"]');
     if (await showListBtn2.count()) await showListBtn2.click();
-    await waitForVisibleFitted(phone, '.list a.row .fn-slot');
+    await waitForVisibleFitted(phone, '.list a.row .fn-slot', null, tracker);
+    const beforeBatches = await phone.evaluate(() => window.__LEGION_NAME_FIT_STATS__?.totalBatches || 0);
     await phone.evaluate(() => {
       document.documentElement.dataset.text = 'large';
     });
-    await phone.waitForTimeout(120);
-    await waitForVisibleFitted(phone, '.list a.row .fn-slot');
+    await tracker.waitForFn(
+      phone,
+      (prev) => (window.__LEGION_NAME_FIT_STATS__?.totalBatches || 0) > prev,
+      beforeBatches,
+      'name-fit recompute after data-text=large',
+    );
+    await waitForVisibleFitted(phone, '.list a.row .fn-slot', null, tracker);
     const largeTextOverflow = await phone.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
     assert.ok(largeTextOverflow <= 1, `Large text size caused overflow: ${largeTextOverflow}px`);
     await phone.evaluate(() => {
@@ -816,18 +803,21 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
       viewport: { width: 1440, height: 900 },
       colorScheme: 'dark',
     });
-    const desk = await deskCtx.newPage();
-    desk.on('console', (m) => {
-      if (m.type() === 'error') consoleErrors.push(`desktop: ${m.text()}`);
+    const desk = tracker.attach(await deskCtx.newPage(), {
+      label: 'desktop',
+      collectConsole: consoleErrors,
+      collectPage: pageErrors,
     });
-    desk.on('pageerror', (e) => pageErrors.push(`desktop: ${String(e)}`));
 
-    await connectPage(desk, server.url, tokenOut.token);
+    await connectPage(desk, server.url, tokenOut.token, tracker);
     await desk.goto(capturesHref, { waitUntil: 'domcontentloaded' });
-    await desk.locator('.split-right .grid a.cell, .split-right .list a.row').first().waitFor({ timeout: 10_000 });
+    await tracker.waitForLocator(
+      desk.locator('.split-right .grid a.cell[aria-label="IMG_20261125_140311.jpg"], .split-right .list a.row[aria-label="IMG_20261125_140311.jpg"]'),
+      'Captures folder entries on desktop',
+    );
 
     // Check pinned strip in left split pane.
-    await waitForVisibleFitted(desk, '.split-left .tiles a.tile .fn-slot');
+    await waitForVisibleFitted(desk, '.split-left .tiles a.tile .fn-slot', null, tracker);
     const leftPinned = await desk.evaluate(() =>
       [...document.querySelectorAll('.split-left .tiles a.tile')].map((t) => {
         const slot = t.querySelector('.fn-slot');
@@ -868,22 +858,23 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
     );
 
     // Desktop Grid view screenshots & checks (dark + light).
-    await waitForVisibleFitted(desk, '.split-right .grid a.cell .fn-slot');
-    await setTheme(desk, 'dark');
+    await waitForVisibleFitted(desk, '.split-right .grid a.cell .fn-slot', null, tracker);
+    await setTheme(desk, 'dark', tracker);
     const deskGridColorsDark = await readNameColors(desk, '.split-right .grid a.cell .cell-name');
     assert.ok(deskGridColorsDark, 'Expected dimmed desktop grid cell in dark theme');
     await maybeShot(desk, 'after-desktop-grid-dark');
-    await setTheme(desk, 'light');
+    await setTheme(desk, 'light', tracker);
     const deskGridColorsLight = await readNameColors(desk, '.split-right .grid a.cell .cell-name');
     assert.ok(deskGridColorsLight, 'Expected dimmed desktop grid cell in light theme');
     await maybeShot(desk, 'after-desktop-grid-light');
-    await setTheme(desk, 'dark');
+    await setTheme(desk, 'dark', tracker);
 
     const deskGridCells = await collectAllScrolledRows(
       desk,
       '.split-right .split-body',
       '.split-right .grid a.cell',
       '.fn-slot',
+      tracker,
     );
     assert.equal(deskGridCells.length, 52);
     assert.equal(new Set(deskGridCells.map((c) => c.drawn)).size, 52, 'Desktop grid cells must all differ');
@@ -894,22 +885,22 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
 
     // Switch desktop to List view (dark + light), scroll to Screen Recordings to match before shot.
     await desk.locator('.split-right button[aria-label="Show as list"]').click();
-    await waitForVisibleFitted(desk, '.split-right .list a.row .fn-slot');
+    await waitForVisibleFitted(desk, '.split-right .list a.row .fn-slot', null, tracker);
     await desk.locator('.split-right .list a.row[aria-label="Screen Recording 2026-11-25 at 14.01.12.mov"]').scrollIntoViewIfNeeded();
-    await waitForVisibleFitted(desk, '.split-right .list a.row .fn-slot');
-    await setTheme(desk, 'dark');
+    await waitForVisibleFitted(desk, '.split-right .list a.row .fn-slot', null, tracker);
+    await setTheme(desk, 'dark', tracker);
     const deskListColorsDark = await readNameColors(desk, '.split-right .list a.row .title.fn-title');
     assert.ok(deskListColorsDark, 'Expected dimmed desktop list row in dark theme');
     assert.equal(deskGridColorsDark.primary, deskListColorsDark.primary);
     assert.equal(deskGridColorsDark.dim, deskListColorsDark.dim);
     await maybeShot(desk, 'after-desktop-list-dark');
-    await setTheme(desk, 'light');
+    await setTheme(desk, 'light', tracker);
     const deskListColorsLight = await readNameColors(desk, '.split-right .list a.row .title.fn-title');
     assert.ok(deskListColorsLight, 'Expected dimmed desktop list row in light theme');
     assert.equal(deskGridColorsLight.primary, deskListColorsLight.primary);
     assert.equal(deskGridColorsLight.dim, deskListColorsLight.dim);
     await maybeShot(desk, 'after-desktop-list-light');
-    await setTheme(desk, 'dark');
+    await setTheme(desk, 'dark', tracker);
 
     await desk.evaluate(() => {
       const b = document.querySelector('.split-right .split-body');
@@ -920,6 +911,7 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
       '.split-right .split-body',
       '.split-right .list a.row',
       '.fn-slot',
+      tracker,
     );
     assert.equal(deskListRows.length, expectedCaptures.length);
     assert.equal(new Set(deskListRows.map((r) => r.drawn)).size, expectedCaptures.length);
@@ -968,8 +960,12 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
     await desk.goto(`${server.url}/#/files/tower/${encodeURIComponent(manyDir)}`, {
       waitUntil: 'domcontentloaded',
     });
-    await waitForVisibleFitted(desk, '.split-right .list a.row .fn-slot', '.split-right .split-body');
-    await desk.waitForTimeout(100);
+    await tracker.waitForLocator(
+      desk.locator('.split-right .list a.row[aria-label^="Archive_Backup_2026_11_25_Node_Primary_Snapshot_"]').first(),
+      'ManyFiles entries rendered on desktop',
+    );
+    await waitForVisibleFitted(desk, '.split-right .list a.row .fn-slot', '.split-right .split-body', tracker);
+    await waitForLayoutSettled(desk, 2);
 
     const initialPerf = await desk.evaluate(() => {
       const slots = [...document.querySelectorAll('.split-right .list .fn-slot')];
@@ -1001,7 +997,7 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
         const b = document.querySelector('.split-right .split-body');
         if (b) b.scrollTop = step * 1600;
       }, s);
-      await waitForVisibleFitted(desk, '.split-right .list a.row .fn-slot', '.split-right .split-body');
+      await waitForVisibleFitted(desk, '.split-right .list a.row .fn-slot', '.split-right .split-body', tracker);
       const ms = await desk.evaluate(() => window.__LEGION_NAME_FIT_STATS__?.lastBatchMs || 0);
       scrollBatchMs.push(Number(ms.toFixed(2)));
     }
@@ -1025,4 +1021,5 @@ test('long file names: real legion serve on phone & desktop, list & grid, dark &
     await server.stop();
     fs.rmSync(root, { recursive: true, force: true });
   }
-});
+  },
+);
