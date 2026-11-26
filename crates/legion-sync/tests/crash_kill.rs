@@ -144,6 +144,7 @@ impl SyncEngineHolder {
             legion_sync::RealFs::open(root.join(m)).map_err(|e| e.to_string())?,
             legion_sync::RedbIndexStore::open(root.join(format!("{m}.redb")))
                 .map_err(|e| e.to_string())?,
+            token_store_for(&root.join(m), m),
         )
         .map_err(|e| format!("open {m}: {e}"))?;
         Ok(Self(e))

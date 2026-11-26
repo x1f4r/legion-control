@@ -277,19 +277,18 @@ fn m4_reinstall_while_other_member_off_resurrects() {
     // Laptop goes off for weeks. Tower deletes the file.
     fs::remove_file(t.join("tower/old-tax-return.pdf")).unwrap();
     tower.scan(ts(10)).unwrap();
-    // Tower is reinstalled; its folder is kept, its index is gone.
+    let inc_before = tower.meta().unwrap().incarnation;
+    // Tower is reinstalled: its folder (including its sync store) is kept, while its machine-local
+    // instance token is wiped. Decision 2 rotates incarnation while keeping all deletion history.
     drop(tower);
-    fs::remove_file(t.join("tower.redb")).unwrap();
+    let _ = fs::remove_dir_all(safety_common::token_store_dir(&t.join("tower"), "tower"));
     let mut tower = open_real(&t.join("tower"), &t.join("tower.redb"), "tower", &all);
-    // Item 7: missing index beside existing marker and non-empty folder stops as damaged until
-    // explicitly rebuilt from disk.
-    assert!(tower.is_index_damaged());
-    assert!(matches!(
-        tower.scan(ts(20)),
-        Err(legion_sync::SyncError::IndexDamaged { .. })
-    ));
-    tower.rebuild_from_disk(ts(20)).unwrap();
     assert!(!tower.is_index_damaged());
+    assert_ne!(
+        tower.meta().unwrap().incarnation,
+        inc_before,
+        "reinstall with lost token must rotate incarnation while keeping history"
+    );
     // Laptop returns.
     for k in 0..3 {
         let _ = tower.pull_from_peer(&EnginePeer::new(&laptop, "tower"), ts(30 + k));

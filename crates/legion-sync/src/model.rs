@@ -19,12 +19,15 @@ pub type FolderId = String;
 pub type MemberId = String;
 
 /// Current durable index schema version. Opening an index with a higher version is refused
-/// cleanly with [`SyncError::SchemaTooNew`]; opening an index with an older version is refused as
-/// damaged/incompatible ([`SyncError::IndexDamaged`]) so it is rebuilt rather than misread.
-pub const INDEX_SCHEMA_VERSION: u32 = 5;
+/// cleanly with [`SyncError::SchemaTooNew`]; supported older versions
+/// (`MIN_MIGRATABLE_SCHEMA_VERSION..INDEX_SCHEMA_VERSION`) migrate in place without rebuilding.
+pub const INDEX_SCHEMA_VERSION: u32 = 6;
+
+/// Lowest older schema version that migrates in place to [`INDEX_SCHEMA_VERSION`].
+pub const MIN_MIGRATABLE_SCHEMA_VERSION: u32 = 5;
 
 /// Sync wire/trait protocol version advertised in [`PeerHandshake`] and [`HandshakeHello`].
-pub const SYNC_PROTOCOL_VERSION: u32 = 3;
+pub const SYNC_PROTOCOL_VERSION: u32 = 4;
 
 /// Maximum version vector counter value accepted for any member key (`2^62`).
 pub const MAX_VERSION_COUNTER: u64 = 1u64 << 62;
@@ -171,6 +174,22 @@ pub fn random_incarnation_id() -> Result<u64> {
         }
     }
     Ok(1)
+}
+
+/// Generates a cryptographically random 32-hex-character (128-bit) instance token used to bind
+/// one folder index inside `.legion-sync/` to this machine's local install.
+pub fn random_instance_token() -> Result<String> {
+    let mut buf = [0u8; 16];
+    getrandom::fill(&mut buf).map_err(|err| SyncError::Storage {
+        context: "generate instance token".to_string(),
+        detail: err.to_string(),
+    })?;
+    let mut out = String::with_capacity(32);
+    for b in buf {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    Ok(out)
 }
 
 /// Generates a 16-hex-character random token for bin and temporary identifiers (unique across
@@ -560,7 +579,7 @@ pub enum PeerRollbackClaimDecision {
     IgnoreReports,
 }
 
-/// Persistent folder-level metadata stored in the index.
+/// Persistent folder-level metadata stored in the index inside `.legion-sync/index.redb`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FolderMeta {
     /// Stable folder identifier.
@@ -569,6 +588,13 @@ pub struct FolderMeta {
     pub local_member: MemberId,
     /// Current random non-zero incarnation of this member's index.
     pub incarnation: u64,
+    /// Random instance token matching this machine's local state directory.
+    ///
+    /// When a folder is moved/copied to another machine or the machine is reinstalled, its
+    /// token is unknown to the machine and triggers a clean incarnation rotation keeping all
+    /// history intact.
+    #[serde(default)]
+    pub instance_token: String,
     /// Current active member set for this folder.
     pub members: BTreeSet<MemberId>,
     /// Members that previously belonged to this folder (validated names retained so historical
@@ -588,15 +614,11 @@ pub struct FolderMeta {
     /// Active mass-deletion brake state awaiting user confirmation, if tripped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_brake: Option<DeletionBrake>,
-    /// When `true`, files discovered by the initial scan on disk (join, reinstall, or rollback)
-    /// are tagged `from_join = true` so stale copies are binned rather than causing conflicts or
-    /// resurrecting deletions.
+    /// When `true`, files discovered by the initial scan on disk with no prior index (first join
+    /// on a folder already holding files, or an explicit rebuild after `.legion-sync/index.redb`
+    /// was lost) are recorded as [`RecordProvenance::Unversioned`].
     #[serde(default)]
     pub join_mode: bool,
-    /// Highest local sequence number of any record still carrying `from_join = true` that has not
-    /// yet been confirmed live across every current member (`0` when none are pending).
-    #[serde(default)]
-    pub unconfirmed_join_until_seq: u64,
     /// Chained fingerprint at `local_seq` (commits to the full sequence history `1..=local_seq`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_fingerprint: Option<Hash>,
@@ -606,8 +628,8 @@ pub struct FolderMeta {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub rollback_claims_by_peer: BTreeMap<MemberId, PeerRollbackClaimState>,
     /// Directories deleted remotely that were intentionally kept on disk only because they still
-    /// hold ignored or held-back local files, persisted across tombstone GC and restarts so scans
-    /// never revive them unless synced files are later added inside.
+    /// hold ignored or held-back local files, persisted across restarts so scans never revive
+    /// them unless synced files are later added inside.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub kept_deleted_dirs: BTreeSet<String>,
     /// Live paths that raced with a person's save or move during placement or crash recovery and
@@ -627,8 +649,9 @@ pub struct FolderMeta {
 }
 
 impl FolderMeta {
-    /// Creates initial folder metadata from a [`FolderConfig`] and `incarnation`.
-    pub fn new(config: &FolderConfig, incarnation: u64) -> Self {
+    /// Creates initial folder metadata from a [`FolderConfig`], `incarnation`, and
+    /// `instance_token`.
+    pub fn new(config: &FolderConfig, incarnation: u64, instance_token: String) -> Self {
         let mut former = config.former_members.clone();
         for m in &config.members {
             former.remove(m);
@@ -637,6 +660,7 @@ impl FolderMeta {
             folder_id: config.id.clone(),
             local_member: config.local_member.clone(),
             incarnation,
+            instance_token,
             members: config.members.clone(),
             former_members: former,
             rejoining_peers: BTreeSet::new(),
@@ -645,7 +669,6 @@ impl FolderMeta {
             paused: false,
             pending_brake: None,
             join_mode: true,
-            unconfirmed_join_until_seq: 0,
             head_fingerprint: None,
             rollback_claims_by_peer: BTreeMap::new(),
             kept_deleted_dirs: BTreeSet::new(),
@@ -1005,6 +1028,69 @@ impl FetchOptions {
     }
 }
 
+/// Causal provenance of an [`IndexRecord`].
+///
+/// Content found on disk with no prior history (a new member added to a folder already holding
+/// files, or a folder rebuilt after `.legion-sync/index.redb` was lost) is explicitly
+/// [`Self::Unversioned`] — not an empty [`VersionVector`] and not a fresh incarnation key.
+/// Unversioned records win nothing against versioned history, spread cleanly to peers that have
+/// no record for the path, and gain a [`Self::Versioned`] vector on their first real edit,
+/// deletion, or reconciliation against a versioned record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "vector", rename_all = "snake_case")]
+pub enum RecordProvenance {
+    /// Content found on disk with no recorded history (provenance unknown).
+    Unversioned,
+    /// Authored or reconciled causal version vector keyed by `(member, incarnation)`.
+    Versioned(VersionVector),
+}
+
+impl RecordProvenance {
+    /// Returns `true` when this record has no recorded history (`Unversioned`).
+    pub fn is_unversioned(&self) -> bool {
+        matches!(self, Self::Unversioned)
+    }
+
+    /// Returns `true` when this record carries a version vector (`Versioned`).
+    pub fn is_versioned(&self) -> bool {
+        matches!(self, Self::Versioned(_))
+    }
+
+    /// Borrows the underlying [`VersionVector`], or `None` when [`Self::Unversioned`].
+    pub fn as_versioned(&self) -> Option<&VersionVector> {
+        match self {
+            Self::Unversioned => None,
+            Self::Versioned(vv) => Some(vv),
+        }
+    }
+
+    /// Mutably borrows the underlying [`VersionVector`], or `None` when [`Self::Unversioned`].
+    pub fn as_versioned_mut(&mut self) -> Option<&mut VersionVector> {
+        match self {
+            Self::Unversioned => None,
+            Self::Versioned(vv) => Some(vv),
+        }
+    }
+
+    /// Extracts the underlying [`VersionVector`] (or an empty vector for [`Self::Unversioned`])
+    /// as the starting base before authoring a real edit or deletion with `meta.bump_version`.
+    pub fn to_version_vector(&self) -> VersionVector {
+        match self {
+            Self::Unversioned => VersionVector::new(),
+            Self::Versioned(vv) => vv.clone(),
+        }
+    }
+
+    /// Consumes `self`, returning its [`VersionVector`] (or an empty vector for
+    /// [`Self::Unversioned`]) as the starting base before authoring a real edit or deletion.
+    pub fn into_version_vector(self) -> VersionVector {
+        match self {
+            Self::Unversioned => VersionVector::new(),
+            Self::Versioned(vv) => vv,
+        }
+    }
+}
+
 /// One path's indexed state on a member, exchanged incrementally by sequence number.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexRecord {
@@ -1033,8 +1119,14 @@ pub struct IndexRecord {
     pub link_target: Option<String>,
     /// `true` when this record is a deletion tombstone.
     pub deleted: bool,
-    /// Causal version vector for this path keyed by `(member, incarnation)`.
-    pub version: VersionVector,
+    /// Explicit causal provenance: [`RecordProvenance::Unversioned`] for files found on disk with
+    /// no prior history, or [`RecordProvenance::Versioned`] for authored/reconciled history.
+    pub provenance: RecordProvenance,
+    /// Content hash this change was made directly on top of: for live edits, the hash of the
+    /// prior file replaced by this edit; for deletions, the hash of the file deleted; `None` for
+    /// brand-new creations, unversioned files, directories, and symlinks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_hash: Option<Hash>,
     /// Member that authored the latest modification or deletion of this version.
     pub modified_by: MemberId,
     /// Monotonic local sequence number assigned by the member serving this record.
@@ -1044,10 +1136,6 @@ pub struct IndexRecord {
     /// that was deleted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_hashes: Vec<Hash>,
-    /// `true` when this live record came from pre-existing files discovered on disk during join,
-    /// rollback, or reinstall before reconciling with peers.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub from_join: bool,
     /// Locally derived original path when this live file is a conflict copy.
     ///
     /// Never accepted from a peer on the wire; always derived locally from the canonical conflict
@@ -1065,6 +1153,18 @@ fn is_false(v: &bool) -> bool {
 }
 
 impl IndexRecord {
+    /// Returns `true` when this record has no recorded causal history
+    /// ([`RecordProvenance::Unversioned`]).
+    pub fn is_unversioned(&self) -> bool {
+        self.provenance.is_unversioned()
+    }
+
+    /// Borrows this record's [`VersionVector`] when [`RecordProvenance::Versioned`], or `None`
+    /// when [`RecordProvenance::Unversioned`].
+    pub fn version_vector(&self) -> Option<&VersionVector> {
+        self.provenance.as_versioned()
+    }
+
     /// Returns `true` when `self` and `other` represent the exact same filesystem content.
     pub fn content_equal(&self, other: &Self) -> bool {
         if self.deleted != other.deleted {
@@ -1147,16 +1247,30 @@ impl IndexRecord {
         if let Some(h) = self.hash {
             hasher.update(h.as_bytes());
         }
+        if let Some(bh) = self.base_hash {
+            hasher.update(&[1]);
+            hasher.update(bh.as_bytes());
+        } else {
+            hasher.update(&[0]);
+        }
         if let Some(ref t) = self.link_target {
             hasher.update(t.as_bytes());
         }
         hasher.update(self.modified_by.as_bytes());
         hasher.update(&[0]);
-        for (key, counter) in self.version.iter() {
-            hasher.update(key.member.as_bytes());
-            hasher.update(&[0]);
-            hasher.update(&key.incarnation.to_le_bytes());
-            hasher.update(&counter.to_le_bytes());
+        match &self.provenance {
+            RecordProvenance::Unversioned => {
+                hasher.update(&[0]);
+            }
+            RecordProvenance::Versioned(vv) => {
+                hasher.update(&[1]);
+                for (key, counter) in vv.iter() {
+                    hasher.update(key.member.as_bytes());
+                    hasher.update(&[0]);
+                    hasher.update(&key.incarnation.to_le_bytes());
+                    hasher.update(&counter.to_le_bytes());
+                }
+            }
         }
         Hash::from_bytes(*hasher.finalize().as_bytes())
     }
@@ -1164,21 +1278,25 @@ impl IndexRecord {
     /// Conservative estimate of this record's serialized wire byte footprint, used to enforce
     /// [`PageLimit::max_bytes`] on both sender and receiver.
     pub fn estimated_wire_bytes(&self) -> usize {
-        let base = 160usize;
+        let base = 176usize;
         let path_bytes = self.path.len();
         let mod_bytes = self.modified_by.len();
         let link_bytes = self.link_target.as_ref().map_or(0, String::len);
         let hash_bytes = if self.hash.is_some() { 64 } else { 0 };
+        let base_hash_bytes = if self.base_hash.is_some() { 64 } else { 0 };
         let ancestry_bytes = self.recent_hashes.len().saturating_mul(68);
-        let vv_bytes: usize = self
-            .version
-            .iter()
-            .map(|(k, _)| k.member.len().saturating_add(48))
-            .sum();
+        let vv_bytes: usize = match &self.provenance {
+            RecordProvenance::Unversioned => 24,
+            RecordProvenance::Versioned(vv) => vv
+                .iter()
+                .map(|(k, _)| k.member.len().saturating_add(48))
+                .sum(),
+        };
         base.saturating_add(path_bytes)
             .saturating_add(mod_bytes)
             .saturating_add(link_bytes)
             .saturating_add(hash_bytes)
+            .saturating_add(base_hash_bytes)
             .saturating_add(ancestry_bytes)
             .saturating_add(vv_bytes)
     }
@@ -1489,308 +1607,6 @@ pub struct DeferredItem {
     /// Peer's chained fingerprint at `peer_seq - 1` (if `peer_seq > 1` and available).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prev_chain_fingerprint: Option<Hash>,
-}
-
-/// One line in the append-only, compacted `.legion-sync/deletions.log` kept inside the folder so
-/// wiping the index while keeping the folder never resurrects deleted files.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-pub enum FolderDeletionLogEntry {
-    /// A path was deleted and its tombstone (or held deletion inside the settle window) is active.
-    Deleted {
-        /// Normalized relative path inside the sync folder.
-        path: String,
-        /// Original entry kind.
-        kind: EntryKind,
-        /// Recent content hashes of the deleted entry.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        hashes: Vec<Hash>,
-        /// Version vector of the deletion tombstone (or prior record when held).
-        version: VersionVector,
-        /// Deletion timestamp.
-        mtime: Timestamp,
-        /// Member that authored the deletion.
-        modified_by: MemberId,
-        /// `true` when this deletion was recorded while still held inside the settle period.
-        #[serde(default, skip_serializing_if = "is_false")]
-        held: bool,
-    },
-    /// A previously deleted path became live again.
-    Revived {
-        /// Normalized relative path inside the sync folder.
-        path: String,
-    },
-}
-
-/// Active deletion entry recovered by replaying `.legion-sync/deletions.log`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FolderDeletionRecord {
-    /// Normalized relative path inside the sync folder.
-    pub path: String,
-    /// Original entry kind.
-    pub kind: EntryKind,
-    /// Recent content hashes of the deleted entry.
-    pub hashes: Vec<Hash>,
-    /// Version vector of the deletion tombstone.
-    pub version: VersionVector,
-    /// Deletion timestamp.
-    pub mtime: Timestamp,
-    /// Member that authored the deletion.
-    pub modified_by: MemberId,
-    /// `true` when this entry came from a deletion held inside the settle period.
-    pub held: bool,
-}
-
-impl FolderDeletionLogEntry {
-    /// Builds a `Deleted` log entry from a tombstone [`IndexRecord`].
-    pub fn from_tombstone(rec: &IndexRecord) -> Self {
-        Self::Deleted {
-            path: rec.path.clone(),
-            kind: rec.kind,
-            hashes: rec.recent_hashes.clone(),
-            version: rec.version.clone(),
-            mtime: rec.mtime,
-            modified_by: rec.modified_by.clone(),
-            held: false,
-        }
-    }
-
-    /// Builds a held `Deleted` log entry from a [`PendingLocalDeletion`] inside the settle window.
-    pub fn from_pending_deletion(pd: &PendingLocalDeletion, local_member: &str) -> Self {
-        let mut hashes = pd.old_record.recent_hashes.clone();
-        if let Some(h) = pd.old_record.hash {
-            hashes.retain(|x| *x != h);
-            hashes.insert(0, h);
-            hashes.truncate(MAX_ANCESTRY_HASHES);
-        }
-        Self::Deleted {
-            path: pd.old_record.path.clone(),
-            kind: pd.old_record.kind,
-            hashes,
-            version: pd.old_record.version.clone(),
-            mtime: pd.detected_at,
-            modified_by: local_member.to_string(),
-            held: true,
-        }
-    }
-}
-
-/// Serializes one or more [`FolderDeletionLogEntry`] items as NDJSON bytes.
-pub fn encode_deletion_log_entries(entries: &[FolderDeletionLogEntry]) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    for entry in entries {
-        serde_json::to_writer(&mut out, entry).map_err(|err| SyncError::Storage {
-            context: "serialize deletion log entry".to_string(),
-            detail: err.to_string(),
-        })?;
-        out.push(b'\n');
-    }
-    Ok(out)
-}
-
-/// Replays NDJSON bytes from `.legion-sync/deletions.log`, tolerating an incomplete trailing line
-/// from a crash, and returns the minimal incomparable set of permanent deletions per path.
-///
-/// Compaction semantics:
-/// - Entries for the same path whose versions are ordered (`Newer` / `Equal` / `Older`) are
-///   merged so the dominating version stays and retains the union of deleted content hashes.
-/// - Incomparable (`Concurrent`) deletions for the same path are both kept until a dominating
-///   version supersedes them.
-/// - [`FolderDeletionLogEntry::Revived`] only cancels unsettled `held = true` entries (a file that
-///   returned during the settle window before any deletion was emitted); committed deletions are
-///   never dropped.
-pub fn parse_deletion_log_all(bytes: &[u8]) -> BTreeMap<String, Vec<FolderDeletionRecord>> {
-    let mut per_path: BTreeMap<String, Vec<FolderDeletionRecord>> = BTreeMap::new();
-    for line in bytes.split(|&b| b == b'\n') {
-        let trimmed = trim_ascii_whitespace(line);
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(entry) = serde_json::from_slice::<FolderDeletionLogEntry>(trimmed) else {
-            // Tolerate a truncated trailing line after an abrupt crash.
-            continue;
-        };
-        match entry {
-            FolderDeletionLogEntry::Deleted {
-                path,
-                kind,
-                hashes,
-                version,
-                mtime,
-                modified_by,
-                held,
-            } => {
-                if crate::path::validate_sync_path(&path).is_err() {
-                    continue;
-                }
-                let incoming = FolderDeletionRecord {
-                    path: path.clone(),
-                    kind,
-                    hashes,
-                    version,
-                    mtime,
-                    modified_by,
-                    held,
-                };
-                merge_deletion_record_into_list(per_path.entry(path).or_default(), incoming);
-            }
-            FolderDeletionLogEntry::Revived { path } => {
-                if let Some(list) = per_path.get_mut(&path) {
-                    // Only cancel unsettled held deletions from the settle window; committed
-                    // deletion knowledge is permanent for the life of the folder.
-                    list.retain(|rec| !rec.held);
-                    if list.is_empty() {
-                        per_path.remove(&path);
-                    }
-                }
-            }
-        }
-    }
-    per_path
-}
-
-fn absorb_unique_hashes(dst: &mut Vec<Hash>, extra: &[Hash]) {
-    for &h in extra {
-        if !dst.contains(&h) {
-            dst.push(h);
-        }
-    }
-    dst.truncate(MAX_ANCESTRY_HASHES);
-}
-
-/// Inserts `incoming` into `list`, merging only ordered versions (so the dominating version stays
-/// with the union of deleted hashes) and keeping incomparable concurrent versions intact.
-pub fn merge_deletion_record_into_list(
-    list: &mut Vec<FolderDeletionRecord>,
-    mut incoming: FolderDeletionRecord,
-) {
-    use crate::version::VersionOrder;
-
-    if !incoming.held {
-        // Any committed deletion supersedes unsettled held entries for the same path.
-        let mut carried_hashes = Vec::new();
-        list.retain(|existing| {
-            if existing.held {
-                carried_hashes.extend_from_slice(&existing.hashes);
-                false
-            } else {
-                true
-            }
-        });
-        absorb_unique_hashes(&mut incoming.hashes, &carried_hashes);
-    }
-
-    let mut dominated_by_existing = false;
-    let mut absorbed_hashes = Vec::new();
-    list.retain_mut(|existing| {
-        if existing.held != incoming.held {
-            return true;
-        }
-        match incoming.version.compare(&existing.version) {
-            VersionOrder::Newer | VersionOrder::Equal => {
-                absorbed_hashes.extend_from_slice(&existing.hashes);
-                false
-            }
-            VersionOrder::Older => {
-                absorb_unique_hashes(&mut existing.hashes, &incoming.hashes);
-                dominated_by_existing = true;
-                true
-            }
-            VersionOrder::Concurrent => true,
-        }
-    });
-    if !dominated_by_existing {
-        absorb_unique_hashes(&mut incoming.hashes, &absorbed_hashes);
-        list.push(incoming);
-    }
-}
-
-/// Replays NDJSON bytes from `.legion-sync/deletions.log` and returns one merged
-/// [`FolderDeletionRecord`] per path (preferring committed deletions over unsettled held ones).
-pub fn parse_deletion_log(bytes: &[u8]) -> BTreeMap<String, FolderDeletionRecord> {
-    let all = parse_deletion_log_all(bytes);
-    let mut out = BTreeMap::new();
-    for (path, recs) in all {
-        if let Some(merged) = collapse_deletion_records(recs) {
-            out.insert(path, merged);
-        }
-    }
-    out
-}
-
-/// Collapses one path's deletion log entries into a single record for index caching without
-/// dropping any version key or deleted content hash.
-pub fn collapse_deletion_records(recs: Vec<FolderDeletionRecord>) -> Option<FolderDeletionRecord> {
-    let mut committed: Vec<FolderDeletionRecord> = Vec::new();
-    let mut held: Vec<FolderDeletionRecord> = Vec::new();
-    for r in recs {
-        if r.held {
-            held.push(r);
-        } else {
-            committed.push(r);
-        }
-    }
-    let chosen = if !committed.is_empty() {
-        committed
-    } else {
-        held
-    };
-    let mut iter = chosen.into_iter();
-    let mut acc = iter.next()?;
-    for other in iter {
-        acc.version.merge_in_place(&other.version);
-        if other.mtime > acc.mtime
-            || (other.mtime == acc.mtime && other.modified_by < acc.modified_by)
-        {
-            acc.mtime = other.mtime;
-            acc.modified_by = other.modified_by;
-            acc.kind = other.kind;
-        }
-        absorb_unique_hashes(&mut acc.hashes, &other.hashes);
-    }
-    Some(acc)
-}
-
-/// Compacts `.legion-sync/deletions.log` bytes by merging only entries for the same path whose
-/// versions are ordered (the dominating version stays with the union of deleted hashes). Never
-/// drops committed deletion knowledge.
-pub fn compact_deletion_log_bytes(bytes: &[u8]) -> Result<(Vec<u8>, usize)> {
-    let all = parse_deletion_log_all(bytes);
-    let mut entries = Vec::new();
-    for recs in all.into_values() {
-        for r in recs {
-            entries.push(FolderDeletionLogEntry::Deleted {
-                path: r.path,
-                kind: r.kind,
-                hashes: r.hashes,
-                version: r.version,
-                mtime: r.mtime,
-                modified_by: r.modified_by,
-                held: r.held,
-            });
-        }
-    }
-    let count = entries.len();
-    let encoded = encode_deletion_log_entries(&entries)?;
-    Ok((encoded, count))
-}
-
-fn trim_ascii_whitespace(mut slice: &[u8]) -> &[u8] {
-    while let Some((&first, rest)) = slice.split_first() {
-        if first.is_ascii_whitespace() {
-            slice = rest;
-        } else {
-            break;
-        }
-    }
-    while let Some((&last, rest)) = slice.split_last() {
-        if last.is_ascii_whitespace() {
-            slice = rest;
-        } else {
-            break;
-        }
-    }
-    slice
 }
 
 /// An unresolved conflict ("file with two versions") reported in [`FolderStatus`].

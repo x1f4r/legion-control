@@ -262,18 +262,6 @@ impl SyncFs for StrictPlatformFs {
         Ok(())
     }
 
-    fn append_deletion_log(&self, _bytes: &[u8]) -> legion_sync::Result<()> {
-        Ok(())
-    }
-
-    fn read_deletion_log(&self) -> legion_sync::Result<Vec<u8>> {
-        Ok(Vec::new())
-    }
-
-    fn compact_deletion_log(&self, _bytes: &[u8]) -> legion_sync::Result<()> {
-        Ok(())
-    }
-
     fn ensure_internal_dirs(&self) -> legion_sync::Result<()> {
         Ok(())
     }
@@ -965,7 +953,13 @@ fn open_sim_engine(
     caps: FsCapabilities,
 ) -> SyncEngine<StrictPlatformFs, MemoryIndexStore> {
     let cfg = FolderConfig::new("docs", member, members.iter().map(|s| (*s).to_string()));
-    SyncEngine::open(cfg, StrictPlatformFs::new(caps), MemoryIndexStore::new()).unwrap()
+    SyncEngine::open(
+        cfg,
+        StrictPlatformFs::new(caps),
+        MemoryIndexStore::new(),
+        legion_sync::MemoryInstanceTokenStore::new(),
+    )
+    .unwrap()
 }
 
 #[test]

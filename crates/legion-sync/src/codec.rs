@@ -1,19 +1,22 @@
 //! Compact, versioned binary codec for durable index records and auxiliary tables.
 //!
-//! Format version 2 adds `(member, incarnation)` [`VersionKey`] entries, short content hash
-//! ancestry (`recent_hashes`), `from_join`, and local `conflict_dismissed` flags while remaining
-//! bounds-checked and zero-`unsafe`.
+//! Format version 3 stores explicit [`RecordProvenance`] (`Unversioned` vs `Versioned`),
+//! `base_hash`, and short content hash ancestry (`recent_hashes`), while decoding format version 2
+//! seamlessly for in-place schema migration.
 
 use std::collections::BTreeMap;
 
 use legion_xfer::{EntryKind, Hash, Timestamp};
 
 use crate::error::{Result, SyncError};
-use crate::model::IndexRecord;
+use crate::model::{IndexRecord, RecordProvenance};
 use crate::version::{VersionKey, VersionVector};
 
-/// Format version prefix stored at byte 0 of every encoded [`IndexRecord`].
-const RECORD_CODEC_VERSION: u8 = 2;
+/// Legacy format version accepted during in-place schema migration from schema v5 to v6.
+const RECORD_CODEC_VERSION_V2: u8 = 2;
+
+/// Current format version prefix stored at byte 0 of every encoded [`IndexRecord`].
+const RECORD_CODEC_VERSION: u8 = 3;
 
 const FLAG_DELETED: u8 = 1 << 0;
 const FLAG_HAS_DISK_MTIME: u8 = 1 << 1;
@@ -22,13 +25,15 @@ const FLAG_HAS_HASH: u8 = 1 << 3;
 const FLAG_HAS_LINK_TARGET: u8 = 1 << 4;
 const FLAG_HAS_CONFLICT_OF: u8 = 1 << 5;
 const FLAG_HAS_CHANGE_ID: u8 = 1 << 6;
-const FLAG_FROM_JOIN: u8 = 1 << 7;
+/// In codec v2: `from_join`. In codec v3: `RecordProvenance::Unversioned`.
+const FLAG_UNVERSIONED_OR_JOIN: u8 = 1 << 7;
 
 const FLAG2_CONFLICT_DISMISSED: u8 = 1 << 0;
+const FLAG2_HAS_BASE_HASH: u8 = 1 << 1;
 
 /// Encodes `record` into a compact self-contained byte vector.
 pub fn encode_record(record: &IndexRecord) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(112 + record.path.len() + record.recent_hashes.len() * 32);
+    let mut buf = Vec::with_capacity(144 + record.path.len() + record.recent_hashes.len() * 32);
     buf.push(RECORD_CODEC_VERSION);
     buf.push(match record.kind {
         EntryKind::File => 0,
@@ -58,14 +63,17 @@ pub fn encode_record(record: &IndexRecord) -> Vec<u8> {
     if record.disk_change_id.is_some() {
         flags |= FLAG_HAS_CHANGE_ID;
     }
-    if record.from_join {
-        flags |= FLAG_FROM_JOIN;
+    if record.provenance.is_unversioned() {
+        flags |= FLAG_UNVERSIONED_OR_JOIN;
     }
     buf.push(flags);
 
     let mut flags2 = 0u8;
     if record.conflict_dismissed {
         flags2 |= FLAG2_CONFLICT_DISMISSED;
+    }
+    if record.base_hash.is_some() {
+        flags2 |= FLAG2_HAS_BASE_HASH;
     }
     buf.push(flags2);
 
@@ -86,6 +94,9 @@ pub fn encode_record(record: &IndexRecord) -> Vec<u8> {
     if let Some(hash) = record.hash {
         buf.extend_from_slice(hash.as_bytes());
     }
+    if let Some(base_hash) = record.base_hash {
+        buf.extend_from_slice(base_hash.as_bytes());
+    }
     if let Some(ref target) = record.link_target {
         write_str(&mut buf, target);
     }
@@ -95,11 +106,13 @@ pub fn encode_record(record: &IndexRecord) -> Vec<u8> {
     write_str(&mut buf, &record.modified_by);
     buf.extend_from_slice(&record.seq.to_le_bytes());
 
-    write_u32(&mut buf, record.version.len());
-    for (key, counter) in record.version.iter() {
-        write_str(&mut buf, &key.member);
-        buf.extend_from_slice(&key.incarnation.to_le_bytes());
-        buf.extend_from_slice(&counter.to_le_bytes());
+    if let RecordProvenance::Versioned(ref vv) = record.provenance {
+        write_u32(&mut buf, vv.len());
+        for (key, counter) in vv.iter() {
+            write_str(&mut buf, &key.member);
+            buf.extend_from_slice(&key.incarnation.to_le_bytes());
+            buf.extend_from_slice(&counter.to_le_bytes());
+        }
     }
 
     write_u32(&mut buf, record.recent_hashes.len());
@@ -110,11 +123,12 @@ pub fn encode_record(record: &IndexRecord) -> Vec<u8> {
     buf
 }
 
-/// Decodes an [`IndexRecord`] previously produced by [`encode_record`].
+/// Decodes an [`IndexRecord`] previously produced by [`encode_record`] (accepting both format
+/// version 3 and legacy format version 2 for in-place schema migration).
 pub fn decode_record(bytes: &[u8]) -> Result<IndexRecord> {
     let mut cur = Cursor::new(bytes, "index record");
     let version_byte = cur.read_u8()?;
-    if version_byte != RECORD_CODEC_VERSION {
+    if version_byte != RECORD_CODEC_VERSION && version_byte != RECORD_CODEC_VERSION_V2 {
         return Err(SyncError::CorruptData {
             context: "index record".to_string(),
             detail: format!("unsupported record format version {version_byte}"),
@@ -136,8 +150,9 @@ pub fn decode_record(bytes: &[u8]) -> Result<IndexRecord> {
     let flags = cur.read_u8()?;
     let flags2 = cur.read_u8()?;
     let deleted = (flags & FLAG_DELETED) != 0;
-    let from_join = (flags & FLAG_FROM_JOIN) != 0;
+    let unversioned_flag = (flags & FLAG_UNVERSIONED_OR_JOIN) != 0;
     let conflict_dismissed = (flags2 & FLAG2_CONFLICT_DISMISSED) != 0;
+    let has_base_hash = version_byte == RECORD_CODEC_VERSION && (flags2 & FLAG2_HAS_BASE_HASH) != 0;
 
     let path = cur.read_string()?;
     let size = cur.read_u64()?;
@@ -162,6 +177,11 @@ pub fn decode_record(bytes: &[u8]) -> Result<IndexRecord> {
     } else {
         None
     };
+    let mut base_hash = if has_base_hash {
+        Some(Hash::from_bytes(cur.read_array::<32>()?))
+    } else {
+        None
+    };
     let link_target = if (flags & FLAG_HAS_LINK_TARGET) != 0 {
         Some(cur.read_string()?)
     } else {
@@ -175,19 +195,38 @@ pub fn decode_record(bytes: &[u8]) -> Result<IndexRecord> {
     let modified_by = cur.read_string()?;
     let seq = cur.read_u64()?;
 
-    let vv_len = cur.read_u32()? as usize;
-    let mut vv_map = BTreeMap::new();
-    for _ in 0..vv_len {
-        let member = cur.read_string()?;
-        let incarnation = cur.read_u64()?;
-        let counter = cur.read_u64()?;
-        vv_map.insert(VersionKey::new(member, incarnation), counter);
-    }
+    let provenance = if version_byte == RECORD_CODEC_VERSION && unversioned_flag {
+        if deleted {
+            return Err(SyncError::CorruptData {
+                context: "index record".to_string(),
+                detail: "deletion tombstone cannot be unversioned".to_string(),
+            });
+        }
+        RecordProvenance::Unversioned
+    } else {
+        let vv_len = cur.read_u32()? as usize;
+        let mut vv_map = BTreeMap::new();
+        for _ in 0..vv_len {
+            let member = cur.read_string()?;
+            let incarnation = cur.read_u64()?;
+            let counter = cur.read_u64()?;
+            vv_map.insert(VersionKey::new(member, incarnation), counter);
+        }
+        if version_byte == RECORD_CODEC_VERSION_V2 && unversioned_flag && !deleted {
+            RecordProvenance::Unversioned
+        } else {
+            RecordProvenance::Versioned(VersionVector::from_map(vv_map))
+        }
+    };
 
     let hist_len = cur.read_u32()? as usize;
     let mut recent_hashes = Vec::with_capacity(hist_len.min(32));
     for _ in 0..hist_len {
         recent_hashes.push(Hash::from_bytes(cur.read_array::<32>()?));
+    }
+
+    if version_byte == RECORD_CODEC_VERSION_V2 && base_hash.is_none() && provenance.is_versioned() {
+        base_hash = recent_hashes.first().copied();
     }
 
     if !cur.is_empty() {
@@ -208,11 +247,11 @@ pub fn decode_record(bytes: &[u8]) -> Result<IndexRecord> {
         hash,
         link_target,
         deleted,
-        version: VersionVector::from_map(vv_map),
+        provenance,
+        base_hash,
         modified_by,
         seq,
         recent_hashes,
-        from_join,
         conflict_of,
         conflict_dismissed,
     })
@@ -343,11 +382,11 @@ mod tests {
             hash: Some(hash_bytes(b"hello world")),
             link_target: None,
             deleted: false,
-            version: vv,
+            provenance: RecordProvenance::Versioned(vv),
+            base_hash: Some(hash_bytes(b"v1")),
             modified_by: "tower".to_string(),
             seq: 99,
-            recent_hashes: vec![hash_bytes(b"v0"), hash_bytes(b"v1")],
-            from_join: true,
+            recent_hashes: vec![hash_bytes(b"v1"), hash_bytes(b"v0")],
             conflict_of: Some("docs/orig.txt".to_string()),
             conflict_dismissed: true,
         };
@@ -355,12 +394,33 @@ mod tests {
         let encoded = encode_record(&rec);
         let decoded = decode_record(&encoded).unwrap();
         assert_eq!(decoded, rec);
+
+        let unv = IndexRecord {
+            path: "docs/unversioned.txt".to_string(),
+            kind: EntryKind::File,
+            size: 5,
+            mtime: Timestamp::new(1_795_608_000, 0),
+            disk_mtime: None,
+            disk_change_id: None,
+            mode: None,
+            hash: Some(hash_bytes(b"hello")),
+            link_target: None,
+            deleted: false,
+            provenance: RecordProvenance::Unversioned,
+            base_hash: None,
+            modified_by: "tower".to_string(),
+            seq: 100,
+            recent_hashes: Vec::new(),
+            conflict_of: None,
+            conflict_dismissed: false,
+        };
+        assert_eq!(decode_record(&encode_record(&unv)).unwrap(), unv);
     }
 
     #[test]
     fn rejects_truncated_or_bad_version_record() {
         assert!(decode_record(&[]).is_err());
         assert!(decode_record(&[99, 0, 0, 0]).is_err());
-        assert!(decode_record(&[2, 0, 0, 0, 10, 0, 0, 0]).is_err());
+        assert!(decode_record(&[3, 0, 0, 0, 10, 0, 0, 0]).is_err());
     }
 }

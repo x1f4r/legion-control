@@ -6,16 +6,19 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 
+use legion_os::atomic::{WriteOptions, write_atomic};
 use legion_xfer::{EntryKind, Hash, Timestamp};
 use serde::{Deserialize, Serialize};
 
-use crate::error::Result;
+use crate::error::{Result, SyncError};
 use crate::model::{
-    BinEntry, DeferredItem, FetchOptions, FolderMarker, FolderMeta, HandshakeHello, HeldBackRecord,
-    IndexRecord, MemberId, PageLimit, PeerCursor, PeerHandshake, PendingOp, RecordsPage,
-    SyncProblem,
+    BinEntry, DeferredItem, FetchOptions, FolderId, FolderMarker, FolderMeta, HandshakeHello,
+    HeldBackRecord, IndexRecord, MemberId, PageLimit, PeerCursor, PeerHandshake, PendingOp,
+    RecordsPage, SyncProblem, validate_folder_id,
 };
 use crate::path::IgnoreMatcher;
 
@@ -126,14 +129,168 @@ pub struct FsWalkResult {
 pub trait SyncWrite: Write + Send {
     /// Flushes buffered bytes and commits data to durable storage (`fsync`).
     fn finish_sync(self: Box<Self>) -> Result<()>;
+
+    /// Applies target modification time and Unix permissions (when supported) on the open handle,
+    /// flushes buffered bytes, and commits data and metadata to durable storage in a single
+    /// `fsync`.
+    ///
+    /// Returns `Ok(true)` if the writer applied `mtime` and `mode` directly so the caller does
+    /// not need a second open + `fsync` via [`SyncFs::set_tmp_metadata`], or `Ok(false)` after
+    /// falling back to [`Self::finish_sync`].
+    fn finish_sync_with_metadata(
+        self: Box<Self>,
+        _mtime: Timestamp,
+        _mode: Option<u32>,
+    ) -> Result<bool> {
+        self.finish_sync()?;
+        Ok(false)
+    }
+}
+
+/// Machine-local storage for each sync folder's random instance token.
+///
+/// The sync index lives inside `.legion-sync/index.redb` so folder files and sync history travel
+/// together. The machine's own state directory keeps only one small value per folder — a random
+/// instance token also recorded in the folder's index — so reinstalling, copying or moving a
+/// folder to another machine, or restoring onto a new machine presents an unknown token and
+/// cleanly rotates the incarnation while keeping all history intact.
+pub trait InstanceTokenStore {
+    /// Reads the last known instance token for `folder_id` on this machine, if any.
+    fn read_token(&self, folder_id: &str) -> Result<Option<String>>;
+
+    /// Atomically persists `token` for `folder_id` on this machine.
+    fn write_token(&self, folder_id: &str, token: &str) -> Result<()>;
+
+    /// Removes the stored instance token for `folder_id` on this machine, if present.
+    fn remove_token(&self, folder_id: &str) -> Result<()>;
+}
+
+/// Filesystem-backed [`InstanceTokenStore`] storing one `<folder_id>.token` file per folder
+/// inside a machine-local state directory outside the sync folder.
+#[derive(Debug, Clone)]
+pub struct FileInstanceTokenStore {
+    state_dir: PathBuf,
+}
+
+impl FileInstanceTokenStore {
+    /// Creates a file-backed token store rooted at `state_dir`.
+    pub fn new(state_dir: impl AsRef<Path>) -> Self {
+        Self {
+            state_dir: state_dir.as_ref().to_path_buf(),
+        }
+    }
+
+    /// Returns the state directory backing this token store.
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
+    fn token_path(&self, folder_id: &str) -> Result<PathBuf> {
+        validate_folder_id(folder_id)?;
+        Ok(self.state_dir.join(format!("{folder_id}.token")))
+    }
+}
+
+impl InstanceTokenStore for FileInstanceTokenStore {
+    fn read_token(&self, folder_id: &str) -> Result<Option<String>> {
+        let path = self.token_path(folder_id)?;
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => {
+                let trimmed = raw.trim().to_string();
+                if trimmed.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(trimmed))
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(SyncError::from_io(Some(path.display().to_string()), err)),
+        }
+    }
+
+    fn write_token(&self, folder_id: &str, token: &str) -> Result<()> {
+        let path = self.token_path(folder_id)?;
+        std::fs::create_dir_all(&self.state_dir)
+            .map_err(|err| SyncError::from_io(Some(self.state_dir.display().to_string()), err))?;
+        write_atomic(
+            &path,
+            format!("{token}\n").as_bytes(),
+            WriteOptions::with_mode(0o600),
+        )
+        .map_err(|err| SyncError::from_os(Some(path.display().to_string()), err))?;
+        Ok(())
+    }
+
+    fn remove_token(&self, folder_id: &str) -> Result<()> {
+        let path = self.token_path(folder_id)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(SyncError::from_io(Some(path.display().to_string()), err)),
+        }
+    }
+}
+
+/// Shared in-memory [`InstanceTokenStore`] for deterministic tests and the simulator.
+///
+/// Cloning shares the same underlying map so reopening an engine on the same simulated machine
+/// sees its persisted token, while calling [`Self::clear`] or passing a fresh store simulates a
+/// reinstall or another machine.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryInstanceTokenStore {
+    tokens: Arc<Mutex<BTreeMap<FolderId, String>>>,
+}
+
+impl MemoryInstanceTokenStore {
+    /// Creates an empty in-memory instance token store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Clears every token stored in this simulated machine state directory (simulates reinstall).
+    pub fn clear(&self) {
+        if let Ok(mut map) = self.tokens.lock() {
+            map.clear();
+        }
+    }
+}
+
+impl InstanceTokenStore for MemoryInstanceTokenStore {
+    fn read_token(&self, folder_id: &str) -> Result<Option<String>> {
+        let map = self.tokens.lock().map_err(|_| SyncError::Storage {
+            context: "read instance token".to_string(),
+            detail: "instance token store lock poisoned".to_string(),
+        })?;
+        Ok(map.get(folder_id).cloned())
+    }
+
+    fn write_token(&self, folder_id: &str, token: &str) -> Result<()> {
+        validate_folder_id(folder_id)?;
+        let mut map = self.tokens.lock().map_err(|_| SyncError::Storage {
+            context: "write instance token".to_string(),
+            detail: "instance token store lock poisoned".to_string(),
+        })?;
+        map.insert(folder_id.to_string(), token.to_string());
+        Ok(())
+    }
+
+    fn remove_token(&self, folder_id: &str) -> Result<()> {
+        let mut map = self.tokens.lock().map_err(|_| SyncError::Storage {
+            context: "remove instance token".to_string(),
+            detail: "instance token store lock poisoned".to_string(),
+        })?;
+        map.remove(folder_id);
+        Ok(())
+    }
 }
 
 /// Filesystem boundary of a single sync folder.
 ///
 /// Operations on the live tree are strictly separated from `.legion-sync/tmp/`,
-/// `.legion-sync/bin/`, and `.legion-sync/marker.json` so no live operation can touch sync
-/// metadata or escape the folder root. All placements and bin moves use non-replacing renames or
-/// atomic swaps so an entry created or modified in the race window is never silently overwritten.
+/// `.legion-sync/bin/`, `.legion-sync/index.redb`, and `.legion-sync/marker.json` so no live
+/// operation can touch sync metadata or escape the folder root. All placements and bin moves use
+/// non-replacing renames or atomic swaps so an entry created or modified in the race window is
+/// never silently overwritten.
 pub trait SyncFs {
     /// Returns this filesystem's platform naming and case rules.
     fn capabilities(&self) -> FsCapabilities;
@@ -144,15 +301,6 @@ pub trait SyncFs {
 
     /// Atomically writes the folder identity marker to `.legion-sync/marker.json`.
     fn write_marker(&self, marker: &FolderMarker) -> Result<()>;
-
-    /// Appends serialized NDJSON entries to `.legion-sync/deletions.log` and syncs them to disk.
-    fn append_deletion_log(&self, bytes: &[u8]) -> Result<()>;
-
-    /// Reads the raw bytes of `.legion-sync/deletions.log` (empty `Vec` if absent).
-    fn read_deletion_log(&self) -> Result<Vec<u8>>;
-
-    /// Atomically replaces `.legion-sync/deletions.log` with compacted NDJSON bytes.
-    fn compact_deletion_log(&self, bytes: &[u8]) -> Result<()>;
 
     /// Ensures `.legion-sync/tmp` and `.legion-sync/bin` exist. Called only when initializing a
     /// new folder or after verifying an existing folder marker.
@@ -462,6 +610,14 @@ impl StoreBatch {
 pub trait IndexStore {
     /// Returns the schema version recorded in this store.
     fn schema_version(&self) -> Result<u32>;
+
+    /// Migrates an older supported schema version in place to [`crate::INDEX_SCHEMA_VERSION`]
+    /// without dropping any records, deletions, or version history.
+    ///
+    /// Returns `Ok(true)` if an in-place migration ran, or `Ok(false)` if already current.
+    fn migrate_schema_in_place(&mut self) -> Result<bool> {
+        Ok(false)
+    }
 
     /// Loads the stored [`FolderMeta`], or `Ok(None)` if this store has not yet been initialized.
     fn load_meta(&self) -> Result<Option<FolderMeta>>;

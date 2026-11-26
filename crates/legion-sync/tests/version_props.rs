@@ -5,7 +5,9 @@
 
 use std::cmp::Ordering;
 
-use legion_sync::{IndexRecord, VersionKey, VersionOrder, VersionVector, compare_live_winner};
+use legion_sync::{
+    IndexRecord, RecordProvenance, VersionKey, VersionOrder, VersionVector, compare_live_winner,
+};
 use legion_xfer::hash::hash_bytes;
 use legion_xfer::{EntryKind, Timestamp};
 use proptest::prelude::*;
@@ -47,11 +49,14 @@ fn live_record() -> impl Strategy<Value = IndexRecord> {
             hash: Some(hash_bytes(&bytes)),
             link_target: None,
             deleted: false,
-            version: VersionVector::singleton(VersionKey::new(member.clone(), 1), 1),
+            provenance: RecordProvenance::Versioned(VersionVector::singleton(
+                VersionKey::new(member.clone(), 1),
+                1,
+            )),
+            base_hash: None,
             modified_by: member,
             seq: 1,
             recent_hashes: Vec::new(),
-            from_join: false,
             conflict_of: None,
             conflict_dismissed: false,
         })

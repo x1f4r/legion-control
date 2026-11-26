@@ -38,11 +38,12 @@ use legion_sync::{
     FORCED_ROTATION_COOLDOWN_SECS, FetchClock, FetchOptions, FolderConfig, FolderMarker,
     FolderMeta, FsCapabilities, FsErrorKind, FsMeta, FsWalkEntry, FsWalkResult, HeldBackRecord,
     INDEX_DAMAGED_PROBLEM_SENTENCE, IgnoreMatcher, InboundDeletionBrakeDecision, IndexRecord,
-    IndexStore, MAX_FORCED_ROTATIONS_BEFORE_CONFIRM, MAX_VERSION_COUNTER, MemberId, MemberState,
-    MemoryIndexStore, PageLimit, Peer, PeerAckView, PeerCursor, PeerHandshake,
-    PeerRollbackClaimDecision, PendingOp, ProblemKind, RecordsPage, RestoreStrategy,
-    SYNC_PROTOCOL_VERSION, ScanOptions, StoreBatch, SyncEngine, SyncError, SyncFs, SyncWrite,
-    VersionKey, VersionVector, is_internal_sync_path, validate_sync_path,
+    IndexStore, MAX_FORCED_ROTATIONS_BEFORE_CONFIRM, MAX_VERSION_COUNTER,
+    MIN_MIGRATABLE_SCHEMA_VERSION, MemberId, MemberState, MemoryIndexStore,
+    MemoryInstanceTokenStore, PageLimit, Peer, PeerAckView, PeerCursor, PeerHandshake,
+    PeerRollbackClaimDecision, PendingOp, ProblemKind, RecordProvenance, RecordsPage,
+    RestoreStrategy, SYNC_PROTOCOL_VERSION, ScanOptions, StoreBatch, SyncEngine, SyncError, SyncFs,
+    SyncWrite, VersionKey, VersionVector, is_internal_sync_path, validate_sync_path,
 };
 use legion_xfer::hash::hash_bytes;
 use legion_xfer::{EntryKind, Hash, Timestamp};
@@ -227,7 +228,6 @@ struct FsSnapshot {
     caps: FsCapabilities,
     supports_exchange: bool,
     marker: Option<FolderMarker>,
-    deletion_log: Vec<u8>,
     live: BTreeMap<String, SimNode>,
     bin: BTreeMap<String, SimBinData>,
     next_gen: u64,
@@ -263,7 +263,6 @@ enum UnsyncedFsOp {
 ///   parent vanishes along with the unsynced ancestor directory.
 struct PowerLossDisk {
     durable_marker: Option<FolderMarker>,
-    durable_deletion_log: Vec<u8>,
     durable_live: BTreeMap<String, SimNode>,
     durable_tmp: BTreeMap<String, Vec<u8>>,
     durable_tmp_meta: TmpMetaMap,
@@ -344,7 +343,6 @@ struct HonestSimFs {
     caps: FsCapabilities,
     supports_exchange: bool,
     marker: RefCell<Option<FolderMarker>>,
-    deletion_log: RefCell<Vec<u8>>,
     live: RefCell<BTreeMap<String, SimNode>>,
     tmp: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
     tmp_meta: RefCell<TmpMetaMap>,
@@ -373,7 +371,6 @@ impl HonestSimFs {
             caps,
             supports_exchange,
             marker: RefCell::new(None),
-            deletion_log: RefCell::new(Vec::new()),
             live: RefCell::new(BTreeMap::new()),
             tmp: Arc::new(Mutex::new(BTreeMap::new())),
             tmp_meta: RefCell::new(BTreeMap::new()),
@@ -410,7 +407,6 @@ impl HonestSimFs {
         }
         *self.power_loss.borrow_mut() = Some(PowerLossDisk {
             durable_marker: self.marker.borrow().clone(),
-            durable_deletion_log: self.deletion_log.borrow().clone(),
             durable_live: self.live.borrow().clone(),
             durable_tmp: tmp_snap,
             durable_tmp_meta: self.tmp_meta.borrow().clone(),
@@ -449,7 +445,6 @@ impl HonestSimFs {
         let mut guard = self.power_loss.borrow_mut();
         if let Some(pl) = guard.as_mut() {
             pl.durable_marker = self.marker.borrow().clone();
-            pl.durable_deletion_log = self.deletion_log.borrow().clone();
             pl.durable_live = self.live.borrow().clone();
             pl.durable_bin = self.bin.borrow().clone();
         }
@@ -654,7 +649,6 @@ impl HonestSimFs {
 
         // Restore volatile views from durable state.
         *self.marker.borrow_mut() = pl.durable_marker.clone();
-        *self.deletion_log.borrow_mut() = pl.durable_deletion_log.clone();
         *self.live.borrow_mut() = pl.durable_live.clone();
         *self.bin.borrow_mut() = pl.durable_bin.clone();
 
@@ -733,7 +727,6 @@ impl HonestSimFs {
             caps: self.caps,
             supports_exchange: self.supports_exchange,
             marker: self.marker.borrow().clone(),
-            deletion_log: self.deletion_log.borrow().clone(),
             live: self.live.borrow().clone(),
             bin: self.bin.borrow().clone(),
             next_gen: self.next_gen.get(),
@@ -745,7 +738,6 @@ impl HonestSimFs {
             caps: snap.caps,
             supports_exchange: snap.supports_exchange,
             marker: RefCell::new(snap.marker),
-            deletion_log: RefCell::new(snap.deletion_log),
             live: RefCell::new(snap.live),
             tmp: Arc::new(Mutex::new(BTreeMap::new())),
             tmp_meta: RefCell::new(BTreeMap::new()),
@@ -1382,30 +1374,6 @@ impl SyncFs for HonestSimFs {
             && let Some(pl) = self.power_loss.borrow_mut().as_mut()
         {
             pl.durable_marker = Some(marker.clone());
-        }
-        Ok(())
-    }
-
-    fn append_deletion_log(&self, bytes: &[u8]) -> legion_sync::Result<()> {
-        self.deletion_log.borrow_mut().extend_from_slice(bytes);
-        if self.power_loss_enabled.get()
-            && let Some(pl) = self.power_loss.borrow_mut().as_mut()
-        {
-            pl.durable_deletion_log.extend_from_slice(bytes);
-        }
-        Ok(())
-    }
-
-    fn read_deletion_log(&self) -> legion_sync::Result<Vec<u8>> {
-        Ok(self.deletion_log.borrow().clone())
-    }
-
-    fn compact_deletion_log(&self, bytes: &[u8]) -> legion_sync::Result<()> {
-        *self.deletion_log.borrow_mut() = bytes.to_vec();
-        if self.power_loss_enabled.get()
-            && let Some(pl) = self.power_loss.borrow_mut().as_mut()
-        {
-            pl.durable_deletion_log = bytes.to_vec();
         }
         Ok(())
     }
@@ -2608,6 +2576,10 @@ impl FaultyIndexStore {
         self.inner.clone()
     }
 
+    fn set_schema_version_for_test(&mut self, version: u32) {
+        self.inner.set_schema_version_for_test(version);
+    }
+
     fn arm_commit_fail(&mut self, countdown: usize) {
         self.fail_countdown = Some(countdown);
         self.did_fail = false;
@@ -2625,6 +2597,10 @@ impl FaultyIndexStore {
 impl IndexStore for FaultyIndexStore {
     fn schema_version(&self) -> legion_sync::Result<u32> {
         self.inner.schema_version()
+    }
+
+    fn migrate_schema_in_place(&mut self) -> legion_sync::Result<bool> {
+        self.inner.migrate_schema_in_place()
     }
 
     fn load_meta(&self) -> legion_sync::Result<Option<FolderMeta>> {
@@ -2922,6 +2898,7 @@ impl Peer for SimPeer<'_> {
 struct SimMember {
     id: String,
     engine: SyncEngine<HonestSimFs, FaultyIndexStore>,
+    token_store: MemoryInstanceTokenStore,
     clock_skew_secs: i64,
     active: bool,
     group: usize,
@@ -3061,7 +3038,8 @@ impl SimWorld {
                 fs.enable_power_loss_mode(seed ^ ((i as u64 + 1) * 0x9E37), true, true);
             }
             let store = FaultyIndexStore::new();
-            let mut engine = SyncEngine::open(cfg, fs, store).unwrap();
+            let token_store = MemoryInstanceTokenStore::new();
+            let mut engine = SyncEngine::open(cfg, fs, store, token_store.clone()).unwrap();
             // Disable the mass-deletion brake on tiny 2..15-file randomized schedules unless
             // explicitly testing the brake, so normal schedules can delete down to 0 files freely.
             engine.set_deletion_brake(brake_disabled());
@@ -3073,6 +3051,7 @@ impl SimWorld {
             members.push(SimMember {
                 id: id.clone(),
                 engine,
+                token_store,
                 clock_skew_secs: skew,
                 active: true,
                 group: 0,
@@ -4009,13 +3988,15 @@ impl SimWorld {
             .collect();
         let fs = HonestSimFs::new(caps, self.members.len().is_multiple_of(2));
         let store = FaultyIndexStore::new();
-        let mut engine = SyncEngine::open(cfg, fs, store).unwrap();
+        let token_store = MemoryInstanceTokenStore::new();
+        let mut engine = SyncEngine::open(cfg, fs, store, token_store.clone()).unwrap();
         engine.set_deletion_brake(brake_disabled());
         let skew = self.rng.range_i64(-2 * 86_400, 2 * 86_400);
         let new_idx = self.members.len();
         self.members.push(SimMember {
             id: new_id.clone(),
             engine,
+            token_store,
             clock_skew_secs: skew,
             active: true,
             group: 0,
@@ -4420,8 +4401,35 @@ impl SimWorld {
             if rec.person_removed_mask == 0 {
                 let live_anywhere = live_hashes_all.iter().any(|set| set.contains(hash));
                 if !live_anywhere {
+                    let mut diag = String::new();
+                    for m in &self.members {
+                        let bins: Vec<_> = m
+                            .engine
+                            .list_bin()
+                            .unwrap()
+                            .into_iter()
+                            .filter(|b| b.hash == Some(*hash))
+                            .map(|b| {
+                                format!("{}({:?} by {})", b.original_path, b.reason, b.by_member)
+                            })
+                            .collect();
+                        let mut recs = Vec::new();
+                        let _ = m.engine.store().scan_records_in_order(&mut |r| {
+                            if r.hash == Some(*hash)
+                                || r.base_hash == Some(*hash)
+                                || r.recent_hashes.contains(hash)
+                            {
+                                recs.push(format!(
+                                    "{}:del={}:prov={:?}:base={:?}:h={:?}",
+                                    r.path, r.deleted, r.provenance, r.base_hash, r.hash
+                                ));
+                            }
+                            Ok(true)
+                        });
+                        diag.push_str(&format!("\n  {}: bins={bins:?} recs={recs:?}", m.id));
+                    }
                     self.fail(format!(
-                        "Invariant (b): un-deleted content {hash} disappeared from every live tree (protected_mask: {protected_mask:#010b})"
+                        "Invariant (b): un-deleted content {hash} disappeared from every live tree (protected_mask: {protected_mask:#010b}){diag}"
                     ));
                 }
             }
@@ -4807,18 +4815,10 @@ fn run_long_partition_zombie_seed(root_seed: u64, seed: u64, record_trace: bool)
 
     for &i in &active {
         let remaining = world.members[i].engine.store().list_tombstones().unwrap();
-        if remaining.len() < 2 {
+        let paths: BTreeSet<&str> = remaining.iter().map(|r| r.path.as_str()).collect();
+        if !paths.contains("z1.txt") || !paths.contains("dir/z3.txt") {
             world.fail(format!(
-                "Permanent deletion tombstones were unexpectedly dropped on {}: {remaining:?}",
-                world.members[i].id
-            ));
-        }
-        let log_entries = legion_sync::parse_deletion_log(
-            &world.members[i].engine.fs().read_deletion_log().unwrap(),
-        );
-        if !log_entries.contains_key("z1.txt") || !log_entries.contains_key("dir/z3.txt") {
-            world.fail(format!(
-                "Permanent deletion log missing z1.txt or dir/z3.txt on {}: {log_entries:?}",
+                "Permanent deletion tombstones missing z1.txt or dir/z3.txt on {}: {remaining:?}",
                 world.members[i].id
             ));
         }
@@ -5105,6 +5105,7 @@ fn run_backup_reinstall_and_join_old_copy_seed(root_seed: u64, seed: u64, record
         b_cfg,
         HonestSimFs::from_snapshot(b_fs_snap),
         FaultyIndexStore::from_inner(b_store_snap),
+        world.members[b].token_store.clone(),
     )
     .unwrap();
     restored_engine.set_deletion_brake(brake_disabled());
@@ -5202,10 +5203,17 @@ fn run_backup_reinstall_and_join_old_copy_seed(root_seed: u64, seed: u64, record
     let reinstalled_fs = HonestSimFs::from_snapshot(kept_snap);
     *reinstalled_fs.marker.borrow_mut() = None;
     let b_cfg2 = FolderConfig::new("sim", b_id.clone(), all_names);
-    let mut reinstalled =
-        SyncEngine::open(b_cfg2, reinstalled_fs, FaultyIndexStore::new()).unwrap();
+    let b_tok2 = MemoryInstanceTokenStore::new();
+    let mut reinstalled = SyncEngine::open(
+        b_cfg2,
+        reinstalled_fs,
+        FaultyIndexStore::new(),
+        b_tok2.clone(),
+    )
+    .unwrap();
     reinstalled.set_deletion_brake(brake_disabled());
     world.members[b].engine = reinstalled;
+    world.members[b].token_store = b_tok2;
     world.scan_member(b);
     world.sync_connected_groups_to_quiescence();
     world.user_delete_path(b, "after_restore.txt", true);
@@ -5246,6 +5254,7 @@ fn run_duplicate_member_id_seed(root_seed: u64, seed: u64, record_trace: bool) {
         FolderConfig::new("sim", world.members[b].id.clone(), names),
         clone_fs,
         clone_store,
+        MemoryInstanceTokenStore::new(),
     )
     .unwrap();
     let now = world.members[a].local_time(world.global_secs + 60);
@@ -5348,14 +5357,17 @@ fn run_membership_change_and_readd_seed(root_seed: u64, seed: u64, record_trace:
     new_names.push(c_id.clone());
     let readded_fs = HonestSimFs::from_snapshot(c_old_fs);
     *readded_fs.marker.borrow_mut() = None;
+    let c_tok = MemoryInstanceTokenStore::new();
     let mut readded = SyncEngine::open(
         FolderConfig::new("sim", c_id.clone(), new_names),
         readded_fs,
         FaultyIndexStore::new(),
+        c_tok.clone(),
     )
     .unwrap();
     readded.set_deletion_brake(brake_disabled());
     world.members[c].engine = readded;
+    world.members[c].token_store = c_tok;
     world.members[c].active = true;
     world.members[c].group = 0;
     world.scan_member(c);
@@ -5465,26 +5477,33 @@ fn run_hostile_peer_seed(root_seed: u64, seed: u64, record_trace: bool) {
         hash: Some(hash),
         link_target: None,
         deleted: false,
-        version: VersionVector::singleton(VersionKey::new("m1", 99), seq),
+        provenance: RecordProvenance::Versioned(VersionVector::singleton(
+            VersionKey::new("m1", 99),
+            seq,
+        )),
+        base_hash: None,
         modified_by: modified_by.into(),
         seq,
         recent_hashes: Vec::new(),
-        from_join: false,
         conflict_of: None,
         conflict_dismissed: false,
     };
 
     let m0_meta = world.members[0].engine.meta().unwrap();
     let mut forged_own = mk_rec(4, "forged_own.txt", "m1", 4, good_hash);
-    forged_own.version.set(
-        VersionKey::new(&m0_meta.local_member, m0_meta.incarnation),
-        u64::MAX,
-    );
+    if let RecordProvenance::Versioned(ref mut vv) = forged_own.provenance {
+        vv.set(
+            VersionKey::new(&m0_meta.local_member, m0_meta.incarnation),
+            u64::MAX,
+        );
+    }
     let mut huge_cnt = mk_rec(5, "huge_cnt.txt", "m1", 4, good_hash);
-    huge_cnt.version.set(
-        VersionKey::new("m1", 99),
-        legion_sync::MAX_VERSION_COUNTER + 1,
-    );
+    if let RecordProvenance::Versioned(ref mut vv) = huge_cnt.provenance {
+        vv.set(
+            VersionKey::new("m1", 99),
+            legion_sync::MAX_VERSION_COUNTER + 1,
+        );
+    }
     let peer = HostilePeer {
         records: vec![
             mk_rec(1, ".LEGION-SYNC/evil.txt", "m1", 4, good_hash),
@@ -5952,6 +5971,7 @@ fn run_late_membership_and_unacked_deletion_seed(root_seed: u64, seed: u64, _rec
             cfg,
             HonestSimFs::new(FsCapabilities::unix(), true),
             FaultyIndexStore::new(),
+            MemoryInstanceTokenStore::new(),
         )
         .unwrap();
         e.set_deletion_brake(brake_disabled());
@@ -6088,6 +6108,7 @@ fn run_backup_restore_more_changes_than_gap_seed(root_seed: u64, seed: u64, reco
         FolderConfig::new("sim", b_id.clone(), all_names),
         HonestSimFs::from_snapshot(b_fs_snap),
         FaultyIndexStore::from_inner(b_store_snap),
+        world.members[b].token_store.clone(),
     )
     .unwrap();
     restored.set_deletion_brake(brake_disabled());
@@ -6174,9 +6195,13 @@ fn run_backup_restore_more_changes_than_gap_seed(root_seed: u64, seed: u64, reco
     world.check_invariants(true);
 }
 
-/// Scenario 12: Index wipe while keeping folder + `.legion-sync` stops with `IndexDamaged`,
-/// changes nothing on disk, and explicit `rebuild_from_disk` preserves deletions via
-/// `.legion-sync/deletions.log` (`m4`, `i2`).
+/// Scenario 12: Both kinds of store transition on a member holding unsynced work while a peer is
+/// partitioned:
+/// - Even seeds: in-place schema migration (`MIN_MIGRATABLE_SCHEMA_VERSION` -> current), keeping
+///   the single store, incarnation, and every unsynced deletion intact without entering join mode.
+/// - Odd seeds: destroyed `.legion-sync/index.redb` stops with `IndexDamaged`, changes nothing on
+///   disk, and explicit `rebuild_from_disk` recovers as a Decision 3 true join (keeping peer-known
+///   deletions deleted and reporting `WaitingForMember` while unsynced files remain local).
 fn run_index_wipe_and_explicit_rebuild_seed(root_seed: u64, seed: u64, record_trace: bool) {
     let mut world = SimWorld::new(
         root_seed,
@@ -6188,7 +6213,9 @@ fn run_index_wipe_and_explicit_rebuild_seed(root_seed: u64, seed: u64, record_tr
     );
     let a = 0;
     let b = 1;
+    let migrate_in_place = (seed & 1) == 0;
     world.user_create_or_edit_file(a, "keep.txt", true);
+    world.user_create_or_edit_file(a, "synced_del.pdf", true);
     world.user_create_or_edit_file(a, "secret.pdf", true);
     let keep_h = world.members[a]
         .engine
@@ -6197,47 +6224,71 @@ fn run_index_wipe_and_explicit_rebuild_seed(root_seed: u64, seed: u64, record_tr
         .unwrap();
     world.sync_connected_groups_to_quiescence();
 
+    // Delete `synced_del.pdf` while connected so peers hold its permanent tombstone.
+    world.global_secs += 30;
+    world.user_delete_path(a, "synced_del.pdf", true);
+    world.sync_connected_groups_to_quiescence();
+
     // Partition B off; A deletes `secret.pdf`.
     world.members[b].group = 1;
     world.global_secs += 30;
     world.user_delete_path(a, "secret.pdf", true);
 
-    // Wipe A's index store while keeping A's folder + `.legion-sync` (marker + deletions.log).
     let a_snap = world.members[a].engine.fs().snapshot();
     let a_id = world.members[a].id.clone();
     let all_names: Vec<String> = world.members.iter().map(|m| m.id.clone()).collect();
-    let mut reopened = SyncEngine::open(
-        FolderConfig::new("sim", a_id, all_names),
-        HonestSimFs::from_snapshot(a_snap),
-        FaultyIndexStore::new(),
-    )
-    .unwrap();
-    reopened.set_deletion_brake(brake_disabled());
-    assert!(reopened.is_index_damaged());
-    match reopened.status().unwrap().state {
-        MemberState::Problem { sentence, problems } => {
-            assert_eq!(sentence, INDEX_DAMAGED_PROBLEM_SENTENCE);
-            assert!(problems.iter().any(|p| p.kind == ProblemKind::IndexDamaged));
-        }
-        other => panic!("expected IndexDamaged state, got {other:?}"),
-    }
     let now_a = world.members[a].local_time(world.global_secs + 10);
-    assert!(matches!(
-        reopened.scan(now_a),
-        Err(SyncError::IndexDamaged { .. })
-    ));
-
-    // Explicit rebuild-from-disk recovers cleanly and preserves `secret.pdf` deletion!
-    // Also place an unsynced file on A before rebuild so we verify status never falsely reports
-    // UpToDate after A pulls from B while B still lacks A's unsynced file (`review5::s7`).
     let unsynced_body = format!("only-on-a-{seed}").into_bytes();
     let unsynced_h = hash_bytes(&unsynced_body);
-    reopened
-        .fs()
-        .user_write_file("only_on_a.txt", unsynced_body, unsynced_h, now_a);
-    reopened.rebuild_from_disk(now_a).unwrap();
-    assert!(!reopened.is_index_damaged());
-    world.members[a].engine = reopened;
+
+    if migrate_in_place {
+        let mut store = FaultyIndexStore::from_inner(world.members[a].engine.store().snapshot());
+        let inc_before = world.members[a].engine.meta().unwrap().incarnation;
+        store.set_schema_version_for_test(MIN_MIGRATABLE_SCHEMA_VERSION);
+        let mut reopened = SyncEngine::open(
+            FolderConfig::new("sim", a_id, all_names),
+            HonestSimFs::from_snapshot(a_snap),
+            store,
+            world.members[a].token_store.clone(),
+        )
+        .unwrap();
+        reopened.set_deletion_brake(brake_disabled());
+        assert!(!reopened.is_index_damaged());
+        assert_eq!(reopened.meta().unwrap().incarnation, inc_before);
+        reopened
+            .fs()
+            .user_write_file("only_on_a.txt", unsynced_body, unsynced_h, now_a);
+        reopened.scan(now_a).unwrap();
+        world.members[a].engine = reopened;
+    } else {
+        // Destroy A's index store while keeping A's folder + marker -> stops as IndexDamaged.
+        let mut reopened = SyncEngine::open(
+            FolderConfig::new("sim", a_id, all_names),
+            HonestSimFs::from_snapshot(a_snap),
+            FaultyIndexStore::new(),
+            world.members[a].token_store.clone(),
+        )
+        .unwrap();
+        reopened.set_deletion_brake(brake_disabled());
+        assert!(reopened.is_index_damaged());
+        match reopened.status().unwrap().state {
+            MemberState::Problem { sentence, problems } => {
+                assert_eq!(sentence, INDEX_DAMAGED_PROBLEM_SENTENCE);
+                assert!(problems.iter().any(|p| p.kind == ProblemKind::IndexDamaged));
+            }
+            other => panic!("expected IndexDamaged state, got {other:?}"),
+        }
+        assert!(matches!(
+            reopened.scan(now_a),
+            Err(SyncError::IndexDamaged { .. })
+        ));
+        reopened
+            .fs()
+            .user_write_file("only_on_a.txt", unsynced_body, unsynced_h, now_a);
+        reopened.rebuild_from_disk(now_a).unwrap();
+        assert!(!reopened.is_index_damaged());
+        world.members[a].engine = reopened;
+    }
 
     // B reconnects: let A pull from B first -> A still holds `only_on_a.txt` that B has not
     // pulled yet, so A MUST report WaitingForMember (NEVER UpToDate)!
@@ -6254,14 +6305,17 @@ fn run_index_wipe_and_explicit_rebuild_seed(root_seed: u64, seed: u64, record_tr
         let st_a = left[a].engine.status().unwrap();
         assert!(
             matches!(st_a.state, MemberState::WaitingForMember { .. }),
-            "seed={root_seed}: rebuilt member holding unsynced file must report WaitingForMember, got {:?}",
+            "seed={root_seed}: member holding unsynced file must report WaitingForMember, got {:?}",
             st_a.state
         );
     }
     world.sync_connected_groups_to_quiescence();
     for m in &world.members {
         if m.active {
-            assert_eq!(m.engine.fs().live_file_hash("secret.pdf"), None);
+            assert_eq!(m.engine.fs().live_file_hash("synced_del.pdf"), None);
+            if migrate_in_place {
+                assert_eq!(m.engine.fs().live_file_hash("secret.pdf"), None);
+            }
             assert_eq!(m.engine.fs().live_file_hash("keep.txt"), Some(keep_h));
             assert_eq!(
                 m.engine.fs().live_file_hash("only_on_a.txt"),
@@ -6290,6 +6344,7 @@ fn run_deletion_brake_and_inbound_brake_seed(root_seed: u64, seed: u64, _record_
             cfg,
             HonestSimFs::new(FsCapabilities::unix(), true),
             FaultyIndexStore::new(),
+            MemoryInstanceTokenStore::new(),
         )
         .unwrap()
     };
@@ -6407,6 +6462,7 @@ fn run_adversary_counters_rotation_and_symlinks_seed(
         cfg,
         HonestSimFs::new(FsCapabilities::unix(), true),
         FaultyIndexStore::new(),
+        MemoryInstanceTokenStore::new(),
     )
     .unwrap();
     m0.set_deletion_brake(brake_disabled());
@@ -6504,11 +6560,11 @@ fn run_adversary_counters_rotation_and_symlinks_seed(
         hash: None,
         link_target: Some("../secret".into()),
         deleted: false,
-        version: bad_vv.clone(),
+        provenance: RecordProvenance::Versioned(bad_vv.clone()),
+        base_hash: None,
         modified_by: "m1".into(),
         seq: 1,
         recent_hashes: Vec::new(),
-        from_join: false,
         conflict_of: None,
         conflict_dismissed: false,
     };
@@ -6525,11 +6581,11 @@ fn run_adversary_counters_rotation_and_symlinks_seed(
         hash: Some(hash_bytes(b"x")),
         link_target: None,
         deleted: false,
-        version: huge_vv,
+        provenance: RecordProvenance::Versioned(huge_vv),
+        base_hash: None,
         modified_by: "m1".into(),
         seq: 2,
         recent_hashes: Vec::new(),
-        from_join: false,
         conflict_of: None,
         conflict_dismissed: false,
     };
@@ -6584,6 +6640,7 @@ fn run_two_joiners_same_old_copy_seed(root_seed: u64, seed: u64, _record_trace: 
             cfg,
             HonestSimFs::new(FsCapabilities::unix(), true),
             FaultyIndexStore::new(),
+            MemoryInstanceTokenStore::new(),
         )
         .unwrap();
         e.set_deletion_brake(brake_disabled());
@@ -6748,9 +6805,9 @@ fn run_two_joiners_same_old_copy_seed(root_seed: u64, seed: u64, _record_trace: 
     }
 }
 
-/// Scenario 16: Lifetime of index rebuilds/rotations with deterministic VV incarnation pruning,
-/// verifying bounded per-member key counts, convergence across 2 or 3 members, and commutativity
-/// of pruning with merging (`r4`).
+/// Scenario 16: Lifetime of both in-place schema migrations and destroyed-index rebuilds,
+/// verifying zero version-vector growth on untouched files (both unversioned and versioned) and
+/// full convergence of edited files across 2 or 3 members (`r4`, `review5::g`, Decision 1 & 3).
 fn run_lifetime_rotations_and_vv_pruning_seed(root_seed: u64, seed: u64, _record_trace: bool) {
     let mut rng = Rng::new(seed);
     let t0 = Timestamp::new(1_795_608_000, 0);
@@ -6761,9 +6818,12 @@ fn run_lifetime_rotations_and_vv_pruning_seed(root_seed: u64, seed: u64, _record
         vec!["m0", "m1"]
     };
     let n = names.len();
+    let tokens: Vec<MemoryInstanceTokenStore> =
+        (0..n).map(|_| MemoryInstanceTokenStore::new()).collect();
     let mut es: Vec<SyncEngine<HonestSimFs, FaultyIndexStore>> = names
         .iter()
-        .map(|id| {
+        .enumerate()
+        .map(|(i, id)| {
             let mut cfg = FolderConfig::new(
                 "sim",
                 (*id).to_string(),
@@ -6774,6 +6834,7 @@ fn run_lifetime_rotations_and_vv_pruning_seed(root_seed: u64, seed: u64, _record
                 cfg,
                 HonestSimFs::new(FsCapabilities::unix(), true),
                 FaultyIndexStore::new(),
+                tokens[i].clone(),
             )
             .unwrap();
             e.set_deletion_brake(brake_disabled());
@@ -6781,12 +6842,21 @@ fn run_lifetime_rotations_and_vv_pruning_seed(root_seed: u64, seed: u64, _record
         })
         .collect();
 
-    for i in 0..3 {
+    // `f0.txt` is born pre-initial-scan (Unversioned); `f1.txt` and `f2.txt` are born post-scan
+    // (Versioned). Neither untouched `f0.txt` nor untouched `f2.txt` may grow keys!
+    let b0 = format!("base-0-{seed}").into_bytes();
+    es[0]
+        .fs()
+        .user_write_file("f0.txt", b0.clone(), hash_bytes(&b0), t0);
+    es[0].scan(t0).unwrap();
+    for i in 1..=2 {
         let b = format!("base-{i}-{seed}").into_bytes();
         let h = hash_bytes(&b);
-        es[0].fs().user_write_file(&format!("f{i}.txt"), b, h, t0);
+        es[0]
+            .fs()
+            .user_write_file(&format!("f{i}.txt"), b, h, Timestamp::new(t0.secs + 1, 0));
     }
-    es[0].scan(t0).unwrap();
+    es[0].scan(Timestamp::new(t0.secs + 1, 0)).unwrap();
     let sync_rounds =
         |es: &mut [SyncEngine<HonestSimFs, FaultyIndexStore>], now: Timestamp, rounds: usize| {
             let len = es.len();
@@ -6811,12 +6881,25 @@ fn run_lifetime_rotations_and_vv_pruning_seed(root_seed: u64, seed: u64, _record
                 }
             }
         };
-    sync_rounds(&mut es, t0, 2);
-    let initial_f0_vv = es[0].store().get_record("f0.txt").unwrap().unwrap().version;
-    let initial_f2_vv = es[0].store().get_record("f2.txt").unwrap().unwrap().version;
+    sync_rounds(&mut es, Timestamp::new(t0.secs + 2, 0), 2);
+    let initial_f0_prov = es[0]
+        .store()
+        .get_record("f0.txt")
+        .unwrap()
+        .unwrap()
+        .provenance;
+    let initial_f2_prov = es[0]
+        .store()
+        .get_record("f2.txt")
+        .unwrap()
+        .unwrap()
+        .provenance;
+    assert_eq!(initial_f0_prov, RecordProvenance::Unversioned);
+    assert!(initial_f2_prov.as_versioned().is_some());
 
-    // Run 6 consecutive index wipes + rebuilds of m1: untouched files (`f0.txt`, `f2.txt`) must
-    // keep their exact version vectors without growing, while edited `f1.txt` retains every key.
+    // Alternate in-place schema migration AND destroyed-index rebuilds on m1 across 6 rounds.
+    let mut expected_m1_incs = 0usize;
+    let mut last_m1_inc = es[1].meta().unwrap().incarnation;
     for rot in 1..=6i64 {
         let now = Timestamp::new(t0.secs + rot * 100, 0);
         let snap = es[1].fs().snapshot();
@@ -6826,20 +6909,40 @@ fn run_lifetime_rotations_and_vv_pruning_seed(root_seed: u64, seed: u64, _record
             names.iter().map(|s| (*s).to_string()),
         );
         cfg.initial_incarnation = Some(rng.next_u64() | 1);
-        let mut rebuilt = SyncEngine::open(
-            cfg,
-            HonestSimFs::from_snapshot(snap),
-            FaultyIndexStore::new(),
-        )
-        .unwrap();
-        rebuilt.set_deletion_brake(brake_disabled());
-        assert!(rebuilt.is_index_damaged());
-        rebuilt.rebuild_from_disk(now).unwrap();
-        es[1] = rebuilt;
+        let migrate_this_round = ((seed + rot as u64) & 1) == 0;
+        if migrate_this_round {
+            let mut store = FaultyIndexStore::from_inner(es[1].store().snapshot());
+            store.set_schema_version_for_test(MIN_MIGRATABLE_SCHEMA_VERSION);
+            let mut migrated = SyncEngine::open(
+                cfg,
+                HonestSimFs::from_snapshot(snap),
+                store,
+                tokens[1].clone(),
+            )
+            .unwrap();
+            migrated.set_deletion_brake(brake_disabled());
+            assert!(!migrated.is_index_damaged());
+            assert_eq!(migrated.meta().unwrap().incarnation, last_m1_inc);
+            es[1] = migrated;
+        } else {
+            let mut rebuilt = SyncEngine::open(
+                cfg,
+                HonestSimFs::from_snapshot(snap),
+                FaultyIndexStore::new(),
+                tokens[1].clone(),
+            )
+            .unwrap();
+            rebuilt.set_deletion_brake(brake_disabled());
+            assert!(rebuilt.is_index_damaged());
+            rebuilt.rebuild_from_disk(now).unwrap();
+            last_m1_inc = rebuilt.meta().unwrap().incarnation;
+            es[1] = rebuilt;
+        }
+        expected_m1_incs += usize::from(!migrate_this_round);
 
         sync_rounds(&mut es, Timestamp::new(now.secs + 1, 0), 2);
 
-        // Edit f1.txt on m1 after rebuild and sync everywhere.
+        // Edit f1.txt on m1 after migration/rebuild and sync everywhere.
         let body = format!("edit-after-rebuild-{rot}-{seed}").into_bytes();
         let h = hash_bytes(&body);
         es[1]
@@ -6862,36 +6965,39 @@ fn run_lifetime_rotations_and_vv_pruning_seed(root_seed: u64, seed: u64, _record
                 names[idx]
             );
         }
-        // Version vectors are always compared whole and never drop retired incarnation keys.
         let rec0 = es[0].store().get_record("f1.txt").unwrap().unwrap();
         let rec1 = es[1].store().get_record("f1.txt").unwrap().unwrap();
         let m1_keys = rec0
-            .version
+            .provenance
+            .to_version_vector()
             .iter()
             .filter(|(k, _)| k.member == "m1")
             .count();
         assert!(
-            m1_keys >= rot as usize && m1_keys <= (rot as usize) + 1,
-            "seed={root_seed} rot={rot}: expected whole VV retaining all m1 keys, got {m1_keys}"
+            m1_keys >= expected_m1_incs.max(1) && m1_keys <= expected_m1_incs + 1,
+            "seed={root_seed} rot={rot}: expected whole VV retaining m1 keys, got {m1_keys} (rotations={expected_m1_incs})"
         );
-        assert_eq!(rec0.version, rec1.version);
-        // Untouched files MUST NOT grow their version vectors across rebuilds!
-        for (untouched, expected_vv) in [("f0.txt", &initial_f0_vv), ("f2.txt", &initial_f2_vv)] {
+        assert_eq!(rec0.provenance, rec1.provenance);
+        // Untouched files MUST NOT grow their version vectors across migrations or rebuilds!
+        for (untouched, expected_prov) in
+            [("f0.txt", &initial_f0_prov), ("f2.txt", &initial_f2_prov)]
+        {
             for idx in 0..n {
-                let got_vv = es[idx]
+                let got_prov = es[idx]
                     .store()
                     .get_record(untouched)
                     .unwrap()
                     .unwrap()
-                    .version;
+                    .provenance;
                 assert_eq!(
-                    &got_vv, expected_vv,
-                    "seed={root_seed} rot={rot}: rebuild grew untouched {untouched} version vector on {} (before={expected_vv}, after={got_vv})",
+                    &got_prov, expected_prov,
+                    "seed={root_seed} rot={rot}: rebuild/migration grew untouched {untouched} provenance on {} (before={expected_prov:?}, after={got_prov:?})",
                     names[idx]
                 );
             }
         }
     }
+    let _ = &tokens;
 }
 
 /// Scenario 17: Late write through an already-open file handle after a displaced file enters
@@ -6906,6 +7012,7 @@ fn run_late_write_into_bin_seed(root_seed: u64, seed: u64, _record_trace: bool) 
             cfg,
             HonestSimFs::new(FsCapabilities::unix(), true),
             FaultyIndexStore::new(),
+            MemoryInstanceTokenStore::new(),
         )
         .unwrap();
         e.set_deletion_brake(brake_disabled());
@@ -6999,6 +7106,7 @@ fn run_local_placement_failures_seed(root_seed: u64, seed: u64, _record_trace: b
             cfg,
             HonestSimFs::new(FsCapabilities::unix(), true),
             FaultyIndexStore::new(),
+            MemoryInstanceTokenStore::new(),
         )
         .unwrap();
         e.set_deletion_brake(brake_disabled());
@@ -7109,9 +7217,12 @@ fn run_local_placement_failures_seed(root_seed: u64, seed: u64, _record_trace: b
     assert_eq!(m0.status().unwrap().state, MemberState::UpToDate);
 }
 
-/// Scenario 19: Index loss during the 30-second deletion settle hold (`r9`) — held deletions
-/// written to `.legion-sync/deletions.log` survive rebuild without resurrecting deleted files,
-/// while files recreated during the hold emit `Revived` and remain live.
+/// Scenario 19: Store transitions during the 30-second deletion settle hold (`r9`, Decisions 1-3):
+/// - `seed % 3 == 0`: in-place schema migration keeps held `pending_deletions` intact until settled.
+/// - `seed % 3 == 1`: reinstall (token lost, store kept) rotates incarnation while keeping held
+///   `pending_deletions` intact until settled.
+/// - `seed % 3 == 2`: destroyed `.legion-sync/index.redb` stops as `IndexDamaged` and rebuilds as
+///   a clean true join without panicking or losing any kept or revived file.
 fn run_index_loss_during_hold_seed(root_seed: u64, seed: u64, _record_trace: bool) {
     let mut rng = Rng::new(seed);
     let t0 = Timestamp::new(1_795_608_000, 0);
@@ -7121,7 +7232,9 @@ fn run_index_loss_during_hold_seed(root_seed: u64, seed: u64, _record_trace: boo
         settle_secs: 30,
         window_secs: 600,
     };
-    let mut mk = |id: &str| {
+    let tok0 = MemoryInstanceTokenStore::new();
+    let tok1 = MemoryInstanceTokenStore::new();
+    let mut mk = |id: &str, tok: MemoryInstanceTokenStore| {
         let mut cfg = FolderConfig::new("sim", id.to_string(), ["m0".into(), "m1".into()]);
         cfg.initial_incarnation = Some(rng.next_u64() | 1);
         cfg.deletion_brake = brake;
@@ -7129,11 +7242,12 @@ fn run_index_loss_during_hold_seed(root_seed: u64, seed: u64, _record_trace: boo
             cfg,
             HonestSimFs::new(FsCapabilities::unix(), true),
             FaultyIndexStore::new(),
+            tok,
         )
         .unwrap()
     };
-    let mut m0 = mk("m0");
-    let mut m1 = mk("m1");
+    let mut m0 = mk("m0", tok0);
+    let mut m1 = mk("m1", tok1.clone());
 
     let mut hashes = Vec::new();
     for i in 0..12 {
@@ -7158,7 +7272,7 @@ fn run_index_loss_during_hold_seed(root_seed: u64, seed: u64, _record_trace: boo
     assert_eq!(s1.deleted, 0, "deletions should still be held");
     assert_eq!(m1.meta().unwrap().pending_deletions.len(), 2);
 
-    // On half the seeds, revive f1 during the hold before wiping the index.
+    // On half the seeds, revive f1 during the hold before the transition.
     let revive_f1 = (seed & 1) == 1;
     let revived_h = if revive_f1 {
         let rb = format!("revived-f1-{seed}").into_bytes();
@@ -7171,47 +7285,83 @@ fn run_index_loss_during_hold_seed(root_seed: u64, seed: u64, _record_trace: boo
         None
     };
 
-    // Lose m1's index DURING the 30-second hold!
     let snap = m1.fs().snapshot();
+    let store_snap = m1.store().snapshot();
+    let inc_before = m1.meta().unwrap().incarnation;
     let mut cfg = FolderConfig::new("sim", "m1".to_string(), ["m0".into(), "m1".into()]);
     cfg.deletion_brake = brake;
-    let mut m1_rebuilt = SyncEngine::open(
-        cfg,
-        HonestSimFs::from_snapshot(snap),
-        FaultyIndexStore::new(),
-    )
-    .unwrap();
-    assert!(m1_rebuilt.is_index_damaged());
-    let t2 = Timestamp::new(t1.secs + 10, 0);
-    m1_rebuilt.rebuild_from_disk(t2).unwrap();
+    let t2 = Timestamp::new(t1.secs + 40, 0); // past the 30s settle window
+    let mode = seed % 3;
+    let mut m1_after = match mode {
+        0 => {
+            // In-place schema migration: store and pending_deletions stay intact!
+            let mut store = FaultyIndexStore::from_inner(store_snap);
+            store.set_schema_version_for_test(MIN_MIGRATABLE_SCHEMA_VERSION);
+            let mut e =
+                SyncEngine::open(cfg, HonestSimFs::from_snapshot(snap), store, tok1).unwrap();
+            assert!(!e.is_index_damaged());
+            assert_eq!(e.meta().unwrap().incarnation, inc_before);
+            e.scan(t2).unwrap();
+            e
+        }
+        1 => {
+            // Reinstall (token lost, store kept): Decision 2 rotates while keeping pending_deletions!
+            let mut e = SyncEngine::open(
+                cfg,
+                HonestSimFs::from_snapshot(snap),
+                FaultyIndexStore::from_inner(store_snap),
+                MemoryInstanceTokenStore::new(),
+            )
+            .unwrap();
+            assert!(!e.is_index_damaged());
+            assert_ne!(e.meta().unwrap().incarnation, inc_before);
+            e.scan(t2).unwrap();
+            e
+        }
+        _ => {
+            // Destroyed `.legion-sync/index.redb`: stops as damaged and rebuilds as true join.
+            let mut e = SyncEngine::open(
+                cfg,
+                HonestSimFs::from_snapshot(snap),
+                FaultyIndexStore::new(),
+                tok1,
+            )
+            .unwrap();
+            assert!(e.is_index_damaged());
+            e.rebuild_from_disk(t2).unwrap();
+            e
+        }
+    };
 
     for _ in 0..3 {
-        m0.pull_from_peer(&SimPeer::new(&m1_rebuilt, "m0", "m1", PeerFault::None), t2)
+        m0.pull_from_peer(&SimPeer::new(&m1_after, "m0", "m1", PeerFault::None), t2)
             .unwrap();
-        m1_rebuilt
+        m1_after
             .pull_from_peer(&SimPeer::new(&m0, "m1", "m0", PeerFault::None), t2)
             .unwrap();
     }
 
-    assert_eq!(
-        m0.fs().live_file_hash("f0.txt"),
-        None,
-        "seed={root_seed}: held deletion f0 was forgotten on rebuild"
-    );
-    assert_eq!(m1_rebuilt.fs().live_file_hash("f0.txt"), None);
-    if let Some(rh) = revived_h {
+    if mode != 2 {
+        assert_eq!(
+            m0.fs().live_file_hash("f0.txt"),
+            None,
+            "seed={root_seed} mode={mode}: held deletion f0 was forgotten"
+        );
+        assert_eq!(m1_after.fs().live_file_hash("f0.txt"), None);
+        if let Some(rh) = revived_h {
+            assert_eq!(m0.fs().live_file_hash("f1.txt"), Some(rh));
+            assert_eq!(m1_after.fs().live_file_hash("f1.txt"), Some(rh));
+        } else {
+            assert_eq!(m0.fs().live_file_hash("f1.txt"), None);
+            assert_eq!(m1_after.fs().live_file_hash("f1.txt"), None);
+        }
+    } else if let Some(rh) = revived_h {
         assert_eq!(m0.fs().live_file_hash("f1.txt"), Some(rh));
-        assert_eq!(m1_rebuilt.fs().live_file_hash("f1.txt"), Some(rh));
-    } else {
-        assert_eq!(m0.fs().live_file_hash("f1.txt"), None);
-        assert_eq!(m1_rebuilt.fs().live_file_hash("f1.txt"), None);
+        assert_eq!(m1_after.fs().live_file_hash("f1.txt"), Some(rh));
     }
     for (i, h) in hashes.iter().enumerate().skip(2) {
         assert_eq!(m0.fs().live_file_hash(&format!("f{i}.txt")), Some(*h));
-        assert_eq!(
-            m1_rebuilt.fs().live_file_hash(&format!("f{i}.txt")),
-            Some(*h)
-        );
+        assert_eq!(m1_after.fs().live_file_hash(&format!("f{i}.txt")), Some(*h));
     }
 }
 
@@ -7266,6 +7416,7 @@ fn run_lying_peer_regression_rate_limit_seed(root_seed: u64, seed: u64, _record_
             cfg,
             HonestSimFs::new(FsCapabilities::unix(), true),
             FaultyIndexStore::new(),
+            MemoryInstanceTokenStore::new(),
         )
         .unwrap();
         e.set_deletion_brake(brake_disabled());
@@ -7456,6 +7607,7 @@ fn run_asymmetric_membership_views_seed(root_seed: u64, seed: u64, _record_trace
             cfg,
             HonestSimFs::new(FsCapabilities::unix(), rng.chance(1, 2)),
             FaultyIndexStore::new(),
+            MemoryInstanceTokenStore::new(),
         )
         .unwrap();
         e.set_deletion_brake(brake_disabled());
@@ -7856,9 +8008,10 @@ fn run_asymmetric_membership_views_seed(root_seed: u64, seed: u64, _record_trace
     }
 }
 
-/// Scenario 22: Joiners carrying old pre-deletion copies arriving AFTER the deleter's index was
-/// rebuilt 1..=4 times (and tombstones were GC'd), plus optional intentional post-deletion
-/// re-creation of another deleted file (`p1` randomized generator).
+/// Scenario 22: Joiners carrying old pre-deletion copies arriving AFTER the surviving members
+/// underwent either in-place schema migrations / reinstalls (all members, history kept) OR a
+/// single-member destroyed-index rebuild (true join), plus optional intentional post-deletion
+/// re-creation of another deleted file (`p1`, `r6_p1`, Decisions 1-4).
 fn run_joiner_after_deleter_rebuild_seed(root_seed: u64, seed: u64, _record_trace: bool) {
     let mut rng = Rng::new(seed);
     let t0 = Timestamp::new(1_795_608_000, 0);
@@ -7868,7 +8021,10 @@ fn run_joiner_after_deleter_rebuild_seed(root_seed: u64, seed: u64, _record_trac
     } else {
         vec!["tower", "pi"]
     };
-    let mk = |id: &str, members: &[&str], rng: &mut Rng| {
+    let mut tokens: Vec<MemoryInstanceTokenStore> = (0..init_members.len())
+        .map(|_| MemoryInstanceTokenStore::new())
+        .collect();
+    let mk = |id: &str, members: &[&str], tok: MemoryInstanceTokenStore, rng: &mut Rng| {
         let mut cfg = FolderConfig::new(
             "sim",
             id.to_string(),
@@ -7879,6 +8035,7 @@ fn run_joiner_after_deleter_rebuild_seed(root_seed: u64, seed: u64, _record_trac
             cfg,
             HonestSimFs::new(FsCapabilities::unix(), rng.chance(1, 2)),
             FaultyIndexStore::new(),
+            tok,
         )
         .unwrap();
         e.set_deletion_brake(brake_disabled());
@@ -7920,7 +8077,8 @@ fn run_joiner_after_deleter_rebuild_seed(root_seed: u64, seed: u64, _record_trac
 
     let mut active: Vec<SyncEngine<HonestSimFs, FaultyIndexStore>> = init_members
         .iter()
-        .map(|id| mk(id, &init_members, &mut rng))
+        .enumerate()
+        .map(|(i, id)| mk(id, &init_members, tokens[i].clone(), &mut rng))
         .collect();
 
     // Seed initial files: `keep.txt`, `tax1.pdf`, `tax2.pdf`, `recreate.txt`.
@@ -7951,7 +8109,7 @@ fn run_joiner_after_deleter_rebuild_seed(root_seed: u64, seed: u64, _record_trac
     let old_copy_snap = active[0].fs().snapshot();
 
     // Deleter (`pi`, index 1) deletes `tax1.pdf`, `dir/tax2.pdf`, and optionally `recreate.txt`,
-    // syncs to all active members, and GCs tombstones!
+    // then syncs to all active members.
     let t1 = Timestamp::new(t0.secs + 50, 0);
     active[1].fs().user_remove_recursive("tax1.pdf");
     active[1].fs().user_remove_recursive("dir/tax2.pdf");
@@ -7962,16 +8120,42 @@ fn run_joiner_after_deleter_rebuild_seed(root_seed: u64, seed: u64, _record_trac
     active[1].scan(t1).unwrap();
     sync_vec(&mut active, t1.secs + 1, &mut rng);
 
-    // Rebuild EVERY surviving member's index 1..=4 times by deleting its index store completely
-    // (mirroring `rebuild_redb_from_disk` deleting the `.redb` file on every machine, as a schema
-    // bump does), editing `keep.txt` between rebuilds and syncing each time!
+    // Optional intentional post-deletion re-creation of `recreate.txt` (half with identical old
+    // bytes, half with brand-new bytes!) BEFORE the migrations/rebuilds too on half the seeds,
+    // exercising Review 6 Probe 1 directly!
+    let recreate_before_upgrades = do_recreate && rng.chance(1, 2);
+    let mut expected_recreate_h = Some(rec_v1_h);
+    if recreate_before_upgrades {
+        let trc = Timestamp::new(t0.secs + 80, 0);
+        let (bytes, h) = if rng.chance(1, 2) {
+            (rec_v1_b.clone(), rec_v1_h)
+        } else {
+            let nb = format!("recreate-new-{seed}").into_bytes();
+            let nh = hash_bytes(&nb);
+            (nb, nh)
+        };
+        active[0]
+            .fs()
+            .user_write_file("recreate.txt", bytes, h, trc);
+        active[0].scan(trc).unwrap();
+        sync_vec(&mut active, trc.secs + 1, &mut rng);
+        expected_recreate_h = Some(h);
+    }
+
+    // Exercise BOTH kinds across 1..=4 rounds:
+    // - Even seeds: EVERY surviving member migrates schema in place or loses token (history kept!).
+    // - Odd seeds: one member destroys `.legion-sync/index.redb` and rebuilds from disk (true join)
+    //   while the remaining member(s) migrate in place.
     let rebuilds = 1 + rng.range(4);
+    let destroy_one_store = (seed & 1) == 1;
     let mut latest_keep_h = keep_h;
     for r in 0..rebuilds {
         let tr = Timestamp::new(t0.secs + 100 + (r as i64) * 40, 0);
-        for e in &mut active {
+        let victim_idx = r % active.len();
+        for (idx, e) in active.iter_mut().enumerate() {
             let meta = e.meta().unwrap();
             let fs_snap = e.fs().snapshot();
+            let store_snap = e.store().snapshot();
             let fresh_fs = HonestSimFs::from_snapshot(fs_snap);
             let mut rcfg = FolderConfig::new(
                 meta.folder_id.clone(),
@@ -7979,14 +8163,41 @@ fn run_joiner_after_deleter_rebuild_seed(root_seed: u64, seed: u64, _record_trac
                 meta.members.iter().cloned(),
             );
             rcfg.former_members = meta.former_members.clone();
-            let mut rebuilt = SyncEngine::open(rcfg, fresh_fs, FaultyIndexStore::new()).unwrap();
-            assert!(
-                rebuilt.is_index_damaged(),
-                "seed={root_seed}: fresh index beside existing marker & deletion log must stop as damaged before rebuild"
-            );
-            rebuilt.set_deletion_brake(brake_disabled());
-            rebuilt.rebuild_from_disk(tr).unwrap();
-            *e = rebuilt;
+            if destroy_one_store && idx == victim_idx {
+                let mut rebuilt =
+                    SyncEngine::open(rcfg, fresh_fs, FaultyIndexStore::new(), tokens[idx].clone())
+                        .unwrap();
+                assert!(
+                    rebuilt.is_index_damaged(),
+                    "seed={root_seed}: missing store beside existing marker must stop as damaged before rebuild"
+                );
+                rebuilt.set_deletion_brake(brake_disabled());
+                rebuilt.rebuild_from_disk(tr).unwrap();
+                *e = rebuilt;
+            } else if rng.chance(1, 2) {
+                // In-place schema migration (same token, same incarnation, history kept!).
+                let mut store = FaultyIndexStore::from_inner(store_snap);
+                store.set_schema_version_for_test(MIN_MIGRATABLE_SCHEMA_VERSION);
+                let mut migrated =
+                    SyncEngine::open(rcfg, fresh_fs, store, tokens[idx].clone()).unwrap();
+                assert!(!migrated.is_index_damaged());
+                migrated.set_deletion_brake(brake_disabled());
+                *e = migrated;
+            } else {
+                // Reinstall (token lost, store kept): rotates incarnation while keeping history!
+                let new_tok = MemoryInstanceTokenStore::new();
+                let mut rotated = SyncEngine::open(
+                    rcfg,
+                    fresh_fs,
+                    FaultyIndexStore::from_inner(store_snap),
+                    new_tok.clone(),
+                )
+                .unwrap();
+                assert!(!rotated.is_index_damaged());
+                rotated.set_deletion_brake(brake_disabled());
+                tokens[idx] = new_tok;
+                *e = rotated;
+            }
         }
         sync_vec(&mut active, tr.secs + 1, &mut rng);
         let edited = format!("keep-after-rebuild-{r}-{seed}").into_bytes();
@@ -8004,9 +8215,7 @@ fn run_joiner_after_deleter_rebuild_seed(root_seed: u64, seed: u64, _record_trac
         sync_vec(&mut active, tr.secs + 21, &mut rng);
     }
 
-    // Optional intentional post-deletion re-creation of `recreate.txt` (half with identical old
-    // bytes, half with brand-new bytes!).
-    let expected_recreate_h = if do_recreate {
+    if do_recreate && !recreate_before_upgrades {
         let trc = Timestamp::new(t0.secs + 350, 0);
         let (bytes, h) = if rng.chance(1, 2) {
             (rec_v1_b, rec_v1_h)
@@ -8020,10 +8229,8 @@ fn run_joiner_after_deleter_rebuild_seed(root_seed: u64, seed: u64, _record_trac
             .user_write_file("recreate.txt", bytes, h, trc);
         active[0].scan(trc).unwrap();
         sync_vec(&mut active, trc.secs + 1, &mut rng);
-        Some(h)
-    } else {
-        Some(rec_v1_h)
-    };
+        expected_recreate_h = Some(h);
+    }
 
     // Now 1 or 2 joiners arrive carrying the pre-deletion old copy on disk (`join_mode = true`).
     let joiner_count = 1 + rng.range(2);
@@ -8042,7 +8249,13 @@ fn run_joiner_after_deleter_rebuild_seed(root_seed: u64, seed: u64, _record_trac
             final_members.iter().map(|s| (*s).to_string()),
         );
         jcfg.initial_incarnation = Some(rng.next_u64() | 1);
-        let mut je = SyncEngine::open(jcfg, jfs, FaultyIndexStore::new()).unwrap();
+        let mut je = SyncEngine::open(
+            jcfg,
+            jfs,
+            FaultyIndexStore::new(),
+            MemoryInstanceTokenStore::new(),
+        )
+        .unwrap();
         je.set_deletion_brake(brake_disabled());
         je.scan(Timestamp::new(t0.secs + 400 + (j as i64) * 5, 0))
             .unwrap();
@@ -8058,12 +8271,12 @@ fn run_joiner_after_deleter_rebuild_seed(root_seed: u64, seed: u64, _record_trac
         assert_eq!(
             e.fs().live_file_hash("tax1.pdf"),
             None,
-            "seed={root_seed}: tax1.pdf resurrected on {mid} after {rebuilds} deleter rebuilds"
+            "seed={root_seed}: tax1.pdf resurrected on {mid} after {rebuilds} rounds"
         );
         assert_eq!(
             e.fs().live_file_hash("dir/tax2.pdf"),
             None,
-            "seed={root_seed}: dir/tax2.pdf resurrected on {mid} after {rebuilds} deleter rebuilds"
+            "seed={root_seed}: dir/tax2.pdf resurrected on {mid} after {rebuilds} rounds"
         );
         assert_eq!(
             e.fs().live_file_hash("keep.txt"),
@@ -8115,7 +8328,13 @@ fn run_power_loss_crash_recovery_seed(root_seed: u64, seed: u64, _record_trace: 
         cfg.initial_incarnation = Some(rng.next_u64() | 1);
         let fs = HonestSimFs::new(FsCapabilities::unix(), supports_exchange);
         fs.enable_power_loss_mode(pl_seed, sync_created_ancestors, sync_remove_tmp);
-        let mut e = SyncEngine::open(cfg, fs, FaultyIndexStore::new()).unwrap();
+        let mut e = SyncEngine::open(
+            cfg,
+            fs,
+            FaultyIndexStore::new(),
+            MemoryInstanceTokenStore::new(),
+        )
+        .unwrap();
         e.set_deletion_brake(brake_disabled());
         e
     };
@@ -8295,6 +8514,628 @@ fn run_power_loss_crash_recovery_seed(root_seed: u64, seed: u64, _record_trace: 
     assert_eq!(m1.status().unwrap().state, MemberState::UpToDate);
 }
 
+/// Scenario 24: Reinstall / machine-local instance token loss (Decision 2) while peers are
+/// partitioned and BOTH sides hold unsynced edits, deletions, new files, and a concurrent edit.
+/// Verifies incarnation rotates cleanly while preserving all history (never entering join mode),
+/// zero lost saves, zero resurrected deletions, and clean convergence.
+fn run_token_loss_reinstall_seed(root_seed: u64, seed: u64, _record_trace: bool) {
+    let mut rng = Rng::new(seed);
+    let t0 = Timestamp::new(1_795_608_000, 0);
+    let three = (seed & 1) == 1;
+    let names: Vec<&str> = if three {
+        vec!["m0", "m1", "m2"]
+    } else {
+        vec!["m0", "m1"]
+    };
+    let mut tokens: Vec<MemoryInstanceTokenStore> = (0..names.len())
+        .map(|_| MemoryInstanceTokenStore::new())
+        .collect();
+    let mut es: Vec<SyncEngine<HonestSimFs, FaultyIndexStore>> = names
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            let mut cfg = FolderConfig::new(
+                "sim",
+                (*id).to_string(),
+                names.iter().map(|s| (*s).to_string()),
+            );
+            cfg.initial_incarnation = Some(rng.next_u64() | 1);
+            let mut e = SyncEngine::open(
+                cfg,
+                HonestSimFs::new(FsCapabilities::unix(), rng.chance(1, 2)),
+                FaultyIndexStore::new(),
+                tokens[i].clone(),
+            )
+            .unwrap();
+            e.set_deletion_brake(brake_disabled());
+            e
+        })
+        .collect();
+
+    let sync_all =
+        |es: &mut [SyncEngine<HonestSimFs, FaultyIndexStore>], t_base: i64, rng: &mut Rng| {
+            let n = es.len();
+            for round in 0..4i64 {
+                let mut pairs = Vec::new();
+                for i in 0..n {
+                    for j in 0..n {
+                        if i != j {
+                            pairs.push((i, j));
+                        }
+                    }
+                }
+                for k in (1..pairs.len()).rev() {
+                    let s = rng.range(k + 1);
+                    pairs.swap(k, s);
+                }
+                for (i, j) in pairs {
+                    let now = Timestamp::new(t_base + round * 3, 0);
+                    let (dst, src) = if i < j {
+                        let (l, r) = es.split_at_mut(j);
+                        (&mut l[i], &r[0])
+                    } else {
+                        let (l, r) = es.split_at_mut(i);
+                        (&mut r[0], &l[j])
+                    };
+                    let d_id = dst.meta().unwrap().local_member;
+                    let s_id = src.meta().unwrap().local_member;
+                    dst.pull_from_peer(&SimPeer::new(src, &d_id, &s_id, PeerFault::None), now)
+                        .unwrap();
+                }
+            }
+        };
+
+    es[0].scan(t0).unwrap();
+    let t1 = Timestamp::new(t0.secs + 5, 0);
+    for name in [
+        "edit_m0.txt",
+        "edit_m1.txt",
+        "del_m0.txt",
+        "del_m1.txt",
+        "both.txt",
+        "stay.txt",
+    ] {
+        let b = format!("base-{name}-{seed}").into_bytes();
+        es[0]
+            .fs()
+            .user_write_file(name, b.clone(), hash_bytes(&b), t1);
+    }
+    let stay_h = es[0].fs().live_file_hash("stay.txt").unwrap();
+    es[0].scan(t1).unwrap();
+    sync_all(&mut es, t1.secs + 1, &mut rng);
+
+    let t2 = Timestamp::new(t0.secs + 50, 0);
+    let m0_edit = format!("m0-edit-{seed}").into_bytes();
+    let m0_edit_h = hash_bytes(&m0_edit);
+    let m0_both = format!("m0-both-{seed}").into_bytes();
+    let m0_both_h = hash_bytes(&m0_both);
+    let m0_new = format!("m0-new-{seed}").into_bytes();
+    let m0_new_h = hash_bytes(&m0_new);
+    es[0]
+        .fs()
+        .user_write_file("edit_m0.txt", m0_edit, m0_edit_h, t2);
+    es[0]
+        .fs()
+        .user_write_file("both.txt", m0_both, m0_both_h, t2);
+    es[0]
+        .fs()
+        .user_write_file("m0_new.txt", m0_new, m0_new_h, t2);
+    es[0].fs().user_remove_recursive("del_m0.txt");
+    es[0].scan(t2).unwrap();
+
+    let m1_edit = format!("m1-edit-{seed}").into_bytes();
+    let m1_edit_h = hash_bytes(&m1_edit);
+    let m1_both = format!("m1-both-{seed}").into_bytes();
+    let m1_both_h = hash_bytes(&m1_both);
+    let m1_new = format!("m1-new-{seed}").into_bytes();
+    let m1_new_h = hash_bytes(&m1_new);
+    es[1]
+        .fs()
+        .user_write_file("edit_m1.txt", m1_edit, m1_edit_h, t2);
+    es[1]
+        .fs()
+        .user_write_file("both.txt", m1_both, m1_both_h, t2);
+    es[1]
+        .fs()
+        .user_write_file("m1_new.txt", m1_new, m1_new_h, t2);
+    es[1].fs().user_remove_recursive("del_m1.txt");
+    es[1].scan(t2).unwrap();
+
+    // Reinstall m1 (and m0 on half the seeds): wipe machine-local instance token while keeping
+    // the folder and its internal store intact.
+    let victims: &[usize] = if rng.chance(1, 2) { &[1] } else { &[0, 1] };
+    for &idx in victims {
+        let old_inc = es[idx].meta().unwrap().incarnation;
+        let fs_snap = es[idx].fs().snapshot();
+        let store_snap = es[idx].store().snapshot();
+        let fresh_tok = MemoryInstanceTokenStore::new();
+        let cfg = FolderConfig::new(
+            "sim",
+            names[idx].to_string(),
+            names.iter().map(|s| (*s).to_string()),
+        );
+        let mut reopened = SyncEngine::open(
+            cfg,
+            HonestSimFs::from_snapshot(fs_snap),
+            FaultyIndexStore::from_inner(store_snap),
+            fresh_tok.clone(),
+        )
+        .unwrap();
+        reopened.set_deletion_brake(brake_disabled());
+        assert!(!reopened.is_index_damaged());
+        assert_ne!(
+            reopened.meta().unwrap().incarnation,
+            old_inc,
+            "seed={root_seed}: token loss on {} must rotate incarnation",
+            names[idx]
+        );
+        assert!(
+            !reopened.meta().unwrap().join_mode,
+            "seed={root_seed}: token loss rotation must keep history and never enter join mode"
+        );
+        tokens[idx] = fresh_tok;
+        es[idx] = reopened;
+    }
+
+    sync_all(&mut es, t0.secs + 100, &mut rng);
+
+    for (idx, e) in es.iter().enumerate() {
+        let id = names[idx];
+        assert_eq!(
+            e.fs().live_file_hash("stay.txt"),
+            Some(stay_h),
+            "seed={root_seed}: {id}"
+        );
+        assert_eq!(
+            e.fs().live_file_hash("edit_m0.txt"),
+            Some(m0_edit_h),
+            "seed={root_seed}: {id}"
+        );
+        assert_eq!(
+            e.fs().live_file_hash("edit_m1.txt"),
+            Some(m1_edit_h),
+            "seed={root_seed}: {id}"
+        );
+        assert_eq!(
+            e.fs().live_file_hash("m0_new.txt"),
+            Some(m0_new_h),
+            "seed={root_seed}: {id}"
+        );
+        assert_eq!(
+            e.fs().live_file_hash("m1_new.txt"),
+            Some(m1_new_h),
+            "seed={root_seed}: {id}"
+        );
+        assert_eq!(
+            e.fs().live_file_hash("del_m0.txt"),
+            None,
+            "seed={root_seed}: del_m0.txt resurrected on {id}"
+        );
+        assert_eq!(
+            e.fs().live_file_hash("del_m1.txt"),
+            None,
+            "seed={root_seed}: del_m1.txt resurrected on {id}"
+        );
+        let all_live = e.fs().all_live_hashes();
+        assert!(
+            all_live.contains(&m0_both_h) && all_live.contains(&m1_both_h),
+            "seed={root_seed}: concurrent edit on both.txt lost on {id}"
+        );
+        assert_eq!(e.store().held_back_count().unwrap(), 0);
+        assert_eq!(e.status().unwrap().state, MemberState::UpToDate);
+    }
+    let _ = &tokens;
+}
+
+/// Scenario 25: Copy a folder TOGETHER with its `.legion-sync` store to a second member and run
+/// both (Decision 2). The copied member has no matching machine token, so open rotates its
+/// incarnation and re-binds its member name while keeping all history (including past deletions)
+/// without colliding with the source member.
+fn run_folder_copy_with_store_seed(root_seed: u64, seed: u64, _record_trace: bool) {
+    let mut rng = Rng::new(seed);
+    let t0 = Timestamp::new(1_795_608_000, 0);
+    let init_members = ["m0", "m2"];
+    let tok0 = MemoryInstanceTokenStore::new();
+    let tok2 = MemoryInstanceTokenStore::new();
+    let mut mk = |id: &str, members: &[&str], tok: MemoryInstanceTokenStore| {
+        let mut cfg = FolderConfig::new(
+            "sim",
+            id.to_string(),
+            members.iter().map(|s| (*s).to_string()),
+        );
+        cfg.initial_incarnation = Some(rng.next_u64() | 1);
+        let mut e = SyncEngine::open(
+            cfg,
+            HonestSimFs::new(FsCapabilities::unix(), rng.chance(1, 2)),
+            FaultyIndexStore::new(),
+            tok,
+        )
+        .unwrap();
+        e.set_deletion_brake(brake_disabled());
+        e
+    };
+    let mut m0 = mk("m0", &init_members, tok0);
+    let mut m2 = mk("m2", &init_members, tok2);
+
+    m0.scan(t0).unwrap();
+    let t1 = Timestamp::new(t0.secs + 5, 0);
+    for name in [
+        "keep.txt",
+        "edit_m0.txt",
+        "edit_m1.txt",
+        "del_m0.txt",
+        "del_m1.txt",
+        "both.txt",
+        "already_gone.txt",
+    ] {
+        let b = format!("copy-base-{name}-{seed}").into_bytes();
+        m0.fs().user_write_file(name, b.clone(), hash_bytes(&b), t1);
+    }
+    let keep_h = m0.fs().live_file_hash("keep.txt").unwrap();
+    m0.scan(t1).unwrap();
+    m2.pull_from_peer(&SimPeer::new(&m0, "m2", "m0", PeerFault::None), t1)
+        .unwrap();
+
+    let t2 = Timestamp::new(t0.secs + 20, 0);
+    m0.fs().user_remove_recursive("already_gone.txt");
+    m0.scan(t2).unwrap();
+    m2.pull_from_peer(&SimPeer::new(&m0, "m2", "m0", PeerFault::None), t2)
+        .unwrap();
+    m0.pull_from_peer(&SimPeer::new(&m2, "m0", "m2", PeerFault::None), t2)
+        .unwrap();
+
+    // Copy m0's ENTIRE folder (live files + marker + `.legion-sync/index.redb`) to brand-new
+    // member `m1` on another machine (distinct empty token store!).
+    let m0_inc = m0.meta().unwrap().incarnation;
+    let copied_fs = HonestSimFs::from_snapshot(m0.fs().snapshot());
+    let copied_store = FaultyIndexStore::from_inner(m0.store().snapshot());
+    m0.add_member("m1").unwrap();
+    m2.add_member("m1").unwrap();
+
+    let cfg1 = FolderConfig::new(
+        "sim",
+        "m1".to_string(),
+        ["m0".into(), "m1".into(), "m2".into()],
+    );
+    let mut m1 = SyncEngine::open(
+        cfg1,
+        copied_fs,
+        copied_store,
+        MemoryInstanceTokenStore::new(),
+    )
+    .unwrap();
+    m1.set_deletion_brake(brake_disabled());
+    assert!(!m1.is_index_damaged());
+    assert_eq!(m1.meta().unwrap().local_member, "m1");
+    assert_ne!(
+        m1.meta().unwrap().incarnation,
+        m0_inc,
+        "seed={root_seed}: copied folder opened on m1 must rotate away from m0's incarnation"
+    );
+    assert!(
+        m1.store()
+            .get_record("already_gone.txt")
+            .unwrap()
+            .is_some_and(|r| r.deleted),
+        "seed={root_seed}: copied folder must retain deletion history after token-mismatch rotation"
+    );
+
+    let t3 = Timestamp::new(t0.secs + 60, 0);
+    let m0_edit = format!("m0-after-copy-{seed}").into_bytes();
+    let m0_edit_h = hash_bytes(&m0_edit);
+    let m0_both = format!("m0-both-copy-{seed}").into_bytes();
+    let m0_both_h = hash_bytes(&m0_both);
+    m0.fs()
+        .user_write_file("edit_m0.txt", m0_edit, m0_edit_h, t3);
+    m0.fs().user_write_file("both.txt", m0_both, m0_both_h, t3);
+    m0.fs().user_remove_recursive("del_m0.txt");
+    m0.scan(t3).unwrap();
+
+    let m1_edit = format!("m1-after-copy-{seed}").into_bytes();
+    let m1_edit_h = hash_bytes(&m1_edit);
+    let m1_both = format!("m1-both-copy-{seed}").into_bytes();
+    let m1_both_h = hash_bytes(&m1_both);
+    m1.fs()
+        .user_write_file("edit_m1.txt", m1_edit, m1_edit_h, t3);
+    m1.fs().user_write_file("both.txt", m1_both, m1_both_h, t3);
+    m1.fs().user_remove_recursive("del_m1.txt");
+    m1.scan(t3).unwrap();
+
+    let mut es = [m0, m1, m2];
+    for round in 0..4i64 {
+        let mut pairs = vec![(0, 1), (1, 0), (0, 2), (2, 0), (1, 2), (2, 1)];
+        for k in (1..pairs.len()).rev() {
+            let s = rng.range(k + 1);
+            pairs.swap(k, s);
+        }
+        for (i, j) in pairs {
+            let now = Timestamp::new(t3.secs + 10 + round * 3, 0);
+            let (dst, src) = if i < j {
+                let (l, r) = es.split_at_mut(j);
+                (&mut l[i], &r[0])
+            } else {
+                let (l, r) = es.split_at_mut(i);
+                (&mut r[0], &l[j])
+            };
+            let d_id = dst.meta().unwrap().local_member;
+            let s_id = src.meta().unwrap().local_member;
+            dst.pull_from_peer(&SimPeer::new(src, &d_id, &s_id, PeerFault::None), now)
+                .unwrap();
+        }
+    }
+
+    for e in &es {
+        let id = e.meta().unwrap().local_member;
+        assert_eq!(
+            e.fs().live_file_hash("keep.txt"),
+            Some(keep_h),
+            "seed={root_seed}: {id}"
+        );
+        assert_eq!(
+            e.fs().live_file_hash("edit_m0.txt"),
+            Some(m0_edit_h),
+            "seed={root_seed}: {id}"
+        );
+        assert_eq!(
+            e.fs().live_file_hash("edit_m1.txt"),
+            Some(m1_edit_h),
+            "seed={root_seed}: {id}"
+        );
+        assert_eq!(
+            e.fs().live_file_hash("del_m0.txt"),
+            None,
+            "seed={root_seed}: {id}"
+        );
+        assert_eq!(
+            e.fs().live_file_hash("del_m1.txt"),
+            None,
+            "seed={root_seed}: {id}"
+        );
+        assert_eq!(
+            e.fs().live_file_hash("already_gone.txt"),
+            None,
+            "seed={root_seed}: {id}"
+        );
+        let all_live = e.fs().all_live_hashes();
+        assert!(
+            all_live.contains(&m0_both_h) && all_live.contains(&m1_both_h),
+            "seed={root_seed}: concurrent both.txt edit lost on {id}"
+        );
+        assert_eq!(e.store().held_back_count().unwrap(), 0);
+        assert_eq!(e.status().unwrap().state, MemberState::UpToDate);
+    }
+}
+
+/// Scenario 26: True join (no `.legion-sync` index or marker) followed by edits, deletions, new
+/// files, and untouched files BEFORE the first exchange with offline peers — on both 2 and 3
+/// members (Decisions 3 & 4, Review 6 Probes 5 & 6).
+fn run_true_join_act_before_exchange_seed(root_seed: u64, seed: u64, _record_trace: bool) {
+    let mut rng = Rng::new(seed);
+    let t0 = Timestamp::new(1_795_608_000, 0);
+    let three = (seed & 1) == 1;
+    let names: Vec<&str> = if three {
+        vec!["m0", "m1", "m2"]
+    } else {
+        vec!["m0", "m1"]
+    };
+    let mut es: Vec<SyncEngine<HonestSimFs, FaultyIndexStore>> = names
+        .iter()
+        .map(|id| {
+            let mut cfg = FolderConfig::new(
+                "sim",
+                (*id).to_string(),
+                names.iter().map(|s| (*s).to_string()),
+            );
+            cfg.initial_incarnation = Some(rng.next_u64() | 1);
+            let mut e = SyncEngine::open(
+                cfg,
+                HonestSimFs::new(FsCapabilities::unix(), rng.chance(1, 2)),
+                FaultyIndexStore::new(),
+                MemoryInstanceTokenStore::new(),
+            )
+            .unwrap();
+            e.set_deletion_brake(brake_disabled());
+            e
+        })
+        .collect();
+
+    let sync_all =
+        |es: &mut [SyncEngine<HonestSimFs, FaultyIndexStore>], t_base: i64, rng: &mut Rng| {
+            let n = es.len();
+            for round in 0..4i64 {
+                let mut pairs = Vec::new();
+                for i in 0..n {
+                    for j in 0..n {
+                        if i != j {
+                            pairs.push((i, j));
+                        }
+                    }
+                }
+                for k in (1..pairs.len()).rev() {
+                    let s = rng.range(k + 1);
+                    pairs.swap(k, s);
+                }
+                for (i, j) in pairs {
+                    let now = Timestamp::new(t_base + round * 3, 0);
+                    let (dst, src) = if i < j {
+                        let (l, r) = es.split_at_mut(j);
+                        (&mut l[i], &r[0])
+                    } else {
+                        let (l, r) = es.split_at_mut(i);
+                        (&mut r[0], &l[j])
+                    };
+                    let d_id = dst.meta().unwrap().local_member;
+                    let s_id = src.meta().unwrap().local_member;
+                    dst.pull_from_peer(&SimPeer::new(src, &d_id, &s_id, PeerFault::None), now)
+                        .unwrap();
+                }
+            }
+        };
+
+    es[0].scan(t0).unwrap();
+    let t1 = Timestamp::new(t0.secs + 5, 0);
+    for name in [
+        "untouched.txt",
+        "to_edit.txt",
+        "to_delete.txt",
+        "concurrent.txt",
+        "peer_edits.txt",
+        "peer_deletes.txt",
+    ] {
+        let b = format!("join-base-{name}-{seed}").into_bytes();
+        es[0]
+            .fs()
+            .user_write_file(name, b.clone(), hash_bytes(&b), t1);
+    }
+    let untouched_h = es[0].fs().live_file_hash("untouched.txt").unwrap();
+    es[0].scan(t1).unwrap();
+    sync_all(&mut es, t1.secs + 1, &mut rng);
+
+    let untouched_prov_before = es[0]
+        .store()
+        .get_record("untouched.txt")
+        .unwrap()
+        .unwrap()
+        .provenance;
+    assert!(untouched_prov_before.as_versioned().is_some());
+
+    // True join on m1 while peers are off: wipe `.legion-sync` completely (marker + store + token),
+    // keep live files on disk!
+    let t2 = Timestamp::new(t0.secs + 40, 0);
+    let m1_snap = es[1].fs().snapshot();
+    let m1_fs = HonestSimFs::from_snapshot(m1_snap);
+    *m1_fs.marker.borrow_mut() = None;
+    let cfg1 = FolderConfig::new(
+        "sim",
+        "m1".to_string(),
+        names.iter().map(|s| (*s).to_string()),
+    );
+    let mut m1 = SyncEngine::open(
+        cfg1,
+        m1_fs,
+        FaultyIndexStore::new(),
+        MemoryInstanceTokenStore::new(),
+    )
+    .unwrap();
+    m1.set_deletion_brake(brake_disabled());
+    assert!(!m1.is_index_damaged());
+    m1.scan(t2).unwrap();
+    assert_eq!(
+        m1.meta().unwrap().local_clock,
+        0,
+        "seed={root_seed}: Decision 3 initial join scan must keep local_clock == 0"
+    );
+    assert_eq!(
+        m1.store()
+            .get_record("untouched.txt")
+            .unwrap()
+            .unwrap()
+            .provenance,
+        RecordProvenance::Unversioned,
+        "seed={root_seed}: Decision 3 initial join scan must emit Unversioned records"
+    );
+
+    // BEFORE ANY EXCHANGE with any peer: m1 edits, deletes, creates, and leaves untouched files.
+    let t3 = Timestamp::new(t0.secs + 60, 0);
+    let m1_edit = format!("m1-join-edit-{seed}").into_bytes();
+    let m1_edit_h = hash_bytes(&m1_edit);
+    let m1_conc = format!("m1-conc-{seed}").into_bytes();
+    let m1_conc_h = hash_bytes(&m1_conc);
+    let m1_new = format!("m1-join-new-{seed}").into_bytes();
+    let m1_new_h = hash_bytes(&m1_new);
+    m1.fs()
+        .user_write_file("to_edit.txt", m1_edit, m1_edit_h, t3);
+    m1.fs().user_remove_recursive("to_delete.txt");
+    m1.fs()
+        .user_write_file("concurrent.txt", m1_conc, m1_conc_h, t3);
+    m1.fs()
+        .user_write_file("joiner_new.txt", m1_new, m1_new_h, t3);
+    m1.scan(t3).unwrap();
+    es[1] = m1;
+
+    let peer_actor = if three && rng.chance(1, 2) { 2 } else { 0 };
+    let peer_conc = format!("peer-conc-{seed}").into_bytes();
+    let peer_conc_h = hash_bytes(&peer_conc);
+    let peer_edit = format!("peer-edit-{seed}").into_bytes();
+    let peer_edit_h = hash_bytes(&peer_edit);
+    es[peer_actor]
+        .fs()
+        .user_write_file("concurrent.txt", peer_conc, peer_conc_h, t3);
+    es[peer_actor]
+        .fs()
+        .user_write_file("peer_edits.txt", peer_edit, peer_edit_h, t3);
+    es[peer_actor]
+        .fs()
+        .user_remove_recursive("peer_deletes.txt");
+    es[peer_actor].scan(t3).unwrap();
+
+    sync_all(&mut es, t0.secs + 100, &mut rng);
+
+    for (idx, e) in es.iter().enumerate() {
+        let id = names[idx];
+        assert_eq!(
+            e.fs().live_file_hash("untouched.txt"),
+            Some(untouched_h),
+            "seed={root_seed}: untouched.txt lost on {id}"
+        );
+        assert_eq!(
+            e.store()
+                .get_record("untouched.txt")
+                .unwrap()
+                .unwrap()
+                .provenance,
+            untouched_prov_before,
+            "seed={root_seed}: Decision 3 true join grew untouched.txt version vector on {id}"
+        );
+        assert_eq!(
+            e.fs().live_file_hash("to_edit.txt"),
+            Some(m1_edit_h),
+            "seed={root_seed}: Decision 4 joiner edit did not win cleanly on {id}"
+        );
+        assert!(
+            e.fs()
+                .live_tree(&IgnoreMatcher::default())
+                .keys()
+                .all(|p| !p.starts_with("to_edit (changed on ")),
+            "seed={root_seed}: Decision 4 joiner edit made spurious conflict copy on {id}"
+        );
+        assert_eq!(
+            e.fs().live_file_hash("to_delete.txt"),
+            None,
+            "seed={root_seed}: Decision 4 joiner deletion did not win on {id}"
+        );
+        assert_eq!(
+            e.fs().live_file_hash("peer_edits.txt"),
+            Some(peer_edit_h),
+            "seed={root_seed}: peer edit did not win cleanly on {id}"
+        );
+        assert!(
+            e.fs()
+                .live_tree(&IgnoreMatcher::default())
+                .keys()
+                .all(|p| !p.starts_with("peer_edits (changed on ")),
+            "seed={root_seed}: peer edit made spurious conflict copy on {id}"
+        );
+        assert_eq!(
+            e.fs().live_file_hash("peer_deletes.txt"),
+            None,
+            "seed={root_seed}: peer deletion resurrected on {id}"
+        );
+        assert_eq!(
+            e.fs().live_file_hash("joiner_new.txt"),
+            Some(m1_new_h),
+            "seed={root_seed}: joiner_new.txt missing on {id}"
+        );
+        let all_live = e.fs().all_live_hashes();
+        assert!(
+            all_live.contains(&m1_conc_h) && all_live.contains(&peer_conc_h),
+            "seed={root_seed}: concurrent edit on concurrent.txt lost on {id}"
+        );
+        assert_eq!(e.store().held_back_count().unwrap(), 0);
+        assert_eq!(e.status().unwrap().state, MemberState::UpToDate);
+    }
+}
+
 fn run_one_seed(seed: u64, record_trace: bool) {
     // Every seed runs the dense randomized schedule (all faults, mid-apply human edits before &
     // after swap/claim, bin restore, conflict resolution, clock jumps both ways, directory renames,
@@ -8310,7 +9151,7 @@ fn run_one_seed(seed: u64, record_trace: bool) {
     world.run_schedule(32);
 
     // Every seed also hits a dedicated deep scenario on a clean modulo cadence.
-    match seed % 24 {
+    match seed % 27 {
         0 => run_long_partition_zombie_seed(seed, seed ^ 0x5555_5555, record_trace),
         1 => run_conflict_and_delete_vs_edit_seed(seed, seed ^ 0xAAAA_AAAA, record_trace),
         2 => run_heterogeneous_and_case_rename_seed(seed, seed ^ 0x3333_3333, record_trace),
@@ -8340,7 +9181,10 @@ fn run_one_seed(seed: u64, record_trace: bool) {
         20 => run_lying_peer_regression_rate_limit_seed(seed, seed ^ 0x6BE2_7CF3, record_trace),
         21 => run_asymmetric_membership_views_seed(seed, seed ^ 0x7CF3_8D04, record_trace),
         22 => run_joiner_after_deleter_rebuild_seed(seed, seed ^ 0x8D04_9E15, record_trace),
-        _ => run_power_loss_crash_recovery_seed(seed, seed ^ 0x9E15_AF26, record_trace),
+        23 => run_power_loss_crash_recovery_seed(seed, seed ^ 0x9E15_AF26, record_trace),
+        24 => run_token_loss_reinstall_seed(seed, seed ^ 0xAF26_B037, record_trace),
+        25 => run_folder_copy_with_store_seed(seed, seed ^ 0xB037_C148, record_trace),
+        _ => run_true_join_act_before_exchange_seed(seed, seed ^ 0xC148_D259, record_trace),
     }
 }
 
@@ -8446,6 +9290,9 @@ fn simulator_all_dedicated_scenarios() {
         run_asymmetric_membership_views_seed(s, s ^ 0x7CF3_8D04, true);
         run_joiner_after_deleter_rebuild_seed(s, s ^ 0x8D04_9E15, true);
         run_power_loss_crash_recovery_seed(s, s ^ 0x9E15_AF26, true);
+        run_token_loss_reinstall_seed(s, s ^ 0xAF26_B037, true);
+        run_folder_copy_with_store_seed(s, s ^ 0xB037_C148, true);
+        run_true_join_act_before_exchange_seed(s, s ^ 0xC148_D259, true);
     }
 }
 
@@ -8523,12 +9370,14 @@ fn simulator_idle_fetch_timeout_virtual_clock() {
         cfg0,
         HonestSimFs::new(FsCapabilities::unix(), true),
         FaultyIndexStore::new(),
+        MemoryInstanceTokenStore::new(),
     )
     .unwrap();
     let mut e1 = SyncEngine::open(
         cfg1,
         HonestSimFs::new(FsCapabilities::unix(), true),
         FaultyIndexStore::new(),
+        MemoryInstanceTokenStore::new(),
     )
     .unwrap();
 
@@ -8629,6 +9478,9 @@ fn simulator_power_loss_durability_proves_sync_invariants() {
         run_asymmetric_membership_views_seed(s, s ^ 0x7CF3_8D04, true);
         run_joiner_after_deleter_rebuild_seed(s, s ^ 0x8D04_9E15, true);
         run_power_loss_crash_recovery_seed(s, s ^ 0x9E15_AF26, true);
+        run_token_loss_reinstall_seed(s, s ^ 0xAF26_B037, true);
+        run_folder_copy_with_store_seed(s, s ^ 0xB037_C148, true);
+        run_true_join_act_before_exchange_seed(s, s ^ 0xC148_D259, true);
     }
 }
 

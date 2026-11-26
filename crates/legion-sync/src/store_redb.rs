@@ -25,9 +25,10 @@ use crate::codec::{decode_record, decode_string_list, encode_record, encode_stri
 use crate::error::{INDEX_DAMAGED_PROBLEM_SENTENCE, Result, SyncError};
 use crate::model::{
     BinEntry, DeferredItem, FolderMeta, HeldBackRecord, INDEX_SCHEMA_VERSION, IndexRecord,
-    MemberId, PageLimit, PeerCursor, PendingOp, RecordsPage, SyncProblem,
+    MIN_MIGRATABLE_SCHEMA_VERSION, MemberId, PageLimit, PeerCursor, PendingOp, RecordsPage,
+    SyncProblem,
 };
-use crate::path::{fold_case, is_descendant_of};
+use crate::path::{SYNC_INDEX_FILE, fold_case, is_descendant_of};
 use crate::traits::{IndexStore, StoreBatch};
 
 const RECORDS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("records");
@@ -89,18 +90,88 @@ fn catch_redb<T>(label: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
     }
 }
 
+fn unsupported_durable_index_err(path_label: &str, detail: impl std::fmt::Display) -> SyncError {
+    SyncError::Unsupported {
+        reason: format!(
+            "Cannot use this folder for syncing because its file system does not support durable index commits at '{path_label}': {detail}."
+        ),
+        hint: Some(
+            "Choose a folder on a local file system that supports durable file writes and locking."
+                .to_string(),
+        ),
+    }
+}
+
+fn is_non_durable_fs_io_error(err: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    if matches!(
+        err.kind(),
+        ErrorKind::PermissionDenied | ErrorKind::Unsupported | ErrorKind::ReadOnlyFilesystem
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    if let Some(code) = err.raw_os_error() {
+        // EROFS (30), EACCES (13), EPERM (1), EOPNOTSUPP/ENOTSUP (95 on Linux, 45 on macOS),
+        // ENOLCK (37 on Linux, 77 on macOS), ENOSYS (38/78), EINVAL (22) on sync/lock.
+        if matches!(code, 1 | 13 | 22 | 30 | 37 | 38 | 45 | 77 | 78 | 95) {
+            return true;
+        }
+    }
+    #[cfg(windows)]
+    if let Some(code) = err.raw_os_error() {
+        // ERROR_ACCESS_DENIED (5), ERROR_WRITE_PROTECT (19), ERROR_NOT_SUPPORTED (50)
+        if matches!(code, 5 | 19 | 50) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(unix)]
+fn sync_parent_dir_if_exists(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        let dir = std::fs::File::open(parent)
+            .map_err(|err| unsupported_durable_index_err(&path.display().to_string(), err))?;
+        dir.sync_all()
+            .map_err(|err| unsupported_durable_index_err(&path.display().to_string(), err))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir_if_exists(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 impl RedbIndexStore {
-    /// Opens an existing `redb` index file at `path` (verifying its integrity and refusing 0-byte,
-    /// truncated, corrupt, or panicking files with [`SyncError::IndexDamaged`]) or creates a new
-    /// one with all tables initialized when `path` does not yet exist.
+    /// Opens or creates the folder's single durable sync index inside
+    /// `<folder_root>/.legion-sync/index.redb`, verifying that this filesystem supports durable
+    /// commits there and migrating supported older schema versions in place.
+    pub fn open_in_folder(folder_root: impl AsRef<Path>) -> Result<Self> {
+        Self::open(folder_root.as_ref().join(SYNC_INDEX_FILE))
+    }
+
+    /// Opens an existing `redb` index file at `path` (verifying its integrity, migrating
+    /// supported older schema versions in place, and refusing 0-byte, truncated, corrupt, or
+    /// panicking files with [`SyncError::IndexDamaged`]) or creates a new one with all tables
+    /// initialized and durably committed when `path` does not yet exist.
+    ///
+    /// If the folder's filesystem cannot create or durably commit the index file, returns
+    /// [`SyncError::Unsupported`] with a plain-language sentence.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let path_label = path.display().to_string();
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
+            && let Err(err) = std::fs::create_dir_all(parent)
         {
-            std::fs::create_dir_all(parent)
-                .map_err(|err| SyncError::from_io(Some(parent.display().to_string()), err))?;
+            if is_non_durable_fs_io_error(&err) {
+                return Err(unsupported_durable_index_err(&path_label, err));
+            }
+            return Err(SyncError::from_io(Some(parent.display().to_string()), err));
         }
 
         let existed = match std::fs::symlink_metadata(path) {
@@ -117,6 +188,9 @@ impl RedbIndexStore {
                 true
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(err) if is_non_durable_fs_io_error(&err) => {
+                return Err(unsupported_durable_index_err(&path_label, err));
+            }
             Err(err) => return Err(SyncError::from_io(Some(path_label), err)),
         };
 
@@ -139,6 +213,11 @@ impl RedbIndexStore {
                             });
                         }
                         Err(redb::DatabaseError::Storage(redb::StorageError::Io(io_err)))
+                            if is_non_durable_fs_io_error(&io_err) =>
+                        {
+                            return Err(unsupported_durable_index_err(&path_label, io_err));
+                        }
+                        Err(redb::DatabaseError::Storage(redb::StorageError::Io(io_err)))
                             if io_err.raw_os_error().is_some() =>
                         {
                             return Err(SyncError::from_io(Some(path_label.clone()), io_err));
@@ -148,16 +227,19 @@ impl RedbIndexStore {
                 }
             } else {
                 Database::create(path).map_err(|err| match err {
+                    redb::DatabaseError::Storage(redb::StorageError::Io(io_err))
+                        if is_non_durable_fs_io_error(&io_err) =>
+                    {
+                        unsupported_durable_index_err(&path_label, io_err)
+                    }
                     redb::DatabaseError::Storage(redb::StorageError::Io(io_err)) => {
                         SyncError::from_io(Some(path_label.clone()), io_err)
                     }
-                    other => SyncError::Storage {
-                        context: format!("create redb index at {path_label}"),
-                        detail: other.to_string(),
-                    },
+                    other => unsupported_durable_index_err(&path_label, other),
                 })?
             };
 
+            let mut needs_schema_migration = false;
             if existed {
                 let intact = db
                     .check_integrity()
@@ -187,13 +269,16 @@ impl RedbIndexStore {
                                 supported: INDEX_SCHEMA_VERSION,
                             });
                         }
-                        if found < INDEX_SCHEMA_VERSION {
+                        if found < MIN_MIGRATABLE_SCHEMA_VERSION {
                             return Err(damaged_err(
                                 &path_label,
                                 format!(
-                                    "index schema version {found} is older than supported version {INDEX_SCHEMA_VERSION} and must be rebuilt"
+                                    "index schema version {found} is too old to migrate in place (minimum supported is {MIN_MIGRATABLE_SCHEMA_VERSION})"
                                 ),
                             ));
+                        }
+                        if found < INDEX_SCHEMA_VERSION {
+                            needs_schema_migration = true;
                         }
                     }
                     if let Some(g) = meta_table
@@ -227,18 +312,17 @@ impl RedbIndexStore {
                 drop(rtxn);
             }
 
-            let txn = db.begin_write().map_err(|err| {
-                if existed {
-                    damaged_err(&path_label, err)
-                } else {
-                    SyncError::Storage {
-                        context: "initialize redb tables".to_string(),
-                        detail: err.to_string(),
-                    }
+            let txn = db.begin_write().map_err(|err| match err {
+                redb::TransactionError::Storage(redb::StorageError::Io(io_err))
+                    if is_non_durable_fs_io_error(&io_err) =>
+                {
+                    unsupported_durable_index_err(&path_label, io_err)
                 }
+                other if existed => damaged_err(&path_label, other),
+                other => unsupported_durable_index_err(&path_label, other),
             })?;
             let schema_version = {
-                let _ = txn.open_table(RECORDS_TABLE).map_err(table_err)?;
+                let mut records_table = txn.open_table(RECORDS_TABLE).map_err(table_err)?;
                 let _ = txn.open_table(BY_SEQ_TABLE).map_err(table_err)?;
                 let _ = txn.open_table(TOMBSTONES_TABLE).map_err(table_err)?;
                 let _ = txn.open_table(CONFLICTS_TABLE).map_err(table_err)?;
@@ -264,13 +348,42 @@ impl RedbIndexStore {
                             supported: INDEX_SCHEMA_VERSION,
                         });
                     }
-                    Some(found) if found < INDEX_SCHEMA_VERSION => {
+                    Some(found) if found < MIN_MIGRATABLE_SCHEMA_VERSION => {
                         return Err(damaged_err(
                             &path_label,
                             format!(
-                                "index schema version {found} is older than supported version {INDEX_SCHEMA_VERSION} and must be rebuilt"
+                                "index schema version {found} is too old to migrate in place (minimum supported is {MIN_MIGRATABLE_SCHEMA_VERSION})"
                             ),
                         ));
+                    }
+                    Some(found) if found < INDEX_SCHEMA_VERSION || needs_schema_migration => {
+                        // In-place schema migration: preserve EVERY record, deletion, version
+                        // vector, peer cursor, bin entry, and folder metadata intact while
+                        // upgrading encoded records and bumping `schema_version`.
+                        let mut reencoded: Vec<(String, Vec<u8>)> = Vec::new();
+                        {
+                            let iter = records_table
+                                .iter()
+                                .map_err(|e| storage_err("migrate iterate records", e))?;
+                            for item in iter {
+                                let (k, v) =
+                                    item.map_err(|e| storage_err("migrate step records", e))?;
+                                let rec = decode_record(v.value())?;
+                                reencoded.push((k.value().to_string(), encode_record(&rec)));
+                            }
+                        }
+                        for (k, bytes) in reencoded {
+                            records_table
+                                .insert(k.as_str(), bytes.as_slice())
+                                .map_err(|e| storage_err("migrate rewrite record", e))?;
+                        }
+                        meta_table
+                            .insert(
+                                META_KEY_SCHEMA,
+                                INDEX_SCHEMA_VERSION.to_le_bytes().as_slice(),
+                            )
+                            .map_err(|e| storage_err("migrate write schema_version", e))?;
+                        INDEX_SCHEMA_VERSION
                     }
                     Some(found) => found,
                     None => {
@@ -284,16 +397,18 @@ impl RedbIndexStore {
                     }
                 }
             };
-            txn.commit().map_err(|err| {
-                if existed {
-                    damaged_err(&path_label, err)
-                } else {
-                    SyncError::Storage {
-                        context: "commit initial redb tables".to_string(),
-                        detail: err.to_string(),
-                    }
+            txn.commit().map_err(|err| match err {
+                redb::CommitError::Storage(redb::StorageError::Io(io_err))
+                    if is_non_durable_fs_io_error(&io_err) =>
+                {
+                    unsupported_durable_index_err(&path_label, io_err)
                 }
+                other if existed => damaged_err(&path_label, other),
+                other => unsupported_durable_index_err(&path_label, other),
             })?;
+            if !existed {
+                sync_parent_dir_if_exists(path)?;
+            }
 
             Ok(Self {
                 db,

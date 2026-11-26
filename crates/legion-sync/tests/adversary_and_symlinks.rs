@@ -111,11 +111,11 @@ fn file_record(
         hash: Some(hash_bytes(data)),
         link_target: None,
         deleted: false,
-        version,
+        provenance: legion_sync::RecordProvenance::Versioned(version),
+        base_hash: None,
         modified_by: modified_by.to_string(),
         seq,
         recent_hashes: Vec::new(),
-        from_join: false,
         conflict_of: None,
         conflict_dismissed: false,
     }
@@ -126,11 +126,11 @@ fn forged_own_counter_and_huge_counter_are_refused_unacked_and_durable() {
     let tmp = scratch();
     let t = tmp.path();
     let all = ["tower", "evil"];
-    let mut tower = open_real(&t.join("tower"), &t.join("tower.redb"), "tower", &all);
-
     fs::create_dir_all(t.join("tower")).unwrap();
-    fs::write(t.join("tower/doc.txt"), b"tower original").unwrap();
+    let mut tower = open_real(&t.join("tower"), &t.join("tower.redb"), "tower", &all);
     tower.scan(ts(0)).unwrap();
+    fs::write(t.join("tower/doc.txt"), b"tower original").unwrap();
+    tower.scan(ts(1)).unwrap();
 
     let tower_meta = tower.meta().unwrap();
     let tower_inc = tower_meta.incarnation;
@@ -418,11 +418,14 @@ fn inbound_escaping_and_absolute_symlinks_are_held_back_unacked() {
         hash: None,
         link_target: Some(target.to_string()),
         deleted: false,
-        version: VersionVector::singleton(VersionKey::new("evil", 42), seq),
+        provenance: legion_sync::RecordProvenance::Versioned(VersionVector::singleton(
+            VersionKey::new("evil", 42),
+            seq,
+        )),
+        base_hash: None,
         modified_by: "evil".to_string(),
         seq,
         recent_hashes: Vec::new(),
-        from_join: false,
         conflict_of: None,
         conflict_dismissed: false,
     };

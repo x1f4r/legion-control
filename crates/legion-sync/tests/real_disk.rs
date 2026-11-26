@@ -171,18 +171,6 @@ impl<F: SyncFs> SyncFs for CrashInjectingFs<F> {
         self.inner.write_marker(marker)
     }
 
-    fn append_deletion_log(&self, bytes: &[u8]) -> legion_sync::Result<()> {
-        self.inner.append_deletion_log(bytes)
-    }
-
-    fn read_deletion_log(&self) -> legion_sync::Result<Vec<u8>> {
-        self.inner.read_deletion_log()
-    }
-
-    fn compact_deletion_log(&self, bytes: &[u8]) -> legion_sync::Result<()> {
-        self.inner.compact_deletion_log(bytes)
-    }
-
     fn ensure_internal_dirs(&self) -> legion_sync::Result<()> {
         self.inner.ensure_internal_dirs()
     }
@@ -408,7 +396,17 @@ fn open_real_engine(
         None => RealFs::open(root).unwrap(),
     };
     let store = RedbIndexStore::open(db_path).unwrap();
-    SyncEngine::open(cfg, fs, store).unwrap()
+    let token_dir = db_path
+        .parent()
+        .unwrap_or(root)
+        .join(format!(".tokens-{member}"));
+    SyncEngine::open(
+        cfg,
+        fs,
+        store,
+        legion_sync::FileInstanceTokenStore::new(token_dir),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -688,7 +686,14 @@ fn real_disk_crash_injection_at_every_apply_step_converges_without_loss() {
                 CrashInjectingFs::new(RealFs::open(&dst_root).unwrap(), Some(op_idx), crash_after);
             let cfg = FolderConfig::new("docs", "pi", ["tower".into(), "pi".into()]);
             let store = RedbIndexStore::open(&dst_db).unwrap();
-            let mut dst_crash = SyncEngine::open(cfg, crash_fs, store).unwrap();
+            let token_dir = dst_db.parent().unwrap().join(".tokens-pi");
+            let mut dst_crash = SyncEngine::open(
+                cfg,
+                crash_fs,
+                store,
+                legion_sync::FileInstanceTokenStore::new(token_dir),
+            )
+            .unwrap();
 
             let res = dst_crash.pull_from_peer(&EnginePeer::new(&src, "pi"), t1);
             let did_crash = dst_crash.fs().did_crash();
@@ -846,11 +851,14 @@ impl SyntheticLinuxPeer {
             hash: Some(hash),
             link_target: None,
             deleted: false,
-            version: VersionVector::singleton(self.vkey(), self.clock),
+            provenance: legion_sync::RecordProvenance::Versioned(VersionVector::singleton(
+                self.vkey(),
+                self.clock,
+            )),
+            base_hash: None,
             modified_by: self.member_id.clone(),
             seq: self.seq,
             recent_hashes: Vec::new(),
-            from_join: false,
             conflict_of: None,
             conflict_dismissed: false,
         });
@@ -870,11 +878,14 @@ impl SyntheticLinuxPeer {
             hash: None,
             link_target: None,
             deleted: false,
-            version: VersionVector::singleton(self.vkey(), self.clock),
+            provenance: legion_sync::RecordProvenance::Versioned(VersionVector::singleton(
+                self.vkey(),
+                self.clock,
+            )),
+            base_hash: None,
             modified_by: self.member_id.clone(),
             seq: self.seq,
             recent_hashes: Vec::new(),
-            from_join: false,
             conflict_of: None,
             conflict_dismissed: false,
         });
@@ -894,11 +905,14 @@ impl SyntheticLinuxPeer {
             hash: None,
             link_target: Some(target.to_string()),
             deleted: false,
-            version: VersionVector::singleton(self.vkey(), self.clock),
+            provenance: legion_sync::RecordProvenance::Versioned(VersionVector::singleton(
+                self.vkey(),
+                self.clock,
+            )),
+            base_hash: None,
             modified_by: self.member_id.clone(),
             seq: self.seq,
             recent_hashes: Vec::new(),
-            from_join: false,
             conflict_of: None,
             conflict_dismissed: false,
         });
@@ -914,7 +928,7 @@ impl SyntheticLinuxPeer {
             .unwrap();
         self.seq += 1;
         self.clock += 1;
-        let mut version = prev.version;
+        let mut version = prev.provenance.into_version_vector();
         version.bump_above(self.vkey(), self.clock);
         self.files.remove(path);
         let mut recent = Vec::new();
@@ -932,11 +946,11 @@ impl SyntheticLinuxPeer {
             hash: None,
             link_target: None,
             deleted: true,
-            version,
+            provenance: legion_sync::RecordProvenance::Versioned(version),
+            base_hash: prev.hash,
             modified_by: self.member_id.clone(),
             seq: self.seq,
             recent_hashes: recent,
-            from_join: false,
             conflict_of: None,
             conflict_dismissed: false,
         });
@@ -1406,15 +1420,6 @@ fn real_disk_holds_back_file_mutating_during_scan_hash() {
         fn write_marker(&self, marker: &FolderMarker) -> legion_sync::Result<()> {
             self.inner.write_marker(marker)
         }
-        fn append_deletion_log(&self, bytes: &[u8]) -> legion_sync::Result<()> {
-            self.inner.append_deletion_log(bytes)
-        }
-        fn read_deletion_log(&self) -> legion_sync::Result<Vec<u8>> {
-            self.inner.read_deletion_log()
-        }
-        fn compact_deletion_log(&self, bytes: &[u8]) -> legion_sync::Result<()> {
-            self.inner.compact_deletion_log(bytes)
-        }
         fn ensure_internal_dirs(&self) -> legion_sync::Result<()> {
             self.inner.ensure_internal_dirs()
         }
@@ -1580,7 +1585,13 @@ fn real_disk_holds_back_file_mutating_during_scan_hash() {
     };
     let cfg = FolderConfig::new("docs", "tower", ["tower".into(), "pi".into()]);
     let store = RedbIndexStore::open(&db).unwrap();
-    let mut engine = SyncEngine::open(cfg, fs_wrap, store).unwrap();
+    let mut engine = SyncEngine::open(
+        cfg,
+        fs_wrap,
+        store,
+        legion_sync::MemoryInstanceTokenStore::new(),
+    )
+    .unwrap();
 
     let r1 = engine.scan(now).unwrap();
     assert_eq!(r1.created, 0);

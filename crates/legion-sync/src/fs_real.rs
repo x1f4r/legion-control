@@ -17,9 +17,9 @@ use legion_xfer::{EntryKind, Hash, Timestamp};
 use crate::error::{FsErrorKind, Result, SyncError};
 use crate::model::FolderMarker;
 use crate::path::{
-    IgnoreMatcher, SYNC_BIN_DIR, SYNC_DELETIONS_LOG_FILE, SYNC_MARKER_FILE, SYNC_META_DIR,
-    SYNC_TMP_DIR, ancestors, check_fs_compatibility, is_dot_legion_sync_segment,
-    validate_flat_internal_name, validate_staged_tmp_token, validate_sync_path,
+    IgnoreMatcher, SYNC_BIN_DIR, SYNC_MARKER_FILE, SYNC_META_DIR, SYNC_TMP_DIR, ancestors,
+    check_fs_compatibility, is_dot_legion_sync_segment, validate_flat_internal_name,
+    validate_staged_tmp_token, validate_sync_path,
 };
 use crate::traits::{FsCapabilities, FsMeta, FsWalkEntry, FsWalkResult, SyncFs, SyncWrite};
 
@@ -514,6 +514,37 @@ impl SyncWrite for RealSyncWriter {
             .map_err(|e| SyncError::from_io(Some(self.path.display().to_string()), e))?;
         Ok(())
     }
+
+    fn finish_sync_with_metadata(
+        mut self: Box<Self>,
+        mtime: Timestamp,
+        mode: Option<u32>,
+    ) -> Result<bool> {
+        let label = self.path.display().to_string();
+        self.file
+            .flush()
+            .map_err(|e| SyncError::from_io(Some(label.clone()), e))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let effective_mode = mode.unwrap_or(0o644) & 0o777;
+            self.file
+                .set_permissions(fs::Permissions::from_mode(effective_mode))
+                .map_err(|e| SyncError::from_io(Some(label.clone()), e))?;
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        if let Some(st) = timestamp_to_system_time(mtime) {
+            let times = FileTimes::new().set_modified(st);
+            self.file
+                .set_times(times)
+                .map_err(|e| SyncError::from_io(Some(label.clone()), e))?;
+        }
+        self.file
+            .sync_all()
+            .map_err(|e| SyncError::from_io(Some(label), e))?;
+        Ok(true)
+    }
 }
 
 impl SyncFs for RealFs {
@@ -549,54 +580,6 @@ impl SyncFs for RealFs {
         self.record_trace(RealFsDurabilityEvent::WriteFileSync {
             parent: self.meta_dir(),
             path: marker_path,
-        });
-        self.sync_dir(&self.meta_dir())?;
-        Ok(())
-    }
-
-    fn append_deletion_log(&self, bytes: &[u8]) -> Result<()> {
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        self.ensure_internal_dirs()?;
-        let path = self.meta_dir().join("deletions.log");
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|err| SyncError::from_io(Some(SYNC_DELETIONS_LOG_FILE.to_string()), err))?;
-        file.write_all(bytes)
-            .map_err(|err| SyncError::from_io(Some(SYNC_DELETIONS_LOG_FILE.to_string()), err))?;
-        file.sync_all()
-            .map_err(|err| SyncError::from_io(Some(SYNC_DELETIONS_LOG_FILE.to_string()), err))?;
-        self.record_trace(RealFsDurabilityEvent::WriteFileSync {
-            parent: self.meta_dir(),
-            path,
-        });
-        self.sync_dir(&self.meta_dir())?;
-        Ok(())
-    }
-
-    fn read_deletion_log(&self) -> Result<Vec<u8>> {
-        let path = self.meta_dir().join("deletions.log");
-        match fs::read(&path) {
-            Ok(bytes) => Ok(bytes),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(err) => Err(SyncError::from_io(
-                Some(SYNC_DELETIONS_LOG_FILE.to_string()),
-                err,
-            )),
-        }
-    }
-
-    fn compact_deletion_log(&self, bytes: &[u8]) -> Result<()> {
-        self.ensure_internal_dirs()?;
-        let path = self.meta_dir().join("deletions.log");
-        write_atomic(&path, bytes, WriteOptions::with_mode(0o600))
-            .map_err(|err| SyncError::from_os(Some(SYNC_DELETIONS_LOG_FILE.to_string()), err))?;
-        self.record_trace(RealFsDurabilityEvent::WriteFileSync {
-            parent: self.meta_dir(),
-            path,
         });
         self.sync_dir(&self.meta_dir())?;
         Ok(())
@@ -1672,7 +1655,7 @@ pub fn audit_real_fs_durability(scratch_dir: &Path) -> Result<RealFsDurabilityAu
         }
     };
 
-    // 1. Internal dirs, marker, deletion log append + compact.
+    // 1. Internal dirs and marker.
     fs.ensure_internal_dirs()?;
     check_trace(
         "ensure_internal_dirs",
@@ -1684,20 +1667,6 @@ pub fn audit_real_fs_durability(scratch_dir: &Path) -> Result<RealFsDurabilityAu
     fs.write_marker(&marker)?;
     check_trace(
         "write_marker",
-        &fs.take_durability_trace(),
-        &mut unsynced_ops,
-    );
-
-    fs.append_deletion_log(b"{}\n")?;
-    check_trace(
-        "append_deletion_log",
-        &fs.take_durability_trace(),
-        &mut unsynced_ops,
-    );
-
-    fs.compact_deletion_log(b"{}\n")?;
-    check_trace(
-        "compact_deletion_log",
         &fs.take_durability_trace(),
         &mut unsynced_ops,
     );

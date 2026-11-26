@@ -10,9 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use legion_sync::{
     BinEntry, DeferredItem, FolderMeta, HeldBackRecord, INDEX_DAMAGED_PROBLEM_SENTENCE,
-    IndexRecord, IndexStore, MemberId, MemberState, MemoryIndexStore, PeerCursor, PendingOp,
-    ProblemKind, RealFs, RecordsPage, RedbIndexStore, StoreBatch, SyncEngine, SyncError,
-    SyncProblem,
+    IndexRecord, IndexStore, MemberId, MemberState, MemoryIndexStore, MemoryInstanceTokenStore,
+    PeerCursor, PendingOp, ProblemKind, RealFs, RecordsPage, RedbIndexStore, SYNC_INDEX_FILE,
+    StoreBatch, SyncEngine, SyncError, SyncProblem,
 };
 use legion_xfer::Hash;
 use safety_common::*;
@@ -22,30 +22,45 @@ fn i1_truncated_or_torn_index() {
     let tmp = scratch();
     let t = tmp.path();
     let all = ["tower", "pi"];
-    let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
+    let tower_root = t.join("tower");
+    let pi_root = t.join("pi");
+    fs::create_dir_all(&tower_root).unwrap();
+    fs::create_dir_all(&pi_root).unwrap();
+    let mut pi = open_folder(&pi_root, &token_store_dir(&pi_root, "pi"), "pi", &all);
     {
-        let mut tower = open_real(&t.join("tower"), &t.join("tower.redb"), "tower", &all);
-        fs::create_dir_all(t.join("tower")).unwrap();
+        let mut tower = open_folder(
+            &tower_root,
+            &token_store_dir(&tower_root, "tower"),
+            "tower",
+            &all,
+        );
         for i in 0..200 {
-            fs::write(t.join(format!("tower/f{i}.txt")), format!("{i}")).unwrap();
+            fs::write(tower_root.join(format!("f{i}.txt")), format!("{i}")).unwrap();
         }
         tower.scan(ts(0)).unwrap();
-        // Sync all 200 files to pi, then delete 50 on tower while pi is offline.
+        // Sync all 200 files to pi, then delete 25 and sync those deletions to pi, then delete 25
+        // more while pi is offline.
         pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(1))
             .unwrap();
         tower
             .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(1))
             .unwrap();
-        for i in 0..50 {
-            fs::remove_file(t.join(format!("tower/f{i}.txt"))).unwrap();
+        for i in 0..25 {
+            fs::remove_file(tower_root.join(format!("f{i}.txt"))).unwrap();
         }
         tower.scan(ts(2)).unwrap();
-        // Let the 50 unmatched deletions finish the 30s move-awareness settle period so they
-        // commit as tombstones and into `.legion-sync/deletions.log`.
-        assert_eq!(tower.flush_settled_deletions(ts(35)).unwrap(), 50);
+        assert_eq!(tower.flush_settled_deletions(ts(35)).unwrap(), 25);
+        pi.pull_from_peer(&EnginePeer::new(&tower, "pi"), ts(36))
+            .unwrap();
+        for i in 25..50 {
+            fs::remove_file(tower_root.join(format!("f{i}.txt"))).unwrap();
+        }
+        tower.scan(ts(40)).unwrap();
+        assert_eq!(tower.flush_settled_deletions(ts(75)).unwrap(), 25);
     }
-    let orig = fs::read(t.join("tower.redb")).unwrap();
-    let orig_marker = fs::read(t.join("tower/.legion-sync/marker.json")).unwrap();
+    let tower_db = tower_root.join(SYNC_INDEX_FILE);
+    let orig = fs::read(&tower_db).unwrap();
+    let orig_marker = fs::read(tower_root.join(".legion-sync/marker.json")).unwrap();
     type DamageCase = (&'static str, Box<dyn Fn(&std::path::Path)>);
     let cases: Vec<DamageCase> = vec![
         (
@@ -101,9 +116,9 @@ fn i1_truncated_or_torn_index() {
         ),
     ];
     for (name, damage) in cases {
-        fs::write(t.join("tower.redb"), &orig).unwrap();
-        damage(&t.join("tower.redb"));
-        let err = match RedbIndexStore::open(t.join("tower.redb")) {
+        fs::write(&tower_db, &orig).unwrap();
+        damage(&tower_db);
+        let err = match RedbIndexStore::open(&tower_db) {
             Ok(_) => panic!("{name}: damaged index must be refused on open"),
             Err(e) => e,
         };
@@ -117,47 +132,48 @@ fn i1_truncated_or_torn_index() {
             other => panic!("{name}: expected SyncError::IndexDamaged, got {other:?}"),
         }
         assert_eq!(
-            fs::read(t.join("tower/.legion-sync/marker.json")).unwrap(),
+            fs::read(tower_root.join(".legion-sync/marker.json")).unwrap(),
             orig_marker,
             "{name}: marker must not change when index is damaged"
         );
     }
 
-    // Explicit rebuild-from-disk recovers cleanly from the damaged redb file, rotates incarnation,
-    // keeps all 150 live files, and preserves the 50 recorded deletions via deletions.log!
-    let (mut rebuilt, report) = SyncEngine::rebuild_redb_from_disk(
+    // Explicit rebuild-from-disk recovers cleanly as a Decision 3 true join: keeps all 150 live
+    // files, honours the 25 deletions known to pi, and receives the 25 files whose unsynced
+    // deletions lived only in the destroyed index without losing any data.
+    let (mut rebuilt, report) = SyncEngine::rebuild_folder_from_disk(
         cfg("tower", &all),
-        RealFs::open(t.join("tower")).unwrap(),
-        t.join("tower.redb"),
-        ts(10),
+        &tower_root,
+        token_store_for(&tower_root, "tower"),
+        ts(80),
     )
     .unwrap();
     assert!(!rebuilt.is_index_damaged());
     assert_eq!(report.created, 150);
     for k in 0..3 {
         rebuilt
-            .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(20 + k))
+            .pull_from_peer(&EnginePeer::new(&pi, "tower"), ts(90 + k))
             .unwrap();
-        pi.pull_from_peer(&EnginePeer::new(&rebuilt, "pi"), ts(20 + k))
+        pi.pull_from_peer(&EnginePeer::new(&rebuilt, "pi"), ts(90 + k))
             .unwrap();
     }
-    for i in 0..50 {
+    for i in 0..25 {
         assert!(
-            !t.join(format!("tower/f{i}.txt")).exists(),
+            !tower_root.join(format!("f{i}.txt")).exists(),
             "f{i}.txt resurrected on tower after rebuild"
         );
         assert!(
-            !t.join(format!("pi/f{i}.txt")).exists(),
-            "f{i}.txt was not deleted on pi after rebuild"
+            !pi_root.join(format!("f{i}.txt")).exists(),
+            "f{i}.txt came back on pi after rebuild"
         );
     }
-    for i in 50..200 {
+    for i in 25..200 {
         assert_eq!(
-            fs::read_to_string(t.join(format!("tower/f{i}.txt"))).unwrap(),
+            fs::read_to_string(tower_root.join(format!("f{i}.txt"))).unwrap(),
             format!("{i}")
         );
         assert_eq!(
-            fs::read_to_string(t.join(format!("pi/f{i}.txt"))).unwrap(),
+            fs::read_to_string(pi_root.join(format!("f{i}.txt"))).unwrap(),
             format!("{i}")
         );
     }
@@ -235,6 +251,12 @@ impl IndexStore for PanickingStore {
             panic!("simulated redb btree corruption panic");
         }
         self.inner.schema_version()
+    }
+    fn migrate_schema_in_place(&mut self) -> legion_sync::Result<bool> {
+        if self.panic_now.load(Ordering::Relaxed) {
+            panic!("simulated redb migrate panic");
+        }
+        self.inner.migrate_schema_in_place()
     }
     fn load_meta(&self) -> legion_sync::Result<Option<FolderMeta>> {
         if self.panic_now.load(Ordering::Relaxed) {
@@ -342,6 +364,7 @@ fn i3_store_panic_is_caught_at_engine_boundary() {
         cfg("tower", &["tower", "pi"]),
         RealFs::open(&root).unwrap(),
         store,
+        MemoryInstanceTokenStore::new(),
     )
     .unwrap();
     engine.scan(ts(0)).unwrap();
@@ -377,41 +400,91 @@ fn i3_store_panic_is_caught_at_engine_boundary() {
 }
 
 #[test]
-fn i4_old_schema_version_refused_and_rebuilt_cleanly() {
+fn i4_schema_upgrade_migrates_in_place_and_ancient_schema_is_refused() {
     let tmp = scratch();
     let root = tmp.path().join("tower");
-    let db_path = tmp.path().join("tower.redb");
     fs::create_dir_all(&root).unwrap();
     fs::write(root.join("keep.txt"), b"preserved").unwrap();
+    fs::write(root.join("gone.txt"), b"to delete").unwrap();
 
+    let inc_before;
+    let keep_prov_before;
     {
-        let mut engine = SyncEngine::open(
-            cfg("tower", &["tower", "pi"]),
-            RealFs::open(&root).unwrap(),
-            RedbIndexStore::open(&db_path).unwrap(),
-        )
-        .unwrap();
+        let mut engine = open_folder(
+            &root,
+            &token_store_dir(&root, "tower"),
+            "tower",
+            &["tower", "pi"],
+        );
         engine.scan(ts(0)).unwrap();
+        fs::remove_file(root.join("gone.txt")).unwrap();
+        engine.scan(ts(1)).unwrap();
+        engine.flush_settled_deletions(ts(40)).unwrap();
+        inc_before = engine.meta().unwrap().incarnation;
+        keep_prov_before = engine
+            .store()
+            .get_record("keep.txt")
+            .unwrap()
+            .unwrap()
+            .provenance;
         engine
             .store_mut()
-            .write_schema_version_for_test(legion_sync::INDEX_SCHEMA_VERSION - 1)
+            .write_schema_version_for_test(legion_sync::MIN_MIGRATABLE_SCHEMA_VERSION)
             .unwrap();
     }
 
-    // Opening the older-schema redb file is refused as IndexDamaged instead of misreading it.
+    // Decision 1: a migratable schema version upgrades IN PLACE without rebuilding, preserving
+    // incarnation, versions, live records, and deletion tombstones.
+    {
+        let engine = open_folder(
+            &root,
+            &token_store_dir(&root, "tower"),
+            "tower",
+            &["tower", "pi"],
+        );
+        assert_eq!(
+            engine.store().schema_version().unwrap(),
+            legion_sync::INDEX_SCHEMA_VERSION
+        );
+        assert_eq!(engine.meta().unwrap().incarnation, inc_before);
+        assert_eq!(
+            engine
+                .store()
+                .get_record("keep.txt")
+                .unwrap()
+                .unwrap()
+                .provenance,
+            keep_prov_before
+        );
+        assert!(
+            engine
+                .store()
+                .get_record("gone.txt")
+                .unwrap()
+                .unwrap()
+                .deleted
+        );
+    }
+
+    // An ancient schema version older than MIN_MIGRATABLE_SCHEMA_VERSION is still refused as
+    // IndexDamaged instead of misreading it, and can be explicitly rebuilt from disk.
+    let db_path = root.join(SYNC_INDEX_FILE);
+    {
+        let mut store = RedbIndexStore::open(&db_path).unwrap();
+        store.write_schema_version_for_test(1).unwrap();
+    }
     match RedbIndexStore::open(&db_path) {
         Err(SyncError::IndexDamaged { .. }) => {}
-        Err(other) => panic!("expected IndexDamaged for older schema version, got {other:?}"),
-        Ok(_) => panic!("expected IndexDamaged for older schema version, got Ok"),
+        Err(other) => panic!("expected IndexDamaged for ancient schema version, got {other:?}"),
+        Ok(_) => panic!("expected IndexDamaged for ancient schema version, got Ok"),
     }
     assert_eq!(fs::read(root.join("keep.txt")).unwrap(), b"preserved");
 
-    // Rebuilding from disk recreates a fresh current-schema index cleanly without losing files.
-    let (engine, report) = SyncEngine::rebuild_redb_from_disk(
+    let (engine, report) = SyncEngine::rebuild_folder_from_disk(
         cfg("tower", &["tower", "pi"]),
-        RealFs::open(&root).unwrap(),
-        &db_path,
-        ts(10),
+        &root,
+        token_store_for(&root, "tower"),
+        ts(50),
     )
     .unwrap();
     assert_eq!(report.created, 1);

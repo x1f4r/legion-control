@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 use legion_sync::{
-    FetchOptions, FolderConfig, FolderMarker, FsCapabilities, FsErrorKind, FsMeta, FsWalkResult,
-    IgnoreMatcher, IndexStore, Peer, PeerHandshake, RealFs, RecordsPage, RedbIndexStore,
-    SyncEngine, SyncError, SyncFs, SyncWrite,
+    FetchOptions, FileInstanceTokenStore, FolderConfig, FolderMarker, FsCapabilities, FsErrorKind,
+    FsMeta, FsWalkResult, IgnoreMatcher, IndexStore, Peer, PeerHandshake, RealFs, RecordsPage,
+    RedbIndexStore, SyncEngine, SyncError, SyncFs, SyncWrite,
 };
 use legion_xfer::{Hash, Timestamp};
 
@@ -239,15 +239,6 @@ impl SyncFs for HookFs {
     fn write_marker(&self, marker: &FolderMarker) -> legion_sync::Result<()> {
         self.w("write_marker", "", |f| f.write_marker(marker))
     }
-    fn append_deletion_log(&self, bytes: &[u8]) -> legion_sync::Result<()> {
-        self.inner.append_deletion_log(bytes)
-    }
-    fn read_deletion_log(&self) -> legion_sync::Result<Vec<u8>> {
-        self.inner.read_deletion_log()
-    }
-    fn compact_deletion_log(&self, bytes: &[u8]) -> legion_sync::Result<()> {
-        self.inner.compact_deletion_log(bytes)
-    }
     fn ensure_internal_dirs(&self) -> legion_sync::Result<()> {
         self.inner.ensure_internal_dirs()
     }
@@ -432,6 +423,31 @@ pub fn cfg(member: &str, members: &[&str]) -> FolderConfig {
     FolderConfig::new("docs", member, members.iter().map(|s| (*s).to_string()))
 }
 
+pub fn token_store_dir(root: &Path, member: &str) -> PathBuf {
+    let dir_name = root.file_name().and_then(|n| n.to_str()).unwrap_or("root");
+    root.parent()
+        .unwrap_or(root)
+        .join(format!(".tokens-{dir_name}-{member}"))
+}
+
+pub fn token_store_for(root: &Path, member: &str) -> FileInstanceTokenStore {
+    FileInstanceTokenStore::new(token_store_dir(root, member))
+}
+
+pub fn open_folder(
+    root: &Path,
+    state_dir: &Path,
+    member: &str,
+    members: &[&str],
+) -> SyncEngine<RealFs, RedbIndexStore> {
+    SyncEngine::open_folder(
+        cfg(member, members),
+        root,
+        FileInstanceTokenStore::new(state_dir),
+    )
+    .unwrap()
+}
+
 pub fn open_real(
     root: &Path,
     db: &Path,
@@ -442,6 +458,7 @@ pub fn open_real(
         cfg(member, members),
         RealFs::open(root).unwrap(),
         RedbIndexStore::open(db).unwrap(),
+        token_store_for(root, member),
     )
     .unwrap()
 }
@@ -456,6 +473,7 @@ pub fn open_hook(
         cfg(member, members),
         HookFs::new(root),
         RedbIndexStore::open(db).unwrap(),
+        token_store_for(root, member),
     )
     .unwrap()
 }
@@ -475,7 +493,7 @@ pub fn all_bytes(root: &Path) -> Vec<(String, Vec<u8>)> {
                 if p.extension().is_some_and(|x| x == "json") && norm.contains(".legion-sync/bin") {
                     continue;
                 }
-                if norm.ends_with("marker.json") {
+                if norm.ends_with("marker.json") || norm.ends_with(".legion-sync/index.redb") {
                     continue;
                 }
                 let rel = p
@@ -516,7 +534,7 @@ pub fn where_is(root: &Path, content: &[u8]) -> Vec<String> {
                 if p.extension().is_some_and(|x| x == "json") && norm.contains(".legion-sync/bin") {
                     continue;
                 }
-                if norm.ends_with("marker.json") {
+                if norm.ends_with("marker.json") || norm.ends_with(".legion-sync/index.redb") {
                     continue;
                 }
                 let Ok(meta) = e.metadata() else { continue };

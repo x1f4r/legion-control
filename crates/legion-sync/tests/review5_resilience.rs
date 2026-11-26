@@ -13,8 +13,9 @@ use std::sync::atomic::AtomicBool;
 
 use legion_sync::{
     FetchOptions, FolderConfig, FolderMeta, HandshakeHello, IndexRecord, IndexStore,
-    MAX_PAGE_BYTES, MemberState, MemoryIndexStore, PageLimit, Peer, PeerAckView, PeerCursor,
-    PeerHandshake, PeerRollbackClaimDecision, ProblemKind, RealFs, RecordsPage, RedbIndexStore,
+    MAX_PAGE_BYTES, MIN_MIGRATABLE_SCHEMA_VERSION, MemberState, MemoryIndexStore,
+    MemoryInstanceTokenStore, PageLimit, Peer, PeerAckView, PeerCursor, PeerHandshake,
+    PeerRollbackClaimDecision, ProblemKind, RealFs, RecordProvenance, RecordsPage, RedbIndexStore,
     SYNC_PROTOCOL_VERSION, StoreBatch, SyncEngine, VersionKey, VersionVector,
     audit_real_fs_durability,
 };
@@ -72,12 +73,13 @@ fn sync_all(engines: &mut [&mut E], t0: i64) -> Vec<String> {
     errs
 }
 
-/// Review 5 Probe A: every member's index is rebuilt (schema bump / index loss) after deletions
-/// have settled and synced; a joiner carrying an old USB copy arrives. The deleted file MUST NEVER
-/// resurrect on any member (whether none, one, both, or the sole surviving member rebuilt).
+/// Review 5 Probe A: every member upgrades schema in place or reinstalls (losing its machine
+/// token) after deletions have settled and synced; a joiner carrying an old USB copy arrives. The
+/// deleted file MUST NEVER resurrect on any member (whether none, one, both, or the sole surviving
+/// member upgraded/reinstalled).
 #[test]
 fn review5_a_rebuild_every_member_after_deletions_never_resurrects() {
-    for (tower_rebuilds, pi_rebuilds, pi_gone) in [
+    for (tower_reinstalls, pi_upgrades, pi_gone) in [
         (false, false, false),
         (true, false, false),
         (true, true, false),
@@ -90,8 +92,18 @@ fn review5_a_rebuild_every_member_after_deletions_never_resurrects() {
         fs::create_dir_all(t.join("pi")).unwrap();
         fs::write(t.join("pi/tax.pdf"), b"deleted on purpose").unwrap();
         fs::write(t.join("pi/keep.txt"), b"keep").unwrap();
-        let mut tower = open_real(&t.join("tower"), &t.join("tower.redb"), "tower", &all);
-        let mut pi = open_real(&t.join("pi"), &t.join("pi.redb"), "pi", &all);
+        let mut tower = open_folder(
+            &t.join("tower"),
+            &token_store_dir(&t.join("tower"), "tower"),
+            "tower",
+            &all,
+        );
+        let mut pi = open_folder(
+            &t.join("pi"),
+            &token_store_dir(&t.join("pi"), "pi"),
+            "pi",
+            &all,
+        );
         tower.scan(ts(0)).unwrap();
         pi.scan(ts(0)).unwrap();
         assert!(sync_all(&mut [&mut tower, &mut pi], 1).is_empty());
@@ -104,8 +116,6 @@ fn review5_a_rebuild_every_member_after_deletions_never_resurrects() {
         pi.flush_settled_deletions(ts(100)).unwrap();
         for k in 0..4 {
             assert!(sync_all(&mut [&mut tower, &mut pi], 101 + 10 * k).is_empty());
-            tower.compact_deletion_log().unwrap();
-            pi.compact_deletion_log().unwrap();
         }
         assert!(
             tower
@@ -115,43 +125,45 @@ fn review5_a_rebuild_every_member_after_deletions_never_resurrects() {
                 .is_some_and(|r| r.deleted),
             "committed deletion tombstone must remain permanently in index"
         );
-        let log = fs::read_to_string(t.join("tower/.legion-sync/deletions.log")).unwrap();
-        assert!(
-            log.contains("tax.pdf"),
-            "compacted deletion log must keep tax.pdf permanently"
-        );
         assert!(!t.join("tower/tax.pdf").exists());
 
-        // Simulate a schema bump / index loss rebuild on every requested member.
-        if tower_rebuilds {
+        // Simulate a reinstall (token lost) on tower and an in-place schema upgrade on pi.
+        if tower_reinstalls {
             drop(tower);
-            let (e, _) = SyncEngine::rebuild_redb_from_disk(
-                cfg("tower", &all),
-                RealFs::open(t.join("tower")).unwrap(),
-                t.join("tower.redb"),
-                ts(200),
-            )
-            .unwrap();
-            tower = e;
+            let _ = fs::remove_dir_all(token_store_dir(&t.join("tower"), "tower"));
+            tower = open_folder(
+                &t.join("tower"),
+                &token_store_dir(&t.join("tower"), "tower"),
+                "tower",
+                &all,
+            );
             assert!(
                 tower
                     .store()
                     .get_record("tax.pdf")
                     .unwrap()
                     .is_some_and(|r| r.deleted),
-                "rebuilt tower must restore tax.pdf tombstone from deletions.log"
+                "reinstalled tower must keep tax.pdf tombstone in folder index"
             );
         }
-        if pi_rebuilds {
+        if pi_upgrades {
+            pi.store_mut()
+                .write_schema_version_for_test(MIN_MIGRATABLE_SCHEMA_VERSION)
+                .unwrap();
             drop(pi);
-            let (e, _) = SyncEngine::rebuild_redb_from_disk(
-                cfg("pi", &all),
-                RealFs::open(t.join("pi")).unwrap(),
-                t.join("pi.redb"),
-                ts(200),
-            )
-            .unwrap();
-            pi = e;
+            pi = open_folder(
+                &t.join("pi"),
+                &token_store_dir(&t.join("pi"), "pi"),
+                "pi",
+                &all,
+            );
+            assert!(
+                pi.store()
+                    .get_record("tax.pdf")
+                    .unwrap()
+                    .is_some_and(|r| r.deleted),
+                "in-place schema upgrade on pi must keep tax.pdf tombstone"
+            );
         }
         if !pi_gone {
             for k in 0..3 {
@@ -165,7 +177,12 @@ fn review5_a_rebuild_every_member_after_deletions_never_resurrects() {
             pi.add_member("laptop").unwrap();
         }
         fs::rename(t.join("usb"), t.join("laptop")).unwrap();
-        let mut laptop = open_real(&t.join("laptop"), &t.join("laptop.redb"), "laptop", &all3);
+        let mut laptop = open_folder(
+            &t.join("laptop"),
+            &token_store_dir(&t.join("laptop"), "laptop"),
+            "laptop",
+            &all3,
+        );
         laptop.scan(ts(500)).unwrap();
 
         if pi_gone {
@@ -179,11 +196,11 @@ fn review5_a_rebuild_every_member_after_deletions_never_resurrects() {
 
         assert!(
             !t.join("tower/tax.pdf").exists(),
-            "tower_rebuilds={tower_rebuilds} pi_rebuilds={pi_rebuilds} pi_gone={pi_gone}: tax.pdf resurrected on tower"
+            "tower_reinstalls={tower_reinstalls} pi_upgrades={pi_upgrades} pi_gone={pi_gone}: tax.pdf resurrected on tower"
         );
         assert!(
             !t.join("laptop/tax.pdf").exists(),
-            "tower_rebuilds={tower_rebuilds} pi_rebuilds={pi_rebuilds} pi_gone={pi_gone}: tax.pdf not binned on laptop"
+            "tower_reinstalls={tower_reinstalls} pi_upgrades={pi_upgrades} pi_gone={pi_gone}: tax.pdf not binned on laptop"
         );
         assert!(
             laptop
@@ -397,7 +414,12 @@ fn review5_c_lying_peer_stops_after_three_until_confirmed() {
         "dishonest peer must trigger at most 3 rotations before stopping"
     );
     let rec = pi.store().get_record("a.txt").unwrap().unwrap();
-    let pi_keys = rec.version.iter().filter(|(k, _)| k.member == "pi").count();
+    let pi_keys = rec
+        .provenance
+        .to_version_vector()
+        .iter()
+        .filter(|(k, _)| k.member == "pi")
+        .count();
     assert!(
         pi_keys <= 4,
         "a.txt should have at most 4 pi incarnation keys, got {pi_keys}"
@@ -565,6 +587,7 @@ fn review5_s_and_s7_honest_status_never_falsely_up_to_date() {
         cfg("tower3", &all_s7),
         RealFs::open(t.join("tower3")).unwrap(),
         t.join("tower3.redb"),
+        token_store_for(&t.join("tower3"), "tower3"),
         ts(10),
     )
     .unwrap();
@@ -588,7 +611,7 @@ fn review5_s_and_s7_honest_status_never_falsely_up_to_date() {
     fs::create_dir_all(&s8_dir).unwrap();
     let s8_cfg = FolderConfig::new("s8", "tower", ["tower".to_string(), "pi".to_string()]);
     let mut mem = MemoryIndexStore::new();
-    let mut meta = FolderMeta::new(&s8_cfg, 77);
+    let mut meta = FolderMeta::new(&s8_cfg, 77, "tok-s8".to_string());
     meta.join_mode = false;
     let mut batch = StoreBatch::default();
     let pi_inc = 88u64;
@@ -606,11 +629,14 @@ fn review5_s_and_s7_honest_status_never_falsely_up_to_date() {
             hash: Some(hash_bytes(b"x")),
             link_target: None,
             deleted: false,
-            version: VersionVector::singleton(VersionKey::new("pi", pi_inc), i),
+            provenance: RecordProvenance::Versioned(VersionVector::singleton(
+                VersionKey::new("pi", pi_inc),
+                i,
+            )),
+            base_hash: None,
             modified_by: "pi".to_string(),
             seq,
             recent_hashes: Vec::new(),
-            from_join: false,
             conflict_of: None,
             conflict_dismissed: false,
         };
@@ -632,11 +658,14 @@ fn review5_s_and_s7_honest_status_never_falsely_up_to_date() {
         hash: Some(hash_bytes(b"r")),
         link_target: None,
         deleted: false,
-        version: VersionVector::singleton(VersionKey::new("laptop", lap_inc), 1),
+        provenance: RecordProvenance::Versioned(VersionVector::singleton(
+            VersionKey::new("laptop", lap_inc),
+            1,
+        )),
+        base_hash: None,
         modified_by: "laptop".to_string(),
         seq: relay_seq,
         recent_hashes: Vec::new(),
-        from_join: false,
         conflict_of: None,
         conflict_dismissed: false,
     };
@@ -662,7 +691,9 @@ fn review5_s_and_s7_honest_status_never_falsely_up_to_date() {
         &legion_sync::FolderMarker::new("s8".into(), "tower".into(), 77),
     )
     .unwrap();
-    let s8_eng = SyncEngine::open(s8_cfg, s8_fs, mem).unwrap();
+    let s8_tokens = MemoryInstanceTokenStore::new();
+    legion_sync::InstanceTokenStore::write_token(&s8_tokens, "s8", "tok-s8").unwrap();
+    let s8_eng = SyncEngine::open(s8_cfg, s8_fs, mem, s8_tokens).unwrap();
     let s8_st = s8_eng.status_at(ts(3)).unwrap();
     assert_eq!(
         s8_st.state,
@@ -706,29 +737,34 @@ fn review5_g_rebuild_without_edits_leaves_every_vector_unchanged() {
     tower.flush_settled_deletions(ts(60)).unwrap();
     assert!(sync_all(&mut [&mut tower, &mut pi], 61).is_empty());
 
-    let expected_u = tower.store().get_record("u.txt").unwrap().unwrap().version;
-    let expected_sub = tower.store().get_record("sub").unwrap().unwrap().version;
+    let expected_u = tower
+        .store()
+        .get_record("u.txt")
+        .unwrap()
+        .unwrap()
+        .provenance;
+    let expected_sub = tower.store().get_record("sub").unwrap().unwrap().provenance;
     let expected_nested = tower
         .store()
         .get_record("sub/nested.txt")
         .unwrap()
         .unwrap()
-        .version;
+        .provenance;
     let expected_post = tower
         .store()
         .get_record("post.txt")
         .unwrap()
         .unwrap()
-        .version;
+        .provenance;
     let expected_del = tower
         .store()
         .get_record("deleted.txt")
         .unwrap()
         .unwrap()
-        .version;
-    assert_eq!(expected_u.len(), 1);
-    assert_eq!(expected_post.len(), 1);
-    assert_eq!(expected_del.len(), 1);
+        .provenance;
+    assert_eq!(expected_u, RecordProvenance::Unversioned);
+    assert_eq!(expected_post.to_version_vector().len(), 1);
+    assert_eq!(expected_del.to_version_vector().len(), 1);
 
     for r in 0..10i64 {
         drop(pi);
@@ -736,6 +772,7 @@ fn review5_g_rebuild_without_edits_leaves_every_vector_unchanged() {
             cfg("pi", &all),
             RealFs::open(t.join("pi")).unwrap(),
             t.join("pi.redb"),
+            token_store_for(&t.join("pi"), "pi"),
             ts(100 + 10 * r),
         )
         .unwrap();
@@ -749,21 +786,21 @@ fn review5_g_rebuild_without_edits_leaves_every_vector_unchanged() {
             ("post.txt", &expected_post),
             ("deleted.txt", &expected_del),
         ] {
-            let tv = tower.store().get_record(name).unwrap().unwrap().version;
-            let pv = pi.store().get_record(name).unwrap().unwrap().version;
+            let tv = tower.store().get_record(name).unwrap().unwrap().provenance;
+            let pv = pi.store().get_record(name).unwrap().unwrap().provenance;
             assert_eq!(
                 &tv, expected,
-                "rebuild {r}: tower's version vector for {name} grew ({expected} -> {tv})"
+                "rebuild {r}: tower's provenance for {name} changed ({expected:?} -> {tv:?})"
             );
             assert_eq!(
                 &pv, expected,
-                "rebuild {r}: pi's version vector for {name} grew ({expected} -> {pv})"
+                "rebuild {r}: pi's provenance for {name} changed ({expected:?} -> {pv:?})"
             );
         }
     }
 
-    // Also verify rebuilding while a 3rd member `nas` is offline (so both tower and pi still have
-    // `from_join = true` on `pre.txt`): version vector STILL stays length 1 across 5 rebuilds!
+    // Also verify rebuilding while a 3rd member `nas` is offline (so both tower and pi hold
+    // `pre.txt` as `Unversioned`): provenance stays `Unversioned` (0 keys) across 5 rebuilds!
     let three = ["tower3", "pi3", "nas3"];
     for n in three {
         fs::create_dir_all(t.join(n)).unwrap();
@@ -779,22 +816,22 @@ fn review5_g_rebuild_without_edits_leaves_every_vector_unchanged() {
             cfg("pi3", &three),
             RealFs::open(t.join("pi3")).unwrap(),
             t.join("pi3.redb"),
+            token_store_for(&t.join("pi3"), "pi3"),
             ts(50 + 10 * r),
         )
         .unwrap();
         pi3 = e;
         assert!(sync_all(&mut [&mut tower3, &mut pi3], 55 + 10 * r).is_empty());
-        let v = tower3
+        let p = tower3
             .store()
             .get_record("pre.txt")
             .unwrap()
             .unwrap()
-            .version;
+            .provenance;
         assert_eq!(
-            v.len(),
-            1,
-            "rebuild {r} with offline 3rd member grew pre.txt vector to {}: {v}",
-            v.len()
+            p,
+            RecordProvenance::Unversioned,
+            "rebuild {r} with offline 3rd member grew pre.txt provenance to {p:?}"
         );
     }
 }
@@ -933,6 +970,7 @@ fn review5_byte_bounded_pages_split_and_never_deadlock() {
     };
     assert!(probe_page.estimated_wire_bytes() > MAX_PAGE_BYTES);
 
+    fs::create_dir_all(t.join("pi_fresh")).unwrap();
     let mut pi_fresh = open_real(&t.join("pi_fresh"), &t.join("pi_fresh.redb"), "pi", &all);
     pi_fresh
         .pull_from_peer(

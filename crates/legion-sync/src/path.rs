@@ -14,8 +14,8 @@ pub const SYNC_META_DIR: &str = ".legion-sync";
 /// Relative path of the folder identity marker inside `.legion-sync/`.
 pub const SYNC_MARKER_FILE: &str = ".legion-sync/marker.json";
 
-/// Relative path of the append-only, compacted folder deletion log inside `.legion-sync/`.
-pub const SYNC_DELETIONS_LOG_FILE: &str = ".legion-sync/deletions.log";
+/// Relative path of the folder's durable sync index inside `.legion-sync/`.
+pub const SYNC_INDEX_FILE: &str = ".legion-sync/index.redb";
 
 /// Relative directory inside the sync folder for deleted and replaced copies.
 pub const SYNC_BIN_DIR: &str = ".legion-sync/bin";

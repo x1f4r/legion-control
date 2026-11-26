@@ -120,7 +120,18 @@ impl Member {
         cfg.deletion_brake = self.brake;
         let fs = RealFs::open(&self.root).unwrap();
         let store = RedbIndexStore::open(&self.db).unwrap();
-        SyncEngine::open(cfg, fs, store).unwrap()
+        let token_dir = self
+            .db
+            .parent()
+            .unwrap()
+            .join(format!(".tokens-{}", self.id));
+        SyncEngine::open(
+            cfg,
+            fs,
+            store,
+            legion_sync::FileInstanceTokenStore::new(token_dir),
+        )
+        .unwrap()
     }
 
     fn write(&self, rel: &str, bytes: &[u8]) {
@@ -611,11 +622,11 @@ fn rec(
         hash: bytes.map(h),
         link_target: None,
         deleted: false,
-        version: v,
+        provenance: legion_sync::RecordProvenance::Versioned(v),
+        base_hash: None,
         modified_by: by.to_string(),
         seq,
         recent_hashes: Vec::new(),
-        from_join: false,
         conflict_of: None,
         conflict_dismissed: false,
     }
@@ -1184,7 +1195,10 @@ fn item_f_path_safety_restore_destinations_and_held_back_bound() {
     del.deleted = true;
     del.size = 0;
     del.hash = None;
-    del.version.bump_above(VersionKey::new("evil", evil_inc), 1);
+    let mut del_v = del.provenance.into_version_vector();
+    del_v.bump_above(VersionKey::new("evil", evil_inc), 1);
+    del.provenance = legion_sync::RecordProvenance::Versioned(del_v);
+    del.base_hash = b_rec.hash;
     del.modified_by = "evil".into();
     del.seq = 1;
     let peer = FakePeer {
@@ -1232,6 +1246,7 @@ fn item_f_path_safety_restore_destinations_and_held_back_bound() {
         FolderConfig::new("docs", "win", ["win".into(), "evil".into()]),
         win_fs,
         RedbIndexStore::open(&win_db).unwrap(),
+        legion_sync::MemoryInstanceTokenStore::new(),
     )
     .unwrap();
     let total = MAX_HELD_BACK_ENTRIES + 50;
@@ -1433,6 +1448,7 @@ fn item_i_nested_sync_folders_refused_and_git_is_not_fixed_ignored() {
         FolderConfig::new("outer", "a", ["a".into()]),
         RealFs::open(&outer).unwrap(),
         RedbIndexStore::open(&outer_db).unwrap(),
+        legion_sync::MemoryInstanceTokenStore::new(),
     )
     .unwrap();
 
@@ -1449,6 +1465,7 @@ fn item_i_nested_sync_folders_refused_and_git_is_not_fixed_ignored() {
         FolderConfig::new("inner", "a", ["a".into()]),
         RealFs::open(&inner).unwrap(),
         RedbIndexStore::open(&inner_db).unwrap(),
+        legion_sync::MemoryInstanceTokenStore::new(),
     );
     assert!(matches!(nested_res, Err(SyncError::InvalidConfig { .. })));
 
@@ -1465,12 +1482,14 @@ fn item_i_nested_sync_folders_refused_and_git_is_not_fixed_ignored() {
         FolderConfig::new("child", "a", ["a".into()]),
         RealFs::open(&child_dir).unwrap(),
         RedbIndexStore::open(tmp.path().join("child.redb")).unwrap(),
+        legion_sync::MemoryInstanceTokenStore::new(),
     )
     .unwrap();
     let parent_res = SyncEngine::open(
         FolderConfig::new("parent", "a", ["a".into()]),
         RealFs::open(&parent_dir).unwrap(),
         RedbIndexStore::open(tmp.path().join("parent.redb")).unwrap(),
+        legion_sync::MemoryInstanceTokenStore::new(),
     );
     assert!(matches!(parent_res, Err(SyncError::InvalidConfig { .. })));
 }
@@ -1584,15 +1603,6 @@ fn item_g_mid_apply_non_crash_error_recovers_immediately() {
         }
         fn write_marker(&self, marker: &FolderMarker) -> legion_sync::Result<()> {
             self.inner.write_marker(marker)
-        }
-        fn append_deletion_log(&self, bytes: &[u8]) -> legion_sync::Result<()> {
-            self.inner.append_deletion_log(bytes)
-        }
-        fn read_deletion_log(&self) -> legion_sync::Result<Vec<u8>> {
-            self.inner.read_deletion_log()
-        }
-        fn compact_deletion_log(&self, bytes: &[u8]) -> legion_sync::Result<()> {
-            self.inner.compact_deletion_log(bytes)
         }
         fn ensure_internal_dirs(&self) -> legion_sync::Result<()> {
             self.inner.ensure_internal_dirs()
@@ -1765,6 +1775,7 @@ fn item_g_mid_apply_non_crash_error_recovers_immediately() {
         FolderConfig::new("docs", "b", ["a".into(), "b".into()]),
         fail_fs,
         RedbIndexStore::open(&b_db).unwrap(),
+        legion_sync::MemoryInstanceTokenStore::new(),
     )
     .unwrap();
 

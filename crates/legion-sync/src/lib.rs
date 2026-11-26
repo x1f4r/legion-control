@@ -37,10 +37,16 @@
 //!   brake pauses before recording large-scale deletions; random per-index incarnations detect
 //!   backup restores, reinstalls, and cloned member IDs; short per-path hash ancestry and deleted
 //!   history prevent stale copies from winning or resurrecting deletions on join or re-add.
-//! - **Permanent deletion memory**: deletions are appended durably to `.legion-sync/deletions.log`
-//!   before being acknowledged to any peer and stay there for the life of the folder (compaction
-//!   only merges ordered versions for the same path and never drops knowledge). The index's
-//!   tombstones are a cache of that log rebuilt on every rebuild or schema migration.
+//! - **Single in-folder store**: all sync history — records, permanent deletions, peer
+//!   acknowledgements, member identity, and bin metadata — lives in `.legion-sync/index.redb`
+//!   inside the folder so files and history travel together. Schema upgrades migrate in place.
+//! - **Identity per install**: a random instance token in the machine's local state directory
+//!   binds the folder's index to that install. Reinstalls, folder copies, and rollbacks rotate
+//!   only the incarnation and token while keeping every record, deletion, and version intact.
+//! - **Unversioned joins & content-based causality**: files found on disk with no prior history
+//!   have explicit [`RecordProvenance::Unversioned`] provenance and win nothing over versioned
+//!   history. Every edit and deletion records the content hash it acted on (`base_hash`) so a
+//!   change made on top of content `H` cleanly supersedes a concurrent copy that is still `H`.
 //! - **Direct acknowledgements**: peers report only what they have directly pulled and applied —
 //!   third-party hearsay is never accepted.
 //! - **Fixed ignore rules**: `.legion-sync` at any depth (including case-folded and NFKC
@@ -93,22 +99,20 @@ pub use model::{
     DEFAULT_BRAKE_MIN_FILES, DEFAULT_BRAKE_MIN_PERCENT, DEFAULT_BRAKE_SETTLE_SECS,
     DEFAULT_BRAKE_WINDOW_SECS, DEFAULT_FETCH_TIMEOUT, DeferredItem, DeletionBrake,
     DeletionBrakeConfig, DeletionBrakeDecision, DeletionWindowState, ExpectedLocalSnapshot,
-    FORCED_ROTATION_COOLDOWN_SECS, FetchClock, FetchOptions, FolderConfig, FolderDeletionLogEntry,
-    FolderDeletionRecord, FolderId, FolderMarker, FolderMeta, FolderStatus, HandshakeHello,
-    HeldBackRecord, INDEX_SCHEMA_VERSION, InboundDeletionBrake, InboundDeletionBrakeDecision,
-    IndexRecord, MAX_ANCESTRY_HASHES, MAX_DEFERRAL_ATTEMPTS, MAX_FORCED_ROTATIONS_BEFORE_CONFIRM,
-    MAX_HELD_BACK_ENTRIES, MAX_LINK_TARGET_BYTES, MAX_PAGE_BYTES, MAX_PAGE_RECORDS,
-    MAX_PEER_PROBLEMS, MAX_VERSION_COUNTER, MAX_VV_INCARNATIONS_PER_MEMBER,
+    FORCED_ROTATION_COOLDOWN_SECS, FetchClock, FetchOptions, FolderConfig, FolderId, FolderMarker,
+    FolderMeta, FolderStatus, HandshakeHello, HeldBackRecord, INDEX_SCHEMA_VERSION,
+    InboundDeletionBrake, InboundDeletionBrakeDecision, IndexRecord, MAX_ANCESTRY_HASHES,
+    MAX_DEFERRAL_ATTEMPTS, MAX_FORCED_ROTATIONS_BEFORE_CONFIRM, MAX_HELD_BACK_ENTRIES,
+    MAX_LINK_TARGET_BYTES, MAX_PAGE_BYTES, MAX_PAGE_RECORDS, MAX_PEER_PROBLEMS,
+    MAX_VERSION_COUNTER, MAX_VV_INCARNATIONS_PER_MEMBER, MIN_MIGRATABLE_SCHEMA_VERSION,
     MIN_PLAUSIBLE_CLOCK_SECS, MemberId, MemberState, MemberStatus, PageLimit, PeerAckView,
     PeerCursor, PeerHandshake, PeerRefusalSummary, PeerRollbackClaimDecision,
-    PeerRollbackClaimState, PendingLocalDeletion, PendingOp, ProblemKind, RecordsPage,
-    RestoreStrategy, SYNC_PROTOCOL_VERSION, SyncProblem, SyncProgress, chain_fingerprint,
-    collapse_deletion_records, compact_deletion_log_bytes, encode_deletion_log_entries,
-    merge_deletion_record_into_list, parse_deletion_log, parse_deletion_log_all,
-    validate_folder_id, validate_member_id,
+    PeerRollbackClaimState, PendingLocalDeletion, PendingOp, ProblemKind, RecordProvenance,
+    RecordsPage, RestoreStrategy, SYNC_PROTOCOL_VERSION, SyncProblem, SyncProgress,
+    chain_fingerprint, random_instance_token, validate_folder_id, validate_member_id,
 };
 pub use path::{
-    IgnoreMatcher, ParsedConflictPath, SYNC_BIN_DIR, SYNC_DELETIONS_LOG_FILE, SYNC_MARKER_FILE,
+    IgnoreMatcher, ParsedConflictPath, SYNC_BIN_DIR, SYNC_INDEX_FILE, SYNC_MARKER_FILE,
     SYNC_META_DIR, SYNC_TMP_DIR, check_fs_compatibility, check_symlink_target_contained,
     conflict_copy_path, is_fixed_ignored, is_internal_sync_path, is_os_litter_name,
     parse_conflict_copy_path, validate_staged_tmp_token, validate_sync_path,
@@ -121,7 +125,7 @@ pub use scan::{ScanOptions, ScanReport};
 pub use store_mem::MemoryIndexStore;
 pub use store_redb::RedbIndexStore;
 pub use traits::{
-    FsCapabilities, FsMeta, FsWalkEntry, FsWalkResult, IndexStore, Peer, StoreBatch, SyncFs,
-    SyncWrite,
+    FileInstanceTokenStore, FsCapabilities, FsMeta, FsWalkEntry, FsWalkResult, IndexStore,
+    InstanceTokenStore, MemoryInstanceTokenStore, Peer, StoreBatch, SyncFs, SyncWrite,
 };
 pub use version::{VersionKey, VersionOrder, VersionVector};

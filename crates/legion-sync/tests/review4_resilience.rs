@@ -97,7 +97,7 @@ fn p1_case(rebuild: bool) {
             .store()
             .get_record("tax.pdf")
             .unwrap()
-            .map(|r| r.version)
+            .map(|r| r.provenance)
     );
 
     // pi reinstalls: index lost, rebuilt -> new incarnation.
@@ -118,7 +118,7 @@ fn p1_case(rebuild: bool) {
         .expect("tower must retain permanent tombstone for tax.pdf");
     assert!(tomb.deleted);
     assert!(
-        !tomb.version.is_empty(),
+        !tomb.provenance.to_version_vector().is_empty(),
         "permanent deletion tombstone must never lose its keys"
     );
 
@@ -360,7 +360,8 @@ fn p3_sixty_four_incarnation_cap_truthful_and_isolated() {
         .get_record("f.txt")
         .unwrap()
         .unwrap()
-        .version
+        .provenance
+        .to_version_vector()
         .iter()
         .filter(|(k, _)| k.member == "pi")
         .count();
@@ -1203,15 +1204,6 @@ fn p10b_unplaceable_non_dir_ancestor_held_back_without_aborting_pull() {
         fn write_marker(&self, m: &legion_sync::FolderMarker) -> legion_sync::Result<()> {
             self.inner.write_marker(m)
         }
-        fn append_deletion_log(&self, b: &[u8]) -> legion_sync::Result<()> {
-            self.inner.append_deletion_log(b)
-        }
-        fn read_deletion_log(&self) -> legion_sync::Result<Vec<u8>> {
-            self.inner.read_deletion_log()
-        }
-        fn compact_deletion_log(&self, b: &[u8]) -> legion_sync::Result<()> {
-            self.inner.compact_deletion_log(b)
-        }
         fn ensure_internal_dirs(&self) -> legion_sync::Result<()> {
             self.inner.ensure_internal_dirs()
         }
@@ -1362,6 +1354,7 @@ fn p10b_unplaceable_non_dir_ancestor_held_back_without_aborting_pull() {
             block_d: Arc::clone(&block_d),
         },
         RedbIndexStore::open(t.join("tower.redb")).unwrap(),
+        token_store_for(&t.join("tower"), "tower"),
     )
     .unwrap();
 

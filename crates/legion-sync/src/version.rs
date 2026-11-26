@@ -144,6 +144,17 @@ impl VersionVector {
         }
     }
 
+    /// Returns `true` if `self` and `other` share at least one `(member, incarnation)` key,
+    /// meaning the two versioned histories descend from a common causal ancestor.
+    pub fn shares_any_key(&self, other: &Self) -> bool {
+        self.counters.keys().any(|k| other.counters.contains_key(k))
+    }
+
+    /// Removes `key` from the version vector, returning its previous counter if present.
+    pub fn remove(&mut self, key: &VersionKey) -> Option<u64> {
+        self.counters.remove(key)
+    }
+
     /// Raises `key`'s counter to at least `value` without ever decreasing it.
     pub fn raise(&mut self, key: VersionKey, value: u64) {
         if value == 0 {

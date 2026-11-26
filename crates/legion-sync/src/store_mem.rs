@@ -6,10 +6,11 @@ use std::ops::Bound;
 
 use legion_xfer::{EntryKind, Hash};
 
-use crate::error::Result;
+use crate::error::{INDEX_DAMAGED_PROBLEM_SENTENCE, Result, SyncError};
 use crate::model::{
     BinEntry, DeferredItem, FolderMeta, HeldBackRecord, INDEX_SCHEMA_VERSION, IndexRecord,
-    MemberId, PageLimit, PeerCursor, PendingOp, RecordsPage, SyncProblem,
+    MIN_MIGRATABLE_SCHEMA_VERSION, MemberId, PageLimit, PeerCursor, PendingOp, RecordsPage,
+    SyncProblem,
 };
 use crate::path::fold_case;
 use crate::traits::{IndexStore, StoreBatch};
@@ -66,11 +67,17 @@ impl MemoryIndexStore {
     }
 
     /// Creates an empty in-memory store stamped with an explicit schema version (for testing
-    /// newer-schema refusal).
+    /// newer-schema refusal or in-place schema migration).
     pub fn with_schema_version(schema_version: u32) -> Self {
         let mut s = Self::new();
         s.schema_version = schema_version;
         s
+    }
+
+    /// Stamps `schema_version` on an existing in-memory store (intended for tests and the
+    /// simulator verifying in-place schema migration).
+    pub fn set_schema_version_for_test(&mut self, schema_version: u32) {
+        self.schema_version = schema_version;
     }
 
     fn unindex_record(&mut self, old: &IndexRecord) {
@@ -117,6 +124,38 @@ impl MemoryIndexStore {
 impl IndexStore for MemoryIndexStore {
     fn schema_version(&self) -> Result<u32> {
         Ok(self.schema_version)
+    }
+
+    fn migrate_schema_in_place(&mut self) -> Result<bool> {
+        if self.schema_version == INDEX_SCHEMA_VERSION {
+            return Ok(false);
+        }
+        if self.schema_version > INDEX_SCHEMA_VERSION {
+            return Err(SyncError::SchemaTooNew {
+                found: self.schema_version,
+                supported: INDEX_SCHEMA_VERSION,
+            });
+        }
+        if self.schema_version < MIN_MIGRATABLE_SCHEMA_VERSION {
+            return Err(SyncError::IndexDamaged {
+                folder_id: self
+                    .meta
+                    .as_ref()
+                    .map_or_else(|| "memory".to_string(), |m| m.folder_id.clone()),
+                sentence: INDEX_DAMAGED_PROBLEM_SENTENCE.to_string(),
+                detail: format!(
+                    "index schema version {} is too old to migrate in place (minimum supported is {MIN_MIGRATABLE_SCHEMA_VERSION})",
+                    self.schema_version
+                ),
+            });
+        }
+        for rec in self.records.values_mut() {
+            if rec.base_hash.is_none() && rec.provenance.is_versioned() {
+                rec.base_hash = rec.recent_hashes.first().copied();
+            }
+        }
+        self.schema_version = INDEX_SCHEMA_VERSION;
+        Ok(true)
     }
 
     fn load_meta(&self) -> Result<Option<FolderMeta>> {
