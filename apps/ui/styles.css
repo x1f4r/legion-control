@@ -2798,8 +2798,8 @@ button.row:active {
 
 .btn.icon.player-center-btn {
   pointer-events: auto;
-  width: 54px;
-  height: 54px;
+  width: 56px;
+  height: 56px;
   border-radius: 50%;
   background: rgb(0 0 0 / 0.52);
   color: #fff;
@@ -2807,20 +2807,20 @@ button.row:active {
 }
 
 .btn.icon.player-center-btn svg {
-  width: 26px;
-  height: 26px;
+  width: 28px;
+  height: 28px;
 }
 
 .btn.icon.player-center-btn.main {
-  width: 66px;
-  height: 66px;
+  width: 68px;
+  height: 68px;
   background: rgb(0 0 0 / 0.68);
   border-color: rgb(255 255 255 / 0.22);
 }
 
 .btn.icon.player-center-btn.main svg {
-  width: 30px;
-  height: 30px;
+  width: 32px;
+  height: 32px;
 }
 
 .player-bottom {
@@ -3424,8 +3424,8 @@ button.row:active {
 }
 
 .btn.icon.music-play-btn svg {
-  width: 28px;
-  height: 28px;
+  width: 32px;
+  height: 32px;
 }
 
 .music-vol-row {
