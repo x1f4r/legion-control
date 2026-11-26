@@ -5905,14 +5905,16 @@ mod tests {
             .await
             .unwrap();
         // Wait until some bytes have landed in `.part`, then simulate process termination.
-        for _ in 0..100 {
-            if fs::metadata(mgr2.part_path(&rid))
-                .map(|m| m.len())
-                .unwrap_or(0)
-                >= 16 * 1024
-            {
-                break;
-            }
+        let part_deadline = Instant::now() + Duration::from_secs(10);
+        while fs::metadata(mgr2.part_path(&rid))
+            .map(|m| m.len())
+            .unwrap_or(0)
+            < 16 * 1024
+        {
+            assert!(
+                Instant::now() < part_deadline,
+                "timed out waiting for .part file to accumulate 16 KiB before simulated restart"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         mgr2.shutdown();
@@ -7100,7 +7102,12 @@ mod tests {
             .unwrap();
         assert_eq!(paused.state, TransferState::Paused);
         platform.finalize_release.notify_waiters();
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        let _ = wait_for_finalized_path(
+            &mgr,
+            &id,
+            "paused finalize_download finishing before Cancel",
+        )
+        .await;
 
         let saved_path = platform.downloads_dir.join("paused-cancel.jpg");
         assert!(
@@ -7670,10 +7677,12 @@ mod tests {
             )
             .await
             .unwrap();
-        for _ in 0..100 {
-            if mgr.part_path(&id_brief).exists() {
-                break;
-            }
+        let brief_deadline = Instant::now() + Duration::from_secs(10);
+        while !mgr.part_path(&id_brief).exists() {
+            assert!(
+                Instant::now() < brief_deadline,
+                "timed out waiting for brief-lock .part file to appear"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         platform.fail_delete_part.store(2, Ordering::SeqCst);
@@ -7698,10 +7707,12 @@ mod tests {
             )
             .await
             .unwrap();
-        for _ in 0..100 {
-            if mgr.part_path(&id_part).exists() {
-                break;
-            }
+        let part_deadline = Instant::now() + Duration::from_secs(10);
+        while !mgr.part_path(&id_part).exists() {
+            assert!(
+                Instant::now() < part_deadline,
+                "timed out waiting for locked-part .part file to appear"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         platform.fail_delete_part.store(100, Ordering::SeqCst);
@@ -7746,12 +7757,12 @@ mod tests {
             .unwrap();
         platform.finalize_release.notify_waiters();
         let saved_path = platform.downloads_dir.join("locked-saved.pdf");
-        for _ in 0..100 {
-            if saved_path.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        let _ = wait_for_finalized_path(
+            &mgr,
+            &id_saved,
+            "paused finalize_download finishing before Cancel with locked saved file",
+        )
+        .await;
         assert!(saved_path.exists());
 
         platform.fail_delete_saved.store(100, Ordering::SeqCst);
@@ -7817,12 +7828,15 @@ mod tests {
             .unwrap();
         platform.finalize_release.notify_waiters();
         let saved_path = platform.downloads_dir.join("restart-cancel.pdf");
-        for _ in 0..100 {
-            if saved_path.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        // Wait for the worker to finish post-finalize `.part` cleanup and clear its slot before
+        // recreating the stray `.part` file, so the worker cannot race and delete our test file.
+        let _ = wait_for_finalized_path(
+            &mgr1,
+            &id,
+            "paused finalize_download finishing before recreating stray .part",
+        )
+        .await;
+        assert!(saved_path.exists());
         // Recreate a stray `.part` alongside the saved file and lock both so cancel persists as
         // `Cancelling` across app exit.
         fs::write(mgr1.part_path(&id), b"partial").unwrap();

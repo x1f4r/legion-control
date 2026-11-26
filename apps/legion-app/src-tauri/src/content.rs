@@ -2906,16 +2906,14 @@ mod tests {
         assert_eq!(status, 404);
 
         // Once tickets are gone and idle_shutdown elapses, the listener stops automatically.
-        for _ in 0..30 {
-            if server.loopback_port().is_none() {
-                break;
-            }
+        let stop_deadline = Instant::now() + Duration::from_secs(5);
+        while server.loopback_port().is_some() {
+            assert!(
+                Instant::now() < stop_deadline,
+                "timed out waiting for idle loopback listener to stop"
+            );
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
-        assert!(
-            server.loopback_port().is_none(),
-            "loopback listener should stop when idle with no live tickets"
-        );
 
         // Re-enabling pairing and minting a new ticket lazily restarts the listener.
         live.store(true, Ordering::Release);
@@ -5223,15 +5221,17 @@ mod tests {
         }
         // Wait until Legion's accept task exits and releases `old_port`.
         let squatter = {
-            let mut bound = None;
-            for _ in 0..40 {
+            let release_deadline = Instant::now() + Duration::from_secs(5);
+            loop {
                 if let Ok(l) = TcpListener::bind(("127.0.0.1", old_port)).await {
-                    bound = Some(l);
-                    break;
+                    break l;
                 }
+                assert!(
+                    Instant::now() < release_deadline,
+                    "timed out waiting for released old_port {old_port} to become bindable"
+                );
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            bound.expect("squatter should bind the released old port")
         };
 
         let squatter_hits = Arc::new(AtomicUsize::new(0));
