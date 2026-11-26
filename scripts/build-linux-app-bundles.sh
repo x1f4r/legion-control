@@ -4,13 +4,16 @@
 # without requiring newer glibc symbols from the host or CI runner.
 #
 # Usage:
-#   scripts/build-linux-app-bundles.sh [--sequence <YYYYMMDDHHMM>] [--build-log <path>]
+#   scripts/build-linux-app-bundles.sh [--sequence <YYYYMMDDHHMM>] [--build-log <path>] [--preview-key <pubkey.pem>]
 #
 # Optional environment variables:
 #   LEGION_BUILD_SEQUENCE   Positive update sequence (overridden by --sequence).
 #   LEGION_BUILD_REV        Git revision embedded in the app (defaults to git HEAD).
 #   LEGION_APP_U22_CACHE    Host cache directory for the container's tauri-cli binary
 #                           (default: ${XDG_CACHE_HOME:-$HOME/.cache}/legion-app-u22).
+#
+# Preview update keys are only forwarded when explicitly passed via --preview-key so
+# ordinary release-keyed builds can never inherit LEGION_PREVIEW_UPDATE_KEY from the shell.
 set -euo pipefail
 
 die() {
@@ -20,6 +23,7 @@ die() {
 
 SEQUENCE="${LEGION_BUILD_SEQUENCE:-}"
 BUILD_LOG=""
+PREVIEW_KEY=""
 
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
@@ -41,9 +45,18 @@ while [[ "$#" -gt 0 ]]; do
       BUILD_LOG="${1#--build-log=}"
       shift
       ;;
+    --preview-key)
+      [[ "$#" -ge 2 ]] || die "--preview-key requires a path."
+      PREVIEW_KEY="$2"
+      shift 2
+      ;;
+    --preview-key=*)
+      PREVIEW_KEY="${1#--preview-key=}"
+      shift
+      ;;
     -h|--help)
       cat <<'EOF'
-Usage: scripts/build-linux-app-bundles.sh [--sequence <YYYYMMDDHHMM>] [--build-log <path>]
+Usage: scripts/build-linux-app-bundles.sh [--sequence <YYYYMMDDHHMM>] [--build-log <path>] [--preview-key <pubkey.pem>]
 EOF
       exit 0
       ;;
@@ -105,6 +118,22 @@ DOCKER_MOUNTS=(
 )
 if [[ -d "${CARGO_HOME_HOST}/git" ]]; then
   DOCKER_MOUNTS+=(-v "${CARGO_HOME_HOST}/git:/opt/host-git")
+fi
+
+DOCKER_ENVS=(
+  -e "HOST_UID=${HOST_UID}"
+  -e "HOST_GID=${HOST_GID}"
+  -e "LEGION_BUILD_REV=${BUILD_REV}"
+  -e "LEGION_BUILD_SEQUENCE=${SEQUENCE}"
+  -e "TAURI_CFG=${TAURI_CFG}"
+)
+if [[ -n "$PREVIEW_KEY" ]]; then
+  [[ -f "$PREVIEW_KEY" ]] || die "Preview public key file does not exist: ${PREVIEW_KEY}"
+  PREVIEW_KEY_ABS="$(cd -- "$(dirname -- "$PREVIEW_KEY")" && pwd -P)/$(basename -- "$PREVIEW_KEY")"
+  PREVIEW_KEY_SHA="$(sha256sum "$PREVIEW_KEY_ABS" | awk '{ print $1 }')"
+  PREVIEW_KEY_CONTAINER="/opt/preview-keys/${PREVIEW_KEY_SHA}.pub.pem"
+  DOCKER_MOUNTS+=(-v "${PREVIEW_KEY_ABS}:${PREVIEW_KEY_CONTAINER}:ro")
+  DOCKER_ENVS+=(-e "LEGION_PREVIEW_UPDATE_KEY=${PREVIEW_KEY_CONTAINER}")
 fi
 
 CONTAINER_SCRIPT="$(cat <<'CONTAINER_EOF'
@@ -186,19 +215,11 @@ if [[ -n "$BUILD_LOG" ]]; then
   mkdir -p "$(dirname -- "$BUILD_LOG")"
   "${DOCKER_CMD[@]}" run --rm \
     "${DOCKER_MOUNTS[@]}" \
-    -e "HOST_UID=${HOST_UID}" \
-    -e "HOST_GID=${HOST_GID}" \
-    -e "LEGION_BUILD_REV=${BUILD_REV}" \
-    -e "LEGION_BUILD_SEQUENCE=${SEQUENCE}" \
-    -e "TAURI_CFG=${TAURI_CFG}" \
+    "${DOCKER_ENVS[@]}" \
     ubuntu:22.04 bash -c "$CONTAINER_SCRIPT" 2>&1 | tee "$BUILD_LOG"
 else
   "${DOCKER_CMD[@]}" run --rm \
     "${DOCKER_MOUNTS[@]}" \
-    -e "HOST_UID=${HOST_UID}" \
-    -e "HOST_GID=${HOST_GID}" \
-    -e "LEGION_BUILD_REV=${BUILD_REV}" \
-    -e "LEGION_BUILD_SEQUENCE=${SEQUENCE}" \
-    -e "TAURI_CFG=${TAURI_CFG}" \
+    "${DOCKER_ENVS[@]}" \
     ubuntu:22.04 bash -c "$CONTAINER_SCRIPT"
 fi

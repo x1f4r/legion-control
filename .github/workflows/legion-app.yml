@@ -6,6 +6,7 @@ on:
       - 'apps/**'
       - 'crates/**'
       - '.github/workflows/legion-app.yml'
+      - 'scripts/build-desktop-preview.mjs'
       - 'scripts/build-linux-app-bundles.sh'
       - 'scripts/ios-sim-check.sh'
       - 'scripts/ios-sim-resume.sh'
@@ -16,6 +17,7 @@ on:
       - 'apps/**'
       - 'crates/**'
       - '.github/workflows/legion-app.yml'
+      - 'scripts/build-desktop-preview.mjs'
       - 'scripts/build-linux-app-bundles.sh'
       - 'scripts/ios-sim-check.sh'
       - 'scripts/ios-sim-resume.sh'
@@ -302,7 +304,9 @@ jobs:
             --os linux \
             --sequence "$LEGION_PREVIEW_SEQUENCE"
       - name: Install Rust
-        run: rustup toolchain install
+        run: |
+          rustup toolchain install
+          rustup target add x86_64-unknown-linux-musl
       - name: Install Linux Tauri bundle and headless display dependencies
         run: |
           sudo apt-get update -q
@@ -317,6 +321,7 @@ jobs:
             file \
             curl \
             build-essential \
+            musl-tools \
             xvfb \
             dbus-x11 \
             gstreamer1.0-plugins-base \
