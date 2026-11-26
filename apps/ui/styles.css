@@ -3851,6 +3851,10 @@ button.row:active {
     text-align: left;
   }
 
+  .music-title .fn-line {
+    text-align: left;
+  }
+
   .music-resume-inline,
   .player-resume-chip.inline {
     justify-self: start;
@@ -4026,14 +4030,13 @@ button.row:active {
 
 .mini-player-title {
   display: block;
+  width: 100%;
   min-width: 0;
   font-size: 14px;
   font-weight: 600;
   line-height: 1.25;
   color: var(--text);
-  white-space: nowrap;
   overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .mini-player-artist {

@@ -6,6 +6,7 @@
 import { html, useMemo, useRef } from '../vendor/preact-htm.js';
 import { Icon } from '../icons.js';
 import { formatMiniPlayerDisplay, MINI_PLAYER_SWIPE_DISMISS_PX } from '../lib/player.js';
+import { FileNameSingle } from './file-name.js';
 
 export function MiniPlayer({ musicState, musicController, onOpenScreen }) {
   const barRef = useRef(null);
@@ -157,7 +158,9 @@ export function MiniPlayer({ musicState, musicController, onOpenScreen }) {
             : html`<span class="mini-player-cover-tile"><${Icon} name="music" /></span>`}
         </span>
         <span class="mini-player-meta">
-          <span class="mini-player-title" title=${display.title}>${display.title}</span>
+          <span class="mini-player-title" aria-label=${display.title} title=${display.title}>
+            <${FileNameSingle} name=${display.title} lines=${1} titleOnHover=${false} />
+          </span>
           ${display.artist ? html`<span class="mini-player-artist">${display.artist}</span>` : null}
         </span>
       </button>

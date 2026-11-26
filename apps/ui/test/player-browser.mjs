@@ -1978,10 +1978,7 @@ test('Player: wide 1440x900 two-pane split layout isolates inert panes and rail,
     await page.locator('audio[data-legion-music-audio][src]').waitFor({ state: 'attached', timeout: 5000 });
     await assertShellInert(true);
 
-    await page.evaluate(async () => {
-      const a = document.querySelector('audio[data-legion-music-audio]');
-      await a.play();
-    });
+    await page.locator('.music-play-btn').click();
     await page.waitForFunction(() => {
       const a = document.querySelector('audio[data-legion-music-audio]');
       return Boolean(a && !a.paused);

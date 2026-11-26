@@ -322,6 +322,43 @@ test('Music background: small player bar geometry, visibility, single state, swi
       assert.equal(afterReplace.hasArtist, false, 'Untagged song must omit artist line (never Unknown artist)');
       assert.equal(afterReplace.hasNext, false, 'Next button must be absent on last song');
 
+      // Small player title uses FileNameSingle (one ellipsis keeping the ending, full accessible name).
+      await page.setViewportSize({ width: 250, height: 844 });
+      await page.waitForFunction(
+        () => {
+          const slot = document.querySelector('.mini-player-title .fn-slot');
+          return Boolean(slot && slot.getAttribute('data-fn-ready') === '1' && slot.textContent?.includes('…'));
+        },
+        null,
+        { timeout: 5000 },
+      );
+      const miniLongTitle = await page.evaluate(() => {
+        const wrap = document.querySelector('.mini-player-title');
+        const slot = wrap?.querySelector('.fn-slot');
+        const lines = [...(slot?.querySelectorAll('.fn-line') || [])];
+        const drawn = lines.map((l) => l.textContent || '').join('');
+        return {
+          ariaLabel: wrap?.getAttribute('aria-label') || '',
+          titleAttr: wrap?.getAttribute('title') || '',
+          lineCount: lines.length,
+          drawn,
+          ellipsisCount: (drawn.match(/…/g) || []).length,
+          lineOverflows: lines.some((l) => l.scrollWidth > (slot?.clientWidth || 0) + 2),
+          overflow: document.documentElement.scrollWidth - window.innerWidth,
+        };
+      });
+      assert.equal(miniLongTitle.ariaLabel, 'field_recording_untagged');
+      assert.equal(miniLongTitle.titleAttr, 'field_recording_untagged');
+      assert.equal(miniLongTitle.lineCount, 1, `Mini player title must stay 1 line, got ${miniLongTitle.lineCount}`);
+      assert.equal(miniLongTitle.ellipsisCount, 1, `Expected single ellipsis, got "${miniLongTitle.drawn}"`);
+      assert.ok(
+        miniLongTitle.drawn.endsWith('untagged'),
+        `Mini player fitted title must keep ending: "${miniLongTitle.drawn}"`,
+      );
+      assert.equal(miniLongTitle.lineOverflows, false, `Mini player title overflowed slot: "${miniLongTitle.drawn}"`);
+      assert.ok(miniLongTitle.overflow <= 1, `Narrow mini player horizontal overflow: ${miniLongTitle.overflow}px`);
+      await page.setViewportSize({ width: 390, height: 844 });
+
       // Swipe down dismisses small player and revokes active stream URL.
       await swipeDownMiniPlayer(page);
       await page.locator('.mini-player').waitFor({ state: 'detached' });
