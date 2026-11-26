@@ -288,8 +288,9 @@ mod tests {
         let (client, server) = UnixStream::pair().expect("unix stream pair");
         let _dup = client.try_clone().expect("clone client");
         let server_fd = server.as_raw_fd();
-        client.shutdown(Shutdown::Write).expect("shutdown write");
         assert!(!fd_peer_closed(server_fd));
+        // One call, with no half-close before it: macOS answers a full shutdown that follows a
+        // write half-close with ENOTCONN. The half-close cases are covered by the tests above.
         client.shutdown(Shutdown::Both).expect("shutdown both");
         assert!(
             fd_peer_closed(server_fd),
