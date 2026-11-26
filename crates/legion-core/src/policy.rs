@@ -857,19 +857,17 @@ impl Grant {
         };
         let resolved = resolve_keeping_last(&expanded).map_err(|error| match error {
             Unresolved::Invalid(error) => error,
-            Unresolved::Unclear(_, reason) => denied(&reason).with_hint(
-                "A confined role may only use a path that resolves, link by link, to a place under its roots.",
-            ),
+            Unresolved::Unclear(_, _) => {
+                denied("it cannot be resolved cleanly under the role's roots").with_hint(
+                    "A confined role may only use a path that resolves, link by link, to a place under its roots.",
+                )
+            }
         })?;
         let mut resolved_roots = Vec::with_capacity(roots.len());
         for root in roots {
             let expanded = expand_tilde(Path::new(root.as_str()), self.paths.home())?;
-            let resolved_root = resolve(&expanded).map_err(|error| {
-                let reason = match error {
-                    Unresolved::Invalid(error) => error.message,
-                    Unresolved::Unclear(_, reason) => reason,
-                };
-                denied(&format!("its role's root {} cannot be resolved ({reason})", root.as_str()))
+            let resolved_root = resolve(&expanded).map_err(|_| {
+                denied(&format!("its role's root {} cannot be resolved", root.as_str()))
                     .with_hint("Ask the owner of this machine to fix the role's paths in policy.toml, or the directory they name.")
             })?;
             resolved_roots.push(resolved_root);
@@ -887,8 +885,8 @@ impl Grant {
             ))
             .with_hint("Use a path under one of those directories, or ask the owner to add the directory to the role's paths in policy.toml.")
             .with_details(json!({
-                "path": resolved.path(),
-                "roots": resolved_roots.iter().map(Resolved::path).collect::<Vec<_>>(),
+                "path": given,
+                "roots": roots.iter().map(PathRoot::as_str).collect::<Vec<_>>(),
             }))
         };
         if !inside(&resolved) {
@@ -1036,12 +1034,17 @@ impl Grant {
         if self.allows_effect(Effect::Admin) {
             return Ok(());
         }
+        let confined = self.rules.paths.is_some();
         let unclear = |error: Unresolved| match error {
             Unresolved::Invalid(error) => error,
-            Unresolved::Unclear(code, reason) => ErrorBody::new(
-                code,
-                format!("{} cannot be checked: {reason}.", path.display()),
-            ),
+            Unresolved::Unclear(code, reason) => {
+                let message = if confined {
+                    format!("{} cannot be checked.", path.display())
+                } else {
+                    format!("{} cannot be checked: {reason}.", path.display())
+                };
+                ErrorBody::new(code, message)
+            }
         };
         let resolved = resolve_keeping_last(path).map_err(unclear)?;
         let cache = self.protected_cache();
@@ -1049,18 +1052,14 @@ impl Grant {
             .own_dirs
             .iter()
             .map(|entry| {
-                entry.as_ref().map_err(|(_, dir, error)| {
-                    let reason = match error {
-                        Unresolved::Invalid(error) => error.message.clone(),
-                        Unresolved::Unclear(_, reason) => reason.clone(),
-                    };
+                entry.as_ref().map_err(|(place, _, _)| {
                     ErrorBody::new(
                         ErrorCode::Denied,
                         format!(
-                            "{} may not create or replace {}: Legion's own directory {} cannot be resolved ({reason}).",
+                            "{} may not create or replace {}: {} cannot be resolved.",
                             self.principal,
                             path.display(),
-                            dir.display()
+                            place.describe()
                         ),
                     )
                     .with_hint("Run meta.doctor as the owner to see what is wrong with it.")
@@ -1104,8 +1103,7 @@ impl Grant {
                 if touches && !exempt_existing_home_dir {
                     let what = if is_parent {
                         format!(
-                            "creating missing parent {} would create an ancestor of {}",
-                            candidate.path().display(),
+                            "creating its missing parents would create an ancestor of {}",
                             dir.place.describe()
                         )
                     } else {
@@ -1138,8 +1136,7 @@ impl Grant {
                         )
                     } else if is_parent {
                         format!(
-                            "creating missing parent {} would create an ancestor of secret location {}",
-                            candidate.path().display(),
+                            "creating its missing parents would create an ancestor of secret location {}",
                             secret.label
                         )
                     } else {
@@ -1512,7 +1509,7 @@ impl Grant {
                     secret.label
                 ))
                 .with_details(json!({
-                    "path": resolved.path(),
+                    "path": given,
                     "secret": secret.label,
                 })));
             }
@@ -1535,7 +1532,7 @@ impl Grant {
                     prefix.label
                 ))
                 .with_details(json!({
-                    "path": resolved.path(),
+                    "path": given,
                     "secret": prefix.label,
                 })));
             }
@@ -1606,14 +1603,10 @@ impl Grant {
             .own_dirs
             .iter()
             .map(|entry| {
-                entry.as_ref().map_err(|(_, dir, error)| {
-                    let reason = match error {
-                        Unresolved::Invalid(error) => error.message.clone(),
-                        Unresolved::Unclear(_, reason) => reason.clone(),
-                    };
+                entry.as_ref().map_err(|(place, _, _)| {
                     refuse(format!(
-                        "Legion's own directory {} cannot be resolved ({reason}), so no path can be told apart from it",
-                        dir.display()
+                        "{} cannot be resolved, so no path can be told apart from it",
+                        place.describe()
                     ))
                     .with_hint("Run meta.doctor as the owner to see what is wrong with it.")
                 })
@@ -1640,12 +1633,14 @@ impl Grant {
                         .is_some_and(|identity| ancestors.contains(identity));
                 if inside {
                     return Err(refuse(format!(
-                        "it is in {}, {}, which only a role that allows effect:admin may read or change",
-                        dir.dir.display(),
+                        "it is in {}, which only a role that allows effect:admin may read or change",
                         dir.place.describe()
                     ))
                     .with_hint("Legion's own files are read through its tools, such as audit.tail and meta.whoami; ask the owner of this machine for more.")
-                    .with_details(json!({"path": resolved.path(), "directory": dir.dir})));
+                    .with_details(json!({
+                        "path": given,
+                        "place": format!("{:?}", dir.place).to_lowercase(),
+                    })));
                 }
             }
         }
@@ -3296,6 +3291,95 @@ paths = ["~/**"]
                 );
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn denied_errors_never_leak_resolved_paths_outside_grants() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home-real-user-name");
+        let projects = home.join("projects");
+        let outside = dir.path().join("private-vault-outside-grant");
+        let legion_dir = dir.path().join("hidden-legion-home");
+        let ssh_dir = home.join(".ssh");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+        std::fs::write(outside.join("secret.txt"), "top-secret").unwrap();
+        std::fs::write(ssh_dir.join("id_ed25519"), "key").unwrap();
+
+        let paths = Paths::under(&legion_dir).with_home(&home);
+        std::fs::create_dir_all(paths.config_dir()).unwrap();
+        std::fs::create_dir_all(paths.state_dir()).unwrap();
+        std::fs::write(paths.config_file("tokens.toml"), "").unwrap();
+
+        symlink(&outside, projects.join("escape_dir")).unwrap();
+        symlink(outside.join("secret.txt"), projects.join("escape_file")).unwrap();
+        symlink(paths.config_dir(), projects.join("legion_link")).unwrap();
+        symlink(&ssh_dir, projects.join("ssh_link")).unwrap();
+
+        let pol = policy(
+            r#"
+[principals.confined]
+role = "confined"
+[principals.wide]
+role = "wide"
+[roles.confined]
+allow = ["effect:read", "effect:write"]
+paths = ["~/projects"]
+[roles.wide]
+allow = ["effect:read", "effect:write"]
+"#,
+        );
+
+        let confined = pol.grant("confined", &paths);
+        for probe in [
+            "~/projects/escape_dir/secret.txt",
+            "~/projects/escape_file",
+            "~/projects/legion_link/tokens.toml",
+            "~/projects/ssh_link/id_ed25519",
+        ] {
+            let err = confined.check_path(probe, Access::Read).unwrap_err();
+            assert_eq!(err.code, ErrorCode::Denied, "{probe}");
+            let serialized = serde_json::to_string(&err).unwrap();
+            assert!(
+                !serialized.contains("private-vault-outside-grant"),
+                "{probe} leaked outside target: {serialized}"
+            );
+            assert!(
+                !serialized.contains("hidden-legion-home"),
+                "{probe} leaked legion dir: {serialized}"
+            );
+            assert!(
+                !serialized.contains("home-real-user-name"),
+                "{probe} leaked expanded home path: {serialized}"
+            );
+        }
+
+        // Unconfined non-admin accessing Legion's config or ~/.ssh via symlink must not leak the
+        // resolved directory path in message or details.
+        let wide = pol.grant("wide", &paths);
+        let own_err = wide
+            .check_path("~/projects/legion_link/tokens.toml", Access::Read)
+            .unwrap_err();
+        assert_eq!(own_err.code, ErrorCode::Denied);
+        let own_json = serde_json::to_string(&own_err).unwrap();
+        assert!(
+            !own_json.contains("hidden-legion-home"),
+            "own-dir refusal leaked legion dir: {own_json}"
+        );
+
+        let ssh_err = wide
+            .check_path("~/projects/ssh_link/id_ed25519", Access::Read)
+            .unwrap_err();
+        assert_eq!(ssh_err.code, ErrorCode::Denied);
+        let ssh_json = serde_json::to_string(&ssh_err).unwrap();
+        assert!(
+            !ssh_json.contains("home-real-user-name"),
+            "secret refusal leaked expanded home path: {ssh_json}"
+        );
     }
 
     #[cfg(any(windows, target_os = "macos"))]
