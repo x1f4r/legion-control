@@ -942,6 +942,27 @@ export function FilesViewer({
     caps?.hasAudioThumb,
   ]);
 
+  // Once capabilities have resolved for the active file, keep them latched across transient
+  // `capsStore.invalidate()` refreshes (such as expanding Android Picture-in-Picture or returning
+  // to the foreground) so a playing video or open viewer is never torn down and restarted at 0:00.
+  const latchedCapsRef = useRef(null);
+  if (latchedCapsRef.current?.key !== fileKey) {
+    latchedCapsRef.current = null;
+  }
+  if (caps && caps.known !== false) {
+    latchedCapsRef.current = {
+      key: fileKey,
+      known: true,
+      hasContentUrl: Boolean(caps.hasContentUrl),
+      hasThumb: Boolean(caps.hasThumb),
+      hasRead: Boolean(caps.hasRead),
+    };
+  }
+  const loadCaps =
+    caps && caps.known === false && latchedCapsRef.current?.key === fileKey
+      ? latchedCapsRef.current
+      : caps;
+
   // Load media URL, machine preview, or text content whenever machine/path/mode changes.
   useEffect(() => {
     if (managedAudio) return undefined;
@@ -982,7 +1003,7 @@ export function FilesViewer({
         ? capsStore.call(tool, args, { ...opts, on: machine }).then((r) => r.value)
         : link.call(tool, args, { ...opts, on: machine });
 
-    if (caps && caps.known === false) {
+    if (loadCaps && loadCaps.known === false) {
       if (category === 'text' || isExtensionlessProbe) {
         setTextState((prev) => ({ ...prev, key: targetKey, loading: true, error: null }));
       } else if (category === 'image' || category === 'video' || category === 'audio') {
@@ -1248,10 +1269,10 @@ export function FilesViewer({
     skipMediaPlayer,
     preferThumbPreview,
     retryNonce,
-    caps?.known,
-    caps?.hasContentUrl,
-    caps?.hasThumb,
-    caps?.hasRead,
+    loadCaps?.known,
+    loadCaps?.hasContentUrl,
+    loadCaps?.hasThumb,
+    loadCaps?.hasRead,
     capsStore,
   ]);
 
