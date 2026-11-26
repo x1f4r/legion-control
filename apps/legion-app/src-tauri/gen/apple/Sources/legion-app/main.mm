@@ -9,6 +9,9 @@
 extern "C" void legion_install_ios_immersive_bridge(void);
 extern "C" void legion_ios_attach_webview(void *webview_ptr);
 extern "C" void legion_ios_reset_player_state(void);
+extern "C" void legion_install_ios_audio_bridge(void);
+extern "C" void legion_ios_audio_attach_webview(void *webview_ptr);
+extern "C" void legion_ios_audio_reset(void);
 
 @interface WKWebView (LegionImmersiveHook)
 - (instancetype)legion_initWithFrame:(CGRect)frame
@@ -26,6 +29,7 @@ std::unordered_map<const void *, IMP> &terminationOriginals() {
 
 void legion_webViewWebContentProcessDidTerminate(id self, SEL _cmd, WKWebView *webView) {
   legion_ios_reset_player_state();
+  legion_ios_audio_reset();
   Class cls = object_getClass(self);
   auto &originals = terminationOriginals();
   while (cls != Nil) {
@@ -100,6 +104,7 @@ void installWebViewCreationHooks() {
   WKWebView *webView = [self legion_initWithFrame:frame configuration:configuration];
   if (webView != nil) {
     legion_ios_attach_webview((__bridge void *)webView);
+    legion_ios_audio_attach_webview((__bridge void *)webView);
   }
   return webView;
 }
@@ -114,6 +119,7 @@ void installWebViewCreationHooks() {
 int main(int argc, char *argv[]) {
   installWebViewCreationHooks();
   legion_install_ios_immersive_bridge();
+  legion_install_ios_audio_bridge();
   ffi::start_app();
   return 0;
 }

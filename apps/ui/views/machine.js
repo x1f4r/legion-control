@@ -310,6 +310,9 @@ function OverviewTab({
 
     let mounted = true;
     const poller = createOverviewPoller({
+      isVisible: () =>
+        (typeof document === 'undefined' ? true : document.visibilityState === 'visible') &&
+        !link.isAppSuspended?.(),
       onStaleChange(nextStale) {
         if (mounted) setStale(nextStale);
       },

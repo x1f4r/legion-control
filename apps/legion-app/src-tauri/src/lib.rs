@@ -1,5 +1,6 @@
 //! Native shell for Legion across Android, iOS, macOS, Windows and Linux.
 
+pub mod audio;
 pub mod backend;
 pub mod commands;
 pub mod content;
@@ -80,6 +81,9 @@ struct SharedAndroidTransferPlatform(Arc<transfers::android::AndroidTransferPlat
 
 #[cfg(target_os = "android")]
 struct SharedAndroidTransferPlugin(Arc<transfers::android::AndroidTransferPluginHandle>);
+
+#[cfg(target_os = "android")]
+struct SharedAndroidAudioPlugin(Arc<audio::AndroidAudioPluginHandle>);
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 struct SharedDesktopTransferPlatform(Arc<transfers::desktop::DesktopTransferPlatform>);
@@ -340,6 +344,24 @@ fn android_files_transfer_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
         .build()
 }
 
+/// Registers the in-app `AudioPlugin` Kotlin plugin on Android to connect `AudioBridge` to Rust's
+/// private `LocalSocket` and handle the lazy notification-permission rationale dialog on first
+/// music playback.
+#[cfg(target_os = "android")]
+fn android_audio_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
+    tauri::plugin::Builder::new("audio-player")
+        .setup(|app, api| {
+            let handle = api.register_android_plugin("com.x1f4r.legion", "AudioPlugin")?;
+            let shared = Arc::new(audio::AndroidAudioPluginHandle(handle));
+            app.manage(SharedAndroidAudioPlugin(Arc::clone(&shared)));
+            if let Some(audio) = app.try_state::<audio::SharedAudio>() {
+                audio.0.attach_plugin(shared);
+            }
+            Ok(())
+        })
+        .build()
+}
+
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub(crate) fn reset_desktop_player_state(
     app: &tauri::AppHandle,
@@ -584,10 +606,28 @@ pub fn run() {
         }
         transfers.start();
 
+        #[cfg(target_os = "android")]
+        let audio = {
+            let mgr = audio::AudioManager::new(
+                app.handle().clone(),
+                &data_dir,
+                Arc::clone(&backend),
+                Arc::clone(&content_server),
+            )
+            .map_err(|err| std::io::Error::other(err.message))?;
+            if let Some(plugin) = app.try_state::<SharedAndroidAudioPlugin>() {
+                mgr.attach_plugin(Arc::clone(&plugin.0));
+            }
+            mgr
+        };
+        #[cfg(not(target_os = "android"))]
+        let audio = audio::AudioManager::new();
+
         app.manage(store);
         app.manage(SharedBackend(backend));
         app.manage(SharedContentServer(content_server));
         app.manage(SharedTransfers(transfers));
+        app.manage(audio::SharedAudio(audio));
         app.manage(SharedUpdater(updater));
         app.manage(commands::DesktopImmersiveState::default());
         app.manage(commands::DesktopKeepScreenOn::default());
@@ -642,6 +682,12 @@ pub fn run() {
                 commands::content_url,
                 commands::content_status,
                 commands::content_revoke,
+                commands::audio_load_queue,
+                commands::audio_command,
+                commands::audio_set_modes,
+                commands::audio_dismiss,
+                commands::audio_state,
+                commands::audio_request_notification_permission,
                 commands::transfer_download,
                 commands::transfer_pick_uploads,
                 commands::transfer_upload,
@@ -673,7 +719,8 @@ pub fn run() {
     let builder = builder
         .plugin(android_barcode_scanner_plugin())
         .plugin(android_app_updater_plugin())
-        .plugin(android_files_transfer_plugin());
+        .plugin(android_files_transfer_plugin())
+        .plugin(android_audio_plugin());
 
     #[cfg(target_os = "ios")]
     let builder = builder.plugin(tauri_plugin_barcode_scanner::init());
@@ -688,6 +735,7 @@ pub fn run() {
         commands::media_check_spec,
         commands::media_check_report,
         commands::debug_set_window_fullscreen,
+        commands::audio_debug_trace,
         commands::transfer_upload_test_files,
     ));
 
@@ -701,6 +749,7 @@ pub fn run() {
         commands::media_check_spec,
         commands::media_check_report,
         commands::debug_set_window_fullscreen,
+        commands::audio_debug_trace,
     ));
 
     #[cfg(all(any(target_os = "android", target_os = "ios"), not(debug_assertions)))]
@@ -715,6 +764,7 @@ pub fn run() {
         commands::media_check_spec,
         commands::media_check_report,
         commands::debug_set_window_fullscreen,
+        commands::audio_debug_trace,
         commands::transfer_upload_test_files,
     ));
 
@@ -727,6 +777,7 @@ pub fn run() {
         commands::media_check_spec,
         commands::media_check_report,
         commands::debug_set_window_fullscreen,
+        commands::audio_debug_trace,
     ));
 
     #[cfg(all(
@@ -855,7 +906,10 @@ pub fn run() {
             };
             #[cfg(target_os = "android")]
             {
-                if code.is_none() && transfers.0.has_unfinished_or_paused() {
+                let audio_active = app_handle
+                    .try_state::<audio::SharedAudio>()
+                    .is_some_and(|a| a.0.is_active());
+                if code.is_none() && (transfers.0.has_unfinished_or_paused() || audio_active) {
                     api.prevent_exit();
                 }
             }
@@ -887,6 +941,9 @@ pub fn run() {
                 if let Some(flag) = app_handle.try_state::<SharedExitRequested>() {
                     flag.0.store(true, Ordering::SeqCst);
                 }
+            }
+            if let Some(audio) = app_handle.try_state::<audio::SharedAudio>() {
+                audio.0.shutdown();
             }
             if let Some(transfers) = app_handle.try_state::<SharedTransfers>() {
                 transfers.0.shutdown();

@@ -2,6 +2,7 @@ package com.x1f4r.legion
 
 import android.app.Activity
 import android.Manifest
+import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
@@ -37,6 +38,8 @@ class MainActivity : TauriActivity() {
   private val pendingLocalNetworkRequests = mutableListOf<Int>()
   private val pendingNotificationCallbacks = mutableListOf<(Boolean) -> Unit>()
   private val immersiveState = ImmersiveState()
+  @Volatile
+  private var pendingOpenMusicPlayer = false
 
   private val backCallback = object : OnBackPressedCallback(false) {
     override fun handleOnBackPressed() {
@@ -94,6 +97,11 @@ class MainActivity : TauriActivity() {
           put("model", Build.MODEL?.trim().orEmpty())
         }
         runCatching { replyProxy.postMessage(payload.toString()) }
+        if (pendingOpenMusicPlayer) {
+          pendingOpenMusicPlayer = false
+          val openMsg = JSONObject().put("type", "open_music_player").toString()
+          runCatching { replyProxy.postMessage(openMsg) }
+        }
       }
       "request_local_network" -> {
         bridgeReplyProxy = replyProxy
@@ -274,13 +282,18 @@ class MainActivity : TauriActivity() {
         }
       }
     TransferBridge.setActiveActivity(this)
+    AudioBridge.setActiveActivity(this)
+    if (intent?.getBooleanExtra(EXTRA_OPEN_MUSIC_PLAYER, false) == true) {
+      pendingOpenMusicPlayer = true
+    }
     requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
     window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     applySystemBarStyle(resources.configuration)
     super.onCreate(savedInstanceState)
-    // If the process stayed alive for TransferForegroundService after the user swiped Legion away
-    // from Recents, notify Rust so it rebuilds the main WebView inside this recreated Activity.
+    // If the process stayed alive for TransferForegroundService or MusicPlaybackService after
+    // MainActivity was swiped away from Recents, notify Rust so it rebuilds the main WebView.
     TransferBridge.sendEvent(JSONObject().put("event", "activity_created"))
+    AudioBridge.sendEvent(JSONObject().put("event", "activity_created"))
 
     // Observe system bar + display cutout insets on the decor view without consuming them so the
     // WebView still receives raw WindowInsets and we can feed CSS variables whenever they change.
@@ -369,15 +382,33 @@ class MainActivity : TauriActivity() {
       }
       PluginManager.load(webView, "app-updater", AppUpdaterPlugin(this), "{}")
       PluginManager.load(webView, "files-transfer", FilesTransferPlugin(this), "{}")
+      PluginManager.load(webView, "audio-player", AudioPlugin(this), "{}")
     }
     pluginsInitializedOnce = true
     lastPluginActivityRef = WeakReference(this)
+  }
+
+  override fun onNewIntent(intent: Intent) {
+    super.onNewIntent(intent)
+    setIntent(intent)
+    if (intent.getBooleanExtra(EXTRA_OPEN_MUSIC_PLAYER, false)) {
+      val proxy = bridgeReplyProxy
+      if (proxy != null) {
+        val openMsg = JSONObject().put("type", "open_music_player").toString()
+        runOnUiThread {
+          runCatching { proxy.postMessage(openMsg) }
+        }
+      } else {
+        pendingOpenMusicPlayer = true
+      }
+    }
   }
 
   override fun onResume() {
     super.onResume()
     PluginManager.activity = this
     TransferBridge.setActiveActivity(this)
+    AudioBridge.setActiveActivity(this)
     attachedWebView?.let { syncBackNavigation(it) }
     reapplyImmersiveBarsIfActive()
   }
@@ -387,6 +418,9 @@ class MainActivity : TauriActivity() {
     immersiveState.resetAll()
     if (TransferBridge.currentActivity() === this) {
       TransferBridge.setActiveActivity(null)
+    }
+    if (AudioBridge.currentActivity() === this) {
+      AudioBridge.setActiveActivity(null)
     }
     super.onDestroy()
   }
@@ -444,6 +478,7 @@ class MainActivity : TauriActivity() {
   }
 
   companion object {
+    const val EXTRA_OPEN_MUSIC_PLAYER = "com.x1f4r.legion.OPEN_MUSIC_PLAYER"
     @Volatile
     private var pluginsInitializedOnce = false
     @Volatile
@@ -506,6 +541,8 @@ class MainActivity : TauriActivity() {
               delete pending[msg.id];
               resolveAck(Boolean(msg.active));
             }
+          } else if (msg.type === 'open_music_player') {
+            window.dispatchEvent(new Event('legion:open-music-player'));
           }
         };
 

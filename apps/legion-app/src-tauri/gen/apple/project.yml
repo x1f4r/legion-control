@@ -50,6 +50,8 @@ targets:
         NSLocalNetworkUsageDescription: Legion uses the local network to reach your own machines.
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
+        UIBackgroundModes:
+          - audio
         UILaunchStoryboardName: LaunchScreen
         UIViewControllerBasedStatusBarAppearance: true
         UIRequiredDeviceCapabilities: [arm64, metal]
@@ -83,7 +85,9 @@ targets:
     dependencies:
       - framework: libapp.a
         embed: false
+      - sdk: AVFoundation.framework
       - sdk: CoreGraphics.framework
+      - sdk: MediaPlayer.framework
       - sdk: Metal.framework
       - sdk: MetalKit.framework
       - sdk: QuartzCore.framework

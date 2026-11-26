@@ -143,6 +143,7 @@ export function createAppLink() {
   let hasLocalPipe = false;
   let localPipeNode = null;
   const appResumeListeners = new Set();
+  const appSuspendListeners = new Set();
   let nativeResumeUnlistens = null;
   let nativeResumeReady = null;
   let nativeResumeToken = null;
@@ -150,6 +151,16 @@ export function createAppLink() {
 
   function notifyAppResume(source) {
     for (const listener of appResumeListeners) {
+      try {
+        listener({ source });
+      } catch {
+        // Keep notifying remaining listeners.
+      }
+    }
+  }
+
+  function notifyAppSuspend(source) {
+    for (const listener of appSuspendListeners) {
       try {
         listener({ source });
       } catch {
@@ -170,6 +181,7 @@ export function createAppLink() {
     };
     const onSuspended = () => {
       sawNativeSuspend = true;
+      notifyAppSuspend('tauri://suspended');
     };
     const onFocus = () => {
       if (!sawNativeSuspend) return;
@@ -182,7 +194,10 @@ export function createAppLink() {
       Promise.resolve(ev.listen('tauri://focus', onFocus)).catch(() => null),
     ]).then((unlistens) => {
       const active = unlistens.filter((fn) => typeof fn === 'function');
-      if (nativeResumeToken !== token || appResumeListeners.size === 0) {
+      if (
+        nativeResumeToken !== token ||
+        (appResumeListeners.size === 0 && appSuspendListeners.size === 0)
+      ) {
         for (const fn of active) {
           try {
             const res = fn();
@@ -223,10 +238,26 @@ export function createAppLink() {
     ensureNativeResumeSubscription().catch(() => {});
     return () => {
       appResumeListeners.delete(listener);
-      if (appResumeListeners.size === 0) {
+      if (appResumeListeners.size === 0 && appSuspendListeners.size === 0) {
         teardownNativeResumeSubscription();
       }
     };
+  }
+
+  function onAppSuspend(listener) {
+    if (typeof listener !== 'function') return () => {};
+    appSuspendListeners.add(listener);
+    ensureNativeResumeSubscription().catch(() => {});
+    return () => {
+      appSuspendListeners.delete(listener);
+      if (appResumeListeners.size === 0 && appSuspendListeners.size === 0) {
+        teardownNativeResumeSubscription();
+      }
+    };
+  }
+
+  function isAppSuspended() {
+    return sawNativeSuspend;
   }
 
   function machineKey(machine) {
@@ -2111,6 +2142,12 @@ export function createAppLink() {
     return handler && typeof handler.postMessage === 'function' ? handler : null;
   }
 
+  function iosAudioHandler() {
+    if (typeof window === 'undefined') return null;
+    const handler = window.webkit?.messageHandlers?.legionAudio;
+    return handler && typeof handler.postMessage === 'function' ? handler : null;
+  }
+
   function currentImmersiveCap() {
     return detectAppImmersiveCapability({
       hasAndroidBridge: Boolean(androidBridge()),
@@ -2280,6 +2317,8 @@ export function createAppLink() {
     repairStore,
     invalidateSessions,
     onAppResume,
+    onAppSuspend,
+    isAppSuspended,
     scanInvite,
     updateState,
     watchUpdates,
@@ -2305,6 +2344,190 @@ export function createAppLink() {
     onWindowHidden,
     keepScreenOn,
   };
+
+  // On Android, background music runs in a native Media3 MediaSessionService over a private
+  // LocalSocket bridge so songs keep advancing with the screen off and lock-screen controls work.
+  if (androidPlatform && Boolean(tauriCore())) {
+    let audioPermissionAsked = false;
+    const ensureAudioNotificationPermissionOnce = async () => {
+      if (audioPermissionAsked) return;
+      audioPermissionAsked = true;
+      try {
+        await invoke('audio_request_notification_permission');
+      } catch {
+        // Refusing notification permission must never block playback.
+      }
+    };
+    const audioStateListeners = new Set();
+    let audioStateUnlisten = null;
+    let audioStateReady = null;
+    let audioStateToken = null;
+
+    const ensureAudioStateSubscription = () => {
+      if (audioStateReady) return audioStateReady;
+      const ev = tauriEvent();
+      if (!ev) return Promise.resolve(false);
+      const token = {};
+      audioStateToken = token;
+      const onUpdate = (event) => {
+        const payload = event?.payload;
+        if (!payload || typeof payload !== 'object') return;
+        for (const fn of audioStateListeners) {
+          try {
+            fn(payload);
+          } catch {
+            // Keep notifying remaining listeners.
+          }
+        }
+      };
+      audioStateReady = Promise.resolve(ev.listen('legion://audio-state', onUpdate))
+        .catch(() => null)
+        .then((unlisten) => {
+          if (typeof unlisten !== 'function') return false;
+          if (audioStateToken !== token || audioStateListeners.size === 0) {
+            try {
+              const res = unlisten();
+              if (res && typeof res.catch === 'function') res.catch(() => {});
+            } catch {
+              // Best-effort cleanup.
+            }
+            return false;
+          }
+          audioStateUnlisten = unlisten;
+          return true;
+        });
+      return audioStateReady;
+    };
+
+    const teardownAudioStateSubscription = () => {
+      audioStateToken = null;
+      audioStateReady = null;
+      const unlisten = audioStateUnlisten;
+      audioStateUnlisten = null;
+      if (typeof unlisten === 'function') {
+        try {
+          const res = unlisten();
+          if (res && typeof res.catch === 'function') res.catch(() => {});
+        } catch {
+          // Best-effort cleanup.
+        }
+      }
+    };
+
+    link.nativeAudio = {
+      async loadQueue(payload = {}) {
+        if (payload?.autoPlay) {
+          await ensureAudioNotificationPermissionOnce();
+        }
+        try {
+          return await invoke('audio_load_queue', {
+            payload: {
+              ...payload,
+              machine: wireTargetFor(payload?.machine) || payload?.machine || '',
+            },
+          });
+        } catch (err) {
+          throw formatError(err);
+        }
+      },
+      async command(action, payload = {}) {
+        if (action === 'play' || action === 'toggle') {
+          await ensureAudioNotificationPermissionOnce();
+        }
+        try {
+          return await invoke('audio_command', { action: String(action || ''), payload });
+        } catch (err) {
+          throw formatError(err);
+        }
+      },
+      async setModes(payload = {}) {
+        try {
+          return await invoke('audio_set_modes', { payload });
+        } catch (err) {
+          throw formatError(err);
+        }
+      },
+      async dismiss() {
+        try {
+          return await invoke('audio_dismiss');
+        } catch (err) {
+          throw formatError(err);
+        }
+      },
+      async getState() {
+        try {
+          return await invoke('audio_state');
+        } catch {
+          return { loaded: false };
+        }
+      },
+      onState(listener) {
+        if (typeof listener !== 'function') return () => {};
+        audioStateListeners.add(listener);
+        ensureAudioStateSubscription().catch(() => {});
+        return () => {
+          audioStateListeners.delete(listener);
+          if (audioStateListeners.size === 0) {
+            teardownAudioStateSubscription();
+          }
+        };
+      },
+    };
+  }
+
+  // On iOS/iPadOS, wire AVAudioSession (.playback), MPNowPlayingInfoCenter, MPRemoteCommandCenter,
+  // and interruption/route-change callbacks through the origin-scoped `legionAudio` message handler.
+  if (iosPlatform && Boolean(iosAudioHandler())) {
+    const iosRemoteListeners = new Set();
+    const postIosAudio = (msg) => {
+      const handler = iosAudioHandler();
+      if (!handler) return;
+      try {
+        handler.postMessage(msg);
+      } catch {
+        // Ignore if WebView message handler is unavailable.
+      }
+    };
+    const installDispatch = () => {
+      if (typeof window === 'undefined') return;
+      window.__LEGION_IOS_AUDIO_DISPATCH__ = (cmd) => {
+        if (!cmd || typeof cmd !== 'object') return;
+        for (const fn of iosRemoteListeners) {
+          try {
+            fn(cmd);
+          } catch {
+            // Keep notifying remaining listeners.
+          }
+        }
+      };
+    };
+
+    link.iosAudio = {
+      activateSession() {
+        postIosAudio({ type: 'activate' });
+      },
+      updateNowPlaying(info = {}) {
+        postIosAudio({ type: 'now_playing', ...info });
+      },
+      updatePlaybackState(info = {}) {
+        postIosAudio({ type: 'playback_state', ...info });
+      },
+      clearNowPlaying() {
+        postIosAudio({ type: 'clear' });
+      },
+      onRemoteCommand(listener) {
+        if (typeof listener !== 'function') return () => {};
+        iosRemoteListeners.add(listener);
+        installDispatch();
+        return () => {
+          iosRemoteListeners.delete(listener);
+          if (iosRemoteListeners.size === 0 && typeof window !== 'undefined') {
+            delete window.__LEGION_IOS_AUDIO_DISPATCH__;
+          }
+        };
+      },
+    };
+  }
 
   // Tactile feedback exists only on Android and iOS/iPadOS; leave it absent on desktop.
   if (typeof androidBridge()?.haptic === 'function' || Boolean(iosImmersiveHandler())) {

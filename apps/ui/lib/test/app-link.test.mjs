@@ -951,13 +951,16 @@ test('createAppLink onAppResume listens to native tauri://resumed and deduplicat
   try {
     const link = createAppLink();
     const events = [];
+    const suspends = [];
     const unsub = link.onAppResume((ev) => events.push(ev.source));
+    const unsubSuspend = link.onAppSuspend((ev) => suspends.push(ev.source));
     // Allow async listen() promises to settle.
     await new Promise((r) => setTimeout(r, 0));
 
     assert.ok(handlers.has('tauri://resumed'));
     assert.ok(handlers.has('tauri://suspended'));
     assert.ok(handlers.has('tauri://focus'));
+    assert.equal(link.isAppSuspended(), false);
 
     // Focus alone without prior suspend (e.g. startup or desktop focus) never triggers resume.
     handlers.get('tauri://focus')({});
@@ -969,16 +972,24 @@ test('createAppLink onAppResume listens to native tauri://resumed and deduplicat
 
     // Standard iOS/Android sequence: suspended -> resumed -> focus fires once only.
     handlers.get('tauri://suspended')({});
+    assert.equal(link.isAppSuspended(), true);
+    assert.deepEqual(suspends, ['tauri://suspended']);
     handlers.get('tauri://resumed')({});
+    assert.equal(link.isAppSuspended(), false);
     handlers.get('tauri://focus')({});
     assert.deepEqual(events, ['tauri://resumed', 'tauri://resumed']);
 
     // Short iOS inactive -> active without sceneDidEnterBackground: suspended -> focus fires once.
     handlers.get('tauri://suspended')({});
+    assert.equal(link.isAppSuspended(), true);
     handlers.get('tauri://focus')({});
+    assert.equal(link.isAppSuspended(), false);
     assert.deepEqual(events, ['tauri://resumed', 'tauri://resumed', 'tauri://focus']);
+    assert.deepEqual(suspends, ['tauri://suspended', 'tauri://suspended']);
 
     unsub();
+    assert.equal(unlistenCount, 0);
+    unsubSuspend();
     assert.equal(unlistenCount, 3);
     assert.equal(handlers.size, 0);
   } finally {
@@ -2311,5 +2322,133 @@ test('createAppLink restorePairing() invokes restore_pairing with existingPrinci
   } finally {
     if (prevWindow === undefined) delete globalThis.window;
     else globalThis.window = prevWindow;
+  }
+});
+
+test('createAppLink exposes nativeAudio only on Android, asks notification permission once on first play, and forwards state events', async () => {
+  const prevWindow = globalThis.window;
+  const prevNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  const calls = [];
+  const listeners = new Map();
+
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { userAgent: 'Mozilla/5.0 (Linux; Android 16; Pixel 10) AppleWebKit/537.36' },
+  });
+  globalThis.window = {
+    location: { origin: 'http://tauri.localhost' },
+    __TAURI__: {
+      core: {
+        invoke(command, payload) {
+          calls.push({ command, payload });
+          if (command === 'audio_request_notification_permission') {
+            return Promise.resolve(false);
+          }
+          if (command === 'audio_state') {
+            return Promise.resolve({ loaded: true, playing: true, path: '/music/01.mp3' });
+          }
+          return Promise.resolve({ ok: true });
+        },
+      },
+      event: {
+        listen(name, handler) {
+          listeners.set(name, handler);
+          return Promise.resolve(() => listeners.delete(name));
+        },
+      },
+    },
+  };
+
+  try {
+    const link = createAppLink();
+    assert.ok(link.nativeAudio, 'Android app link must expose nativeAudio');
+
+    const seen = [];
+    const unsub = link.nativeAudio.onState((st) => seen.push(st));
+    await Promise.resolve();
+    listeners.get('legion://audio-state')?.({ payload: { loaded: true, playing: false, path: '/music/01.mp3' } });
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].path, '/music/01.mp3');
+
+    // Loading paused does not ask notification permission yet.
+    await link.nativeAudio.loadQueue({ machine: 'tower', tracks: [{ path: '/music/01.mp3', name: '01.mp3' }], startIndex: 0, autoPlay: false });
+    assert.equal(calls.filter((c) => c.command === 'audio_request_notification_permission').length, 0);
+
+    // First play asks notification permission once and still sends play even if refused.
+    await link.nativeAudio.command('play');
+    await link.nativeAudio.command('play');
+    assert.equal(calls.filter((c) => c.command === 'audio_request_notification_permission').length, 1);
+    assert.equal(calls.filter((c) => c.command === 'audio_command' && c.payload?.action === 'play').length, 2);
+
+    const st = await link.nativeAudio.getState();
+    assert.equal(st.playing, true);
+    await link.nativeAudio.setModes({ shuffle: true, repeat: 'folder', order: ['/music/01.mp3'] });
+    await link.nativeAudio.dismiss();
+    unsub();
+
+    // Desktop app link omits nativeAudio.
+    Object.defineProperty(globalThis, 'navigator', {
+      configurable: true,
+      value: { userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36' },
+    });
+    const desktopLink = createAppLink();
+    assert.equal(desktopLink.nativeAudio, undefined);
+  } finally {
+    if (prevWindow === undefined) delete globalThis.window;
+    else globalThis.window = prevWindow;
+    if (prevNavigator) Object.defineProperty(globalThis, 'navigator', prevNavigator);
+    else delete globalThis.navigator;
+  }
+});
+
+test('createAppLink exposes iosAudio when iOS legionAudio handler exists and routes Now Playing & remote commands', () => {
+  const prevWindow = globalThis.window;
+  const prevNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  const posted = [];
+
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15' },
+  });
+  globalThis.window = {
+    location: { origin: 'tauri://localhost' },
+    webkit: {
+      messageHandlers: {
+        legionAudio: {
+          postMessage(msg) {
+            posted.push(msg);
+          },
+        },
+      },
+    },
+    __TAURI__: { core: { invoke: () => Promise.resolve({}) } },
+  };
+
+  try {
+    const link = createAppLink();
+    assert.ok(link.iosAudio, 'iOS app link must expose iosAudio when handler is attached');
+    assert.equal(link.nativeAudio, undefined);
+
+    const received = [];
+    const unsub = link.iosAudio.onRemoteCommand((cmd) => received.push(cmd));
+    link.iosAudio.activateSession();
+    link.iosAudio.updateNowPlaying({ title: 'Track 1', artist: 'Clara', playing: true, canNext: true });
+    link.iosAudio.updatePlaybackState({ elapsed: 12, duration: 60, playing: true, rate: 1, canNext: true });
+    globalThis.window.__LEGION_IOS_AUDIO_DISPATCH__?.({ action: 'next' });
+    globalThis.window.__LEGION_IOS_AUDIO_DISPATCH__?.({ action: 'route_unavailable' });
+    link.iosAudio.clearNowPlaying();
+    unsub();
+
+    assert.deepEqual(
+      posted.map((m) => m.type),
+      ['activate', 'now_playing', 'playback_state', 'clear'],
+    );
+    assert.deepEqual(received, [{ action: 'next' }, { action: 'route_unavailable' }]);
+    assert.equal(globalThis.window.__LEGION_IOS_AUDIO_DISPATCH__, undefined);
+  } finally {
+    if (prevWindow === undefined) delete globalThis.window;
+    else globalThis.window = prevWindow;
+    if (prevNavigator) Object.defineProperty(globalThis, 'navigator', prevNavigator);
+    else delete globalThis.navigator;
   }
 });
