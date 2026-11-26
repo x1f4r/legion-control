@@ -31,10 +31,6 @@ export function makeNeedsNewerLegionError({ machine = null, tool = null, missing
   };
 }
 
-export function isNeedsNewerLegionError(err) {
-  return Boolean(err && typeof err === 'object' && (err.code === 'needs_newer_legion' || err.needsNewerLegion === true));
-}
-
 /**
  * Parses an `invalid_args` error message from a Legion node for an unknown field name and any
  * listed expected field names.
