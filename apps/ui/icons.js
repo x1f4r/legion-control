@@ -116,16 +116,24 @@ export function IconSprite() {
         <path d="m6.5 6.5 8 5.5-8 5.5z" />
       </symbol>
       <symbol id="i-skip-back-10" viewBox="0 0 24 24">
-        <path d="M11.5 5.5a6.5 6.5 0 1 1-5.8 3.6" />
-        <path d="M8 5.5H4.5V9" />
-        <path d="M10.2 10.6v4.8" />
-        <rect x="12.6" y="10.6" width="3.2" height="4.8" rx="1.4" />
+        <path data-part="circle" d="M12 6a7 7 0 1 1-6.062 3.5" />
+        <path data-part="arrow" d="M14.2 3.8 12 6l2.2 2.2" />
+        <g data-part="digits" stroke-width="1.5">
+          <path d="M8.8 11.7 9.8 10.9v4.2" />
+          <rect x="12.2" y="10.9" width="3" height="4.2" rx="1.4" />
+        </g>
       </symbol>
       <symbol id="i-skip-fwd-10" viewBox="0 0 24 24">
-        <path d="M12.5 5.5a6.5 6.5 0 1 0 5.8 3.6" />
-        <path d="M16 5.5h3.5V9" />
-        <path d="M9.4 10.6v4.8" />
-        <rect x="11.8" y="10.6" width="3.2" height="4.8" rx="1.4" />
+        <path data-part="circle" d="M12 6a7 7 0 1 0 6.062 3.5" />
+        <path data-part="arrow" d="M9.8 3.8 12 6 9.8 8.2" />
+        <g data-part="digits" stroke-width="1.5">
+          <path d="M8.8 11.7 9.8 10.9v4.2" />
+          <rect x="12.2" y="10.9" width="3" height="4.2" rx="1.4" />
+        </g>
+      </symbol>
+      <symbol id="i-fast-forward" viewBox="0 0 24 24">
+        <path d="m4.5 6.5 7 5.5-7 5.5z" />
+        <path d="m12.5 6.5 7 5.5-7 5.5z" />
       </symbol>
       <symbol id="i-fullscreen" viewBox="0 0 24 24">
         <path d="M4.5 9V5.5A1 1 0 0 1 5.5 4.5H9M15 4.5h3.5a1 1 0 0 1 1 1V9M19.5 15v3.5a1 1 0 0 1-1 1H15M9 19.5H5.5a1 1 0 0 1-1-1V15" />

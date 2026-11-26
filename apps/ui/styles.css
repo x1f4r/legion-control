@@ -2730,6 +2730,12 @@ button.row:active {
   object-fit: contain;
   display: block;
   background: #000;
+  transform-origin: center center;
+  will-change: transform;
+}
+
+.viewer-video.zoom-settling {
+  transition: transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
 /* ── Video & Music Player ──────────────────────────────────────────────────────────────────── */
@@ -2742,6 +2748,8 @@ button.row:active {
   background: #000;
   user-select: none;
   -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  touch-action: none;
 }
 
 .player-video-wrap.cursor-hidden,
@@ -2753,7 +2761,8 @@ button.row:active {
   position: absolute;
   inset: 0;
   z-index: 1;
-  touch-action: manipulation;
+  touch-action: none;
+  -webkit-touch-callout: none;
 }
 
 .player-overlay {
@@ -2782,6 +2791,17 @@ button.row:active {
   align-items: center;
   justify-content: center;
   gap: 24px;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+}
+
+.player-center.scrubbing-hidden {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.player-center.scrubbing-hidden * {
   pointer-events: none;
 }
 
@@ -3079,6 +3099,105 @@ button.row:active {
 
 .player-seek-flash.right {
   right: 14%;
+}
+
+/* Hold-for-2x top-centre pill ("2×" + two small arrows, fades in 120 ms) */
+.player-hold-pill {
+  position: absolute;
+  left: 50%;
+  top: calc(var(--safe-top) + 14px);
+  z-index: 5;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 6px 13px;
+  border-radius: 999px;
+  border: 1px solid rgb(255 255 255 / 0.16);
+  background: rgb(21 23 26 / 0.86);
+  color: #fff;
+  font: 600 var(--text-sub) / 1 var(--sans);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+  pointer-events: none;
+  opacity: 1;
+  transition: opacity 120ms ease;
+}
+
+.player-hold-pill.fading {
+  opacity: 0;
+}
+
+.player-hold-pill svg {
+  width: 14px;
+  height: 14px;
+  fill: currentColor;
+  stroke: none;
+  display: block;
+}
+
+/* Zoom-to-fill top status chip ("Zoomed to fill" / "Original" for 1.2 s) */
+.player-zoom-chip {
+  position: absolute;
+  left: 50%;
+  top: calc(var(--safe-top) + 14px);
+  z-index: 5;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 7px 14px;
+  border-radius: 999px;
+  border: 1px solid rgb(255 255 255 / 0.16);
+  background: rgb(21 23 26 / 0.88);
+  color: #fff;
+  font: 600 var(--text-sub) / 1.1 var(--sans);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.player-video-wrap.overlay-visible .player-hold-pill,
+.player-video-wrap.overlay-visible .player-zoom-chip {
+  top: calc(var(--safe-top) + 64px);
+}
+
+/* Scrub-anywhere centred readout (large time, signed delta, optional precision rate label) */
+.player-scrub-hud {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  z-index: 4;
+  transform: translate(-50%, -50%);
+  display: grid;
+  justify-items: center;
+  gap: 4px;
+  padding: 12px 20px;
+  border-radius: 14px;
+  background: rgb(0 0 0 / 0.62);
+  color: #fff;
+  text-align: center;
+  pointer-events: none;
+}
+
+.player-scrub-hud-time {
+  font: 650 32px / 1.05 var(--sans);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+  color: #fff;
+}
+
+.player-scrub-hud-delta {
+  font: 600 15px / 1.2 var(--sans);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+  color: var(--accent);
+}
+
+.player-scrub-hud-rate {
+  margin-top: 2px;
+  font: 500 var(--text-small) / 1.2 var(--sans);
+  color: rgb(255 255 255 / 0.78);
 }
 
 /* Resume chip ("Resumed at 12:40 · Start over") */
