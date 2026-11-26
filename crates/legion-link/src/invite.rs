@@ -2287,8 +2287,8 @@ mod tests {
         let conflict_probes = Arc::new(AtomicUsize::new(0));
         let conflict_probes_c = Arc::clone(&conflict_probes);
         let mut existing = sample_device_enrolled();
-        existing.principal = "device:old-pixel".to_owned();
-        existing.device = "old-pixel".to_owned();
+        existing.principal = "device:old-phone".to_owned();
+        existing.device = "old-phone".to_owned();
         let conflict_err = enrol_client::enrol_flow(
             &device_invite,
             CancellationToken::new(),
@@ -2316,8 +2316,8 @@ mod tests {
         assert_eq!(conflict_err.code, ErrorCode::Conflict);
         assert_eq!(conflict_probes.load(Ordering::SeqCst), 1);
         let details = conflict_err.details.as_ref().unwrap();
-        assert_eq!(details["existing_principal"], json!("device:old-pixel"));
-        assert_eq!(details["existing_device"], json!("old-pixel"));
+        assert_eq!(details["existing_principal"], json!("device:old-phone"));
+        assert_eq!(details["existing_device"], json!("old-phone"));
         assert_eq!(details["node"], json!("tower"));
         assert_eq!(details["restorable"], json!(true));
 

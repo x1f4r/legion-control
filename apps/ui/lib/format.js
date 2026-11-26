@@ -218,17 +218,6 @@ export function busyReasonLabel(reason) {
 }
 
 /**
- * Formats a compact list-row phrase for busy reasons (`busy: agents` or `busy: agents +1`).
- */
-export function formatBusyReasonsShort(reasons) {
-  if (!Array.isArray(reasons) || reasons.length === 0) return '';
-  const labels = reasons.map(busyReasonLabel).filter(Boolean);
-  if (labels.length === 0) return '';
-  if (labels.length === 1) return `busy: ${labels[0]}`;
-  return `busy: ${labels[0]} +${labels.length - 1}`;
-}
-
-/**
  * Formats one busy reason as a full detail line (`name: detail`) for Overview and Power views.
  */
 export function formatBusyReasonLine(reason) {
@@ -250,15 +239,4 @@ export function formatBusyReasonLine(reason) {
 export function formatBusyReasonLines(reasons) {
   if (!Array.isArray(reasons) || reasons.length === 0) return [];
   return reasons.map(formatBusyReasonLine).filter(Boolean);
-}
-
-/**
- * Formats the short, plain subtitle for an offline machine row in the Machines list.
- */
-export function formatOfflineSubtext(lastSeenAt, nowMs = Date.now()) {
-  if (lastSeenAt) {
-    const seen = formatRelativeTime(lastSeenAt, nowMs);
-    if (seen) return `Did not answer · last seen ${seen}`;
-  }
-  return 'Did not answer';
 }

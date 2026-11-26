@@ -4157,7 +4157,7 @@ mod tests {
                     link: self.link.clone(),
                     link_node: machine.to_owned(),
                     machine: machine.to_owned(),
-                    principal: "device:pixel".to_owned(),
+                    principal: "device:phone".to_owned(),
                     holder,
                     learned_identity,
                 })
@@ -4290,7 +4290,7 @@ mod tests {
                     user: "me".to_owned(),
                     host_keys: vec![tower_key],
                 },
-                Some("device:pixel".to_owned()),
+                Some("device:phone".to_owned()),
             )],
             ..LinkConfig::default()
         };
@@ -5690,7 +5690,7 @@ mod tests {
                     link: self.link.clone(),
                     link_node: machine.to_owned(),
                     machine: machine.to_owned(),
-                    principal: "device:pixel".to_owned(),
+                    principal: "device:phone".to_owned(),
                     holder: "fleet:1".to_owned(),
                     learned_identity: None,
                 })
@@ -5784,7 +5784,7 @@ mod tests {
                         user: "me".to_owned(),
                         host_keys: vec![tower_key],
                     },
-                    Some("device:pixel".to_owned()),
+                    Some("device:phone".to_owned()),
                 )],
                 ..LinkConfig::default()
             },
@@ -6469,7 +6469,7 @@ mod tests {
                         user: "me".to_owned(),
                         host_keys: vec![tower_key.clone()],
                     },
-                    Some("device:pixel".to_owned()),
+                    Some("device:phone".to_owned()),
                 )],
                 ..LinkConfig::default()
             },
@@ -6486,7 +6486,7 @@ mod tests {
                     user: "me".to_owned(),
                     host_keys: vec![host_key.to_owned()],
                 },
-                Some("device:pixel".to_owned()),
+                Some("device:phone".to_owned()),
             );
             learned.origin = legion_link::NodeOrigin::Learned;
             learned.learned_from = Some("tower".to_owned());
@@ -6564,7 +6564,7 @@ mod tests {
                     link: self.link.clone(),
                     link_node: machine.to_owned(),
                     machine: machine.to_owned(),
-                    principal: "device:pixel".to_owned(),
+                    principal: "device:phone".to_owned(),
                     holder: st.studio_holder,
                     learned_identity: st.studio_learned,
                 })
@@ -7067,7 +7067,7 @@ mod tests {
                             user: "me".to_owned(),
                             host_keys: vec![tower_key_line.clone()],
                         },
-                        Some("device:pixel".to_owned()),
+                        Some("device:phone".to_owned()),
                     ),
                     NodeLink::ssh(
                         "other-hub",
@@ -7077,7 +7077,7 @@ mod tests {
                             user: "me".to_owned(),
                             host_keys: vec![other_key_line.clone()],
                         },
-                        Some("device:pixel".to_owned()),
+                        Some("device:phone".to_owned()),
                     ),
                 ],
                 ..LinkConfig::default()
@@ -7185,7 +7185,7 @@ mod tests {
                         link: self.link.clone(),
                         link_node: entry.node.clone(),
                         machine: entry.node.clone(),
-                        principal: "device:pixel".to_owned(),
+                        principal: "device:phone".to_owned(),
                         holder: format!("pairing:{}:1", entry.node),
                         learned_identity,
                     });
@@ -7194,7 +7194,7 @@ mod tests {
                     link: self.link.clone(),
                     link_node: machine.to_owned(),
                     machine: machine.to_owned(),
-                    principal: "device:pixel".to_owned(),
+                    principal: "device:phone".to_owned(),
                     holder: "fleet:1".to_owned(),
                     learned_identity: None,
                 })
@@ -7274,7 +7274,7 @@ mod tests {
                     user: "me".to_owned(),
                     host_keys: vec![studio_b_key_line.clone()],
                 },
-                Some("device:pixel".to_owned()),
+                Some("device:phone".to_owned()),
             );
             learned_b.origin = NodeOrigin::Learned;
             learned_b.learned_from = Some("other-hub".to_owned());
@@ -7370,7 +7370,7 @@ mod tests {
                     user: "me".to_owned(),
                     host_keys: vec![studio_a_key_line.clone()],
                 },
-                Some("device:pixel".to_owned()),
+                Some("device:phone".to_owned()),
             );
             learned_a.origin = NodeOrigin::Learned;
             learned_a.learned_from = Some("tower".to_owned());

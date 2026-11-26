@@ -2310,8 +2310,6 @@ export const OLD_FIXTURE_TOOLS = [
   }
 ];
 
-export const OLD_FIXTURE_TOOL_MAP = new Map(OLD_FIXTURE_TOOLS.map((t) => [t.name, t]));
-
 /**
  * Strictly validates call arguments against a tool's JSON schema, throwing the exact
  * `invalid_args` error message and CLI hint that a real Legion node returns.

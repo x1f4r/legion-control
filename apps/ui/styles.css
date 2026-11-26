@@ -1156,17 +1156,6 @@ button.row:active {
   white-space: normal;
 }
 
-.row .end {
-  color: var(--dim);
-  font: var(--text-sub) var(--mono);
-  text-align: right;
-}
-
-.row .value {
-  color: var(--dim);
-  font-size: 14px;
-}
-
 .row .chev {
   color: var(--faint);
   font: 18px var(--mono);
@@ -1985,55 +1974,6 @@ button.row:active {
 
 .spaced-lg {
   margin-top: 28px;
-}
-
-.crumbs-bar {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  margin: 4px 0 10px;
-}
-
-.crumbs {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-wrap: nowrap;
-  align-items: center;
-  gap: 2px;
-  overflow-x: auto;
-  white-space: nowrap;
-  scrollbar-width: none;
-  font: var(--text-sub) var(--mono);
-  color: var(--dim);
-}
-
-.crumbs::-webkit-scrollbar {
-  display: none;
-}
-
-.crumb-item {
-  flex: none;
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-}
-
-.crumbs a {
-  display: inline-flex;
-  align-items: center;
-  min-height: 36px;
-  padding: 0 6px;
-  border-radius: 6px;
-  color: inherit;
-  text-decoration: none;
-  white-space: nowrap;
-}
-
-.crumbs a:hover,
-.crumbs a:active {
-  background: var(--raised);
-  color: var(--text);
 }
 
 .search-row {
@@ -3762,7 +3702,6 @@ button.row:active {
     text-align: left;
   }
 
-  .music-resume-inline,
   .player-resume-chip.inline {
     justify-self: start;
   }
@@ -3801,44 +3740,6 @@ button.row:active {
   .music-title {
     font-size: 20px;
   }
-}
-
-.viewer-audio {
-  display: grid;
-  justify-items: center;
-  gap: 16px;
-  width: min(360px, 100%);
-  padding: 24px 16px;
-  text-align: center;
-}
-
-.viewer-audio-art {
-  width: 96px;
-  height: 96px;
-  border-radius: 22px;
-  display: grid;
-  place-items: center;
-  background: #1a1c20;
-  color: var(--viewer-tile-ink);
-}
-
-.viewer-audio-art svg {
-  width: 44px;
-  height: 44px;
-  stroke: currentColor;
-  fill: none;
-  stroke-width: 2;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
-
-.viewer-audio strong {
-  max-width: 100%;
-  overflow-wrap: anywhere;
-}
-
-.viewer-audio audio {
-  width: 100%;
 }
 
 .viewer-text-bar {
@@ -4227,13 +4128,6 @@ button.row:active {
   margin: 14px 2px 6px;
   font-size: var(--text-sub);
   color: var(--dim);
-}
-
-.sheet-note {
-  margin: 8px 2px 0;
-  font-size: var(--text-sub);
-  color: var(--dim);
-  line-height: 1.4;
 }
 
 .transfer-ctl {

@@ -233,4 +233,9 @@ accounts.
 | [Interface](interface.md) | How icons, press feedback, focus rings, and unavailable controls are drawn and checked. |
 | [Security](security.md) | Threat model by attacker class, standing security invariants, and known trust boundaries. |
 | [Design](design.md) | Architecture, workspace crates, wire and stream protocols, platform rules, and milestones. |
+| [Platforms](platforms.md) | Nodes, controllers, the three pipes (in-app ssh, local child, HTTP door), and packaging across platforms. |
+| [Machines](machines.md) | Machine status, hardware telemetry (`sys.info`, `sys.procs`, `sys.kill`), and wake-on-demand. |
+| [Files](files.md) | Browsing, opening, moving, searching, favourites, thumbnails, content streaming, and folder sync. |
+| [Watching and listening](player.md) | The custom video and audio player controls, folder queue, and platform full-screen behaviour. |
+| [Updates](updates.md) | Signed update sets, trust roots, sequence floors, and self-updates for the node, app, and web interface. |
 | [`examples/legion/`](../../examples/legion/) | Validated, commented example files for `node.toml`, `policy.toml`, `fleet.toml`, `projects.toml`, `tokens.toml`, and `tools.d/`. |

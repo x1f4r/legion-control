@@ -849,7 +849,7 @@ plain one-line description of what each role allows. No role or device name is b
 also pass flags directly, or pair under an existing principal:
 
 ```sh
-legion pair --name pixel --role observer
+legion pair --name my-phone --role observer
 legion pair --name tablet --role owner --allow-owner
 legion pair --as phone
 ```
@@ -1023,11 +1023,11 @@ fleet.sync direction=pull from=<machine> documents='["devices.toml"]'` explicitl
 
 ```sh
 legion device.list
-legion device.set name=pixel role=editor
-legion device.set name=pixel rename=pixel-10
+legion device.set name=my-phone role=editor
+legion device.set name=my-phone rename=travel-phone
 legion device.set id=<pairing-id> confirm=true
 legion device.endpoint --on all
-legion device.remove name=pixel-10
+legion device.remove name=travel-phone
 legion device.remove id=<pairing-or-invite-id>
 legion device.remove name=old-phone foreign=true
 ```
