@@ -1096,6 +1096,8 @@ test('iOS/iPadOS bridge attaches at WKWebView creation, fixes requestGeometryUpd
   assert.match(swiftSrc, /legion_ios_attach_webview/);
   assert.match(swiftSrc, /legion_ios_reset_player_state/);
   assert.match(swiftSrc, /injectionTime:\s*\.atDocumentStart/);
+  assert.match(swiftSrc, /case "haptic":/);
+  assert.match(swiftSrc, /UIImpactFeedbackGenerator/);
   assert.match(mainMmSrc, /initWithFrame:configuration:/);
   assert.match(mainMmSrc, /webViewWebContentProcessDidTerminate:/);
 
@@ -1129,6 +1131,7 @@ test('iOS/iPadOS bridge attaches at WKWebView creation, fixes requestGeometryUpd
     };
     const linkNoHandler = createAppLink();
     assert.equal(linkNoHandler.canImmersive(), false);
+    assert.equal(linkNoHandler.haptic, undefined);
     assert.deepEqual(await linkNoHandler.immersive(true, { orientation: 'landscape' }), {
       active: false,
       mode: 'none',
@@ -1149,14 +1152,17 @@ test('iOS/iPadOS bridge attaches at WKWebView creation, fixes requestGeometryUpd
     };
     const linkWithHandler = createAppLink();
     assert.equal(linkWithHandler.canImmersive(), true);
+    assert.equal(typeof linkWithHandler.haptic, 'function');
     assert.deepEqual(await linkWithHandler.immersive(true, { orientation: 'landscape' }), {
       active: true,
       mode: 'ios',
     });
     assert.equal(await linkWithHandler.keepScreenOn(true), true);
+    linkWithHandler.haptic('tick');
     assert.deepEqual(posted, [
       { type: 'immersive', on: true, orientation: 'landscape' },
       { type: 'keep_screen_on', on: true },
+      { type: 'haptic', kind: 'tick' },
     ]);
     assert.deepEqual(invoked, []);
   } finally {

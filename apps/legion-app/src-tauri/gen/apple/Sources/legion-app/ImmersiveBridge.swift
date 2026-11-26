@@ -172,11 +172,30 @@ final class LegionImmersiveBridge: NSObject, WKScriptMessageHandler {
     case "keep_screen_on":
       let on = (body["on"] as? Bool) ?? false
       UIApplication.shared.isIdleTimerDisabled = on
+    case "haptic":
+      let kind = (body["kind"] as? String) ?? ""
+      performHaptic(kind: kind)
     case "reset":
       resetAll()
     default:
       break
     }
+  }
+
+  private func performHaptic(kind: String) {
+    let normalized = kind.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    let style: UIImpactFeedbackGenerator.FeedbackStyle
+    switch normalized {
+    case "tick":
+      style = .light
+    case "tap":
+      style = .medium
+    default:
+      return
+    }
+    let generator = UIImpactFeedbackGenerator(style: style)
+    generator.prepare()
+    generator.impactOccurred()
   }
 
   private func defaultOrientationMask() -> UIInterfaceOrientationMask {

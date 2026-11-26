@@ -1,6 +1,7 @@
 package com.x1f4r.legion
 
 import android.content.pm.ActivityInfo
+import android.view.HapticFeedbackConstants
 import android.view.WindowManager
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -54,5 +55,15 @@ class ImmersiveStateTest {
     assertFalse(reset.hideSystemBars)
     assertEquals(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED, reset.requestedOrientation)
     assertEquals(WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT, reset.cutoutMode)
+  }
+
+  @Test
+  fun hapticKindMapsToViewFeedbackConstants() {
+    assertEquals(HapticFeedbackConstants.CLOCK_TICK, ImmersiveState.hapticFeedbackConstant("tick"))
+    assertEquals(HapticFeedbackConstants.CLOCK_TICK, ImmersiveState.hapticFeedbackConstant(" TICK "))
+    assertEquals(HapticFeedbackConstants.KEYBOARD_TAP, ImmersiveState.hapticFeedbackConstant("tap"))
+    assertNull(ImmersiveState.hapticFeedbackConstant(""))
+    assertNull(ImmersiveState.hapticFeedbackConstant("vibrate"))
+    assertNull(ImmersiveState.hapticFeedbackConstant(null))
   }
 }
