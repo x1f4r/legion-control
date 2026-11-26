@@ -413,10 +413,24 @@ export function fitName(name, before, after, measure, width, lines = 2, opts = {
     const startL = Math.min(SHARED_KEEP_PREFIX, sharedLen, effEndingStart - 1);
 
     // 1. Try keeping first 6 chars (`L = startL`), cutting as little as possible from index 6.
+    // When the right boundary `r` falls mid-word inside the redundant shared stretch, snap it
+    // forward to the next natural break inside that stretch so no stray letter fragment follows `…`.
     if (startL >= 1) {
       const r = minFittingR(startL, startL + 1, effEndingStart);
       if (r !== null && distinguishesOneEllipsis(startL, r)) {
-        const fit = tryRanges([[0, startL], [r, N]]);
+        let chosenR = r;
+        const snapLimit = Math.min(sharedLen, effEndingStart);
+        if (chosenR < snapLimit && !naturalBreaks[chosenR]) {
+          for (let cand = chosenR + 1; cand <= snapLimit; cand += 1) {
+            if (naturalBreaks[cand]) {
+              if (distinguishesOneEllipsis(startL, cand) && tryRanges([[0, startL], [cand, N]])) {
+                chosenR = cand;
+              }
+              break;
+            }
+          }
+        }
+        const fit = tryRanges([[0, startL], [chosenR, N]]);
         if (fit) return accept(fit);
       }
     }

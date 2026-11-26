@@ -46,8 +46,10 @@ function dimPrefixText(res) {
 }
 
 test('toGraphemes preserves emoji ZWJ clusters, combining marks, and RTL text', () => {
-  const emoji = toGraphemes('🎉_👨‍👩‍👧‍👦_👍🏽.mp4');
-  assert.deepEqual(emoji, ['🎉', '_', '👨‍👩‍👧‍👦', '_', '👍🏽', '.', 'm', 'p', '4']);
+  const family = '\u{1F468}\u200D\u{1F469}\u200D\u{1F467}\u200D\u{1F466}';
+  const thumb = '\u{1F44D}\u{1F3FD}';
+  const emoji = toGraphemes(`\u{1F389}_${family}_${thumb}.mp4`);
+  assert.deepEqual(emoji, ['\u{1F389}', '_', family, '_', thumb, '.', 'm', 'p', '4']);
 
   const combining = toGraphemes('cafe\u0301_re\u0301sume\u0301.pdf');
   assert.equal(combining[3], 'e\u0301');
@@ -255,15 +257,17 @@ test('handles no extension, dotfiles, very long extension, overlong word, case-o
   assert.notEqual(cA.text, cB.text);
 
   // Emoji (ZWJ family + skin tone modifier) never split mid-grapheme.
-  const emA = '🎉_family_👨‍👩‍👧‍👦_holiday_2026_11_25_clip_👍🏽_01.mp4';
-  const emB = '🎉_family_👨‍👩‍👧‍👦_holiday_2026_11_25_clip_👍🏽_02.mp4';
+  const family = '\u{1F468}\u200D\u{1F469}\u200D\u{1F467}\u200D\u{1F466}';
+  const thumb = '\u{1F44D}\u{1F3FD}';
+  const emA = `\u{1F389}_family_${family}_holiday_2026_11_25_clip_${thumb}_01.mp4`;
+  const emB = `\u{1F389}_family_${family}_holiday_2026_11_25_clip_${thumb}_02.mp4`;
   const emFitA = fitName(emA, null, emB, measure, 140, 1);
   const emFitB = fitName(emB, emA, null, measure, 140, 1);
   assertValidFit(emFitA, measure, 140, 1, 'emoji A');
   assertValidFit(emFitB, measure, 140, 1, 'emoji B');
   assert.notEqual(emFitA.text, emFitB.text);
   assert.ok(!/[\uD800-\uDFFF]/.test(emFitA.text.replace(/\p{Extended_Pictographic}|\uFE0F|\u200D|\p{Emoji_Modifier}/gu, '')));
-  assert.ok(emFitA.text.includes('👍🏽_01.mp4'));
+  assert.ok(emFitA.text.includes(`${thumb}_01.mp4`));
 
   // Combining marks stay attached to their base characters.
   const combA = 'cafe\u0301_re\u0301sume\u0301_documentation_2026_e\u0301dition_01.pdf';
