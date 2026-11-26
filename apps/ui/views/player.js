@@ -499,8 +499,8 @@ export function VideoPlayer({
       );
       wasPlayingBeforeTeardownRef.current = false;
       wantPlayAfterSwapRef.current = carryPlay;
-      pendingPlayIntentRef.current = carryPlay;
-      setPendingPlayIntent(carryPlay);
+      pendingPlayIntentRef.current = carryPlay ? true : null;
+      setPendingPlayIntent(carryPlay ? true : null);
       prevIdentityRef.current = identityRef.current;
     } else {
       prevIdentityRef.current = identityRef.current;
@@ -543,6 +543,9 @@ export function VideoPlayer({
   // When a newly minted mediaUrl arrives for the current file, clear error and enter loading until metadata arrives.
   useEffect(() => {
     if (!mediaUrl) {
+      controller.setLoading(true);
+    } else if (controller.getState().error) {
+      controller.setError(false);
       controller.setLoading(true);
     }
   }, [mediaUrl, controller]);
@@ -1049,6 +1052,7 @@ export function VideoPlayer({
             }
           }
           controller.setLoading(false);
+          const pendingIntent = pendingPlayIntentRef.current;
           const wantPlay = wantPlayAfterSwapRef.current;
           wantPlayAfterSwapRef.current = false;
           pendingPlayIntentRef.current = null;
@@ -1059,7 +1063,7 @@ export function VideoPlayer({
               v.play().catch(() => {
                 controller.setPlaying(false);
               });
-            } else {
+            } else if (pendingIntent === false) {
               if (!v.paused) {
                 try {
                   v.pause();
@@ -1068,6 +1072,9 @@ export function VideoPlayer({
                 }
               }
               controller.setPlaying(false);
+            } else {
+              // Preserve playback that already started before the queued loadedmetadata event fired.
+              controller.setPlaying(!v.paused && !v.ended);
             }
           }
         }}
@@ -1698,11 +1705,12 @@ export function MusicPlayer({
           (!autoPlayNextRef.current.path || autoPlayNextRef.current.path === pathRef.current),
       );
       const nextWant = !currentWant;
-      autoPlayNextRef.current = nextWant ? { path: pathRef.current, play: true } : null;
+      autoPlayNextRef.current = { path: pathRef.current, play: nextWant };
       setPlaying(nextWant);
       return;
     }
     if (a.paused || a.ended) {
+      autoPlayNextRef.current = null;
       if (a.ended) {
         try {
           a.currentTime = 0;
@@ -2087,9 +2095,13 @@ export function MusicPlayer({
           const pendingAuto = autoPlayNextRef.current;
           autoPlayNextRef.current = null;
           if (!recovered) {
-            if (pendingAuto?.play && (!pendingAuto.path || pendingAuto.path === path)) {
-              a.play().catch(() => {});
-            } else {
+            const matchesTrack = !pendingAuto?.path || pendingAuto.path === path;
+            if (pendingAuto?.play && matchesTrack) {
+              setPlaying(true);
+              a.play().catch(() => {
+                setPlaying(false);
+              });
+            } else if (pendingAuto && pendingAuto.play === false && matchesTrack) {
               if (!a.paused) {
                 try {
                   a.pause();
@@ -2098,6 +2110,9 @@ export function MusicPlayer({
                 }
               }
               setPlaying(false);
+            } else {
+              // Preserve playback that already started before the queued loadedmetadata event fired.
+              setPlaying(!a.paused && !a.ended);
             }
           }
         }}
