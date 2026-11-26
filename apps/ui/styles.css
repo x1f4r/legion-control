@@ -1250,6 +1250,45 @@ button.row:active {
   border-top: 0;
 }
 
+.scroll-container:has(.vlist),
+.scroll-container:has(.vgrid),
+.list.vlist,
+.grid.vgrid,
+.folder-pager {
+  overflow-anchor: none;
+}
+
+.vlist-spacer {
+  pointer-events: none;
+}
+
+.vlist-spacer[data-empty="true"] {
+  display: none;
+}
+
+.vlist-item {
+  border-top: 1px solid var(--line);
+}
+
+.vlist-item[data-vlist-index="0"] {
+  border-top: 0;
+}
+
+.vlist-item > .swipe-row,
+.vlist-item > .row,
+.vlist-item > div > .row {
+  border-top: 0;
+}
+
+.vgrid-spacer {
+  grid-column: 1 / -1;
+  pointer-events: none;
+}
+
+.vgrid-spacer[data-empty="true"] {
+  display: none;
+}
+
 .swipe-row > .row {
   flex: 1;
   min-width: 0;
