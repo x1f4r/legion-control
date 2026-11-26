@@ -17,6 +17,7 @@ import './live-refresh-browser.mjs';
 import './machine-browser.mjs';
 import './player-browser.mjs';
 import './split-view-browser.mjs';
+import './ui-craft-browser.mjs';
 
 const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(TEST_DIR, '..', '..', '..');

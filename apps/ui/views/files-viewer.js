@@ -2553,7 +2553,7 @@ export function FilesViewer({
                         aria-label="Exit full screen"
                         onClick=${() => fullscreenController.leave()}
                       >
-                        <${Icon} name="fullscreen-exit" />
+                        <${Icon} name="exit-fullscreen" />
                       </button>
                     `
                   : null}

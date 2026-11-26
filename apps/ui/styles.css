@@ -14,6 +14,7 @@
   --bg: #0d0e10;
   --surface: #15171a;
   --raised: #1d2024;
+  --press-surface: #262a31;
   --line: #262a2f;
   --line-strong: #3a4047;
   --text: #eceef0;
@@ -86,6 +87,7 @@
   --bg: #f3f2ee;
   --surface: #ffffff;
   --raised: #f8f7f3;
+  --press-surface: #e3e0d7;
   --line: #e3e0d9;
   --line-strong: #c9c5bc;
   --text: #17181a;
@@ -140,6 +142,7 @@
     --bg: #f3f2ee;
     --surface: #ffffff;
     --raised: #f8f7f3;
+    --press-surface: #e3e0d7;
     --line: #e3e0d9;
     --line-strong: #c9c5bc;
     --text: #17181a;
@@ -489,7 +492,7 @@ textarea {
   height: 22px;
   stroke: currentColor;
   fill: none;
-  stroke-width: 1.6;
+  stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -672,7 +675,7 @@ textarea {
 
   .split-tools .tabs {
     margin: 0;
-    padding: 0;
+    padding: 5px 4px;
   }
 
   .split-label {
@@ -1178,6 +1181,19 @@ button.row:active {
   font-weight: 600;
   font-size: var(--text-sub);
   cursor: pointer;
+  touch-action: manipulation;
+  transition: transform 120ms ease, background-color 120ms ease;
+}
+
+.swipe-action:active:not([disabled]) {
+  transform: scale(0.97);
+  background-color: color-mix(in srgb, var(--bad) 80%, #000);
+  transition-duration: 0ms;
+}
+
+.swipe-action:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -3px;
 }
 
 .swipe-action.neutral {
@@ -1186,9 +1202,23 @@ button.row:active {
   border-left: 1px solid var(--line);
 }
 
+.swipe-action.neutral:active:not([disabled]) {
+  background-color: var(--press-surface);
+}
+
 .swipe-action.accent {
   background: var(--accent);
   color: var(--accent-ink);
+}
+
+.swipe-action.accent:active:not([disabled]) {
+  background-color: color-mix(in srgb, var(--accent) 82%, #000);
+}
+
+.swipe-action.accent:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  box-shadow: inset 0 0 0 4px var(--accent-ink);
 }
 
 /* How a thing went, in one word with a mark. */
@@ -1445,12 +1475,25 @@ button.row:active {
   font-weight: 500;
   white-space: nowrap;
   cursor: pointer;
+  touch-action: manipulation;
+  transition: transform 120ms ease, background-color 120ms ease, color 120ms ease;
+}
+
+.seg button:active:not([disabled]) {
+  transform: scale(0.97);
+  background-color: var(--press-surface);
+  color: var(--text);
+  transition-duration: 0ms;
 }
 
 .seg button[aria-pressed="true"] {
   background: var(--surface);
   color: var(--text);
   box-shadow: 0 0 0 1px var(--line-strong);
+}
+
+.seg button[aria-pressed="true"]:active:not([disabled]) {
+  background-color: var(--press-surface);
 }
 
 .swatches {
@@ -1469,6 +1512,13 @@ button.row:active {
   background: var(--c);
   box-shadow: 0 0 0 2px var(--surface), 0 0 0 3px var(--line-strong);
   cursor: pointer;
+  touch-action: manipulation;
+  transition: transform 120ms ease;
+}
+
+.swatch:active:not([disabled]) {
+  transform: scale(0.97);
+  transition-duration: 0ms;
 }
 
 .swatch[aria-pressed="true"] {
@@ -1540,9 +1590,9 @@ button.row:active {
 
 .tabs {
   display: flex;
-  gap: 2px;
-  margin: 0 0 8px;
-  padding: 0 0 4px;
+  gap: 6px;
+  margin: 0 0 6px;
+  padding: 5px 4px;
   overflow-x: auto;
   scrollbar-width: none;
 }
@@ -1562,10 +1612,24 @@ button.row:active {
   font-size: 14px;
   font-weight: 500;
   cursor: pointer;
+  touch-action: manipulation;
+  transition: transform 120ms ease, background-color 120ms ease, color 120ms ease;
+}
+
+.tabs button:active:not([disabled]) {
+  transform: scale(0.97);
+  background-color: var(--press-surface);
+  color: var(--text);
+  transition-duration: 0ms;
 }
 
 .tabs button[aria-selected="true"] {
   background: var(--text);
+  color: var(--bg);
+}
+
+.tabs button[aria-selected="true"]:active:not([disabled]) {
+  background-color: color-mix(in srgb, var(--text) 82%, var(--bg));
   color: var(--bg);
 }
 
@@ -1584,10 +1648,14 @@ button.row:active {
   font-weight: 600;
   text-decoration: none;
   cursor: pointer;
+  touch-action: manipulation;
+  transition: transform 120ms ease, background-color 120ms ease, border-color 120ms ease, color 120ms ease;
 }
 
-.btn:active {
-  transform: translateY(1px);
+.btn:active:not([disabled]) {
+  transform: scale(0.97);
+  background-color: var(--press-surface);
+  transition-duration: 0ms;
 }
 
 .btn[disabled] {
@@ -1601,15 +1669,29 @@ button.row:active {
   color: var(--accent-ink);
 }
 
+.btn.primary:active:not([disabled]) {
+  background-color: color-mix(in srgb, var(--accent) 82%, #000);
+  border-color: color-mix(in srgb, var(--accent) 82%, #000);
+}
+
 .btn.danger {
   border-color: var(--bad);
   background: var(--bad);
   color: #fff;
 }
 
+.btn.danger:active:not([disabled]) {
+  background-color: color-mix(in srgb, var(--bad) 80%, #000);
+  border-color: color-mix(in srgb, var(--bad) 80%, #000);
+}
+
 .btn.quiet {
   border-color: transparent;
   color: var(--dim);
+}
+
+.btn.quiet:active:not([disabled]) {
+  color: var(--text);
 }
 
 .btn.small {
@@ -1621,9 +1703,39 @@ button.row:active {
 }
 
 .btn.icon {
+  position: relative;
+  isolation: isolate;
   width: var(--tap);
+  height: var(--tap);
   padding: 0;
   border-color: transparent;
+  border-radius: 50%;
+}
+
+.btn.icon::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  z-index: -1;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background-color: var(--press-surface);
+  opacity: 0;
+  transform: translate(-50%, -50%) scale(0.88);
+  transition: opacity 120ms ease, transform 120ms ease;
+  pointer-events: none;
+}
+
+.btn.icon:active:not([disabled]) {
+  background-color: transparent;
+}
+
+.btn.icon:active:not([disabled])::before {
+  opacity: 1;
+  transform: translate(-50%, -50%) scale(1);
+  transition-duration: 0ms;
 }
 
 .btn.icon svg {
@@ -1631,7 +1743,7 @@ button.row:active {
   height: 22px;
   stroke: currentColor;
   fill: none;
-  stroke-width: 1.8;
+  stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -1783,12 +1895,25 @@ button.row:active {
   color: var(--dim);
   font: 500 var(--text-sub) var(--mono);
   cursor: pointer;
+  touch-action: manipulation;
+  transition: transform 120ms ease, background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+.chip-btn:active:not([disabled]) {
+  transform: scale(0.97);
+  background-color: var(--press-surface);
+  color: var(--text);
+  transition-duration: 0ms;
 }
 
 .chip-btn[aria-pressed="true"] {
   border-color: var(--accent);
   background: color-mix(in srgb, var(--accent) 16%, transparent);
   color: var(--text);
+}
+
+.chip-btn[aria-pressed="true"]:active:not([disabled]) {
+  background-color: color-mix(in srgb, var(--accent) 28%, var(--press-surface));
 }
 
 .start-heading {
@@ -2059,6 +2184,7 @@ button.row:active {
   color: inherit;
   text-align: left;
   cursor: pointer;
+  touch-action: manipulation;
 }
 
 .update-note-action {
@@ -2080,23 +2206,58 @@ button.row:active {
 }
 
 .update-note-dismiss {
+  position: relative;
+  isolation: isolate;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  width: 36px;
+  height: 36px;
   min-width: 36px;
   min-height: 36px;
   margin-right: -8px;
   padding: 0;
   border: 0;
+  border-radius: 50%;
   background: none;
   color: var(--faint);
   font-size: 20px;
   line-height: 1;
   cursor: pointer;
+  touch-action: manipulation;
+  transition: transform 120ms ease, color 120ms ease;
+}
+
+.update-note-dismiss::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  z-index: -1;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background-color: var(--press-surface);
+  opacity: 0;
+  transform: translate(-50%, -50%) scale(0.88);
+  transition: opacity 120ms ease, transform 120ms ease;
+  pointer-events: none;
 }
 
 .update-note-dismiss:hover {
   color: var(--text);
+}
+
+.update-note-dismiss:active:not([disabled]) {
+  transform: scale(0.97);
+  color: var(--text);
+  transition-duration: 0ms;
+}
+
+.update-note-dismiss:active:not([disabled])::before {
+  opacity: 1;
+  transform: translate(-50%, -50%) scale(1);
+  transition-duration: 0ms;
 }
 
 .startup-update {
@@ -2196,7 +2357,7 @@ button.row:active {
   height: 22px;
   stroke: currentColor;
   fill: none;
-  stroke-width: 1.7;
+  stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -2342,7 +2503,7 @@ button.row:active {
   height: 28px;
   stroke: currentColor;
   fill: none;
-  stroke-width: 1.6;
+  stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -2419,7 +2580,7 @@ button.row:active {
   height: 30px;
   stroke: var(--accent);
   fill: none;
-  stroke-width: 1.6;
+  stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -2461,6 +2622,14 @@ button.row:active {
   color: var(--text);
   font-size: 11px;
   cursor: pointer;
+  touch-action: manipulation;
+  transition: transform 120ms ease, background-color 120ms ease, color 120ms ease;
+}
+
+.bar4 button:active:not([disabled]) {
+  transform: scale(0.97);
+  background-color: var(--press-surface);
+  transition-duration: 0ms;
 }
 
 .bar4 button svg {
@@ -2468,7 +2637,7 @@ button.row:active {
   height: 22px;
   stroke: currentColor;
   fill: none;
-  stroke-width: 1.7;
+  stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -2486,7 +2655,7 @@ button.row:active {
 }
 
 .bar4 button[disabled] {
-  color: var(--faint);
+  opacity: 0.45;
   cursor: default;
 }
 
@@ -2496,7 +2665,7 @@ button.row:active {
   gap: 6px;
   overflow-x: auto;
   scrollbar-width: none;
-  padding: 0 0 8px;
+  padding: 5px 4px 8px;
 }
 
 .filters::-webkit-scrollbar {
@@ -2513,12 +2682,25 @@ button.row:active {
   color: var(--dim);
   font-size: var(--text-sub);
   cursor: pointer;
+  touch-action: manipulation;
+  transition: transform 120ms ease, background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+.filters button:active:not([disabled]) {
+  transform: scale(0.97);
+  background-color: var(--press-surface);
+  color: var(--text);
+  transition-duration: 0ms;
 }
 
 .filters button[aria-pressed="true"] {
   border-color: var(--accent);
   color: var(--text);
   background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.filters button[aria-pressed="true"]:active:not([disabled]) {
+  background-color: color-mix(in srgb, var(--accent) 26%, var(--press-surface));
 }
 
 /* The viewer covers everything, on black, with its actions at the bottom. */
@@ -2558,6 +2740,7 @@ button.row:active {
 .viewer {
   --accent: #b6f24a;
   --accent-ink: #11160a;
+  --press-surface: rgb(255 255 255 / 0.16);
   --viewer-line: #3a4047;
   --viewer-track: #3a4047;
   --viewer-buf: #6c737c;
@@ -2593,6 +2776,7 @@ button.row:active {
 :root[data-theme="light"] .viewer .sheet {
   --accent: #3b7a00;
   --accent-ink: #ffffff;
+  --press-surface: #e3e0d7;
 }
 
 :root[data-theme="light"][data-accent="blue"] .viewer .sheet {
@@ -2624,6 +2808,7 @@ button.row:active {
   :root:not([data-theme="dark"]) .viewer .sheet {
     --accent: #3b7a00;
     --accent-ink: #ffffff;
+    --press-surface: #e3e0d7;
   }
 
   :root:not([data-theme="dark"])[data-accent="blue"] .viewer .sheet {
@@ -2798,29 +2983,43 @@ button.row:active {
 
 .btn.icon.player-center-btn {
   pointer-events: auto;
-  width: 54px;
-  height: 54px;
+  width: 56px;
+  height: 56px;
   border-radius: 50%;
   background: rgb(0 0 0 / 0.52);
   color: #fff;
   border-color: rgb(255 255 255 / 0.14);
 }
 
+.btn.icon.player-center-btn::before {
+  display: none;
+}
+
+.btn.icon.player-center-btn:active:not([disabled]) {
+  background-color: rgb(255 255 255 / 0.24);
+  border-color: rgb(255 255 255 / 0.34);
+}
+
 .btn.icon.player-center-btn svg {
-  width: 26px;
-  height: 26px;
+  width: 28px;
+  height: 28px;
 }
 
 .btn.icon.player-center-btn.main {
-  width: 66px;
-  height: 66px;
+  width: 68px;
+  height: 68px;
   background: rgb(0 0 0 / 0.68);
   border-color: rgb(255 255 255 / 0.22);
 }
 
+.btn.icon.player-center-btn.main:active:not([disabled]) {
+  background-color: rgb(255 255 255 / 0.28);
+  border-color: rgb(255 255 255 / 0.42);
+}
+
 .btn.icon.player-center-btn.main svg {
-  width: 30px;
-  height: 30px;
+  width: 32px;
+  height: 32px;
 }
 
 .player-bottom {
@@ -2878,6 +3077,10 @@ button.row:active {
   white-space: nowrap;
 }
 
+.btn.player-speed-btn:active:not([disabled]) {
+  background-color: rgb(255 255 255 / 0.18);
+}
+
 .player-speed-menu {
   position: absolute;
   right: 0;
@@ -2905,6 +3108,14 @@ button.row:active {
   letter-spacing: 0;
   text-align: right;
   cursor: pointer;
+  touch-action: manipulation;
+  transition: transform 120ms ease, background-color 120ms ease;
+}
+
+.player-speed-menu button:active:not([disabled]) {
+  transform: scale(0.97);
+  background-color: rgb(255 255 255 / 0.14);
+  transition-duration: 0ms;
 }
 
 .player-speed-menu button.active {
@@ -3202,8 +3413,8 @@ button.row:active {
   align-items: center;
   gap: 6px;
   max-width: calc(100% - 32px);
-  min-height: 44px;
-  padding: 0 6px 0 14px;
+  min-height: 46px;
+  padding: 0 2px 0 14px;
   border-radius: 999px;
   border: 1px solid rgb(255 255 255 / 0.18);
   background: rgb(21 23 26 / 0.9);
@@ -3226,11 +3437,20 @@ button.row:active {
   min-width: 44px;
   min-height: 44px;
   border: 0;
-  padding: 0 10px;
+  border-radius: 999px;
+  padding: 0 12px;
   background: none;
   color: var(--accent);
   font-weight: 600;
   cursor: pointer;
+  touch-action: manipulation;
+  transition: transform 120ms ease, background-color 120ms ease;
+}
+
+.player-resume-btn:active:not([disabled]) {
+  transform: scale(0.97);
+  background-color: rgb(255 255 255 / 0.16);
+  transition-duration: 0ms;
 }
 
 /* ── Music Listening Screen ────────────────────────────────────────────────────────────────── */
@@ -3339,7 +3559,7 @@ button.row:active {
   height: 34%;
   stroke: currentColor;
   fill: none;
-  stroke-width: 1.5;
+  stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -3409,6 +3629,10 @@ button.row:active {
   color: #fff;
 }
 
+.btn.icon.music-ctl-btn::before {
+  background-color: rgb(255 255 255 / 0.18);
+}
+
 .btn.icon.music-ctl-btn svg {
   width: 26px;
   height: 26px;
@@ -3423,12 +3647,18 @@ button.row:active {
   color: var(--accent-ink);
 }
 
+.btn.icon.music-play-btn::before {
+  display: none;
+}
+
+.btn.icon.music-play-btn:active:not([disabled]) {
+  background-color: color-mix(in srgb, var(--accent) 82%, #000);
+  border-color: color-mix(in srgb, var(--accent) 82%, #000);
+}
+
 .btn.icon.music-play-btn svg {
-  width: 28px;
-  height: 28px;
-  fill: currentColor;
-  stroke: currentColor;
-  stroke-width: 2.4;
+  width: 32px;
+  height: 32px;
 }
 
 .music-vol-row {
@@ -3533,7 +3763,7 @@ button.row:active {
   height: 44px;
   stroke: currentColor;
   fill: none;
-  stroke-width: 1.6;
+  stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -3632,7 +3862,7 @@ button.row:active {
   height: 30px;
   stroke: currentColor;
   fill: none;
-  stroke-width: 1.6;
+  stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -3769,6 +3999,10 @@ button.row:active {
   color: #fff;
 }
 
+.viewer-bar .bar4 button:active:not([disabled]) {
+  background-color: rgb(255 255 255 / 0.16);
+}
+
 .viewer-bar .bar4 button.active {
   color: var(--accent);
 }
@@ -3812,7 +4046,7 @@ button.row:active {
   height: 20px;
   stroke: currentColor;
   fill: none;
-  stroke-width: 1.7;
+  stroke-width: 2;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -4009,5 +4243,24 @@ button.row:active {
   * {
     transition: none !important;
     animation: none !important;
+  }
+
+  .btn:active,
+  .chip-btn:active,
+  .seg button:active,
+  .tabs button:active,
+  .filters button:active,
+  .bar4 button:active,
+  .swipe-action:active,
+  .update-note-dismiss:active,
+  .player-resume-btn:active,
+  .player-speed-menu button:active,
+  .swatch:active {
+    transform: none !important;
+  }
+
+  .btn.icon::before,
+  .update-note-dismiss::before {
+    transform: translate(-50%, -50%) !important;
   }
 }
