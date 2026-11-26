@@ -222,10 +222,16 @@ browserTest(
 
     // 9b. 123-char no-spaces filename fits cleanly with zero horizontal overflow in list, viewer, and Send to.
     const longNamePrefix = 'quarterly_photogrammetry_orthomosaic';
-    const longRow = page.locator('.list a.row', { hasText: longNamePrefix });
+    const longRow = page.locator(`.list a.row[aria-label^="${longNamePrefix}"]`);
     await longRow.scrollIntoViewIfNeeded();
+    await tracker.waitForLocator(longRow.locator('.fn-slot[data-fn-ready="1"]'), '123-char long row fitted name');
     const listOverflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
     assert.ok(listOverflow <= 1, `List horizontal overflow with 123-char name: ${listOverflow}px`);
+    const longRowDrawn = await longRow.locator('.fn-slot').evaluate((slot) =>
+      [...slot.querySelectorAll('.fn-line')].map((l) => l.textContent || '').join(''),
+    );
+    assert.ok(!longRowDrawn.endsWith('…'), `Long name must not end-truncate: "${longRowDrawn}"`);
+    assert.ok(longRowDrawn.endsWith('fied_v12.txt'), `Long name must preserve its ending: "${longRowDrawn}"`);
     await maybeFilesShot(page, '15-long-name-list', { alsoLight: true });
     await longRow.click();
     await page.locator('.viewer').waitFor();

@@ -24,9 +24,11 @@ import {
 } from './browser-helpers.mjs';
 import './files-browser.mjs';
 import './live-refresh-browser.mjs';
+import './long-names-browser.mjs';
 import './machine-browser.mjs';
 import './player-browser.mjs';
 import './split-view-browser.mjs';
+import './ui-craft-browser.mjs';
 
 const SHOTS_DIR = process.env.LEGION_UI_SHOTS_DIR || '';
 

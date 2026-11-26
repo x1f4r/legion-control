@@ -22,6 +22,7 @@ import { readTextWrapPreference, writeTextWrapPreference } from '../lib/files-st
 import { formatBytePair, formatBytes, formatRelativeTime } from '../lib/format.js';
 import { createFullscreenController, formatSpeed, PLAYBACK_SPEEDS, queueNeighbors } from '../lib/player.js';
 import { CopyButton, Notice, Sheet } from './common.js';
+import { FileNameSingle } from './file-name.js';
 import { MusicPlayer, VideoPlayer } from './player.js';
 
 const TEXT_CHUNK_BYTES = 131072; // 128 KiB
@@ -2578,8 +2579,8 @@ export function FilesViewer({
                 >
                   <${Icon} name=${fullscreenState.active && fullscreenState.source === 'button' ? 'back' : 'down'} />
                 </button>
-                <span class="name">
-                  ${name}
+                <span class="name" role="heading" aria-level="2" aria-label=${name} title=${name}>
+                  <${FileNameSingle} name=${name} lines=${1} titleOnHover=${false} />
                   ${topSub ? html`<small>${topSub}</small>` : null}
                 </span>
                 ${isViewerFullscreen
@@ -2590,7 +2591,7 @@ export function FilesViewer({
                         aria-label="Exit full screen"
                         onClick=${() => fullscreenController.leave()}
                       >
-                        <${Icon} name="fullscreen-exit" />
+                        <${Icon} name="exit-fullscreen" />
                       </button>
                     `
                   : null}
@@ -2660,6 +2661,10 @@ export function FilesViewer({
       ${moreOpen
         ? html`
             <${Sheet} title=${name} onClose=${() => setMoreOpen(false)}>
+              <div class="sheet-name-actions">
+                <${CopyButton} text=${name} label="Copy name" />
+                ${technical ? html`<${CopyButton} text=${`${machine}:${path}`} label="Copy path" />` : null}
+              </div>
               ${useMusicPlayer
                 ? html`
                     <p class="label">Playback speed</p>
@@ -2828,14 +2833,6 @@ export function FilesViewer({
                     `
                   : null}
               </div>
-
-              ${technical
-                ? html`
-                    <div class="sheet-cta">
-                      <${CopyButton} text=${`${machine}:${path}`} label="Copy path" />
-                    </div>
-                  `
-                : null}
             </${Sheet}>
           `
         : null}

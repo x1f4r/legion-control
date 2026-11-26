@@ -48,6 +48,7 @@ import { thumbCacheKey } from '../lib/thumb-cache.js';
 import { Notice, OlderMachineNote, ProgressBar, SwipeRow } from './common.js';
 import {
   FolderMoreSheet,
+  ItemSheet,
   NewFolderSheet,
   RenameSheet,
   SearchFiltersSheet,
@@ -57,12 +58,82 @@ import {
   SyncBinSheet,
   SyncConflictsSheet,
 } from './files-sheets.js';
+import { FileName, FileNameList, FileNameSingle } from './file-name.js';
 import { FilesViewer } from './files-viewer.js';
 import { SplitView } from './split-view.js';
 
 const PAGE_SIZE = 200;
 const RENDER_STEP = 120;
 const LONG_PRESS_MS = 450;
+const LONG_PRESS_MOVE_TOLERANCE_PX = 8;
+
+function useItemLongPress(onTrigger, { disabled = false } = {}) {
+  const timerRef = useRef(null);
+  const firedRef = useRef(false);
+  const originRef = useRef(null);
+
+  const cancel = useCallback(() => {
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+    originRef.current = null;
+  }, []);
+
+  useEffect(() => cancel, [cancel]);
+
+  const start = useCallback(
+    (e, payload) => {
+      if (disabled || typeof onTrigger !== 'function') return;
+      if (e && typeof e.button === 'number' && e.button !== 0) return;
+      firedRef.current = false;
+      originRef.current = e ? { x: e.clientX, y: e.clientY } : null;
+      if (timerRef.current) clearTimeout(timerRef.current);
+      timerRef.current = window.setTimeout(() => {
+        firedRef.current = true;
+        timerRef.current = null;
+        originRef.current = null;
+        onTrigger(payload);
+      }, LONG_PRESS_MS);
+    },
+    [disabled, onTrigger],
+  );
+
+  const move = useCallback(
+    (e) => {
+      if (!timerRef.current || !originRef.current || !e) return;
+      const dx = e.clientX - originRef.current.x;
+      const dy = e.clientY - originRef.current.y;
+      if (Math.hypot(dx, dy) > LONG_PRESS_MOVE_TOLERANCE_PX) {
+        cancel();
+      }
+    },
+    [cancel],
+  );
+
+  const consumeFired = useCallback(() => {
+    if (firedRef.current) {
+      firedRef.current = false;
+      return true;
+    }
+    return false;
+  }, []);
+
+  const contextMenu = useCallback(
+    (e, payload) => {
+      if (disabled || typeof onTrigger !== 'function') return;
+      e.preventDefault();
+      cancel();
+      if (firedRef.current) {
+        return;
+      }
+      onTrigger(payload);
+    },
+    [disabled, onTrigger, cancel],
+  );
+
+  return { start, move, cancel, consumeFired, contextMenu };
+}
 
 const KIND_FILTER_LABELS = {
   image: 'Pictures',
@@ -429,9 +500,24 @@ export function FilesHome({
   activeSyncId,
   onNavigate,
   onOpenFile,
+  onOpenItemSheet = null,
   onStartSearch,
 }) {
   const pinned = useMemo(() => (favourites || []).filter((f) => f.pinned), [favourites]);
+  const pinnedLongPress = useItemLongPress(
+    useCallback(
+      (item) => {
+        if (!onOpenItemSheet || !item) return;
+        onOpenItemSheet(item.machine, {
+          name: item.label || baseFileName(item.path),
+          path: item.path,
+          kind: item.kind || 'file',
+          category: item.category,
+        });
+      },
+      [onOpenItemSheet],
+    ),
+  );
   const hasPinned = Boolean(caps?.hasFav && pinned.length > 0);
   const hasSync = Boolean(caps?.hasSync && syncFolders.length > 0);
   const firstSection = hasPinned ? 'pinned' : hasSync ? 'sync' : 'machines';
@@ -486,8 +572,12 @@ export function FilesHome({
       ${hasPinned
         ? html`
             ${!(hideFirstLabel && firstSection === 'pinned') ? html`<p class="label">Pinned</p>` : null}
-            <div class="tiles">
-              ${pinned.map((item) => {
+            <${FileNameList} className="tiles" lines=${2}>
+              ${pinned.map((item, idx) => {
+                const label = item.label || baseFileName(item.path);
+                const prevLabel = idx > 0 ? pinned[idx - 1].label || baseFileName(pinned[idx - 1].path) : null;
+                const nextLabel =
+                  idx + 1 < pinned.length ? pinned[idx + 1].label || baseFileName(pinned[idx + 1].path) : null;
                 const href =
                   item.kind === 'dir'
                     ? routeHref({ section: 'files', view: 'folder', machine: item.machine, path: item.path })
@@ -500,13 +590,21 @@ export function FilesHome({
                     key=${item.id}
                     class="tile"
                     href=${href}
+                    aria-label=${label}
+                    title=${label}
+                    onPointerDown=${(e) => pinnedLongPress.start(e, item)}
+                    onPointerMove=${pinnedLongPress.move}
+                    onPointerUp=${pinnedLongPress.cancel}
+                    onPointerCancel=${pinnedLongPress.cancel}
+                    onContextMenu=${(e) => pinnedLongPress.contextMenu(e, item)}
                     onClick=${(e) => {
                       e.preventDefault();
+                      if (pinnedLongPress.consumeFired()) return;
                       if (item.kind === 'dir') {
                         onNavigate(href);
                       } else {
                         onOpenFile(item.machine, {
-                          name: item.label || baseFileName(item.path),
+                          name: label,
                           path: item.path,
                           kind: 'file',
                           category: item.category,
@@ -519,27 +617,38 @@ export function FilesHome({
                         ? html`<img src=${thumbUrl} alt="" />`
                         : html`<${Icon} name=${item.kind === 'dir' ? 'files' : entryIconName(item)} />`}
                     </span>
-                    <strong>${item.label || baseFileName(item.path)}</strong>
+                    <${FileName}
+                      as="strong"
+                      name=${label}
+                      before=${prevLabel}
+                      after=${nextLabel}
+                      lines=${2}
+                      titleOnHover=${false}
+                    />
                     <span>${item.machine}</span>
                   </a>
                 `;
               })}
-            </div>
+            <//>
           `
         : null}
 
       ${hasSync
         ? html`
             ${!(hideFirstLabel && firstSection === 'sync') ? html`<p class="label">Kept in sync</p>` : null}
-            <div class="list">
-              ${syncFolders.map((sf) => {
+            <${FileNameList} className="list" lines=${2}>
+              ${syncFolders.map((sf, idx) => {
                 const href = routeHref({ section: 'files', view: 'sync', syncId: sf.id });
                 const selected = wide && activeSyncId === sf.id;
+                const prevName = idx > 0 ? syncFolders[idx - 1].name : null;
+                const nextName = idx + 1 < syncFolders.length ? syncFolders[idx + 1].name : null;
                 return html`
                   <a
                     key=${sf.id}
                     class=${selected ? 'row selected' : 'row'}
                     href=${href}
+                    aria-label=${sf.name}
+                    title=${sf.name}
                     onClick=${(e) => {
                       e.preventDefault();
                       onNavigate(href);
@@ -547,14 +656,21 @@ export function FilesHome({
                   >
                     <span class="thumb folder" aria-hidden="true"><${Icon} name="sync" /></span>
                     <span class="body">
-                      <span class="title">${sf.name}</span>
+                      <${FileName}
+                        className="title fn-title"
+                        name=${sf.name}
+                        before=${prevName}
+                        after=${nextName}
+                        lines=${2}
+                        titleOnHover=${false}
+                      />
                       <span class="sub">${sf.summary || `${joinMemberNames(sf.members)} · Up to date`}</span>
                     </span>
                     <span class="chev" aria-hidden="true">›</span>
                   </a>
                 `;
               })}
-            </div>
+            <//>
           `
         : null}
 
@@ -691,6 +807,7 @@ export function FolderBrowser({
   onTotalChange = null,
   onNavigateFolder,
   onOpenFile,
+  onOpenItemSheet = null,
   onToggleSelect,
   onStartSelectWith,
   onToggleStar,
@@ -726,8 +843,17 @@ export function FolderBrowser({
 
   const pagerRef = useRef(null);
   const crumbsRef = useRef(null);
-  const longPressTimerRef = useRef(null);
-  const longPressFiredRef = useRef(false);
+  const entryLongPress = useItemLongPress(
+    useCallback(
+      (entry) => {
+        if (!entry) return;
+        if (onOpenItemSheet) onOpenItemSheet(machine, entry, { canSelect: Boolean(onStartSelectWith) });
+        else if (onStartSelectWith) onStartSelectWith(entry.path);
+      },
+      [machine, onOpenItemSheet, onStartSelectWith],
+    ),
+    { disabled: selecting },
+  );
   const justAddedTimerRef = useRef(null);
   const abortRef = useRef(null);
   const offsetRef = useRef(0);
@@ -1281,28 +1407,9 @@ export function FolderBrowser({
   const homePath = folderChanges?.getHome?.(machine) || null;
   const crumbs = splitFileCrumbs(machine, resolvedPath, { technical, homePath });
 
-  function startLongPress(entry) {
-    if (selecting) return;
-    longPressFiredRef.current = false;
-    if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current);
-    longPressTimerRef.current = window.setTimeout(() => {
-      longPressFiredRef.current = true;
-      longPressTimerRef.current = null;
-      if (onStartSelectWith) onStartSelectWith(entry.path);
-    }, LONG_PRESS_MS);
-  }
-
-  function cancelLongPress() {
-    if (longPressTimerRef.current) {
-      clearTimeout(longPressTimerRef.current);
-      longPressTimerRef.current = null;
-    }
-  }
-
   function handleEntryTap(e, entry) {
     e.preventDefault();
-    if (longPressFiredRef.current) {
-      longPressFiredRef.current = false;
+    if (entryLongPress.consumeFired()) {
       return;
     }
     if (selecting) {
@@ -1316,10 +1423,12 @@ export function FolderBrowser({
     }
   }
 
-  function renderListRow(entry) {
+  function renderListRow(entry, idx, list) {
     const picked = selecting && selectedPaths.has(entry.path);
     const starred = caps?.hasFav && favPathSet.has(entry.path);
     const thumbUrl = getThumbUrl(entry);
+    const beforeName = idx > 0 ? list[idx - 1].name : null;
+    const afterName = idx + 1 < list.length ? list[idx + 1].name : null;
     const href =
       entry.kind === 'dir'
         ? routeHref({ section: 'files', view: 'folder', machine, path: entry.path })
@@ -1338,22 +1447,26 @@ export function FolderBrowser({
       <a
         class=${rowCls}
         href=${href}
+        aria-label=${entry.name}
+        title=${entry.name}
         aria-selected=${selecting ? (picked ? 'true' : 'false') : undefined}
-        onPointerDown=${() => startLongPress(entry)}
-        onPointerMove=${cancelLongPress}
-        onPointerUp=${cancelLongPress}
-        onPointerCancel=${cancelLongPress}
-        onContextMenu=${(e) => {
-          if (!selecting && onStartSelectWith) {
-            e.preventDefault();
-            onStartSelectWith(entry.path);
-          }
-        }}
+        onPointerDown=${(e) => entryLongPress.start(e, entry)}
+        onPointerMove=${entryLongPress.move}
+        onPointerUp=${entryLongPress.cancel}
+        onPointerCancel=${entryLongPress.cancel}
+        onContextMenu=${(e) => entryLongPress.contextMenu(e, entry)}
         onClick=${(e) => handleEntryTap(e, entry)}
       >
         <${EntryThumb} entry=${entry} thumbUrl=${thumbUrl} observeEl=${observeThumb} />
         <span class="body">
-          <span class=${technical ? 'title mono' : 'title'}>${entry.name}</span>
+          <${FileName}
+            className=${technical ? 'title mono fn-title' : 'title fn-title'}
+            name=${entry.name}
+            before=${beforeName}
+            after=${afterName}
+            lines=${2}
+            titleOnHover=${false}
+          />
           <span class="sub">${entrySubtitle(entry, technical)}</span>
         </span>
         ${selecting
@@ -1412,12 +1525,14 @@ export function FolderBrowser({
       <div>
         ${gridItems.length > 0
           ? html`
-              <div class="grid">
-                ${gridItems.map((entry) => {
+              <${FileNameList} className="grid" lines=${3}>
+                ${gridItems.map((entry, idx) => {
                   const picked = selecting && selectedPaths.has(entry.path);
                   const starred = caps?.hasFav && favPathSet.has(entry.path);
                   const thumbUrl = getThumbUrl(entry);
                   const isDir = entry.kind === 'dir';
+                  const beforeName = idx > 0 ? gridItems[idx - 1].name : null;
+                  const afterName = idx + 1 < gridItems.length ? gridItems[idx + 1].name : null;
                   const href = isDir
                     ? routeHref({ section: 'files', view: 'folder', machine, path: entry.path })
                     : routeHref({
@@ -1441,25 +1556,41 @@ export function FolderBrowser({
                       class=${cls}
                       href=${href}
                       aria-label=${entry.name}
+                      title=${entry.name}
                       ref=${!isDir ? observeThumb : null}
                       data-thumb-path=${!isDir ? entry.path : undefined}
-                      onPointerDown=${() => startLongPress(entry)}
-                      onPointerMove=${cancelLongPress}
-                      onPointerUp=${cancelLongPress}
-                      onPointerCancel=${cancelLongPress}
+                      onPointerDown=${(e) => entryLongPress.start(e, entry)}
+                      onPointerMove=${entryLongPress.move}
+                      onPointerUp=${entryLongPress.cancel}
+                      onPointerCancel=${entryLongPress.cancel}
+                      onContextMenu=${(e) => entryLongPress.contextMenu(e, entry)}
                       onClick=${(e) => handleEntryTap(e, entry)}
                     >
                       ${isDir
                         ? html`
                             <${Icon} name="files" />
-                            <span class="cell-name">${entry.name}</span>
+                            <${FileName}
+                              className="cell-name"
+                              name=${entry.name}
+                              before=${beforeName}
+                              after=${afterName}
+                              lines=${3}
+                              titleOnHover=${false}
+                            />
                           `
                         : thumbUrl
                           ? html`<img src=${thumbUrl} alt=${entry.name} loading="lazy" decoding="async" />`
                           : html`
                               <span class="cell-icon">
                                 <${Icon} name=${entryIconName(entry)} />
-                                <span class="cell-name">${entry.name}</span>
+                                <${FileName}
+                                  className="cell-name"
+                                  name=${entry.name}
+                                  before=${beforeName}
+                                  after=${afterName}
+                                  lines=${3}
+                                  titleOnHover=${false}
+                                />
                               </span>
                             `}
                       ${entry.duration_s != null
@@ -1470,14 +1601,16 @@ export function FolderBrowser({
                     </a>
                   `;
                 })}
-              </div>
+              <//>
             `
           : null}
 
         ${otherItems.length > 0
           ? html`
               <p class="label">Other files</p>
-              <div class="list">${otherItems.map(renderListRow)}</div>
+              <${FileNameList} className="list" lines=${2}>
+                ${otherItems.map((entry, idx) => renderListRow(entry, idx, otherItems))}
+              <//>
             `
           : null}
       </div>
@@ -1487,13 +1620,16 @@ export function FolderBrowser({
   const inlineTools = wide && !selecting && !hideWideChrome;
   const atMachineFilesRoot =
     !path || path === '~' || (homePath && resolvedPath === homePath) || isMachineFilesRoot(resolvedPath);
+  const wideFolderHeading = folderDisplayName(resolvedPath, { technical, homePath });
 
   return html`
     <div data-no-swipe="true">
       ${wide && !embedded && !hideWideChrome
         ? html`
             <div class="files-wide-head">
-              <h2>${folderDisplayName(resolvedPath, { technical, homePath })}</h2>
+              <h2 aria-label=${wideFolderHeading} title=${wideFolderHeading}>
+                <${FileNameSingle} name=${wideFolderHeading} lines=${1} titleOnHover=${false} />
+              </h2>
               ${totalCount != null && totalCount > 0
                 ? html`<span class="dim">${formatFolderTotal(totalCount, totalExact)}</span>`
                 : null}
@@ -1669,7 +1805,11 @@ export function FolderBrowser({
               `
             : effectiveMode === 'grid'
               ? renderGrid()
-              : html`<div class="list">${visibleEntries.map(renderListRow)}</div>`}
+              : html`
+                  <${FileNameList} className="list" lines=${2}>
+                    ${visibleEntries.map((entry, idx) => renderListRow(entry, idx, visibleEntries))}
+                  <//>
+                `}
 
       ${oldTruncated
         ? html`
@@ -1716,6 +1856,7 @@ export function FilesSearchView({
   onRegisterRefresh = null,
   onNavigateFolder,
   onOpenFile,
+  onOpenItemSheet = null,
   onResultCountChange,
   onClearFilters,
   onUpdateQuery = null,
@@ -1728,6 +1869,15 @@ export function FilesSearchView({
   const size = route.query?.size || '';
   const changed = route.query?.changed || '';
   const kindsKey = kinds.join(',');
+  const searchLongPress = useItemLongPress(
+    useCallback(
+      (hit) => {
+        if (!onOpenItemSheet || !hit) return;
+        onOpenItemSheet(hit.machine, hit.entry);
+      },
+      [onOpenItemSheet],
+    ),
+  );
 
   const [resultsByMachine, setResultsByMachine] = useState({});
   const [truncatedByMachine, setTruncatedByMachine] = useState({});
@@ -2100,8 +2250,8 @@ export function FilesSearchView({
               return html`
                 <div key=${mName}>
                   <p class="label">${mName}</p>
-                  <div class="list">
-                    ${items.map((entry) => {
+                  <${FileNameList} className="list" lines=${2} dim=${false}>
+                    ${items.map((entry, idx) => {
                       const parent = parentFilePath(entry.path) || '~';
                       const sub = [
                         formatPathForDisplay(parent, { technical }),
@@ -2113,29 +2263,49 @@ export function FilesSearchView({
                       const starred = machineHasFav && favKeySet.has(`${mName}\0${entry.path}`);
                       const thumbHit = thumbCache.get(thumbCacheKey(mName, entry.path, entry.mtime || '', 128));
                       const thumbUrl = thumbHit && !thumbHit.failed ? thumbHit.url : null;
+                      const prevName = idx > 0 ? items[idx - 1].name : null;
+                      const nextName = idx + 1 < items.length ? items[idx + 1].name : null;
+                      const hitPayload = { machine: mName, entry };
                       return html`
                         <a
                           key=${entry.path}
                           class="row"
+                          aria-label=${entry.name}
+                          title=${entry.name}
                           href=${entry.kind === 'dir'
                             ? routeHref({ section: 'files', view: 'folder', machine: mName, path: entry.path })
                             : routeHref({ ...route, viewer: { machine: mName, path: entry.path } })}
+                          onPointerDown=${(e) => searchLongPress.start(e, hitPayload)}
+                          onPointerMove=${searchLongPress.move}
+                          onPointerUp=${searchLongPress.cancel}
+                          onPointerCancel=${searchLongPress.cancel}
+                          onContextMenu=${(e) => searchLongPress.contextMenu(e, hitPayload)}
                           onClick=${(e) => {
                             e.preventDefault();
+                            if (searchLongPress.consumeFired()) return;
                             if (entry.kind === 'dir') onNavigateFolder(mName, entry.path);
                             else onOpenFile(mName, entry, items);
                           }}
                         >
                           <${EntryThumb} entry=${entry} thumbUrl=${thumbUrl} />
                           <span class="body">
-                            <span class=${technical ? 'title mono' : 'title'}>${entry.name}</span>
+                            <${FileName}
+                              className=${technical ? 'title mono fn-title' : 'title fn-title'}
+                              name=${entry.name}
+                              before=${prevName}
+                              after=${nextName}
+                              lines=${2}
+                              dim=${false}
+                              highlight=${q}
+                              titleOnHover=${false}
+                            />
                             <span class="sub">${sub}</span>
                           </span>
                           ${starred ? html`<span class="star" aria-label="Favourite">★</span>` : null}
                         </a>
                       `;
                     })}
-                  </div>
+                  <//>
                   ${truncatedByMachine[mName]
                     ? html`<p class="search-note">Showing the first ${items.length} matches on ${mName}. Narrow your search to see more.</p>`
                     : null}
@@ -2158,13 +2328,40 @@ export function FilesSearchView({
 
 // ── Favourites & Recent Views ────────────────────────────────────────────────────────────────
 
-function FavouritesView({ favourites, technical, onNavigateFolder, onOpenFile, onTogglePin, onRemoveFav, caps }) {
+function FavouritesView({
+  favourites,
+  technical,
+  onNavigateFolder,
+  onOpenFile,
+  onOpenItemSheet = null,
+  onTogglePin,
+  onRemoveFav,
+  caps,
+}) {
+  const favLongPress = useItemLongPress(
+    useCallback(
+      (item) => {
+        if (!onOpenItemSheet || !item) return;
+        onOpenItemSheet(item.machine, {
+          name: item.label || baseFileName(item.path),
+          path: item.path,
+          kind: item.kind || 'file',
+          category: item.category,
+        });
+      },
+      [onOpenItemSheet],
+    ),
+  );
   if (!favourites || favourites.length === 0) {
     return html`<div class="empty">Star files or folders to find them quickly from any device.</div>`;
   }
   return html`
-    <div class="list">
-      ${favourites.map((item) => {
+    <${FileNameList} className="list" lines=${2}>
+      ${favourites.map((item, idx) => {
+        const label = item.label || baseFileName(item.path);
+        const prevLabel = idx > 0 ? favourites[idx - 1].label || baseFileName(favourites[idx - 1].path) : null;
+        const nextLabel =
+          idx + 1 < favourites.length ? favourites[idx + 1].label || baseFileName(favourites[idx + 1].path) : null;
         const sub = [item.machine, formatPathForDisplay(item.path, { technical }), item.pinned ? 'Pinned' : null]
           .filter(Boolean)
           .join(' · ');
@@ -2176,12 +2373,20 @@ function FavouritesView({ favourites, technical, onNavigateFolder, onOpenFile, o
           <a
             class="row"
             href=${href}
+            aria-label=${label}
+            title=${label}
+            onPointerDown=${(e) => favLongPress.start(e, item)}
+            onPointerMove=${favLongPress.move}
+            onPointerUp=${favLongPress.cancel}
+            onPointerCancel=${favLongPress.cancel}
+            onContextMenu=${(e) => favLongPress.contextMenu(e, item)}
             onClick=${(e) => {
               e.preventDefault();
+              if (favLongPress.consumeFired()) return;
               if (item.kind === 'dir') onNavigateFolder(item.machine, item.path);
               else
                 onOpenFile(item.machine, {
-                  name: item.label || baseFileName(item.path),
+                  name: label,
                   path: item.path,
                   kind: 'file',
                   category: item.category,
@@ -2192,7 +2397,14 @@ function FavouritesView({ favourites, technical, onNavigateFolder, onOpenFile, o
               <${Icon} name=${item.kind === 'dir' ? 'files' : entryIconName(item)} />
             </span>
             <span class="body">
-              <span class="title">${item.label || baseFileName(item.path)}</span>
+              <${FileName}
+                className="title fn-title"
+                name=${label}
+                before=${prevLabel}
+                after=${nextLabel}
+                lines=${2}
+                titleOnHover=${false}
+              />
               <span class="sub">${sub}</span>
             </span>
             <span class="star" aria-label="Favourite">★</span>
@@ -2219,17 +2431,37 @@ function FavouritesView({ favourites, technical, onNavigateFolder, onOpenFile, o
           <//>
         `;
       })}
-    </div>
+    <//>
   `;
 }
 
-function RecentView({ recentFiles, deviceNoun, technical, onOpenFile }) {
+function RecentView({ recentFiles, deviceNoun, technical, onOpenFile, onOpenItemSheet = null }) {
+  const recentLongPress = useItemLongPress(
+    useCallback(
+      (item) => {
+        if (!onOpenItemSheet || !item) return;
+        onOpenItemSheet(item.machine, {
+          name: item.name || baseFileName(item.path),
+          path: item.path,
+          kind: item.kind || 'file',
+          category: item.category,
+          size: item.size,
+          mtime: item.mtime,
+        });
+      },
+      [onOpenItemSheet],
+    ),
+  );
   if (!recentFiles || recentFiles.length === 0) {
     return html`<div class="empty">Files you open on this ${deviceNoun} appear here.</div>`;
   }
   return html`
-    <div class="list">
-      ${recentFiles.map((item) => {
+    <${FileNameList} className="list" lines=${2}>
+      ${recentFiles.map((item, idx) => {
+        const label = item.name || baseFileName(item.path);
+        const prevLabel = idx > 0 ? recentFiles[idx - 1].name || baseFileName(recentFiles[idx - 1].path) : null;
+        const nextLabel =
+          idx + 1 < recentFiles.length ? recentFiles[idx + 1].name || baseFileName(recentFiles[idx + 1].path) : null;
         const sub = [
           item.machine,
           item.size != null ? formatBytes(item.size) : null,
@@ -2242,8 +2474,16 @@ function RecentView({ recentFiles, deviceNoun, technical, onOpenFile }) {
             key=${`${item.machine}:${item.path}`}
             class="row"
             href=${routeHref({ section: 'files', view: 'recent', viewer: { machine: item.machine, path: item.path } })}
+            aria-label=${label}
+            title=${label}
+            onPointerDown=${(e) => recentLongPress.start(e, item)}
+            onPointerMove=${recentLongPress.move}
+            onPointerUp=${recentLongPress.cancel}
+            onPointerCancel=${recentLongPress.cancel}
+            onContextMenu=${(e) => recentLongPress.contextMenu(e, item)}
             onClick=${(e) => {
               e.preventDefault();
+              if (recentLongPress.consumeFired()) return;
               onOpenFile(item.machine, item);
             }}
           >
@@ -2251,13 +2491,20 @@ function RecentView({ recentFiles, deviceNoun, technical, onOpenFile }) {
               <${Icon} name=${entryIconName(item)} />
             </span>
             <span class="body">
-              <span class=${technical ? 'title mono' : 'title'}>${item.name || baseFileName(item.path)}</span>
+              <${FileName}
+                className=${technical ? 'title mono fn-title' : 'title fn-title'}
+                name=${label}
+                before=${prevLabel}
+                after=${nextLabel}
+                lines=${2}
+                titleOnHover=${false}
+              />
               <span class="sub">${sub}</span>
             </span>
           </a>
         `;
       })}
-    </div>
+    <//>
   `;
 }
 
@@ -2990,6 +3237,14 @@ export function FilesView({
     });
   }, [filesActions, startDownload, toggleStar, requestDelete]);
 
+  const openItemSheet = useCallback(
+    (machine, entry, { canSelect = false } = {}) => {
+      if (!machine || !entry) return;
+      filesActions.openSheet({ kind: 'item', machine, entry, canSelect });
+    },
+    [filesActions],
+  );
+
   const folderViewEl = activeFolderMachine
     ? html`
         <${FolderBrowser}
@@ -3031,6 +3286,7 @@ export function FilesView({
           }}
           onNavigateFolder=${navigateFolder}
           onOpenFile=${openFile}
+          onOpenItemSheet=${openItemSheet}
           onToggleSelect=${filesActions.toggleSelect}
           onStartSelectWith=${filesActions.startSelect}
           onToggleStar=${toggleStar}
@@ -3097,6 +3353,7 @@ export function FilesView({
           onRegisterRefresh=${wide ? null : onRegisterRefresh}
           onNavigateFolder=${navigateFolder}
           onOpenFile=${openFile}
+          onOpenItemSheet=${openItemSheet}
           onResultCountChange=${(summary) => {
             setWideSearchSummary(summary);
             filesActions.setSearchSummary(summary);
@@ -3117,6 +3374,7 @@ export function FilesView({
           caps=${localCaps}
           onNavigateFolder=${navigateFolder}
           onOpenFile=${openFile}
+          onOpenItemSheet=${openItemSheet}
           onTogglePin=${(item) => togglePin(item.machine, { path: item.path, name: item.label })}
           onRemoveFav=${(item) => toggleStar(item.machine, { path: item.path, name: item.label })}
         />
@@ -3129,6 +3387,7 @@ export function FilesView({
           deviceNoun=${deviceNoun}
           technical=${technical}
           onOpenFile=${openFile}
+          onOpenItemSheet=${openItemSheet}
         />
       `;
     }
@@ -3165,6 +3424,7 @@ export function FilesView({
         wide=${false}
         onNavigate=${navigateHref}
         onOpenFile=${openFile}
+        onOpenItemSheet=${openItemSheet}
         onStartSearch=${(q) =>
           navigateHref(routeHref({ section: 'files', view: 'search', query: { q: q || '', kinds: [], size: '', changed: '' } }))}
       />
@@ -3249,6 +3509,7 @@ export function FilesView({
         activeSyncId=${route.view === 'sync' ? route.syncId : null}
         onNavigate=${navigateHref}
         onOpenFile=${openFile}
+        onOpenItemSheet=${openItemSheet}
         onStartSearch=${(q) =>
           navigateHref(
             routeHref({ section: 'files', view: 'search', query: { q: q || '', kinds: [], size: '', changed: '' } }),
@@ -3549,6 +3810,35 @@ export function FilesView({
           `
         : null}
 
+      ${sheet?.kind === 'item'
+        ? (() => {
+            const itemFav = favourites.find(
+              (f) => f.machine === sheet.machine && f.path === sheet.entry?.path,
+            );
+            return html`
+              <${ItemSheet}
+                machine=${sheet.machine}
+                entry=${sheet.entry}
+                caps=${machineCapsFor(sheet.machine)}
+                deviceNoun=${deviceNoun}
+                technical=${technical}
+                isStarred=${Boolean(itemFav)}
+                isPinned=${Boolean(itemFav?.pinned)}
+                onStartSelect=${sheet.canSelect ? (p) => filesActions.startSelect(p) : null}
+                onSendTo=${(items) =>
+                  filesActions.openSheet({ kind: 'send', sourceMachine: sheet.machine, items })}
+                onDownload=${(item) => startDownload(sheet.machine, [item])}
+                onToggleStar=${(item) => toggleStar(sheet.machine, item)}
+                onTogglePin=${(item) => togglePin(sheet.machine, item)}
+                onRename=${(item) =>
+                  filesActions.openSheet({ kind: 'rename', machine: sheet.machine, entry: item })}
+                onDelete=${(items) => requestDelete(sheet.machine, items)}
+                onClose=${filesActions.closeSheet}
+              />
+            `;
+          })()
+        : null}
+
       ${sheet?.kind === 'more'
         ? html`
             <${FolderMoreSheet}
@@ -3790,6 +4080,7 @@ export function MachineFilesBrowser({
             viewer: { machine: m, path: entry.path },
           });
         }}
+        onOpenItemSheet=${(m, entry) => openSheet({ kind: 'item', machine: m, entry })}
         onEnsureAwake=${onEnsureAwake}
         onOpenSearch=${(q, m, p) => {
           window.location.hash = routeHref({
@@ -3818,6 +4109,18 @@ export function MachineFilesBrowser({
               kindFilter=${kindFilter}
               onChange=${setSortPref}
               onChangeKind=${setKindFilter}
+              onClose=${closeSheet}
+            />
+          `
+        : null}
+      ${activeSheet?.kind === 'item'
+        ? html`
+            <${ItemSheet}
+              machine=${activeSheet.machine || machine.name}
+              entry=${activeSheet.entry}
+              caps=${caps}
+              deviceNoun=${deviceNoun}
+              technical=${technical}
               onClose=${closeSheet}
             />
           `
