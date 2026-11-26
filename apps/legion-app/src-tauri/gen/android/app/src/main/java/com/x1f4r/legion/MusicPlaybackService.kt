@@ -66,9 +66,6 @@ class MusicPlaybackService : MediaSessionService() {
   private var loaded: Boolean = false
   private var isLoadingTrack: Boolean = false
   private var activeUrl: String? = null
-  private var activeTags: JSONObject? = null
-  private var activeCoverDataUrl: String? = null
-  private var activeCoverBytes: ByteArray? = null
   private var activeError: JSONObject? = null
   private var currentMetadata: MediaMetadata = MediaMetadata.EMPTY
   private var playbackSpeed: Float = 1.0f
@@ -553,33 +550,71 @@ class MusicPlaybackService : MediaSessionService() {
     return JSONObject().put("ok", true)
   }
 
-  internal fun handleDebugTrace(): JSONObject {
+  internal fun handleDebugTrace(params: JSONObject = JSONObject()): JSONObject {
+    val ticksOffset = params.optInt("ticksOffset", 0).coerceAtLeast(0)
+    val ticksLimit = params.optInt("ticksLimit", 100).coerceIn(0, 120)
+    val eventsOffset = params.optInt("eventsOffset", 0).coerceAtLeast(0)
+    val eventsLimit = params.optInt("eventsLimit", 100).coerceIn(0, 120)
+    val includeState = params.optBoolean("includeState", ticksOffset == 0 && eventsOffset == 0)
+
     val ticks = JSONArray()
     val events = JSONArray()
+    val totalTicks: Int
+    val totalEvents: Int
+    val nextTicksOffset: Int?
+    val nextEventsOffset: Int?
     synchronized(debugLock) {
-      for (t in debugTicks) ticks.put(t)
-      for (e in debugEvents) events.put(e)
+      val allTicks = debugTicks.toList()
+      val allEvents = debugEvents.toList()
+      totalTicks = allTicks.size
+      totalEvents = allEvents.size
+      if (ticksLimit > 0 && ticksOffset < totalTicks) {
+        val end = (ticksOffset + ticksLimit).coerceAtMost(totalTicks)
+        for (i in ticksOffset until end) {
+          ticks.put(allTicks[i])
+        }
+        nextTicksOffset = if (end < totalTicks) end else null
+      } else {
+        nextTicksOffset = null
+      }
+      if (eventsLimit > 0 && eventsOffset < totalEvents) {
+        val end = (eventsOffset + eventsLimit).coerceAtMost(totalEvents)
+        for (i in eventsOffset until end) {
+          events.put(allEvents[i])
+        }
+        nextEventsOffset = if (end < totalEvents) end else null
+      } else {
+        nextEventsOffset = null
+      }
     }
-    val snapshot = JSONObject()
-    runOnMainSync {
-      snapshot.put("loaded", loaded)
-      snapshot.put("playing", isEffectivelyPlaying())
-      snapshot.put("playWhenReady", loaded && exoPlayer.playWhenReady)
-      snapshot.put("suppressionReason", suppressionReasonName(exoPlayer.playbackSuppressionReason))
-      snapshot.put("sessionsCount", sessions.size)
-      snapshot.put("isPlaybackOngoing", isPlaybackOngoing)
-      snapshot.put("positionMs", if (loaded) exoPlayer.currentPosition.coerceAtLeast(0L) else 0L)
-      snapshot.put("durationMs", if (loaded) exoPlayer.duration.coerceAtLeast(0L) else 0L)
-      snapshot.put("path", queue.currentTrack()?.path ?: JSONObject.NULL)
-      snapshot.put("title", currentMetadata.title?.toString() ?: JSONObject.NULL)
-      snapshot.put("artist", currentMetadata.artist?.toString() ?: JSONObject.NULL)
-      snapshot.put("error", activeError ?: JSONObject.NULL)
-    }
-    return JSONObject()
+    val out = JSONObject()
       .put("supported", true)
-      .put("state", snapshot)
       .put("ticks", ticks)
+      .put("totalTicks", totalTicks)
+      .put("nextTicksOffset", nextTicksOffset ?: JSONObject.NULL)
       .put("events", events)
+      .put("totalEvents", totalEvents)
+      .put("nextEventsOffset", nextEventsOffset ?: JSONObject.NULL)
+
+    if (includeState) {
+      val snapshot = JSONObject()
+      runOnMainSync {
+        snapshot.put("loaded", loaded)
+        snapshot.put("playing", isEffectivelyPlaying())
+        snapshot.put("playWhenReady", loaded && exoPlayer.playWhenReady)
+        snapshot.put("suppressionReason", suppressionReasonName(exoPlayer.playbackSuppressionReason))
+        snapshot.put("sessionsCount", sessions.size)
+        snapshot.put("isPlaybackOngoing", isPlaybackOngoing)
+        snapshot.put("positionMs", if (loaded) exoPlayer.currentPosition.coerceAtLeast(0L) else 0L)
+        snapshot.put("durationMs", if (loaded) exoPlayer.duration.coerceAtLeast(0L) else 0L)
+        snapshot.put("path", queue.currentTrack()?.path ?: JSONObject.NULL)
+        snapshot.put("title", currentMetadata.title?.toString() ?: JSONObject.NULL)
+        snapshot.put("artist", currentMetadata.artist?.toString() ?: JSONObject.NULL)
+        snapshot.put("error", activeError ?: JSONObject.NULL)
+      }
+      out.put("state", snapshot)
+    }
+    return out
   }
 
   private fun skipNext() {
@@ -646,9 +681,6 @@ class MusicPlaybackService : MediaSessionService() {
     val seq = loadSeq.incrementAndGet()
     val prevUrl = activeUrl
     activeUrl = null
-    activeTags = null
-    activeCoverDataUrl = null
-    activeCoverBytes = null
     activeError = null
     isLoadingTrack = true
     cancelPausedDismiss()
@@ -685,14 +717,8 @@ class MusicPlaybackService : MediaSessionService() {
         }
         val tags = resp.optJSONObject("tags")
         val coverB64 = resp.optString("coverBase64", "").takeIf { it.isNotEmpty() }
-        val coverMime = resp.optString("coverMime", "").takeIf { it.isNotEmpty() }
         val coverBytes = if (coverB64 != null) {
           runCatching { Base64.decode(coverB64, Base64.DEFAULT) }.getOrNull()
-        } else {
-          null
-        }
-        val coverDataUrl = if (coverB64 != null && coverMime != null) {
-          "data:$coverMime;base64,$coverB64"
         } else {
           null
         }
@@ -716,9 +742,6 @@ class MusicPlaybackService : MediaSessionService() {
               return@post
             }
             activeUrl = url
-            activeTags = tags
-            activeCoverBytes = coverBytes
-            activeCoverDataUrl = coverDataUrl
             activeError = null
             isLoadingTrack = false
             currentMetadata = buildMediaMetadata(track, tags, coverBytes)
@@ -811,9 +834,6 @@ class MusicPlaybackService : MediaSessionService() {
     loaded = false
     isLoadingTrack = false
     activeError = null
-    activeTags = null
-    activeCoverDataUrl = null
-    activeCoverBytes = null
     currentMetadata = MediaMetadata.EMPTY
     queue.clear()
     cancelPositionTicker()
@@ -927,7 +947,6 @@ class MusicPlaybackService : MediaSessionService() {
       state.put("name", track?.name ?: "")
       state.put("shuffle", queue.shuffle)
       state.put("repeat", queue.repeat.wireName)
-      state.put("order", JSONArray(queue.currentOrderPaths()))
       state.put("loading", isLoadingTrack)
       state.put("playing", isPlaying)
       state.put("buffering", isBuffering)
@@ -935,30 +954,14 @@ class MusicPlaybackService : MediaSessionService() {
       state.put("durationMs", durationMs)
       state.put("bufferedMs", bufferedMs)
       state.put("playbackRate", playbackSpeed.toDouble())
-      if (activeTags != null) {
-        state.put("tags", activeTags)
-      }
-      if (includeCover && activeCoverDataUrl != null) {
-        state.put("coverDataUrl", activeCoverDataUrl)
-      }
-      if (includeTracks) {
-        val arr = JSONArray()
-        for (item in queue.allTracksInOrder()) {
-          arr.put(
-            JSONObject()
-              .put("path", item.path)
-              .put("name", item.name)
-              .put("kind", "file"),
-          )
-        }
-        state.put("tracks", arr)
-      }
       state.put("error", activeError ?: JSONObject.NULL)
     }
 
     AudioBridge.sendEvent(
       JSONObject()
         .put("event", "audio_state")
+        .put("includeCover", includeCover)
+        .put("includeTracks", includeTracks)
         .put("state", state),
     )
   }
@@ -1135,11 +1138,15 @@ class MusicPlaybackService : MediaSessionService() {
           return existing?.handleStopWithError(params) ?: JSONObject().put("ok", true)
         }
         "debugTrace" -> {
-          return existing?.handleDebugTrace() ?: JSONObject()
+          return existing?.handleDebugTrace(params) ?: JSONObject()
             .put("supported", true)
             .put("state", JSONObject().put("loaded", false))
             .put("ticks", JSONArray())
+            .put("totalTicks", 0)
+            .put("nextTicksOffset", JSONObject.NULL)
             .put("events", JSONArray())
+            .put("totalEvents", 0)
+            .put("nextEventsOffset", JSONObject.NULL)
         }
       }
 

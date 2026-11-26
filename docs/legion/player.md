@@ -233,10 +233,11 @@ inside a `mediaPlayback` `MediaSessionService`, keeping one shared state with th
   transient loss such as a call pauses and resumes when the call ends if music was playing before.
 - **Wake locks.** Held only while music is actively playing (and briefly around the track-switch
   ticket mint while advancing); released immediately on pause, stop, error, or dismiss.
-- **Revocation.** While playing, Rust checks device access on the node's two-second cadence in
-  addition to stream failures. If this device is revoked on the machine, playback stops promptly
-  within the revocation watchdog's window, revokes the ticket, drops the foreground service, and
-  shows a clear sentence naming the machine rather than playing buffered silence or looping.
+- **Revocation.** Legion does not poll the machine while music plays. When this device is revoked
+  on the machine, playback stops as soon as the node cuts an open stream or refuses the next song's
+  ticket, revoking the ticket, dropping the foreground service and wake locks, and showing a clear
+  sentence naming the machine rather than playing silence or looping. A song already fully buffered
+  on the phone may finish before playback stops at the next song.
 
 ### iOS and iPadOS
 
@@ -280,9 +281,11 @@ Picture-in-picture for video remains for a later step.
   songs with embedded covers, lock the screen (`KEYCODE_POWER`) and let it play for five full
   minutes; verify the native 1-second position log has no gap larger than 2 seconds against wall
   time, at least four songs play through in order, `MediaSession` metadata and the notification
-  match each song, `cmd media_session dispatch next` advances, zero wake locks are held while
-  paused, revoking the device on the node stops playback within the revocation watchdog's window
-  with a clear sentence, and focus/headphone events pause and resume as specified.
+  match each song, zero non-stream calls reach the machine between songs, `cmd media_session
+  dispatch next` advances, zero wake locks are held while paused, revoking the device on the node
+  stops a long streaming song promptly and lets a short fully buffered song finish before stopping
+  at the next song (both with a clear sentence and zero wake locks), and focus/headphone events
+  pause and resume as specified.
 - `immersive`: on the Android emulator, screenshots prove the bars are gone and nothing of the
   app surrounds the video, in both orientations, by button and by turning, and that back and
   close restore them. Desktop: the window's state before and after. Browser tests: the viewer

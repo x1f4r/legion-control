@@ -7,10 +7,8 @@
 //!
 //! Keeping this bridge in Rust means `MusicPlaybackService` can mint fresh short-lived loopback
 //! content URLs, revoke previous tickets, fetch `fs.tags` / `fs.thumb` metadata for auto-advanced
-//! tracks, and detect mid-playback device revocation while the screen is off and the WebView is
-//! asleep.
-
-use std::time::Duration;
+//! tracks, and classify stream or next-ticket failures (including device revocation) while the
+//! screen is off and the WebView is asleep.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,11 +19,60 @@ use crate::content::ContentUrlStatus;
 /// Event emitted to the web view whenever the native Android music service state changes.
 pub const EVENT_AUDIO_STATE: &str = "legion://audio-state";
 
-/// Interval for the active-playback device revocation check on Android.
-///
-/// Matches the node's 2-second revocation watchdog so even a short song that finished buffering
-/// into ExoPlayer stops promptly when this device is removed from the node.
-pub const REVOCATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Maximum newline-delimited JSON frame accepted from Kotlin over the Android audio bridge Unix
+/// domain socket (64 KiB). Any line exceeding this cap closes the connection immediately.
+pub const MAX_BRIDGE_LINE_BYTES: usize = 64 * 1024;
+
+/// Failure returned by [`read_bounded_line`].
+#[derive(Debug)]
+pub enum BridgeReadError {
+    /// A single line exceeded the configured byte cap (including its trailing newline, if any).
+    LineTooLong,
+    /// The frame bytes were not valid UTF-8.
+    InvalidUtf8(std::string::FromUtf8Error),
+    /// Underlying stream I/O failure.
+    Io(std::io::Error),
+}
+
+/// Reads one `\n`-delimited UTF-8 frame from `reader` without ever buffering more than `max_bytes`
+/// bytes (including the trailing `\n`). Returns `Ok(None)` at clean EOF with no unread bytes, or
+/// [`BridgeReadError::LineTooLong`] immediately as soon as a frame would exceed `max_bytes`.
+pub async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<Option<String>, BridgeReadError> {
+    let mut buf = Vec::new();
+    loop {
+        let available = tokio::io::AsyncBufReadExt::fill_buf(reader)
+            .await
+            .map_err(BridgeReadError::Io)?;
+        if available.is_empty() {
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            return String::from_utf8(buf)
+                .map(Some)
+                .map_err(BridgeReadError::InvalidUtf8);
+        }
+        if let Some(nl_pos) = available.iter().position(|&b| b == b'\n') {
+            let take = nl_pos + 1;
+            if buf.len().saturating_add(take) > max_bytes {
+                return Err(BridgeReadError::LineTooLong);
+            }
+            buf.extend_from_slice(&available[..take]);
+            tokio::io::AsyncBufReadExt::consume(reader, take);
+            return String::from_utf8(buf)
+                .map(Some)
+                .map_err(BridgeReadError::InvalidUtf8);
+        }
+        if buf.len().saturating_add(available.len()) > max_bytes {
+            return Err(BridgeReadError::LineTooLong);
+        }
+        let take = available.len();
+        buf.extend_from_slice(available);
+        tokio::io::AsyncBufReadExt::consume(reader, take);
+    }
+}
 
 /// Managed Tauri state wrapper for [`AudioManager`].
 pub struct SharedAudio(pub std::sync::Arc<AudioManager>);
@@ -199,17 +246,23 @@ mod platform {
 
     use serde_json::{Value, json};
     use tauri::{AppHandle, Emitter, Manager};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncWriteExt, BufReader};
     use tokio::net::{UnixListener, UnixStream};
-    use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot};
+    use tokio::sync::{Mutex as AsyncMutex, oneshot};
 
     use super::{
-        EVENT_AUDIO_STATE, REVOCATION_POLL_INTERVAL, classify_audio_failure, extract_tags_for_path,
-        extract_thumb_for_path, format_revocation_message, is_revocation_error,
-        verify_bridge_token,
+        BridgeReadError, EVENT_AUDIO_STATE, MAX_BRIDGE_LINE_BYTES, classify_audio_failure,
+        extract_tags_for_path, extract_thumb_for_path, format_revocation_message,
+        is_revocation_error, read_bounded_line, verify_bridge_token,
     };
     use crate::backend::{AppError, Backend, CallRequest, ErrorCode};
     use crate::content::AppContentServer;
+
+    struct CachedTrackMeta {
+        path: String,
+        tags: Option<Value>,
+        cover_data_url: Option<String>,
+    }
 
     /// Managed Tauri plugin handle for `com.x1f4r.legion.AudioPlugin` on Android.
     pub struct AndroidAudioPluginHandle(pub tauri::plugin::PluginHandle<tauri::Wry>);
@@ -323,12 +376,14 @@ mod platform {
         plugin: Mutex<Option<Arc<AndroidAudioPluginHandle>>>,
         client: Mutex<Option<Arc<BridgeClient>>>,
         latest_state: Mutex<Value>,
+        cached_tracks: Mutex<Vec<Value>>,
+        cached_order: Mutex<Vec<String>>,
+        cached_track_meta: Mutex<Option<CachedTrackMeta>>,
         active_loaded: AtomicBool,
         active_playing: AtomicBool,
         active_machine: Mutex<Option<String>>,
         active_url: Mutex<Option<String>>,
         notification_permission_asked: AtomicBool,
-        revocation_notify: Notify,
         shutting_down: AtomicBool,
     }
 
@@ -372,12 +427,14 @@ mod platform {
                 plugin: Mutex::new(None),
                 client: Mutex::new(None),
                 latest_state: Mutex::new(json!({ "loaded": false })),
+                cached_tracks: Mutex::new(Vec::new()),
+                cached_order: Mutex::new(Vec::new()),
+                cached_track_meta: Mutex::new(None),
                 active_loaded: AtomicBool::new(false),
                 active_playing: AtomicBool::new(false),
                 active_machine: Mutex::new(None),
                 active_url: Mutex::new(None),
                 notification_permission_asked: AtomicBool::new(false),
-                revocation_notify: Notify::new(),
                 shutting_down: AtomicBool::new(false),
             });
 
@@ -416,11 +473,6 @@ mod platform {
                         }
                     }
                 }
-            });
-
-            let watch_mgr = Arc::clone(&manager);
-            crate::transfers::spawn_bg(async move {
-                watch_mgr.revocation_watch_loop().await;
             });
 
             Ok(manager)
@@ -508,6 +560,51 @@ mod platform {
         /// Loads a folder queue into `MusicPlaybackService` and starts preparing/playing the
         /// chosen track.
         pub async fn load_queue(&self, payload: Value) -> Result<Value, AppError> {
+            let mut tracks_cache = Vec::new();
+            let mut order_cache = Vec::new();
+            if let Some(arr) = payload.get("tracks").and_then(Value::as_array) {
+                for item in arr {
+                    let Some(path) = item.get("path").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if path.is_empty() {
+                        continue;
+                    }
+                    let name = item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| path.rsplit('/').next().unwrap_or(path));
+                    let mut entry = json!({
+                        "path": path,
+                        "name": name,
+                        "kind": "file",
+                    });
+                    if let Some(obj) = entry.as_object_mut() {
+                        for key in ["size", "mtime", "mime", "duration_s"] {
+                            if let Some(val) = item.get(key)
+                                && !val.is_null()
+                            {
+                                obj.insert(key.to_owned(), val.clone());
+                            }
+                        }
+                    }
+                    tracks_cache.push(entry);
+                    order_cache.push(path.to_owned());
+                }
+            }
+            *self
+                .cached_tracks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = tracks_cache;
+            *self
+                .cached_order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = order_cache;
+            *self
+                .cached_track_meta
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
             let client = self.wait_for_client().await?;
             client.call("loadQueue", payload).await
         }
@@ -526,6 +623,20 @@ mod platform {
 
         /// Updates shuffle/repeat modes and the active playback order in `MusicPlaybackService`.
         pub async fn set_modes(&self, payload: Value) -> Result<Value, AppError> {
+            if let Some(arr) = payload.get("order").and_then(Value::as_array) {
+                let order: Vec<String> = arr
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                if !order.is_empty() {
+                    *self
+                        .cached_order
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = order;
+                }
+            }
             let client = self.wait_for_client().await?;
             client.call("setModes", payload).await
         }
@@ -534,8 +645,8 @@ mod platform {
         pub async fn dismiss(&self) -> Result<Value, AppError> {
             self.active_loaded.store(false, Ordering::Release);
             self.active_playing.store(false, Ordering::Release);
-            self.revocation_notify.notify_one();
             self.revoke_active_url();
+            self.clear_cached_queue();
             *self
                 .active_machine
                 .lock()
@@ -569,11 +680,78 @@ mod platform {
         }
 
         /// Returns the debug-only 1-second position/metadata/event ring buffer from
-        /// `MusicPlaybackService`.
+        /// `MusicPlaybackService`, paged so no bridge frame approaches [`MAX_BRIDGE_LINE_BYTES`].
         #[cfg(debug_assertions)]
         pub async fn debug_trace(&self) -> Result<Value, AppError> {
             let client = self.wait_for_client().await?;
-            client.call("debugTrace", json!({})).await
+            let mut ticks: Vec<Value> = Vec::new();
+            let mut events: Vec<Value> = Vec::new();
+            let mut state = json!({ "loaded": false });
+            let mut supported = true;
+
+            let mut ticks_offset: u64 = 0;
+            let mut include_state = true;
+            loop {
+                let page = client
+                    .call(
+                        "debugTrace",
+                        json!({
+                            "ticksOffset": ticks_offset,
+                            "ticksLimit": 100,
+                            "eventsOffset": 0,
+                            "eventsLimit": 0,
+                            "includeState": include_state,
+                        }),
+                    )
+                    .await?;
+                if include_state {
+                    supported = page
+                        .get("supported")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
+                    if let Some(s) = page.get("state") {
+                        state = s.clone();
+                    }
+                    include_state = false;
+                }
+                if let Some(arr) = page.get("ticks").and_then(Value::as_array) {
+                    ticks.extend(arr.iter().cloned());
+                }
+                match page.get("nextTicksOffset").and_then(Value::as_u64) {
+                    Some(next) if next > ticks_offset => ticks_offset = next,
+                    _ => break,
+                }
+            }
+
+            let mut events_offset: u64 = 0;
+            loop {
+                let page = client
+                    .call(
+                        "debugTrace",
+                        json!({
+                            "ticksOffset": 0,
+                            "ticksLimit": 0,
+                            "eventsOffset": events_offset,
+                            "eventsLimit": 100,
+                            "includeState": false,
+                        }),
+                    )
+                    .await?;
+                if let Some(arr) = page.get("events").and_then(Value::as_array) {
+                    events.extend(arr.iter().cloned());
+                }
+                match page.get("nextEventsOffset").and_then(Value::as_u64) {
+                    Some(next) if next > events_offset => events_offset = next,
+                    _ => break,
+                }
+            }
+
+            Ok(json!({
+                "supported": supported,
+                "state": state,
+                "ticks": ticks,
+                "events": events,
+            }))
         }
 
         /// Stops background watchers and revokes any live audio ticket when the app exits.
@@ -581,8 +759,8 @@ mod platform {
             self.shutting_down.store(true, Ordering::Release);
             self.active_loaded.store(false, Ordering::Release);
             self.active_playing.store(false, Ordering::Release);
-            self.revocation_notify.notify_one();
             self.revoke_active_url();
+            self.clear_cached_queue();
             if let Some(client) = self
                 .client
                 .lock()
@@ -593,6 +771,21 @@ mod platform {
                     let _ = client.call("dismiss", json!({})).await;
                 });
             }
+        }
+
+        fn clear_cached_queue(&self) {
+            self.cached_tracks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+            self.cached_order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+            *self
+                .cached_track_meta
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         }
 
         fn revoke_active_url(&self) {
@@ -643,17 +836,22 @@ mod platform {
         async fn serve_connection(self: Arc<Self>, stream: UnixStream) {
             let (read_half, write_half) = stream.into_split();
             let mut reader = BufReader::new(read_half);
-            let mut first_line = String::new();
-            let Ok(n) =
-                tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut first_line))
-                    .await
-                    .unwrap_or(Ok(0))
-            else {
-                return;
+            let first_line = match tokio::time::timeout(
+                Duration::from_secs(5),
+                read_bounded_line(&mut reader, MAX_BRIDGE_LINE_BYTES),
+            )
+            .await
+            {
+                Ok(Ok(Some(line))) => line,
+                Ok(Err(BridgeReadError::LineTooLong)) => {
+                    log::warn!(
+                        target: "legion-audio",
+                        "rejected oversized audio bridge hello frame (> {MAX_BRIDGE_LINE_BYTES} bytes)"
+                    );
+                    return;
+                }
+                _ => return,
             };
-            if n == 0 {
-                return;
-            }
             let Ok(hello) = serde_json::from_str::<Value>(&first_line) else {
                 return;
             };
@@ -680,46 +878,58 @@ mod platform {
             }
             log::info!(target: "legion-audio", "Android LocalSocket audio bridge connected");
 
-            let mut line = String::new();
             loop {
-                line.clear();
-                match reader.read_line(&mut line).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
-                            continue;
-                        };
-                        if let Some(id) = msg.get("id").and_then(Value::as_u64) {
-                            if let Some(err_msg) = msg.get("error").and_then(Value::as_str) {
-                                let code = match msg.get("errorCode").and_then(Value::as_str) {
-                                    Some("denied") => ErrorCode::Denied,
-                                    Some("not_found") => ErrorCode::NotFound,
-                                    Some("unsupported") => ErrorCode::Unsupported,
-                                    Some("unreachable") => ErrorCode::Unreachable,
-                                    _ => ErrorCode::Failed,
-                                };
-                                client.resolve(id, Err(AppError::new(code, err_msg.to_owned())));
-                            } else {
-                                let result = msg.get("result").cloned().unwrap_or(Value::Null);
-                                client.resolve(id, Ok(result));
-                            }
-                        } else if let Some(req_id) = msg.get("reqId").and_then(Value::as_u64) {
-                            let method = msg
-                                .get("method")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_owned();
-                            let params = msg.get("params").cloned().unwrap_or(Value::Null);
-                            let this = Arc::clone(&self);
-                            let reply_client = Arc::clone(&client);
-                            tokio::spawn(async move {
-                                this.handle_kotlin_request(reply_client, req_id, method, params)
-                                    .await;
-                            });
-                        } else if let Some(event) = msg.get("event").and_then(Value::as_str) {
-                            self.handle_kotlin_event(event, &msg);
-                        }
+                let line = match read_bounded_line(&mut reader, MAX_BRIDGE_LINE_BYTES).await {
+                    Ok(Some(line)) => line,
+                    Ok(None) => break,
+                    Err(BridgeReadError::LineTooLong) => {
+                        log::warn!(
+                            target: "legion-audio",
+                            "closing audio bridge connection after oversized frame (> {MAX_BRIDGE_LINE_BYTES} bytes)"
+                        );
+                        break;
                     }
+                    Err(BridgeReadError::InvalidUtf8(_)) => {
+                        log::warn!(
+                            target: "legion-audio",
+                            "closing audio bridge connection after invalid UTF-8 frame"
+                        );
+                        break;
+                    }
+                    Err(BridgeReadError::Io(_)) => break,
+                };
+                let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if let Some(id) = msg.get("id").and_then(Value::as_u64) {
+                    if let Some(err_msg) = msg.get("error").and_then(Value::as_str) {
+                        let code = match msg.get("errorCode").and_then(Value::as_str) {
+                            Some("denied") => ErrorCode::Denied,
+                            Some("not_found") => ErrorCode::NotFound,
+                            Some("unsupported") => ErrorCode::Unsupported,
+                            Some("unreachable") => ErrorCode::Unreachable,
+                            _ => ErrorCode::Failed,
+                        };
+                        client.resolve(id, Err(AppError::new(code, err_msg.to_owned())));
+                    } else {
+                        let result = msg.get("result").cloned().unwrap_or(Value::Null);
+                        client.resolve(id, Ok(result));
+                    }
+                } else if let Some(req_id) = msg.get("reqId").and_then(Value::as_u64) {
+                    let method = msg
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    let params = msg.get("params").cloned().unwrap_or(Value::Null);
+                    let this = Arc::clone(&self);
+                    let reply_client = Arc::clone(&client);
+                    tokio::spawn(async move {
+                        this.handle_kotlin_request(reply_client, req_id, method, params)
+                            .await;
+                    });
+                } else if let Some(event) = msg.get("event").and_then(Value::as_str) {
+                    self.handle_kotlin_event(event, &msg);
                 }
             }
 
@@ -759,7 +969,7 @@ mod platform {
                         None
                     };
 
-                    let was_playing = self.active_playing.swap(playing, Ordering::AcqRel);
+                    self.active_playing.store(playing, Ordering::Release);
                     self.active_loaded.store(loaded, Ordering::Release);
                     *self
                         .active_machine
@@ -767,15 +977,96 @@ mod platform {
                         .unwrap_or_else(|poisoned| poisoned.into_inner()) = machine;
                     if !loaded {
                         self.revoke_active_url();
+                        self.clear_cached_queue();
+                        let empty = json!({ "loaded": false });
+                        *self
+                            .latest_state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = empty.clone();
+                        let _ = self.app_handle.emit(EVENT_AUDIO_STATE, empty);
+                        return;
                     }
+
+                    let include_cover = msg
+                        .get("includeCover")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let include_tracks = msg
+                        .get("includeTracks")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let state_path = state.get("path").and_then(Value::as_str);
+
+                    let mut full_state = state.clone();
+                    let mut emit_state = state.clone();
+
+                    let order_vec = self
+                        .cached_order
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    if !order_vec.is_empty() {
+                        let order_val =
+                            Value::Array(order_vec.into_iter().map(Value::String).collect());
+                        if let Some(obj) = full_state.as_object_mut() {
+                            obj.insert("order".to_owned(), order_val.clone());
+                        }
+                        if let Some(obj) = emit_state.as_object_mut() {
+                            obj.insert("order".to_owned(), order_val);
+                        }
+                    }
+
+                    let tracks_vec = self
+                        .cached_tracks
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    if !tracks_vec.is_empty() {
+                        let tracks_val = Value::Array(tracks_vec);
+                        if let Some(obj) = full_state.as_object_mut() {
+                            obj.insert("tracks".to_owned(), tracks_val.clone());
+                        }
+                        if include_tracks && let Some(obj) = emit_state.as_object_mut() {
+                            obj.insert("tracks".to_owned(), tracks_val);
+                        }
+                    }
+
+                    if let Some(path) = state_path {
+                        let meta_guard = self
+                            .cached_track_meta
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if let Some(meta) = meta_guard.as_ref().filter(|m| m.path == path) {
+                            if let Some(ref tags) = meta.tags {
+                                if let Some(obj) = full_state.as_object_mut() {
+                                    obj.insert("tags".to_owned(), tags.clone());
+                                }
+                                if let Some(obj) = emit_state.as_object_mut() {
+                                    obj.insert("tags".to_owned(), tags.clone());
+                                }
+                            }
+                            if let Some(ref cover) = meta.cover_data_url {
+                                if let Some(obj) = full_state.as_object_mut() {
+                                    obj.insert(
+                                        "coverDataUrl".to_owned(),
+                                        Value::String(cover.clone()),
+                                    );
+                                }
+                                if include_cover && let Some(obj) = emit_state.as_object_mut() {
+                                    obj.insert(
+                                        "coverDataUrl".to_owned(),
+                                        Value::String(cover.clone()),
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     *self
                         .latest_state
                         .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = state.clone();
-                    if playing != was_playing {
-                        self.revocation_notify.notify_one();
-                    }
-                    let _ = self.app_handle.emit(EVENT_AUDIO_STATE, state.clone());
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = full_state;
+                    let _ = self.app_handle.emit(EVENT_AUDIO_STATE, emit_state);
                 }
                 "activity_created" if self.app_handle.get_webview_window("main").is_none() => {
                     let app = self.app_handle.clone();
@@ -848,6 +1139,21 @@ mod platform {
             }
         }
 
+        /// Runs `meta.whoami` strictly on an error path (stream cut or failed next-track ticket)
+        /// so a revoked device is distinguished cleanly from a dropped connection. Retries once
+        /// on `Unreachable` because the first RPC after the node terminates an SSH session can
+        /// observe EOF before reconnect reports `Denied` (`auth_failed`).
+        async fn probe_whoami_on_error(&self, machine: &str) -> Result<(), AppError> {
+            let first = self.probe_whoami(machine).await;
+            if let Err(ref err) = first
+                && err.code == ErrorCode::Unreachable
+            {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                return self.probe_whoami(machine).await;
+            }
+            first
+        }
+
         async fn rpc_mint_track(&self, params: Value) -> Result<Value, (String, String, bool)> {
             let machine = params
                 .get("machine")
@@ -885,6 +1191,8 @@ mod platform {
                 Ok(res) => res,
                 Err(err) => {
                     if is_revocation_error(&err) {
+                        self.revoke_active_url();
+                        let _ = self.backend.invalidate_sessions().await;
                         return Err((
                             "denied".to_owned(),
                             format_revocation_message(&machine),
@@ -892,9 +1200,11 @@ mod platform {
                         ));
                     }
                     if err.code == ErrorCode::Unreachable
-                        && let Err(who_err) = self.probe_whoami(&machine).await
+                        && let Err(who_err) = self.probe_whoami_on_error(&machine).await
                         && is_revocation_error(&who_err)
                     {
+                        self.revoke_active_url();
+                        let _ = self.backend.invalidate_sessions().await;
                         return Err((
                             "denied".to_owned(),
                             format_revocation_message(&machine),
@@ -959,6 +1269,18 @@ mod platform {
                     cover_base64 = Some(b64);
                     cover_mime = Some(mime);
                 }
+                let cover_data_url = match (&cover_base64, &cover_mime) {
+                    (Some(b64), Some(mime)) => Some(format!("data:{mime};base64,{b64}")),
+                    _ => None,
+                };
+                *self
+                    .cached_track_meta
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(CachedTrackMeta {
+                    path: path.clone(),
+                    tags: tags.clone(),
+                    cover_data_url,
+                });
             }
 
             Ok(json!({
@@ -985,7 +1307,7 @@ mod platform {
             let whoami_err = if machine.is_empty() {
                 None
             } else {
-                self.probe_whoami(&machine).await.err()
+                self.probe_whoami_on_error(&machine).await.err()
             };
             let classified = classify_audio_failure(&status, whoami_err.as_ref(), &machine);
             if classified.revoked {
@@ -997,92 +1319,6 @@ mod platform {
                 "message": classified.message,
                 "revoked": classified.revoked,
             }))
-        }
-
-        async fn revocation_watch_loop(self: Arc<Self>) {
-            loop {
-                if self.shutting_down.load(Ordering::Acquire) {
-                    break;
-                }
-                if !self.active_playing.load(Ordering::Acquire) {
-                    self.revocation_notify.notified().await;
-                    continue;
-                }
-                tokio::select! {
-                    () = self.revocation_notify.notified() => {
-                        continue;
-                    }
-                    () = tokio::time::sleep(REVOCATION_POLL_INTERVAL) => {}
-                }
-                if self.shutting_down.load(Ordering::Acquire)
-                    || !self.active_playing.load(Ordering::Acquire)
-                {
-                    continue;
-                }
-                let Some(machine) = self
-                    .active_machine
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone()
-                else {
-                    continue;
-                };
-
-                let mut probe = self.probe_whoami(&machine).await;
-                if let Err(ref err) = probe
-                    && err.code == ErrorCode::Unreachable
-                    && self.active_playing.load(Ordering::Acquire)
-                {
-                    // When the node terminates a live SSH session on revocation, the first RPC on
-                    // that cached channel can fail with EOF (`Unreachable`) before reconnect sees
-                    // `Denied` (`auth_failed`). Retry once right away so revocation stops within
-                    // the watchdog window.
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                    if self.active_playing.load(Ordering::Acquire) {
-                        probe = self.probe_whoami(&machine).await;
-                    }
-                }
-
-                if let Err(err) = probe
-                    && is_revocation_error(&err)
-                {
-                    let still_same = self.active_playing.load(Ordering::Acquire)
-                        && self
-                            .active_machine
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .as_deref()
-                            == Some(machine.as_str());
-                    if !still_same {
-                        continue;
-                    }
-                    let message = format_revocation_message(&machine);
-                    log::warn!(
-                        target: "legion-audio",
-                        "Device access revoked on {machine} during playback; stopping native audio"
-                    );
-                    self.active_playing.store(false, Ordering::Release);
-                    self.revoke_active_url();
-                    let _ = self.backend.invalidate_sessions().await;
-                    let client = self
-                        .client
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clone();
-                    if let Some(client) = client {
-                        let _ = client
-                            .call(
-                                "stopWithError",
-                                json!({
-                                    "code": "denied",
-                                    "message": message,
-                                    "revoked": true,
-                                }),
-                            )
-                            .await;
-                    }
-                }
-            }
         }
     }
 }
@@ -1310,5 +1546,96 @@ mod tests {
         assert!(!verify_bridge_token("abcdef0123", "abcdef0124"));
         assert!(!verify_bridge_token("abcdef0123", "abcdef"));
         assert!(!verify_bridge_token("", ""));
+    }
+
+    #[tokio::test]
+    async fn read_bounded_line_accepts_exact_cap_and_multiple_frames() {
+        use tokio::io::BufReader;
+
+        let exact_with_nl = format!("{}\n", "a".repeat(MAX_BRIDGE_LINE_BYTES - 1));
+        assert_eq!(exact_with_nl.len(), MAX_BRIDGE_LINE_BYTES);
+        let second = "{\"event\":\"audio_state\"}\n";
+        let mut payload = Vec::with_capacity(exact_with_nl.len() + second.len());
+        payload.extend_from_slice(exact_with_nl.as_bytes());
+        payload.extend_from_slice(second.as_bytes());
+
+        // Small buffer capacity forces multi-chunk reading across the 64 KiB line boundary.
+        let mut reader = BufReader::with_capacity(1024, payload.as_slice());
+        let first_read = read_bounded_line(&mut reader, MAX_BRIDGE_LINE_BYTES).await;
+        assert!(matches!(first_read, Ok(Some(ref s)) if s == &exact_with_nl));
+
+        let second_read = read_bounded_line(&mut reader, MAX_BRIDGE_LINE_BYTES).await;
+        assert!(matches!(second_read, Ok(Some(ref s)) if s == second));
+
+        let eof = read_bounded_line(&mut reader, MAX_BRIDGE_LINE_BYTES).await;
+        assert!(matches!(eof, Ok(None)));
+
+        // Exact cap at EOF with no trailing newline also succeeds.
+        let exact_no_nl = "b".repeat(MAX_BRIDGE_LINE_BYTES);
+        let mut reader_eof = BufReader::with_capacity(512, exact_no_nl.as_bytes());
+        let line_eof = read_bounded_line(&mut reader_eof, MAX_BRIDGE_LINE_BYTES).await;
+        assert!(matches!(line_eof, Ok(Some(ref s)) if s == &exact_no_nl));
+    }
+
+    #[tokio::test]
+    async fn read_bounded_line_rejects_oversized_frames_with_or_without_newline() {
+        use tokio::io::BufReader;
+
+        // 64 KiB + 1 byte ending in '\n' (65536 payload bytes + '\n' = 65537).
+        let over_with_nl = format!("{}\n", "x".repeat(MAX_BRIDGE_LINE_BYTES));
+        assert_eq!(over_with_nl.len(), MAX_BRIDGE_LINE_BYTES + 1);
+        let mut reader = BufReader::with_capacity(1024, over_with_nl.as_bytes());
+        let err = read_bounded_line(&mut reader, MAX_BRIDGE_LINE_BYTES).await;
+        assert!(matches!(err, Err(BridgeReadError::LineTooLong)));
+
+        // 64 KiB + 1 byte with no newline at all (simulating an unbounded flood).
+        let over_no_nl = "y".repeat(MAX_BRIDGE_LINE_BYTES + 1);
+        let mut reader_no_nl = BufReader::with_capacity(1024, over_no_nl.as_bytes());
+        let err_no_nl = read_bounded_line(&mut reader_no_nl, MAX_BRIDGE_LINE_BYTES).await;
+        assert!(matches!(err_no_nl, Err(BridgeReadError::LineTooLong)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_unix_socket_reader_closes_connection_on_oversized_frame()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixStream;
+
+        let (server_stream, mut client_stream) = UnixStream::pair()?;
+
+        let server_task = tokio::spawn(async move {
+            let (read_half, mut write_half) = server_stream.into_split();
+            let mut reader = BufReader::new(read_half);
+
+            let first = read_bounded_line(&mut reader, MAX_BRIDGE_LINE_BYTES).await;
+            assert!(matches!(first, Ok(Some(_))));
+            if let Ok(Some(line)) = first {
+                assert!(write_half.write_all(line.as_bytes()).await.is_ok());
+            }
+
+            // Next frame exceeds 64 KiB: reader must return LineTooLong and drop the socket.
+            let second = read_bounded_line(&mut reader, MAX_BRIDGE_LINE_BYTES).await;
+            assert!(matches!(second, Err(BridgeReadError::LineTooLong)));
+            drop(reader);
+            drop(write_half);
+        });
+
+        client_stream.write_all(b"{\"type\":\"hello\"}\n").await?;
+        let mut echo = [0u8; 17];
+        client_stream.read_exact(&mut echo).await?;
+        assert_eq!(&echo, b"{\"type\":\"hello\"}\n");
+
+        // Send an oversized line (64 KiB + 1 byte) with no newline; server must reject and close.
+        let oversized = vec![b'z'; MAX_BRIDGE_LINE_BYTES + 1];
+        let _ = client_stream.write_all(&oversized).await;
+
+        server_task.await?;
+
+        // Confirm the connection is actually closed from the client's perspective (EOF or error).
+        let mut probe = [0u8; 16];
+        let closed = matches!(client_stream.read(&mut probe).await, Ok(0) | Err(_));
+        assert!(closed, "socket must be closed after oversized frame");
+        Ok(())
     }
 }
