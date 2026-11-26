@@ -2742,3 +2742,168 @@ browserTest(
     }
   },
 );
+
+browserTest(
+  'HTTP door requests quietly retry once after a transient network-change error without showing an error',
+  { timeout: 120_000 },
+  async (_t, tracker) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legion-ui-netchange-'));
+    const legionHome = path.join(root, 'legion');
+    const userHome = path.join(root, 'home');
+    const galleryDir = path.join(userHome, 'gallery');
+    fs.mkdirSync(path.join(legionHome, 'config'), { recursive: true });
+    fs.mkdirSync(path.join(legionHome, 'state'), { recursive: true });
+    fs.mkdirSync(galleryDir, { recursive: true });
+    fs.writeFileSync(path.join(galleryDir, 'harbor.png'), makeSolidPng(160, 120, 60, 150, 210));
+    fs.writeFileSync(
+      path.join(legionHome, 'config', 'node.toml'),
+      'name = "tower"\nsystem = "linux"\nbusy = "none"\n',
+    );
+    fs.writeFileSync(
+      path.join(legionHome, 'config', 'policy.toml'),
+      [
+        'default = "owner"',
+        '',
+        '[principals.ui]',
+        'role = "operator"',
+        '',
+        '[roles.operator]',
+        'allow = ["effect:read", "effect:write"]',
+        '',
+      ].join('\n'),
+    );
+
+    const tokenOut = JSON.parse(runLegion(['token.add', 'name=ui', 'principal=ui', '--json'], legionHome, userHome));
+    const server = await startServer(legionHome, userHome);
+    tracker.setServerStderr(server.getStderr);
+    const browser = await launchBrowser();
+
+    const consoleErrors = [];
+    const pageErrors = [];
+    const counts = { health: 0, tools: 0, fsList: 0, content: 0, fsMkdir: 0 };
+    let page = null;
+
+    try {
+      const ctx = await browser.newContext({ viewport: { width: 1100, height: 720 }, colorScheme: 'dark' });
+      page = tracker.attach(await ctx.newPage(), {
+        label: 'http-net-change',
+        collectConsole: consoleErrors,
+        collectPage: pageErrors,
+      });
+
+      // Drop the first attempt of each door endpoint with a transport-level abort (the same
+      // TypeError('Failed to fetch') path Chromium takes on net::ERR_NETWORK_CHANGED).
+      await page.route('**/v1/**', async (route) => {
+        const req = route.request();
+        const pathname = new URL(req.url()).pathname;
+        if (pathname === '/v1/health') {
+          counts.health += 1;
+          if (counts.health === 1) {
+            await route.abort('connectionaborted');
+            return;
+          }
+        } else if (pathname === '/v1/tools') {
+          counts.tools += 1;
+          if (counts.tools === 1) {
+            await route.abort('connectionaborted');
+            return;
+          }
+        } else if (pathname === '/v1/content' && req.method() === 'POST') {
+          counts.content += 1;
+          if (counts.content === 1) {
+            await route.abort('connectionaborted');
+            return;
+          }
+        } else if (pathname === '/v1/call' && req.method() === 'POST') {
+          let body = null;
+          try {
+            body = JSON.parse(req.postData() || '{}');
+          } catch {
+            body = null;
+          }
+          if (body?.tool === 'fs.list' && String(body?.args?.path || '').includes('gallery')) {
+            counts.fsList += 1;
+            if (counts.fsList === 1) {
+              await route.abort('connectionaborted');
+              return;
+            }
+          } else if (body?.tool === 'fs.mkdir') {
+            counts.fsMkdir += 1;
+            await route.abort('connectionaborted');
+            return;
+          }
+        }
+        try {
+          await route.continue();
+        } catch {
+          // Ignore teardown route races.
+        }
+      });
+
+      // 1. Initial load recovers quietly from aborted /v1/health and /v1/tools.
+      tracker.setStep('initial load survives aborted health and tools');
+      await page.goto(`${server.url}/#token=${encodeURIComponent(tokenOut.token)}`, { waitUntil: 'domcontentloaded' });
+      await tracker.waitForLocator(page.locator('nav.nav a', { hasText: 'Files' }), 'Files nav link');
+      assert.equal(await page.locator('.err, .notice.error, .banner.error').count(), 0);
+
+      // 2. Folder listing recovers quietly from aborted fs.list and shows no error banner.
+      tracker.setStep('gallery folder listing survives aborted fs.list');
+      await page.goto(`${server.url}/#/files/tower/~/gallery`, {
+        waitUntil: 'domcontentloaded',
+      });
+      const harborCell = page
+        .locator('.grid a.cell[aria-label="harbor.png"]')
+        .or(page.locator('a.row', { hasText: 'harbor.png' }))
+        .first();
+      await tracker.waitForLocator(harborCell, 'harbor.png after fs.list retry');
+      assert.equal(counts.fsList, 2, `Expected exactly one retry for fs.list, saw ${counts.fsList}`);
+      assert.equal(await page.locator('.err, .notice.error, .banner.error').count(), 0);
+      const bodyText = await page.locator('body').innerText();
+      assert.equal(bodyText.includes("Can't reach"), false, `Unexpected unreachable text: ${bodyText}`);
+
+      // 3. Opening a picture recovers quietly from aborted POST /v1/content and renders the image.
+      tracker.setStep('opening harbor.png survives aborted /v1/content');
+      await harborCell.click();
+      const viewerImg = page.locator('.viewer img.viewer-img[src]');
+      const imgInfo = await waitForImageLoaded(viewerImg, 'harbor.png viewer image after /v1/content retry', {
+        tracker,
+      });
+      assert.equal(imgInfo.width, 160);
+      assert.equal(imgInfo.height, 120);
+      assert.equal(counts.content, 2, `Expected exactly one retry for /v1/content, saw ${counts.content}`);
+      assert.ok(counts.health >= 2, `Expected /v1/health retry, saw ${counts.health}`);
+      assert.ok(counts.tools >= 2, `Expected /v1/tools retry, saw ${counts.tools}`);
+      assert.equal(await page.locator('.err, .notice.error, .banner.error').count(), 0);
+
+      // 4. A mutating door call (fs.mkdir) is NOT retried when the network drops.
+      tracker.setStep('mutating fs.mkdir does not retry on aborted fetch');
+      const mkdirOutcome = await page.evaluate(async (targetPath) => {
+        const { createHttpLink } = await import('/link/http.js');
+        const link = createHttpLink();
+        try {
+          await link.call('fs.mkdir', { path: targetPath });
+          return { ok: true };
+        } catch (err) {
+          return { ok: false, code: err?.code || null };
+        }
+      }, path.join(galleryDir, 'never-created'));
+      assert.deepEqual(mkdirOutcome, { ok: false, code: 'unreachable' });
+      assert.equal(counts.fsMkdir, 1, `Mutating fs.mkdir must not retry, saw ${counts.fsMkdir}`);
+
+      const unexpectedConsole = consoleErrors.filter(
+        (msg) => !msg.includes('ERR_CONNECTION_ABORTED') && !msg.includes('Failed to load resource'),
+      );
+      assert.deepEqual(unexpectedConsole, [], `Unexpected console errors: ${unexpectedConsole.join('\n')}`);
+      assert.deepEqual(pageErrors, [], `Unexpected page errors: ${pageErrors.join('\n')}`);
+
+      await ctx.close();
+    } finally {
+      if (page) {
+        await page.unrouteAll({ behavior: 'ignoreErrors' }).catch(() => {});
+      }
+      await browser.close();
+      await server.stop();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
