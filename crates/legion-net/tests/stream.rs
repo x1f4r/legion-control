@@ -2138,8 +2138,26 @@ fn keep_open_flushes_pending_audit_on_shutdown() {
         shutdown: Some(shutdown.clone()),
         ..StreamServeOptions::default()
     };
+    struct SharedWriter(std::sync::Arc<(std::sync::Mutex<Vec<u8>>, std::sync::Condvar)>);
+    impl std::io::Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let (lock, cvar) = &*self.0;
+            lock.lock().unwrap().extend_from_slice(buf);
+            cvar.notify_all();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let output_shared = std::sync::Arc::new((
+        std::sync::Mutex::new(Vec::<u8>::new()),
+        std::sync::Condvar::new(),
+    ));
+    let output_for_server = std::sync::Arc::clone(&output_shared);
     let server = std::thread::spawn(move || {
-        let mut output = Vec::new();
+        let mut output = SharedWriter(output_for_server);
         serve_with_options(
             &host,
             None,
@@ -2167,7 +2185,26 @@ fn keep_open_flushes_pending_audit_on_shutdown() {
         })
     );
     tx.send(line.into_bytes()).unwrap();
-    std::thread::sleep(Duration::from_millis(80));
+    // Wait deterministically for the keep_open get's trailing `{"done":true}` frame to be written
+    // before triggering shutdown, instead of sleeping a fixed duration.
+    {
+        let (lock, cvar) = &*output_shared;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut guard = lock.lock().unwrap();
+        while !guard
+            .windows(b"\"done\":true".len())
+            .any(|w| w == b"\"done\":true")
+        {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                panic!(
+                    "timed out waiting for keep_open get done frame before shutdown; output={:?}",
+                    String::from_utf8_lossy(&guard)
+                );
+            };
+            let (next, _) = cvar.wait_timeout(guard, remaining).unwrap();
+            guard = next;
+        }
+    }
     // Trigger shutdown while stdin is still open and audit window has not elapsed.
     shutdown.cancel();
     let res = server.join().unwrap();

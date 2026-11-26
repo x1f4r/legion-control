@@ -42,8 +42,7 @@ use serde::{Deserialize, Serialize};
 use crate::procid;
 use crate::procid::{KillTreeReport, ProcessId};
 use crate::shell::{
-    self, CommandSpec, ResolvedCommand, encode_utf16le_base64, powershell_single_quote,
-    windows_cmdline_escape,
+    self, CommandSpec, ResolvedCommand, powershell_single_quote, windows_cmdline_escape,
 };
 use crate::{OsError, Result};
 
@@ -1499,9 +1498,9 @@ pub(crate) fn build_wmi_create_script_for_cmdline(
 
 /// Build the `-EncodedCommand` command line for a launcher script and wrap it in a WMI
 /// `Invoke-CimMethod` creation script.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn build_wmi_create_script(launcher_script: &str, cwd: Option<&str>) -> Result<String> {
-    let encoded = encode_utf16le_base64(launcher_script);
+    let encoded = shell::encode_utf16le_base64(launcher_script);
     let command_line = format!(
         "powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand {encoded}"
     );

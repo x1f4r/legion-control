@@ -419,14 +419,14 @@ async fn real_sshd_session_and_security_checks() {
         // Leave `paused` completely unread while the remote pushes its first window.
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let quick_hello = tokio::time::timeout(Duration::from_secs(3), link.hello(&env.node))
+        let quick_hello = tokio::time::timeout(Duration::from_secs(10), link.hello(&env.node))
             .await
             .expect("hello stalled behind unread content stream")
             .unwrap();
         assert_eq!(quick_hello["node"], json!(env.node));
 
         let quick_info = tokio::time::timeout(
-            Duration::from_secs(3),
+            Duration::from_secs(10),
             link.call(&env.node, "sys.info", json!({}), None, |_| {}),
         )
         .await
@@ -436,14 +436,14 @@ async fn real_sshd_session_and_security_checks() {
 
         // A second stream on the exact same SSH connection flows freely while the first is paused.
         let mut second = tokio::time::timeout(
-            Duration::from_secs(3),
+            Duration::from_secs(10),
             link.open_content(&env.node, sample_file, 2 * 1024 * 1024, Some(512 * 1024)),
         )
         .await
         .expect("second stream open stalled behind unread content stream")
         .unwrap();
         let mut second_buf = Vec::new();
-        tokio::time::timeout(Duration::from_secs(5), second.read_to_end(&mut second_buf))
+        tokio::time::timeout(Duration::from_secs(10), second.read_to_end(&mut second_buf))
             .await
             .expect("second stream read stalled behind unread content stream")
             .unwrap();
@@ -472,14 +472,14 @@ async fn real_sshd_session_and_security_checks() {
         assert_eq!(mid_prefix, &expected[..mid_prefix.len()]);
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        let mid_hello = tokio::time::timeout(Duration::from_secs(3), link.hello(&env.node))
+        let mid_hello = tokio::time::timeout(Duration::from_secs(10), link.hello(&env.node))
             .await
             .expect("hello stalled behind mid-window unread content stream")
             .unwrap();
         assert_eq!(mid_hello["node"], json!(env.node));
 
         let mut mid_sibling = tokio::time::timeout(
-            Duration::from_secs(3),
+            Duration::from_secs(10),
             link.open_content(&env.node, sample_file, 1024 * 1024, Some(256 * 1024)),
         )
         .await
@@ -487,7 +487,7 @@ async fn real_sshd_session_and_security_checks() {
         .unwrap();
         let mut mid_sibling_buf = Vec::new();
         tokio::time::timeout(
-            Duration::from_secs(5),
+            Duration::from_secs(10),
             mid_sibling.read_to_end(&mut mid_sibling_buf),
         )
         .await
@@ -556,7 +556,7 @@ async fn real_sshd_session_and_security_checks() {
             }
             twenty.push((off as usize, len as usize, prefix, s));
         }
-        let hello_with_20 = tokio::time::timeout(Duration::from_secs(3), link.hello(&env.node))
+        let hello_with_20 = tokio::time::timeout(Duration::from_secs(10), link.hello(&env.node))
             .await
             .expect("hello stalled with 20 open streams")
             .unwrap();

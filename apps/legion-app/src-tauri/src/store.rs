@@ -473,7 +473,7 @@ mod tests {
                 ]
             },
             "current_node": "tower",
-            "node_meta": [{ "node": "tower", "role": "operator", "device": "pixel" }]
+            "node_meta": [{ "node": "tower", "role": "operator", "device": "phone" }]
         })
         .to_string();
         fs::write(store.path(), v1_json)?;

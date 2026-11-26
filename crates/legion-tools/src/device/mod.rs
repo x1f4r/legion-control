@@ -434,7 +434,7 @@ async fn invite(ctx: &Ctx, args: InviteArgs) -> Result<InviteResult, ToolError> 
                     ErrorCode::InvalidArgs,
                     format!("{raw_name:?} is not a valid device name."),
                 )
-                .with_hint("Give a short name such as `pixel` or `tablet`."));
+                .with_hint("Give a short name such as `phone` or `tablet`."));
             }
             let slug = sanitise_device_name(trimmed_name);
             let principal = format!("{DEVICE_PRINCIPAL_PREFIX}{slug}");
@@ -878,7 +878,7 @@ async fn set_device(ctx: &Ctx, args: SetArgs) -> Result<SetResult, ToolError> {
                     ErrorCode::InvalidArgs,
                     format!("{raw:?} is not a valid device name."),
                 )
-                .with_hint("Use a short name such as `pixel` or `tablet`."));
+                .with_hint("Use a short name such as `phone` or `tablet`."));
             }
             Some(sanitise_device_name(trimmed))
         }
@@ -3091,7 +3091,7 @@ role = "owner"
         // Wrong invite id is rejected and changes nothing.
         let device_key1 = generate_ephemeral_ed25519().unwrap();
         let wrong_req = format!(
-            "{{\"enrol\":1,\"id\":\"wrongid\",\"public_key\":\"{}\",\"name\":\"Pixel 10\"}}\n",
+            "{{\"enrol\":1,\"id\":\"wrongid\",\"public_key\":\"{}\",\"name\":\"My Handset\"}}\n",
             device_key1.public_key
         );
         let wrong_reply = run_enrol(&h.node, id, wrong_req.as_bytes()).await;
@@ -3099,7 +3099,7 @@ role = "owner"
 
         // Hostile public key is rejected and leaves the invite usable.
         let bad_key_req = format!(
-            "{{\"enrol\":1,\"id\":\"{id}\",\"public_key\":\"restrict {}\",\"name\":\"Pixel 10\"}}\n",
+            "{{\"enrol\":1,\"id\":\"{id}\",\"public_key\":\"restrict {}\",\"name\":\"My Handset\"}}\n",
             device_key1.public_key
         );
         let bad_key_reply = run_enrol(&h.node, id, bad_key_req.as_bytes()).await;
@@ -3150,7 +3150,7 @@ role = "owner"
 
         // Valid enrolment succeeds.
         let req1 = format!(
-            "{{\"enrol\":1,\"id\":\"{id}\",\"public_key\":\"{} pixel@phone\",\"name\":\"My Pixel!\"}}\n",
+            "{{\"enrol\":1,\"id\":\"{id}\",\"public_key\":\"{} user@phone\",\"name\":\"My Handset!\"}}\n",
             device_key1.public_key
         );
         let reply1 = run_enrol(&h.node, id, req1.as_bytes()).await;
@@ -3161,7 +3161,7 @@ role = "owner"
                 node: "tower".to_owned(),
                 principal: "phone".to_owned(),
                 role: "observer".to_owned(),
-                device: "my-pixel".to_owned(),
+                device: "my-handset".to_owned(),
                 fleet: BTreeMap::new(),
                 not_synced_to: Vec::new(),
                 sync_command: None,
@@ -3181,7 +3181,7 @@ role = "owner"
             h.node.paths(),
             "tower",
             &node_file,
-            "my-pixel",
+            "my-handset",
             &pid1,
             "phone",
             None,
@@ -3214,7 +3214,7 @@ role = "owner"
             "duplicate-key Conflict must consume the invite"
         );
 
-        // Second device with the same requested name gets a unique slug (`my-pixel-2`) via a fresh invite.
+        // Second device with the same requested name gets a unique slug (`my-handset-2`) via a fresh invite.
         let inv3 = h
             .call(
                 "device.invite",
@@ -3225,7 +3225,7 @@ role = "owner"
         let id3 = inv3["id"].as_str().unwrap();
         let device_key2 = generate_ephemeral_ed25519().unwrap();
         let req2 = format!(
-            "{{\"enrol\":1,\"id\":\"{id3}\",\"public_key\":\"{}\",\"name\":\"My Pixel!\"}}\n",
+            "{{\"enrol\":1,\"id\":\"{id3}\",\"public_key\":\"{}\",\"name\":\"My Handset!\"}}\n",
             device_key2.public_key
         );
         let reply2 = run_enrol(&h.node, id3, req2.as_bytes()).await;
@@ -3236,7 +3236,7 @@ role = "owner"
                 node: "tower".to_owned(),
                 principal: "phone".to_owned(),
                 role: "observer".to_owned(),
-                device: "my-pixel-2".to_owned(),
+                device: "my-handset-2".to_owned(),
                 fleet: BTreeMap::new(),
                 not_synced_to: Vec::new(),
                 sync_command: None,
@@ -3252,22 +3252,22 @@ role = "owner"
         // Foreign line is still intact in authorized_keys.
         let auth_text = std::fs::read_to_string(&h.auth_keys).unwrap();
         assert!(auth_text.starts_with(&format!("{foreign}\n")));
-        assert!(auth_text.contains("legion-device:my-pixel\n"));
-        assert!(auth_text.contains("legion-device:my-pixel-2\n"));
+        assert!(auth_text.contains("legion-device:my-handset\n"));
+        assert!(auth_text.contains("legion-device:my-handset-2\n"));
         assert!(!auth_text.contains("legion-invite:"));
 
         // device.list shows both devices with fingerprints matching SHA256.
         let listed = h.call("device.list", json!({})).await.unwrap();
         let devices = listed["devices"].as_array().unwrap();
         assert_eq!(devices.len(), 2);
-        assert_eq!(devices[0]["name"], json!("my-pixel"));
+        assert_eq!(devices[0]["name"], json!("my-handset"));
         assert_eq!(devices[0]["fingerprint"], json!(device_key1.fingerprint));
-        assert_eq!(devices[1]["name"], json!("my-pixel-2"));
+        assert_eq!(devices[1]["name"], json!("my-handset-2"));
 
         // device.remove removes the named device and keeps the foreign line + second device,
         // recording key fingerprint, pairing provenance, and remover in the tombstone.
         let removed = h
-            .call("device.remove", json!({"name": "my-pixel"}))
+            .call("device.remove", json!({"name": "my-handset"}))
             .await
             .unwrap();
         assert_eq!(removed["kind"], json!("device"));
@@ -3279,7 +3279,7 @@ role = "owner"
         )
         .unwrap();
         let tomb = saved_after_rm.removed.get(removed_id).unwrap();
-        assert_eq!(tomb.name, "my-pixel");
+        assert_eq!(tomb.name, "my-handset");
         assert_eq!(tomb.principal, "phone");
         assert_eq!(
             tomb.fingerprint.as_deref(),
@@ -3295,8 +3295,8 @@ role = "owner"
         );
         let auth_after = std::fs::read_to_string(&h.auth_keys).unwrap();
         assert!(auth_after.contains(&foreign));
-        assert!(!auth_after.contains("legion-device:my-pixel\n"));
-        assert!(auth_after.contains("legion-device:my-pixel-2\n"));
+        assert!(!auth_after.contains("legion-device:my-handset\n"));
+        assert!(auth_after.contains("legion-device:my-handset-2\n"));
     }
 
     #[tokio::test]
@@ -4295,11 +4295,11 @@ role = "owner"
      {
         let h = Harness::new();
 
-        // 1. Invite `pixel` as `observer` — policy.toml must NOT be touched at invite time.
+        // 1. Invite `handset` as `observer` — policy.toml must NOT be touched at invite time.
         let inv1 = h
             .call(
                 "device.invite",
-                json!({"role": "observer", "name": "pixel", "host": "tower.example", "user": "me"}),
+                json!({"role": "observer", "name": "handset", "host": "tower.example", "user": "me"}),
             )
             .await
             .unwrap();
@@ -4309,17 +4309,17 @@ role = "owner"
             !policy_before
                 .principals
                 .keys()
-                .any(|p| p.as_str() == "device:pixel"),
-            "invite must not create device:pixel in policy.toml before enrolment"
+                .any(|p| p.as_str() == "device:handset"),
+            "invite must not create device:handset in policy.toml before enrolment"
         );
 
-        // 2. Second invite for the same name (`pixel`) as `owner` must be refused.
+        // 2. Second invite for the same name (`handset`) as `owner` must be refused.
         let dup_err = h
             .call(
                 "device.invite",
                 json!({
                     "role": "owner",
-                    "name": "pixel",
+                    "name": "handset",
                     "allow_owner": true,
                     "host": "tower.example",
                     "user": "me"
@@ -4329,7 +4329,7 @@ role = "owner"
             .unwrap_err();
         assert_eq!(dup_err.code, ErrorCode::Conflict, "{dup_err:?}");
 
-        // 3. Enrolling the first invite creates `device:pixel` with `observer` (never `owner`).
+        // 3. Enrolling the first invite creates `device:handset` with `observer` (never `owner`).
         let key1 = generate_ephemeral_ed25519().unwrap();
         let req1 = format!(
             "{{\"enrol\":1,\"id\":\"{inv1_id}\",\"public_key\":\"{}\",\"name\":\"ignored\"}}\n",
@@ -4341,9 +4341,9 @@ role = "owner"
             EnrolReply::Ok {
                 ok: true,
                 node: "tower".to_owned(),
-                principal: "device:pixel".to_owned(),
+                principal: "device:handset".to_owned(),
                 role: "observer".to_owned(),
-                device: "pixel".to_owned(),
+                device: "handset".to_owned(),
                 fleet: BTreeMap::new(),
                 not_synced_to: Vec::new(),
                 sync_command: None,
@@ -4354,7 +4354,7 @@ role = "owner"
                 .config()
                 .get::<Policy>()
                 .unwrap()
-                .role_of("device:pixel")
+                .role_of("device:handset")
                 .0,
             "observer"
         );
@@ -4729,14 +4729,14 @@ allow = ["effect:read", "effect:write"]
         let inv = h
             .call(
                 "device.invite",
-                json!({"role": "observer", "name": "pixel", "host": "tower.example", "user": "me"}),
+                json!({"role": "observer", "name": "handset", "host": "tower.example", "user": "me"}),
             )
             .await
             .unwrap();
         let inv_id = inv["id"].as_str().unwrap();
         let key = generate_ephemeral_ed25519().unwrap();
         let req = format!(
-            "{{\"enrol\":1,\"id\":\"{inv_id}\",\"public_key\":\"{}\",\"name\":\"pixel\"}}\n",
+            "{{\"enrol\":1,\"id\":\"{inv_id}\",\"public_key\":\"{}\",\"name\":\"handset\"}}\n",
             key.public_key
         );
         assert!(run_enrol(&h.node, inv_id, req.as_bytes()).await.is_ok());
@@ -4744,7 +4744,7 @@ allow = ["effect:read", "effect:write"]
         // 1. Unwritable config/ directory: `device.remove` must fail BEFORE touching authorized_keys.
         let cfg_dir = h.node.paths().config_dir().to_path_buf();
         std::fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let unwritable_err = h.call("device.remove", json!({"name": "pixel"})).await;
+        let unwritable_err = h.call("device.remove", json!({"name": "handset"})).await;
         std::fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(
             unwritable_err.is_err(),
@@ -4752,7 +4752,7 @@ allow = ["effect:read", "effect:write"]
         );
         let auth_after_unwritable = std::fs::read_to_string(&h.auth_keys).unwrap();
         assert!(
-            auth_after_unwritable.contains("legion-device:pixel"),
+            auth_after_unwritable.contains("legion-device:handset"),
             "authorized_keys must remain untouched when saving devices.toml fails:\n{auth_after_unwritable}"
         );
 
@@ -4760,12 +4760,12 @@ allow = ["effect:read", "effect:write"]
         //    devices.toml MUST contain the tombstone AND session termination MUST still run.
         let sess_dir = h.node.paths().state_dir().join("device-sessions");
         std::fs::create_dir_all(&sess_dir).unwrap();
-        let marker_session = sess_dir.join("pixel-999999-1.json");
+        let marker_session = sess_dir.join("handset-999999-1.json");
         std::fs::write(&marker_session, b"{\"stale\":true}\n").unwrap();
 
         std::fs::remove_file(&h.auth_keys).unwrap();
         std::fs::create_dir(&h.auth_keys).unwrap();
-        let after_save_err = h.call("device.remove", json!({"name": "pixel"})).await;
+        let after_save_err = h.call("device.remove", json!({"name": "handset"})).await;
         let _ = std::fs::remove_dir(&h.auth_keys);
         assert!(
             after_save_err.is_err(),
@@ -5911,7 +5911,7 @@ allow = [\"effect:read\", \"effect:write\"]
             .call(
                 "device.invite",
                 json!({
-                    "name": "pixel",
+                    "name": "handset",
                     "role": "observer",
                     "host": "127.0.0.1",
                     "port": 22,
@@ -5927,7 +5927,7 @@ allow = [\"effect:read\", \"effect:write\"]
                 "enrol": 1,
                 "id": inv_id,
                 "public_key": ed25519_public_key_from_seed(&[0x33; 32]),
-                "name": "pixel"
+                "name": "handset"
             })
         );
         assert!(run_enrol(&h.node, &inv_id, req.as_bytes()).await.is_ok());
@@ -5950,7 +5950,7 @@ allow = [\"effect:read\", \"effect:write\"]
         std::fs::create_dir_all(&devices_bak).unwrap();
 
         let err = h
-            .call("device.set", json!({"name": "pixel", "role": "editor"}))
+            .call("device.set", json!({"name": "handset", "role": "editor"}))
             .await
             .expect_err("device.set must fail when saving devices.toml fails");
         let _ = std::fs::remove_dir_all(&devices_bak);

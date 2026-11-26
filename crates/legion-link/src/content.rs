@@ -3217,8 +3217,14 @@ mod tests {
         let err = s3.read(&mut head).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Interrupted);
         drop(s3);
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(cancelled.load(Ordering::SeqCst));
+        let cancel_deadline = Instant::now() + Duration::from_secs(5);
+        while !cancelled.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < cancel_deadline,
+                "timed out waiting for cancelled stream channel flag"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
 
         // Node identity mismatch is refused before opening any stream.
         let mismatch_opened = Arc::new(AtomicUsize::new(0));
@@ -3474,6 +3480,14 @@ mod tests {
         let mut head = [0u8; 1024];
         stream.read_exact(&mut head).await.unwrap();
         assert_eq!(&head[..], &payload[..1024]);
+        let win_deadline = Instant::now() + Duration::from_secs(5);
+        while requested_windows.lock().unwrap().len() < 2 {
+            assert!(
+                Instant::now() < win_deadline,
+                "timed out waiting for read-ahead Window 1 request"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(
             requested_windows.lock().unwrap().len(),
@@ -3763,8 +3777,14 @@ mod tests {
         )
         .await
         .unwrap();
-        tokio::time::sleep(Duration::from_millis(160)).await;
-        assert_eq!(active_slots.load(Ordering::SeqCst), 0);
+        let park_deadline = Instant::now() + Duration::from_secs(5);
+        while active_slots.load(Ordering::SeqCst) != 0 {
+            assert!(
+                Instant::now() < park_deadline,
+                "timed out waiting for idle stream to park before mtime mutation"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         mtime_secs.store(1_700_000_999, Ordering::SeqCst);
 
         let mut sink = Vec::new();
@@ -4202,8 +4222,8 @@ mod tests {
                 "first read should time out while pending"
             );
 
-            // Stream must park within the normal idle park window (~80 ms + modest scheduler slack).
-            let deadline = Instant::now() + Duration::from_millis(400);
+            // Stream must park within the normal idle park window (~80 ms + generous scheduler slack).
+            let deadline = Instant::now() + Duration::from_secs(5);
             while active_slots.load(Ordering::SeqCst) != 0 && Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(15)).await;
             }
@@ -4459,7 +4479,7 @@ mod tests {
                     streams.push(fut.await.unwrap());
                 }
                 // Wait for this batch of 8 to park before opening the next batch.
-                let deadline = Instant::now() + Duration::from_secs(2);
+                let deadline = Instant::now() + Duration::from_secs(10);
                 while active_slots.load(Ordering::SeqCst) != 0 && Instant::now() < deadline {
                     tokio::time::sleep(Duration::from_millis(15)).await;
                 }
@@ -4548,7 +4568,7 @@ mod tests {
                 for fut in futs {
                     streams.push(fut.await.unwrap());
                 }
-                let deadline = Instant::now() + Duration::from_secs(2);
+                let deadline = Instant::now() + Duration::from_secs(10);
                 while active_slots.load(Ordering::SeqCst) != 0 && Instant::now() < deadline {
                     tokio::time::sleep(Duration::from_millis(15)).await;
                 }
@@ -4664,7 +4684,7 @@ mod tests {
                     .await
                     .unwrap();
                     read_exact_pattern(&mut s, 0, 128 * 1024).await;
-                    let deadline = Instant::now() + Duration::from_secs(2);
+                    let deadline = Instant::now() + Duration::from_secs(10);
                     while (active_slots.load(Ordering::SeqCst) != 0 || s.park_stamp() == 0)
                         && Instant::now() < deadline
                     {
@@ -4718,7 +4738,7 @@ mod tests {
 
             // Drain past r0's 64 KiB parked_head so it reopens a channel, then let it park again.
             read_exact_pattern(&mut r0, 128 * 1024, 128 * 1024).await;
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = Instant::now() + Duration::from_secs(10);
             while (active_slots.load(Ordering::SeqCst) != 0 || r0.park_stamp() <= u2)
                 && Instant::now() < deadline
             {

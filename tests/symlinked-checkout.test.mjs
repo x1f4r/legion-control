@@ -4,7 +4,6 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
-import { createSigningKey, signManifest } from '../scripts/release-integrity.mjs';
 
 const repository = path.resolve(import.meta.dirname, '..');
 
@@ -16,7 +15,7 @@ function linkedCheckout(t) {
   t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
   const root = path.join(scratch, 'checkout');
   fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
-  for (const script of ['checkout-files.mjs', 'check-syntax.mjs', 'release-integrity.mjs']) {
+  for (const script of ['checkout-files.mjs', 'check-syntax.mjs', 'sign-legion-release.mjs']) {
     fs.copyFileSync(path.join(repository, 'scripts', script), path.join(root, 'scripts', script));
   }
   const link = path.join(scratch, 'link');
@@ -25,19 +24,11 @@ function linkedCheckout(t) {
 }
 const run = (script, args = [], env = {}) => spawnSync(process.execPath, [script, ...args], { encoding: 'utf8', env: { ...process.env, ...env } });
 
-test('release-integrity run through a symlink verifies, and refuses another signer', (t) => {
-  const { scratch, scripts } = linkedCheckout(t);
-  const file = (name) => path.join(scratch, name);
-  createSigningKey(file('private.pem'), file('public.pem'));
-  createSigningKey(file('other-private.pem'), file('other-public.pem'));
-  fs.writeFileSync(file('manifest.json'), '{"version":"1.4.0"}\n');
-  signManifest(file('manifest.json'), file('private.pem'), file('manifest.json.sig'));
-  const trusted = run(path.join(scripts, 'release-integrity.mjs'), ['verify', file('manifest.json'), file('manifest.json.sig'), file('public.pem')]);
-  assert.equal(trusted.status, 0, trusted.stderr);
-  assert.equal(trusted.stdout, 'Release integrity check completed.\n');
-  const other = run(path.join(scripts, 'release-integrity.mjs'), ['verify', file('manifest.json'), file('manifest.json.sig'), file('other-public.pem')]);
-  assert.equal(other.status, 1);
-  assert.match(other.stderr, /does not match the trusted key/);
+test('sign-legion-release run through a symlink runs its CLI entrypoint and rejects an invalid tag', (t) => {
+  const { scripts } = linkedCheckout(t);
+  const bad = run(path.join(scripts, 'sign-legion-release.mjs'), ['not-a-tag']);
+  assert.equal(bad.status, 1);
+  assert.match(bad.stderr, /Usage: node scripts\/sign-legion-release\.mjs/);
 });
 
 test('check-syntax run through a symlink checks the checkout and fails on invalid syntax', (t) => {

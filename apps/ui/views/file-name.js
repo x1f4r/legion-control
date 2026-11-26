@@ -222,10 +222,12 @@ export function FileNameList({
   className = 'list',
   lines = 2,
   dim = true,
+  containerRef: externalRef = null,
   children,
   ...rest
 }) {
   const containerRef = useRef(null);
+  const lastWidthRef = useRef(null);
   const itemsRef = useRef(new Map()); // id -> entry
   const elToIdRef = useRef(new WeakMap()); // DOM Element -> id
   const visibleIdsRef = useRef(new Set());
@@ -234,6 +236,18 @@ export function FileNameList({
   const nextIdRef = useRef(1);
   const defaultsRef = useRef({ lines, dim });
   defaultsRef.current = { lines, dim };
+
+  const setContainerNode = useCallback(
+    (node) => {
+      containerRef.current = node;
+      if (typeof externalRef === 'function') {
+        externalRef(node);
+      } else if (externalRef && typeof externalRef === 'object') {
+        externalRef.current = node;
+      }
+    },
+    [externalRef],
+  );
 
   const flushMeasure = useCallback(() => {
     rafRef.current = 0;
@@ -361,8 +375,17 @@ export function FileNameList({
     if (!container) return undefined;
 
     let ro = null;
+    lastWidthRef.current = null;
     if (typeof ResizeObserver === 'function') {
-      ro = new ResizeObserver(() => {
+      ro = new ResizeObserver((entries) => {
+        const latest = entries[entries.length - 1];
+        const width = latest?.contentRect?.width ?? container.clientWidth;
+        // Ignore height-only changes (virtual spacers, row wrap transitions, page appends) so
+        // scrolling or measuring rows never re-triggers a full list name-fit pass.
+        if (lastWidthRef.current !== null && Math.abs(width - lastWidthRef.current) <= 0.5) {
+          return;
+        }
+        lastWidthRef.current = width;
         scheduleMeasure();
       });
       ro.observe(container);
@@ -466,7 +489,7 @@ export function FileNameList({
 
   return html`
     <${FileNameListContext.Provider} value=${api}>
-      <${as} ref=${containerRef} class=${className} ...${rest}>
+      <${as} ref=${setContainerNode} class=${className} ...${rest}>
         ${children}
       <//>
     <//>

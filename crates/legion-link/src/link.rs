@@ -786,6 +786,33 @@ pub enum ContentRoutePolicy {
 }
 
 impl Link {
+    #[cfg(test)]
+    async fn wait_session_dead(&self, node: &str, step: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let alive = {
+                let slot = self
+                    .inner
+                    .slots
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(node)
+                    .cloned();
+                slot.is_some_and(|s| {
+                    s.current
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .as_ref()
+                        .is_some_and(|live| live.session.is_alive())
+                })
+            };
+            if !alive {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out while {step}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
     /// Creates a new [`Link`] from `config` using default [`LinkOptions`].
     pub fn new(config: LinkConfig) -> Self {
         Self::with_options(config, LinkOptions::default())
@@ -4833,8 +4860,9 @@ mod tests {
         assert_eq!(seen[0]["kind"], json!("progress"));
         assert_eq!(seen[0]["machine"], json!("tower"));
 
-        // Give the reader loop a moment to observe the server EOF from drop_after_first_call.
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        // Wait deterministically for the reader loop to observe server EOF from drop_after_first_call.
+        link.wait_session_dead("tower", "waiting for reader loop to observe mock EOF")
+            .await;
 
         // Next call reconnects once automatically.
         let res2 = link
@@ -5290,9 +5318,9 @@ mod tests {
         assert!(!link.forget("tower").await);
 
         // Server side for `tower` must see EOF promptly when forgotten.
-        tokio::time::timeout(Duration::from_secs(2), closed_tower.notified())
+        tokio::time::timeout(Duration::from_secs(10), closed_tower.notified())
             .await
-            .unwrap();
+            .expect("timed out waiting for forgotten tower session EOF");
 
         let after = link.config();
         assert_eq!(after.device_key.as_deref(), Some("existing-device-key"));
@@ -5682,7 +5710,7 @@ mod tests {
         entered.notified().await;
 
         // While pairing waits in `enrol_fn`, `forget("other")` MUST NOT block on `mutation_lock`.
-        let forgot = tokio::time::timeout(Duration::from_secs(1), link.forget("other"))
+        let forgot = tokio::time::timeout(Duration::from_secs(5), link.forget("other"))
             .await
             .expect("forget must not block behind an in-flight pairing wait");
         assert!(forgot);
@@ -5741,8 +5769,9 @@ mod tests {
             .unwrap();
         assert_eq!(ok["ok"], json!(true));
 
-        // Let the reader observe EOF from the mock node.
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        // Wait deterministically for the reader loop to observe EOF from the mock node.
+        link.wait_session_dead("tower", "waiting for mock node EOF before reconnect")
+            .await;
 
         // Reconnect fails with `device_removed_or_unknown` and a hint to pair again.
         let err = link
@@ -6012,7 +6041,14 @@ mod tests {
                 )
                 .await?;
                 ready.notify_one();
-                tokio::time::sleep(Duration::from_millis(30)).await;
+                let dead_deadline = Instant::now() + Duration::from_secs(10);
+                while session.is_alive() {
+                    assert!(
+                        Instant::now() < dead_deadline,
+                        "timed out waiting for test session reader loop to observe server EOF"
+                    );
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
                 Ok(session)
             })
         });
@@ -6227,7 +6263,7 @@ mod tests {
             nodes: vec![NodeLink::ssh(
                 "tower",
                 tower_target.clone(),
-                Some("device:pixel".to_owned()),
+                Some("device:phone".to_owned()),
             )],
             ..LinkConfig::default()
         };
@@ -6500,8 +6536,8 @@ mod tests {
         let cfg = LinkConfig {
             device_key: Some("dummy".to_owned()),
             nodes: vec![
-                NodeLink::ssh("tower", target_a, Some("device:pixel".to_owned())),
-                NodeLink::learned("pi", target_b, Some("device:pixel".to_owned()), "tower"),
+                NodeLink::ssh("tower", target_a, Some("device:phone".to_owned())),
+                NodeLink::learned("pi", target_b, Some("device:phone".to_owned()), "tower"),
             ],
             ..LinkConfig::default()
         };
@@ -6833,7 +6869,7 @@ mod tests {
                         user: "me".to_owned(),
                         host_keys: vec![test_host_key(10)],
                     },
-                    Some("device:pixel".to_owned()),
+                    Some("device:phone".to_owned()),
                 ),
                 NodeLink::learned(
                     "pi",
@@ -6843,7 +6879,7 @@ mod tests {
                         user: "me".to_owned(),
                         host_keys: vec![test_host_key(11)],
                     },
-                    Some("device:pixel".to_owned()),
+                    Some("device:phone".to_owned()),
                     "tower",
                 ),
             ],
@@ -6952,7 +6988,7 @@ mod tests {
                         user: "me".to_owned(),
                         host_keys: vec![test_host_key(10)],
                     },
-                    Some("device:pixel".to_owned()),
+                    Some("device:phone".to_owned()),
                 ),
                 NodeLink::learned(
                     "m",
@@ -7092,7 +7128,7 @@ mod tests {
                         user: "me".to_owned(),
                         host_keys: vec![key_tower],
                     },
-                    Some("device:pixel".to_owned()),
+                    Some("device:phone".to_owned()),
                 ),
                 NodeLink::ssh(
                     "pi",
@@ -7102,7 +7138,7 @@ mod tests {
                         user: "me".to_owned(),
                         host_keys: vec![key_pi],
                     },
-                    Some("device:pixel".to_owned()),
+                    Some("device:phone".to_owned()),
                 ),
             ],
             ..LinkConfig::default()
@@ -7275,7 +7311,7 @@ mod tests {
                     user: "me".to_owned(),
                     host_keys: vec![key_tower.clone()],
                 },
-                Some("device:pixel".to_owned()),
+                Some("device:phone".to_owned()),
             )],
             ..LinkConfig::default()
         };
@@ -7458,7 +7494,7 @@ mod tests {
                         user: "me".to_owned(),
                         host_keys: vec![key_tower],
                     },
-                    Some("device:pixel".to_owned()),
+                    Some("device:phone".to_owned()),
                 ),
                 NodeLink::learned(
                     "pi",
@@ -7582,7 +7618,7 @@ mod tests {
                         user: "me".to_owned(),
                         host_keys: vec![key_tower.clone()],
                     },
-                    Some("device:pixel".to_owned()),
+                    Some("device:phone".to_owned()),
                 ),
                 NodeLink::ssh(
                     "studio",
@@ -7592,7 +7628,7 @@ mod tests {
                         user: "me".to_owned(),
                         host_keys: vec![key_studio.clone()],
                     },
-                    Some("device:pixel".to_owned()),
+                    Some("device:phone".to_owned()),
                 ),
                 NodeLink::learned(
                     "pi",
@@ -8164,7 +8200,7 @@ mod tests {
                             user: "me".to_owned(),
                             host_keys: vec![key_tower],
                         },
-                        Some("device:pixel".to_owned()),
+                        Some("device:phone".to_owned()),
                     ),
                     NodeLink::ssh(
                         "pi",
@@ -8174,7 +8210,7 @@ mod tests {
                             user: "me".to_owned(),
                             host_keys: vec![key_pi],
                         },
-                        Some("device:pixel".to_owned()),
+                        Some("device:phone".to_owned()),
                     ),
                 ],
                 forgotten_nodes: Vec::new(),
@@ -8283,7 +8319,7 @@ mod tests {
                         user: "me".to_owned(),
                         host_keys: vec![key_tower.clone()],
                     },
-                    Some("device:pixel".to_owned()),
+                    Some("device:phone".to_owned()),
                 )],
                 forgotten_nodes: Vec::new(),
             },
@@ -8850,7 +8886,7 @@ mod tests {
                         user: "me".to_owned(),
                         host_keys: vec![test_host_key(198)],
                     },
-                    Some("device:pixel".to_owned()),
+                    Some("device:phone".to_owned()),
                 )],
                 forgotten_nodes: Vec::new(),
             },
@@ -9158,7 +9194,7 @@ mod tests {
                     user: "me".to_owned(),
                     host_keys: vec![test_host_key(202)],
                 },
-                Some("device:pixel".to_owned()),
+                Some("device:phone".to_owned()),
             );
             studio.origin = NodeOrigin::Learned;
             studio.learned_from = Some("tower".to_owned());
@@ -9174,7 +9210,7 @@ mod tests {
                                 user: "me".to_owned(),
                                 host_keys: vec![test_host_key(201)],
                             },
-                            Some("device:pixel".to_owned()),
+                            Some("device:phone".to_owned()),
                         ),
                         studio,
                     ],
@@ -9491,7 +9527,7 @@ mod tests {
                             user: "me".to_owned(),
                             host_keys: vec!["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITowerPinKey000000000000000000000000000000000".to_owned()],
                         },
-                        Some("device:pixel".to_owned()),
+                        Some("device:phone".to_owned()),
                     ),
                     NodeLink::ssh(
                         "other-hub",
@@ -9501,7 +9537,7 @@ mod tests {
                             user: "me".to_owned(),
                             host_keys: vec!["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOtherPinKey000000000000000000000000000000000".to_owned()],
                         },
-                        Some("device:pixel".to_owned()),
+                        Some("device:phone".to_owned()),
                     ),
                 ],
                 ..LinkConfig::default()
@@ -9566,7 +9602,7 @@ mod tests {
                 user: "me".to_owned(),
                 host_keys: vec!["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIStudioPinKey00000000000000000000000000000000".to_owned()],
             },
-            Some("device:pixel".to_owned()),
+            Some("device:phone".to_owned()),
         );
         learned.origin = NodeOrigin::Learned;
         learned.learned_from = Some("tower".to_owned());

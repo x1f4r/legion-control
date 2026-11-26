@@ -89,7 +89,6 @@ pub enum OsError {
     },
 }
 
-#[allow(dead_code)]
 impl OsError {
     /// Classify an I/O error returned while spawning a process.
     pub(crate) fn from_spawn_io(program: impl Into<String>, source: io::Error) -> Self {

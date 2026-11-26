@@ -37,7 +37,7 @@ pub(super) const STATE_DIR_FLAG: &str = "--state-dir";
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How long the supervisor retries taking the exclusive job lock so a reader's brief shared probe
 /// landing between lock creation and locking never aborts startup.
-const SUPERVISOR_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
+const SUPERVISOR_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum partial line bytes buffered per stream before flushing without a newline, keeping
 /// supervisor memory strictly bounded while preventing stdout and stderr from splitting lines.
 const MAX_LINE_BUFFER_BYTES: usize = 64 * 1024;
@@ -611,6 +611,59 @@ mod tests {
         assert!(!dir.join(store::EXIT_RESERVE_FILE).exists());
         let log = fs::read_to_string(dir.join(LOG_FILE)).unwrap();
         assert_eq!(log.trim(), "lock-retry-ok");
+    }
+
+    #[tokio::test]
+    async fn supervisor_waits_past_one_second_shared_lock_contention() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("state");
+        let id = "lock-slow-probe-race";
+        let dir = job_dir(&state_dir, id);
+        fs::create_dir_all(&dir).unwrap();
+
+        let record = JobRecord {
+            id: id.to_owned(),
+            name: "slow-probe-test".to_owned(),
+            kind: store::JobKind::Exec,
+            title: None,
+            key: None,
+            cmd: Some("echo lock-slow-retry-ok".to_owned()),
+            argv: None,
+            cwd: None,
+            env_names: Vec::new(),
+            principal: "owner".to_owned(),
+            device: None,
+            pairing_id: None,
+            transfer_paths: Vec::new(),
+            transfer_has_remote: false,
+            transfer_local_from: None,
+            transfer_local_to: None,
+            transfer_move: false,
+            created: now_rfc3339(),
+            boot_id: "test-boot".to_owned(),
+            exclusive: false,
+            launching: None,
+            detach: None,
+        };
+        write_job_record(&dir, &record).unwrap();
+
+        // Hold a shared lock for 1.2 s (past the old 1 s limit) as if a reader probe or disk
+        // stall delayed lock release on a busy machine.
+        let shared = FileLock::try_lock_shared(dir.join(LOCK_FILE)).unwrap();
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            let _ = shared.unlock();
+        });
+
+        supervise(&state_dir, id).await.unwrap();
+        releaser.await.unwrap();
+
+        let exit = read_exit_record(&dir)
+            .expect("supervisor must wait past 1s shared lock contention and write exit.json");
+        assert_eq!(exit.outcome, ExitOutcome::Succeeded);
+        assert_eq!(exit.exit_code, Some(0));
+        let log = fs::read_to_string(dir.join(LOG_FILE)).unwrap();
+        assert_eq!(log.trim(), "lock-slow-retry-ok");
     }
 
     #[tokio::test]

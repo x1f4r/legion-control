@@ -7,13 +7,11 @@ import {
   firstSentence,
   formatBusyReasonLine,
   formatBusyReasonLines,
-  formatBusyReasonsShort,
   formatBytePair,
   formatBytes,
   formatDuration,
   formatDurationMs,
   formatElapsed,
-  formatOfflineSubtext,
   formatRelativeTime,
   machineMetrics,
   meterLevel,
@@ -145,16 +143,6 @@ test('busy reason helpers format object, job, string, and empty reasons without 
   assert.equal(busyReasonLabel({}), '');
   assert.equal(busyReasonLabel(null), '');
 
-  // List-row short phrase never includes raw detail or [object Object].
-  assert.equal(formatBusyReasonsShort([probe]), 'busy: agents');
-  assert.equal(formatBusyReasonsShort([probe, probeTwo]), 'busy: agents +1');
-  assert.equal(formatBusyReasonsShort([probe, probeTwo, jobNamed]), 'busy: agents +2');
-  assert.equal(formatBusyReasonsShort(['render']), 'busy: render');
-  assert.equal(formatBusyReasonsShort([]), '');
-  assert.equal(formatBusyReasonsShort([{}, null]), '');
-  assert.ok(!formatBusyReasonsShort([probe]).includes('1239887'));
-  assert.ok(!formatBusyReasonsShort([probe]).includes('[object Object]'));
-
   // Detail lines include name: detail for Overview and Power tabs.
   assert.equal(formatBusyReasonLine(probe), 'agents: busy: 1239887 worker');
   assert.equal(formatBusyReasonLine(jobNamed), 'cargo build --release: exclusive job j-1');
@@ -166,18 +154,4 @@ test('busy reason helpers format object, job, string, and empty reasons without 
     'render: blender frame 42/120',
   ]);
   assert.deepEqual(formatBusyReasonLines([]), []);
-});
-
-test('formatOfflineSubtext stays concise with or without lastSeenAt', () => {
-  const now = Date.parse('2026-11-24T12:00:00Z');
-  assert.equal(formatOfflineSubtext(null, now), 'Did not answer');
-  assert.equal(formatOfflineSubtext(undefined, now), 'Did not answer');
-  assert.equal(
-    formatOfflineSubtext('2026-11-24T11:55:00Z', now),
-    'Did not answer · last seen 5 min ago',
-  );
-  assert.equal(
-    formatOfflineSubtext(Date.parse('2026-11-10T12:00:00Z'), now),
-    'Did not answer · last seen 14 days ago',
-  );
 });

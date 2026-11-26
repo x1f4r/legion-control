@@ -895,7 +895,7 @@ test('detectAppImmersiveCapability and createAppLink report true only when a wor
     };
     Object.defineProperty(globalThis, 'navigator', {
       configurable: true,
-      value: { userAgent: 'Mozilla/5.0 (Linux; Android 15; Pixel 8) AppleWebKit/537.36' },
+      value: { userAgent: 'Mozilla/5.0 (Linux; Android 15; Mobile) AppleWebKit/537.36' },
     });
     const link = createAppLink();
     assert.equal(link.canImmersive(), false);

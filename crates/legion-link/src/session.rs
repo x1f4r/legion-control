@@ -49,8 +49,8 @@ pub fn cancel_reply_timeout(hops: u32) -> Duration {
 
 /// Grace window for clean EOF exit when closing a session.
 const CLOSE_GRACE: Duration = Duration::from_millis(500);
-/// Brief wait for process exit + stderr drain when a pipe closes unexpectedly.
-const EXIT_COLLECT_WAIT: Duration = Duration::from_millis(200);
+/// Bounded wait for process exit + stderr drain when a pipe closes unexpectedly.
+pub(crate) const EXIT_COLLECT_WAIT: Duration = Duration::from_secs(1);
 
 /// Lifecycle handle for the underlying transport backing a [`Session`] (such as a child process
 /// pipe in `legion-net` or an in-process SSH exec channel).
@@ -312,9 +312,21 @@ impl Session {
                 }
                 Err(_) => {
                     drop(writer);
-                    let (exit_code, stderr_text) = collect_failure_context(&mut handle, &stderr).await;
+                    // Unlike EOF, a handshake timeout means the connector is still open and
+                    // unresponsive: read any exit status or stderr already buffered without
+                    // spending EXIT_COLLECT_WAIT waiting for a hung peer to exit.
+                    let (exit_code, mut stderr_text) = if let Some(h) = handle.as_mut() {
+                        h.collect_exit_info(Duration::ZERO).await
+                    } else {
+                        (None, stderr.as_ref().map_or_else(String::new, |s| s.text()))
+                    };
                     if let Some(h) = handle.take() {
                         h.close(CLOSE_GRACE).await;
+                    }
+                    if stderr_text.is_empty()
+                        && let Some(tail) = stderr.as_ref()
+                    {
+                        stderr_text = tail.text();
                     }
                     let mut err = ErrorBody::new(
                         ErrorCode::Unreachable,
@@ -2314,5 +2326,144 @@ mod tests {
 
         session.close().await;
         let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn handshake_eof_collects_delayed_remote_stderr_past_200ms() {
+        struct DelayedStderrHandle {
+            delay: Duration,
+        }
+
+        impl TransportHandle for DelayedStderrHandle {
+            fn collect_exit_info(
+                &mut self,
+                wait_limit: Duration,
+            ) -> Pin<Box<dyn Future<Output = (Option<i32>, String)> + Send + '_>> {
+                let delay = self.delay;
+                Box::pin(async move {
+                    if wait_limit >= delay {
+                        tokio::time::sleep(delay).await;
+                        (Some(1), "legion gate: key expired on remote".to_owned())
+                    } else {
+                        tokio::time::sleep(wait_limit).await;
+                        (None, String::new())
+                    }
+                })
+            }
+
+            fn close(
+                self: Box<Self>,
+                _grace: Duration,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                Box::pin(async {})
+            }
+        }
+
+        // Separate read/write pipes so writing hello succeeds while reading sees immediate EOF
+        // and stderr/exit status arrive 300 ms later.
+        let (client_r, server_w) = tokio::io::duplex(4 * 1024);
+        let (_server_r, client_w) = tokio::io::duplex(4 * 1024);
+        drop(server_w);
+
+        let Err(open_err) = Session::open_transport(
+            client_r,
+            client_w,
+            Box::new(DelayedStderrHandle {
+                delay: Duration::from_millis(300),
+            }),
+            "tower",
+            None,
+            Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .await
+        else {
+            panic!("expected handshake EOF error");
+        };
+        let err = open_err.into_error();
+
+        assert!(
+            err.message.contains("exit status 1"),
+            "expected remote exit status after 300 ms stderr drain, got: {}",
+            err.message
+        );
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|h| h.contains("legion gate: key expired on remote")),
+            "expected remote stderr hint after 300 ms drain, got: {:?}",
+            err.hint
+        );
+    }
+
+    #[tokio::test]
+    async fn handshake_timeout_does_not_spend_exit_collect_wait_on_hung_transport() {
+        struct RecordingHungHandle {
+            stderr: Arc<StderrTail>,
+            collect_limits: Arc<Mutex<Vec<Duration>>>,
+        }
+
+        impl TransportHandle for RecordingHungHandle {
+            fn stderr_tail(&self) -> Option<Arc<StderrTail>> {
+                Some(Arc::clone(&self.stderr))
+            }
+
+            fn collect_exit_info(
+                &mut self,
+                wait_limit: Duration,
+            ) -> Pin<Box<dyn Future<Output = (Option<i32>, String)> + Send + '_>> {
+                self.collect_limits.lock().unwrap().push(wait_limit);
+                let text = self.stderr.text();
+                Box::pin(async move {
+                    if !wait_limit.is_zero() {
+                        tokio::time::sleep(wait_limit).await;
+                    }
+                    (None, text)
+                })
+            }
+
+            fn close(
+                self: Box<Self>,
+                _grace: Duration,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                Box::pin(async {})
+            }
+        }
+
+        let stderr = Arc::new(StderrTail::default());
+        stderr.push_line("ssh: connecting to tower.example\n");
+        let collect_limits = Arc::new(Mutex::new(Vec::new()));
+        let (client_r, _server_w) = tokio::io::duplex(4 * 1024);
+        let (_server_r, client_w) = tokio::io::duplex(4 * 1024);
+
+        let Err(open_err) = Session::open_transport(
+            client_r,
+            client_w,
+            Box::new(RecordingHungHandle {
+                stderr: Arc::clone(&stderr),
+                collect_limits: Arc::clone(&collect_limits),
+            }),
+            "tower",
+            None,
+            Duration::from_millis(80),
+            CancellationToken::new(),
+        )
+        .await
+        else {
+            panic!("expected handshake timeout error");
+        };
+        let err = open_err.into_error();
+        assert_eq!(err.code, ErrorCode::Unreachable);
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|h| h.contains("ssh: connecting to tower.example")),
+            "already-captured stderr must still appear on handshake timeout: {err:?}"
+        );
+        let limits = collect_limits.lock().unwrap().clone();
+        assert!(
+            limits.iter().all(Duration::is_zero),
+            "handshake timeout must not wait EXIT_COLLECT_WAIT on a hung transport; limits={limits:?}"
+        );
     }
 }

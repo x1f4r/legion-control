@@ -795,7 +795,7 @@ pub enum DesktopInstall {
         /// Installed Debian package name reported by `dpkg-query`.
         package: String,
     },
-    /// Running from a pacman package on Arch/CachyOS (never self-replaces).
+    /// Running from a pacman package on Arch Linux or a derivative (never self-replaces).
     LinuxPacman {
         /// Installed pacman package name.
         package: String,

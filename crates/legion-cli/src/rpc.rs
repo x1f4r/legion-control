@@ -42,7 +42,7 @@ const SHUTDOWN_GRACE: Duration = CANCEL_GRACE.saturating_add(Duration::from_secs
 
 /// Serves one session until `input` ends and every call has replied, or until `output` fails and
 /// every call has stopped.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub async fn serve<R, W>(
     input: R,
     output: W,

@@ -227,7 +227,7 @@ pub fn prompt_pair_choices(
                     ErrorCode::InvalidArgs,
                     "A device name is required.",
                 )
-                .with_hint("Run `legion pair` again and enter a short name such as `pixel` or `tablet`."));
+                .with_hint("Run `legion pair` again and enter a short name such as `phone` or `tablet`."));
             }
             trimmed.to_owned()
         }
@@ -498,10 +498,10 @@ deny = ["effect:power", "effect:admin"]
 
         // Choosing by number selects the expected role.
         let mut out = Vec::new();
-        let mut input = Cursor::new(b"Pixel 10\n2\n".to_vec());
+        let mut input = Cursor::new(b"My phone\n2\n".to_vec());
         let (name, role, allow_owner) =
             prompt_pair_choices(&policy, &specs, None, None, false, &mut input, &mut out).unwrap();
-        assert_eq!(name, "Pixel 10");
+        assert_eq!(name, "My phone");
         assert_eq!(role, "editor");
         assert!(!allow_owner);
         let prompt_text = String::from_utf8(out).unwrap();
@@ -547,7 +547,7 @@ deny = ["effect:power", "effect:admin"]
             &json!({
                 "invite": "legion-invite-1.eyJ2IjoxfQ",
                 "node": "tower",
-                "principal": "device:pixel",
+                "principal": "device:phone",
                 "role": "observer",
                 "expires": "2026-11-24T12:15:00Z"
             }),
@@ -558,7 +558,7 @@ deny = ["effect:power", "effect:admin"]
         let lines: Vec<&str> = output.lines().collect();
         assert_eq!(
             lines[0],
-            "Device will act as device:pixel (role: observer) on tower."
+            "Device will act as device:phone (role: observer) on tower."
         );
         assert_eq!(
             lines[1],

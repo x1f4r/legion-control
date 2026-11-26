@@ -57,12 +57,29 @@ async function setupUiVariant(scratchRoot, fixtures, v) {
     runLegionSync(v.bin, ['token.add', 'name=ui', 'principal=operator', '--json'], legionHome, userHome),
   );
   const server = await startLegionServe(v.bin, legionHome, userHome);
-  return { legionHome, userHome, token: tokOut.token, server, folderPath: fixtures.ui5k };
+  return {
+    legionHome,
+    userHome,
+    token: tokOut.token,
+    server,
+    folderPath: fixtures.ui5k,
+    wrappedFolderPath: fixtures.ui5kWrapped,
+  };
 }
 
-async function measureFolderOpenAndScroll(browser, env) {
+async function measureFolderOpenAndScroll(
+  browser,
+  env,
+  {
+    viewport = { width: 1100, height: 720 },
+    folderPath = env.folderPath,
+    firstPrefix = 'file_00000',
+    lastPrefix = 'file_04999',
+    expectWrappedTwoLines = false,
+  } = {},
+) {
   const context = await browser.newContext({
-    viewport: { width: 1100, height: 720 },
+    viewport,
     colorScheme: 'dark',
   });
   const page = await context.newPage();
@@ -94,14 +111,14 @@ async function measureFolderOpenAndScroll(browser, env) {
     fsListCalls = 0;
 
     // 2. Measure time from navigating into the 5,000-entry folder to first paint of its rows.
-    const folderHash = `#/files/tower/${encodeURI(env.folderPath)}`;
+    const folderHash = `#/files/tower/${encodeURI(folderPath)}`;
     const m0 = readProcMetrics(env.server.pid);
     const openT0 = process.hrtime.bigint();
     await page.evaluate((hash) => {
       window.location.hash = hash;
     }, folderHash);
 
-    await page.locator('.list a.row', { hasText: 'file_00000' }).first().waitFor({
+    await page.locator(`.list a.row[aria-label^="${firstPrefix}"]`).first().waitFor({
       state: 'visible',
       timeout: 20_000,
     });
@@ -114,6 +131,18 @@ async function measureFolderOpenAndScroll(browser, env) {
     );
     const firstPaintMs = Number(process.hrtime.bigint() - openT0) / 1e6;
     const initialRows = await page.locator('.list a.row').count();
+
+    if (expectWrappedTwoLines) {
+      await page.waitForFunction(
+        () => {
+          const slots = [...document.querySelectorAll('.list a.row .fn-slot')];
+          const ready = slots.filter((s) => s.getAttribute('data-fn-ready') === '1');
+          return ready.length >= 5 && ready.slice(0, 5).every((s) => s.querySelectorAll('.fn-line').length === 2);
+        },
+        null,
+        { timeout: 15_000 },
+      );
+    }
 
     // 3. Install Long Task observer + continuous rAF frame-delta tracker, then scroll to the end
     //    of all 5,000 entries.
@@ -148,102 +177,114 @@ async function measureFolderOpenAndScroll(browser, env) {
     const scrollT0 = process.hrtime.bigint();
     // Scroll incrementally to the bottom, letting IntersectionObserver load every page until the
     // pager disappears and all 5,000 entries have been traversed (or a safe timeout elapses).
-    const scrollResult = await page.evaluate(async () => {
-      function getFolderList() {
-        const lists = [...document.querySelectorAll('.list')];
-        return lists.find((el) => el.textContent && el.textContent.includes('file_00000')) || lists.at(-1);
-      }
-      function getScroller() {
-        let el = getFolderList();
-        while (el && el !== document.body && el !== document.documentElement) {
-          const style = window.getComputedStyle(el);
-          if (
-            (style.overflowY === 'auto' || style.overflowY === 'scroll') &&
-            el.scrollHeight > el.clientHeight + 2
-          ) {
-            return el;
-          }
-          el = el.parentElement;
+    const scrollResult = await page.evaluate(
+      async ({ firstPfx, lastPfx }) => {
+        function getFolderList() {
+          const lists = [...document.querySelectorAll('.list')];
+          return (
+            lists.find(
+              (el) =>
+                el.querySelector(`a.row[aria-label^="${firstPfx}"]`) ||
+                el.querySelector(`a.row[aria-label^="${lastPfx}"]`) ||
+                el.querySelector('.vlist-item'),
+            ) || lists.at(-1)
+          );
         }
-        return document.scrollingElement || document.documentElement;
-      }
+        function getScroller() {
+          let el = getFolderList();
+          while (el && el !== document.body && el !== document.documentElement) {
+            const style = window.getComputedStyle(el);
+            if (
+              (style.overflowY === 'auto' || style.overflowY === 'scroll') &&
+              el.scrollHeight > el.clientHeight + 2
+            ) {
+              return el;
+            }
+            el = el.parentElement;
+          }
+          return document.scrollingElement || document.documentElement;
+        }
 
-      const deadline = performance.now() + 90_000;
-      let steps = 0;
-      let idleAtBottom = 0;
+        const deadline = performance.now() + 90_000;
+        let steps = 0;
+        let idleAtBottom = 0;
 
-      while (performance.now() < deadline) {
-        const scroller = getScroller();
-        const maxTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
-        const curTop = scroller.scrollTop;
-        const pager = document.querySelector('.folder-pager');
+        while (performance.now() < deadline) {
+          const scroller = getScroller();
+          const maxTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+          const curTop = scroller.scrollTop;
+          const pager = document.querySelector('.folder-pager');
 
-        if (curTop < maxTop - 4) {
-          // Jump ~2.5 viewports per animation frame, simulating fast continuous scrolling.
-          const step = Math.max(scroller.clientHeight * 2.5, 1600);
-          scroller.scrollTop = Math.min(maxTop, curTop + step);
-          steps += 1;
-          idleAtBottom = 0;
-        } else if (pager) {
-          // Ensure the pager is intersecting and wait a frame for the next page/batch.
-          pager.scrollIntoView({ block: 'end' });
-          const btn = pager.querySelector('button:not([disabled])');
-          // Wait a couple of frames for IntersectionObserver first; if still idle, click Show more.
-          idleAtBottom += 1;
-          if (idleAtBottom > 4 && btn) {
-            btn.click();
+          if (curTop < maxTop - 4) {
+            // Jump ~2.5 viewports per animation frame, simulating fast continuous scrolling.
+            const step = Math.max(scroller.clientHeight * 2.5, 1600);
+            scroller.scrollTop = Math.min(maxTop, curTop + step);
+            steps += 1;
             idleAtBottom = 0;
+          } else if (pager) {
+            // Ensure the pager is intersecting and wait a frame for the next page/batch.
+            pager.scrollIntoView({ block: 'end' });
+            const btn = pager.querySelector('button:not([disabled])');
+            // Wait a couple of frames for IntersectionObserver first; if still idle, click Show more.
+            idleAtBottom += 1;
+            if (idleAtBottom > 4 && btn) {
+              btn.click();
+              idleAtBottom = 0;
+            }
+          } else {
+            idleAtBottom += 1;
+            if (idleAtBottom >= 3) {
+              break;
+            }
           }
-        } else {
-          idleAtBottom += 1;
-          if (idleAtBottom >= 3) {
-            break;
-          }
+          await new Promise((r) => requestAnimationFrame(() => r()));
         }
-        await new Promise((r) => requestAnimationFrame(() => r()));
-      }
 
-      const st = window.__benchPerf;
-      st.running = false;
-      if (st.po) st.po.disconnect();
+        const st = window.__benchPerf;
+        st.running = false;
+        if (st.po) st.po.disconnect();
 
-      const frames = st.frames;
-      let dropped33 = 0;
-      let janky50 = 0;
-      let maxFrame = 0;
-      for (const dt of frames) {
-        if (dt > 33.33) dropped33 += 1;
-        if (dt > 50) janky50 += 1;
-        if (dt > maxFrame) maxFrame = dt;
-      }
+        const frames = st.frames;
+        let dropped33 = 0;
+        let janky50 = 0;
+        let maxFrame = 0;
+        for (const dt of frames) {
+          if (dt > 33.33) dropped33 += 1;
+          if (dt > 50) janky50 += 1;
+          if (dt > maxFrame) maxFrame = dt;
+        }
 
-      const longTasks = st.longTasks;
-      const longTaskTotalMs = longTasks.reduce((a, b) => a + b, 0);
-      const maxLongTaskMs = longTasks.length ? Math.max(...longTasks) : 0;
-      const folderList = getFolderList();
-      const rows = folderList ? [...folderList.querySelectorAll('a.row')] : [];
-      const rowsAtEnd = rows.length;
-      const lastRowText = rows.at(-1)?.textContent?.trim() || '';
-      const domNodes = document.getElementsByTagName('*').length;
-      const pagerStillPresent = Boolean(document.querySelector('.folder-pager'));
-      const sawLastFile = lastRowText.includes('file_04999') || (folderList?.textContent || '').includes('file_04999');
+        const longTasks = st.longTasks;
+        const longTaskTotalMs = longTasks.reduce((a, b) => a + b, 0);
+        const maxLongTaskMs = longTasks.length ? Math.max(...longTasks) : 0;
+        const folderList = getFolderList();
+        const rows = folderList ? [...folderList.querySelectorAll('a.row')] : [];
+        const rowsAtEnd = rows.length;
+        const lastRowLabel = rows.at(-1)?.getAttribute('aria-label') || rows.at(-1)?.textContent?.trim() || '';
+        const domNodes = document.getElementsByTagName('*').length;
+        const pagerStillPresent = Boolean(document.querySelector('.folder-pager'));
+        const sawLastFile =
+          lastRowLabel.startsWith(lastPfx) ||
+          Boolean(folderList?.querySelector(`a.row[aria-label^="${lastPfx}"]`));
 
-      return {
-        steps,
-        framesCount: frames.length,
-        dropped33,
-        janky50,
-        maxFrame,
-        longTasksCount: longTasks.length,
-        longTaskTotalMs,
-        maxLongTaskMs,
-        rowsAtEnd,
-        lastRowText,
-        domNodes,
-        pagerStillPresent,
-        sawLastFile,
-      };
-    });
+        return {
+          steps,
+          framesCount: frames.length,
+          dropped33,
+          janky50,
+          maxFrame,
+          longTasksCount: longTasks.length,
+          longTaskTotalMs,
+          maxLongTaskMs,
+          rowsAtEnd,
+          lastRowText: lastRowLabel,
+          domNodes,
+          pagerStillPresent,
+          sawLastFile,
+        };
+      },
+      { firstPfx: firstPrefix, lastPfx: lastPrefix },
+    );
 
     const scrollTotalMs = Number(process.hrtime.bigint() - scrollT0) / 1e6;
     const m1 = readProcMetrics(env.server.pid);
@@ -296,49 +337,91 @@ export async function runUiBrowserSuite({ repoRoot, scratchRoot, fixtures, varia
   });
 
   try {
-    console.error(`[bench:ui-browser] 5,000-entry folder open + scroll (${runs} runs x ${variants.length} variant(s))...`);
-    const samplesByVariant = new Map(variants.map((v) => [v.id, []]));
+    console.error(`[bench:ui-browser] desktop 1100x720 5,000-entry folder (${runs} runs x ${variants.length} variant(s))...`);
+    const deskByVariant = new Map(variants.map((v) => [v.id, []]));
     for (let iter = 0; iter < runs; iter += 1) {
       const order = iter % 2 === 0 ? variants : [...variants].reverse();
       for (const v of order) {
-        const sample = await measureFolderOpenAndScroll(browser, envByVariant.get(v.id));
-        samplesByVariant.get(v.id).push(sample);
+        const sample = await measureFolderOpenAndScroll(browser, envByVariant.get(v.id), {
+          viewport: { width: 1100, height: 720 },
+          folderPath: fixtures.ui5k,
+          firstPrefix: 'file_00000',
+          lastPrefix: 'file_04999',
+        });
+        deskByVariant.get(v.id).push(sample);
+      }
+    }
+
+    console.error(`[bench:ui-browser] phone 390x844 5,000 two-line wrapped names (${runs} runs x ${variants.length} variant(s))...`);
+    const phoneByVariant = new Map(variants.map((v) => [v.id, []]));
+    for (let iter = 0; iter < runs; iter += 1) {
+      const order = iter % 2 === 0 ? variants : [...variants].reverse();
+      for (const v of order) {
+        const sample = await measureFolderOpenAndScroll(browser, envByVariant.get(v.id), {
+          viewport: { width: 390, height: 844 },
+          folderPath: fixtures.ui5kWrapped,
+          firstPrefix: 'Quarterly_Production_Cluster_Rollout_Archive_Snapshot_Node_00000',
+          lastPrefix: 'Quarterly_Production_Cluster_Rollout_Archive_Snapshot_Node_04999',
+          expectWrappedTwoLines: true,
+        });
+        phoneByVariant.get(v.id).push(sample);
       }
     }
 
     const openRow = {
       id: 'ui-5k-first-paint',
-      name: '5,000-entry folder — First paint of rows',
+      name: 'Desktop 1100×720 — 5,000-entry folder, first paint',
       highlight: true,
       note: 'In-app navigation to a 5,000-entry folder on real `legion serve` until first rows paint',
     };
     const scrollRow = {
       id: 'ui-5k-scroll-end',
-      name: '5,000-entry folder — Scroll to end (5,000 rows)',
+      name: 'Desktop 1100×720 — 5,000-entry folder, scroll to end',
       highlight: true,
       note: 'Continuous scroll to bottom; tracks dropped frames (>33.3 ms), long tasks (>50 ms), and DOM nodes',
     };
+    const phoneOpenRow = {
+      id: 'ui-phone-5k-wrapped-first-paint',
+      name: 'Phone 390×844 — 5,000 wrapped 2-line rows, first paint',
+      highlight: true,
+      note: 'Every name wraps to 2 lines on phone viewport via FileNameList',
+    };
+    const phoneScrollRow = {
+      id: 'ui-phone-5k-wrapped-scroll-end',
+      name: 'Phone 390×844 — 5,000 wrapped 2-line rows, scroll to end',
+      highlight: true,
+      note: 'Continuous scroll to bottom across 5,000 two-line wrapped rows on phone viewport',
+    };
 
     for (const v of variants) {
-      const sum = summarizeSamples(samplesByVariant.get(v.id));
-      openRow[v.slot] = {
-        primary_ms: sum.first_paint_ms,
-      };
+      const dSum = summarizeSamples(deskByVariant.get(v.id));
+      openRow[v.slot] = { primary_ms: dSum.first_paint_ms };
       scrollRow[v.slot] = {
-        primary_ms: sum.scroll_total_ms,
-        dropped_frames_33ms: sum.dropped_frames_33ms,
-        long_tasks_total_ms: sum.long_tasks_total_ms,
-        max_frame_ms: sum.max_frame_ms,
-        final_dom_nodes: sum.final_dom_nodes,
-        fs_list_calls: sum.fs_list_calls,
+        primary_ms: dSum.scroll_total_ms,
+        dropped_frames_33ms: dSum.dropped_frames_33ms,
+        long_tasks_total_ms: dSum.long_tasks_total_ms,
+        max_frame_ms: dSum.max_frame_ms,
+        final_dom_nodes: dSum.final_dom_nodes,
+        fs_list_calls: dSum.fs_list_calls,
+      };
+
+      const pSum = summarizeSamples(phoneByVariant.get(v.id));
+      phoneOpenRow[v.slot] = { primary_ms: pSum.first_paint_ms };
+      phoneScrollRow[v.slot] = {
+        primary_ms: pSum.scroll_total_ms,
+        dropped_frames_33ms: pSum.dropped_frames_33ms,
+        long_tasks_total_ms: pSum.long_tasks_total_ms,
+        max_frame_ms: pSum.max_frame_ms,
+        final_dom_nodes: pSum.final_dom_nodes,
+        fs_list_calls: pSum.fs_list_calls,
       };
     }
 
     return {
       id: 'ui-browser',
-      title: '5. Web UI (`legion serve` + Headless Chromium, 5,000-entry folder)',
+      title: 'Web UI (`legion serve` + Headless Chromium, 5,000-entry folders)',
       description:
-        'Desktop viewport (1100×720) opening a real 5,000-entry directory served by `legion serve` and scrolling through all 5,000 entries.',
+        'Interleaved desktop (1100×720, 5,000 rows) and phone (390×844, 5,000 two-line wrapped rows) open + continuous scroll to end on real `legion serve`.',
       columns: [
         { key: 'primary_ms', label: 'Time', unit: 'ms', decimals: 1, primary: true, higherIsBetter: false },
         { key: 'dropped_frames_33ms', label: 'Frames >33ms', unit: '', decimals: 0 },
@@ -347,7 +430,7 @@ export async function runUiBrowserSuite({ repoRoot, scratchRoot, fixtures, varia
         { key: 'final_dom_nodes', label: 'Final DOM Nodes', unit: '', decimals: 0 },
         { key: 'fs_list_calls', label: 'fs.list Calls', unit: '', decimals: 0 },
       ],
-      rows: [openRow, scrollRow],
+      rows: [openRow, scrollRow, phoneOpenRow, phoneScrollRow],
       notes: [
         'Full breakdown including `janky_frames_50ms`, `long_tasks_count`, `max_long_task_ms`, and `rows_at_end` is saved in results.json.',
       ],

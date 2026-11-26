@@ -121,7 +121,8 @@ impl TransportHandle for SshPipeHandle {
         wait_limit: Duration,
     ) -> Pin<Box<dyn Future<Output = (Option<i32>, String)> + Send + '_>> {
         Box::pin(async move {
-            if let Some(mut task) = self.rx_task.take()
+            if !wait_limit.is_zero()
+                && let Some(mut task) = self.rx_task.take()
                 && tokio::time::timeout(wait_limit, &mut task).await.is_err()
             {
                 task.abort();
@@ -136,19 +137,20 @@ impl TransportHandle for SshPipeHandle {
 
     fn close(mut self: Box<Self>, grace: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         Box::pin(async move {
+            let deadline = tokio::time::Instant::now() + grace;
             if let Some(mut tx) = self.tx_task.take()
-                && tokio::time::timeout(grace, &mut tx).await.is_err()
+                && tokio::time::timeout_at(deadline, &mut tx).await.is_err()
             {
                 tx.abort();
             }
             if let Some(mut rx) = self.rx_task.take()
-                && tokio::time::timeout(grace, &mut rx).await.is_err()
+                && tokio::time::timeout_at(deadline, &mut rx).await.is_err()
             {
                 rx.abort();
             }
             if let Some(session) = self.session.take() {
-                let _ = tokio::time::timeout(
-                    grace,
+                let _ = tokio::time::timeout_at(
+                    deadline,
                     session.disconnect(Disconnect::ByApplication, "", "en"),
                 )
                 .await;
@@ -1274,29 +1276,13 @@ impl StreamOpener for SshStreamOpener {
             };
 
             let open_fut = async {
-                // OpenSSH can briefly return `ChannelOpenFailure` while a just-closed channel is
-                // still being reaped in `server_loop2` even though our local permit count stays
-                // strictly below default `MaxSessions = 10`. Retry briefly before surfacing Busy.
-                const RETRY_DELAYS_MS: [u64; 4] = [5, 15, 40, 100];
-                let mut attempt = 0usize;
-                let channel = loop {
-                    match self
-                        .session
+                let channel = open_channel_with_retry(|| async {
+                    self.session
                         .channel_open_session()
                         .await
                         .map_err(classify_channel_open_error)
-                    {
-                        Ok(channel) => break channel,
-                        Err(StreamOpenError::ChannelRefused(body)) => {
-                            let Some(&delay_ms) = RETRY_DELAYS_MS.get(attempt) else {
-                                return Err(StreamOpenError::ChannelRefused(body));
-                            };
-                            attempt += 1;
-                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                        }
-                        Err(other) => return Err(other),
-                    }
-                };
+                })
+                .await?;
                 channel.exec(true, command).await.map_err(|err| {
                     let _ = err;
                     StreamOpenError::DeadSession(
@@ -1334,6 +1320,32 @@ impl StreamOpener for SshStreamOpener {
                 },
             }
         })
+    }
+}
+
+/// OpenSSH can briefly return `ChannelOpenFailure` while a just-closed channel is still being
+/// reaped in `server_loop2` even though our local permit count stays strictly below default
+/// `MaxSessions = 10`. Retry briefly before surfacing `Busy`.
+const CHANNEL_OPEN_RETRY_DELAYS_MS: [u64; 5] = [10, 30, 80, 200, 400];
+
+async fn open_channel_with_retry<T, F, Fut>(mut try_open: F) -> Result<T, StreamOpenError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, StreamOpenError>>,
+{
+    let mut attempt = 0usize;
+    loop {
+        match try_open().await {
+            Ok(channel) => return Ok(channel),
+            Err(StreamOpenError::ChannelRefused(body)) => {
+                let Some(&delay_ms) = CHANNEL_OPEN_RETRY_DELAYS_MS.get(attempt) else {
+                    return Err(StreamOpenError::ChannelRefused(body));
+                };
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            Err(other) => return Err(other),
+        }
     }
 }
 
@@ -1942,5 +1954,31 @@ mod tests {
             "TCP connection must never be opened to a disallowed resolved address"
         );
         accept_task.abort();
+    }
+
+    #[tokio::test]
+    async fn channel_open_retry_rides_out_sshd_reap_delay_past_160ms() {
+        let started = std::time::Instant::now();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let res = open_channel_with_retry(|| {
+            let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                // Simulate sshd taking 250 ms to finish reaping a closed session slot.
+                if started.elapsed() < Duration::from_millis(250) {
+                    Err(StreamOpenError::ChannelRefused(ErrorBody::new(
+                        ErrorCode::Busy,
+                        format!("channel refused on attempt {n}"),
+                    )))
+                } else {
+                    Ok("opened")
+                }
+            }
+        })
+        .await;
+        assert_eq!(
+            res.ok(),
+            Some("opened"),
+            "channel-open retries should outlast a 250 ms sshd reap window"
+        );
     }
 }

@@ -770,7 +770,6 @@ pub struct TransferManager {
     cleanup_notify: Notify,
     scheduler_started: AtomicBool,
     shutdown_token: CancellationToken,
-    #[allow(dead_code)]
     id_salt: AtomicU64,
     #[cfg(test)]
     download_pause_once: Mutex<Option<Arc<DownloadPauseGate>>>,
@@ -5683,23 +5682,69 @@ mod tests {
         }
     }
 
+    async fn wait_for_entry(
+        mgr: &TransferManager,
+        id: &str,
+        step: &str,
+        predicate: impl Fn(&DeviceTransfer) -> bool,
+    ) -> DeviceTransfer {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if let Some(t) = mgr.list().into_iter().find(|t| t.id == id)
+                && predicate(&t)
+            {
+                return t;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "timed out waiting for transfer {id} ({step}); current: {:?}",
+            mgr.list()
+        );
+    }
+
+    async fn wait_for_finalized_path(
+        mgr: &TransferManager,
+        id: &str,
+        step: &str,
+    ) -> DeviceTransfer {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let recorded = {
+                let guard = mgr
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                !guard.running.contains_key(id)
+                    && guard
+                        .items
+                        .iter()
+                        .find(|r| r.transfer.id == id)
+                        .is_some_and(|r| r.finalized_local_path.is_some())
+            };
+            let persisted = recorded
+                && fs::read_to_string(mgr.queue_file_path())
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<PersistedQueue>(&raw).ok())
+                    .and_then(|q| q.items.into_iter().find(|r| r.transfer.id == id))
+                    .is_some_and(|r| r.finalized_local_path.is_some());
+            if persisted && let Some(t) = mgr.list().into_iter().find(|t| t.id == id) {
+                return t;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "timed out waiting for transfer {id} ({step}); current: {:?}",
+            mgr.list()
+        );
+    }
+
     async fn wait_for_state(
         mgr: &TransferManager,
         id: &str,
         predicate: impl Fn(TransferState) -> bool,
     ) -> DeviceTransfer {
-        for _ in 0..200 {
-            if let Some(t) = mgr.list().into_iter().find(|t| t.id == id)
-                && predicate(t.state)
-            {
-                return t;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!(
-            "timed out waiting for transfer {id}; current: {:?}",
-            mgr.list()
-        );
+        wait_for_entry(mgr, id, "target state", |t| predicate(t.state)).await
     }
 
     #[tokio::test]
@@ -5859,14 +5904,16 @@ mod tests {
             .await
             .unwrap();
         // Wait until some bytes have landed in `.part`, then simulate process termination.
-        for _ in 0..100 {
-            if fs::metadata(mgr2.part_path(&rid))
-                .map(|m| m.len())
-                .unwrap_or(0)
-                >= 16 * 1024
-            {
-                break;
-            }
+        let part_deadline = Instant::now() + Duration::from_secs(10);
+        while fs::metadata(mgr2.part_path(&rid))
+            .map(|m| m.len())
+            .unwrap_or(0)
+            < 16 * 1024
+        {
+            assert!(
+                Instant::now() < part_deadline,
+                "timed out waiting for .part file to accumulate 16 KiB before simulated restart"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         mgr2.shutdown();
@@ -6295,8 +6342,12 @@ mod tests {
             .await
             .unwrap();
         platform.finalize_release.notify_waiters();
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        let still_paused = mgr.list().into_iter().find(|t| t.id == id2).unwrap();
+        let still_paused = wait_for_finalized_path(
+            &mgr,
+            &id2,
+            "paused finalize_download recording finalized_local_path",
+        )
+        .await;
         assert_eq!(still_paused.state, TransferState::Paused);
         assert!(
             !platform
@@ -7050,7 +7101,12 @@ mod tests {
             .unwrap();
         assert_eq!(paused.state, TransferState::Paused);
         platform.finalize_release.notify_waiters();
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        let _ = wait_for_finalized_path(
+            &mgr,
+            &id,
+            "paused finalize_download finishing before Cancel",
+        )
+        .await;
 
         let saved_path = platform.downloads_dir.join("paused-cancel.jpg");
         assert!(
@@ -7166,7 +7222,12 @@ mod tests {
             .await
             .unwrap();
         platform.finalize_release.notify_waiters();
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        let _ = wait_for_finalized_path(
+            &mgr,
+            &id2,
+            "paused Android finalize_download recording content URI",
+        )
+        .await;
         assert_eq!(platform.live_content_uris.lock().unwrap().len(), 1);
 
         let c2 = mgr
@@ -7227,7 +7288,12 @@ mod tests {
                 .await
                 .unwrap();
             platform.finalize_release.notify_waiters();
-            tokio::time::sleep(Duration::from_millis(80)).await;
+            let _ = wait_for_finalized_path(
+                &mgr,
+                &id,
+                "paused cache finalize_download recording finalized_local_path",
+            )
+            .await;
             assert_eq!(fs::read_dir(&platform.cache_dir).unwrap().count(), 1);
             assert_eq!(fs::read_dir(&platform.downloads_dir).unwrap().count(), 0);
 
@@ -7302,7 +7368,12 @@ mod tests {
                 .await
                 .unwrap();
             platform.finalize_release.notify_waiters();
-            tokio::time::sleep(Duration::from_millis(80)).await;
+            let _ = wait_for_finalized_path(
+                &mgr,
+                &id,
+                "paused Android cache finalize_download recording FileProvider URI",
+            )
+            .await;
             assert!(
                 platform
                     .live_content_uris
@@ -7605,10 +7676,12 @@ mod tests {
             )
             .await
             .unwrap();
-        for _ in 0..100 {
-            if mgr.part_path(&id_brief).exists() {
-                break;
-            }
+        let brief_deadline = Instant::now() + Duration::from_secs(10);
+        while !mgr.part_path(&id_brief).exists() {
+            assert!(
+                Instant::now() < brief_deadline,
+                "timed out waiting for brief-lock .part file to appear"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         platform.fail_delete_part.store(2, Ordering::SeqCst);
@@ -7633,10 +7706,12 @@ mod tests {
             )
             .await
             .unwrap();
-        for _ in 0..100 {
-            if mgr.part_path(&id_part).exists() {
-                break;
-            }
+        let part_deadline = Instant::now() + Duration::from_secs(10);
+        while !mgr.part_path(&id_part).exists() {
+            assert!(
+                Instant::now() < part_deadline,
+                "timed out waiting for locked-part .part file to appear"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         platform.fail_delete_part.store(100, Ordering::SeqCst);
@@ -7681,12 +7756,12 @@ mod tests {
             .unwrap();
         platform.finalize_release.notify_waiters();
         let saved_path = platform.downloads_dir.join("locked-saved.pdf");
-        for _ in 0..100 {
-            if saved_path.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        let _ = wait_for_finalized_path(
+            &mgr,
+            &id_saved,
+            "paused finalize_download finishing before Cancel with locked saved file",
+        )
+        .await;
         assert!(saved_path.exists());
 
         platform.fail_delete_saved.store(100, Ordering::SeqCst);
@@ -7752,12 +7827,15 @@ mod tests {
             .unwrap();
         platform.finalize_release.notify_waiters();
         let saved_path = platform.downloads_dir.join("restart-cancel.pdf");
-        for _ in 0..100 {
-            if saved_path.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        // Wait for the worker to finish post-finalize `.part` cleanup and clear its slot before
+        // recreating the stray `.part` file, so the worker cannot race and delete our test file.
+        let _ = wait_for_finalized_path(
+            &mgr1,
+            &id,
+            "paused finalize_download finishing before recreating stray .part",
+        )
+        .await;
+        assert!(saved_path.exists());
         // Recreate a stray `.part` alongside the saved file and lock both so cancel persists as
         // `Cancelling` across app exit.
         fs::write(mgr1.part_path(&id), b"partial").unwrap();
@@ -8250,7 +8328,7 @@ mod tests {
                             user: "me".to_owned(),
                             host_keys: vec![tower_key.to_owned()],
                         },
-                        Some("device:pixel".to_owned()),
+                        Some("device:phone".to_owned()),
                     )],
                     ..LinkConfig::default()
                 },
@@ -8329,7 +8407,7 @@ mod tests {
                         link: self.link.clone(),
                         link_node: machine.to_owned(),
                         machine: machine.to_owned(),
-                        principal: "device:pixel".to_owned(),
+                        principal: "device:phone".to_owned(),
                         holder: "fleet:1".to_owned(),
                         learned_identity: None,
                     })
@@ -8593,7 +8671,7 @@ mod tests {
                     link: self.link.clone(),
                     link_node: machine.to_owned(),
                     machine: machine.to_owned(),
-                    principal: "device:pixel".to_owned(),
+                    principal: "device:phone".to_owned(),
                     holder,
                     learned_identity: None,
                 })
@@ -8760,7 +8838,7 @@ mod tests {
                         user: "me".to_owned(),
                         host_keys: vec![tower_key],
                     },
-                    Some("device:pixel".to_owned()),
+                    Some("device:phone".to_owned()),
                 )],
                 ..LinkConfig::default()
             },
@@ -9343,7 +9421,7 @@ mod tests {
                     link: self.link.clone(),
                     link_node: machine.to_owned(),
                     machine: machine.to_owned(),
-                    principal: "device:pixel".to_owned(),
+                    principal: "device:phone".to_owned(),
                     holder: "fleet:1".to_owned(),
                     learned_identity: None,
                 })
@@ -9485,7 +9563,7 @@ mod tests {
                         user: "me".to_owned(),
                         host_keys: vec![tower_key.to_owned()],
                     },
-                    Some("device:pixel".to_owned()),
+                    Some("device:phone".to_owned()),
                 )],
                 ..LinkConfig::default()
             },
@@ -10571,7 +10649,7 @@ mod tests {
                     link: self.link.clone(),
                     link_node: machine.to_owned(),
                     machine: machine.to_owned(),
-                    principal: "device:pixel".to_owned(),
+                    principal: "device:phone".to_owned(),
                     holder: "fleet:1".to_owned(),
                     learned_identity: None,
                 })
@@ -10775,7 +10853,7 @@ mod tests {
                 user: "me".to_owned(),
                 host_keys: vec![tower_key.to_owned()],
             },
-            Some("device:pixel".to_owned()),
+            Some("device:phone".to_owned()),
         ));
         let link = Link::with_opener(cfg, LinkOptions::default(), opener);
         let backend: Arc<dyn Backend> = Arc::new(UpdaterCloseRelayBackend {

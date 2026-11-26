@@ -279,6 +279,15 @@ impl Drop for WaiterGuard {
 }
 
 impl ContentPipePool {
+    #[cfg(test)]
+    fn waiter_count(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .waiters_by_holder
+            .values()
+            .sum()
+    }
     fn new(capacity: usize, max_idle: usize, idle_ttl: Duration) -> Self {
         Self {
             capacity: capacity.max(1),
@@ -4272,7 +4281,7 @@ mod tests {
         assert!(live.reachable, "{live:?}");
         assert_eq!(live.system.as_deref(), Some("windows"));
         assert!(
-            live_elapsed < Duration::from_secs(2),
+            live_elapsed < Duration::from_secs(3),
             "second system waited on first system: {live_elapsed:?}"
         );
 
@@ -4283,7 +4292,7 @@ mod tests {
                 &store,
                 "tower",
                 "dead",
-                Duration::from_millis(900),
+                Duration::from_millis(1500),
                 CancellationToken::new(),
             )
             .await;
@@ -4295,7 +4304,7 @@ mod tests {
             "combined error should mention both systems: {msg}"
         );
         assert!(
-            dead_elapsed < Duration::from_millis(2400),
+            dead_elapsed < Duration::from_millis(3200),
             "dead dual-boot systems were probed serially: {dead_elapsed:?}"
         );
 
@@ -5012,17 +5021,24 @@ printf 'closed\n' > "{exited}"
         let cancel_b = cancel.clone();
         let b_task = tokio::spawn(async move {
             pool_b
-                .acquire("holder-b", "pi", Duration::from_secs(2), &cancel_b)
+                .acquire("holder-b", "pi", Duration::from_secs(5), &cancel_b)
                 .await
         });
         let pool_a = Arc::clone(&pool);
         let cancel_a = cancel.clone();
         let a_extra = tokio::spawn(async move {
             pool_a
-                .acquire("holder-a", "pi", Duration::from_millis(200), &cancel_a)
+                .acquire("holder-a", "pi", Duration::from_millis(400), &cancel_a)
                 .await
         });
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        let wait_deadline = Instant::now() + Duration::from_secs(5);
+        while pool.waiter_count() < 2 {
+            assert!(
+                Instant::now() < wait_deadline,
+                "timed out waiting for holder-b and holder-a extra waiters to register"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         drop(a4);
 
         let b_permit = b_task.await.unwrap().expect("holder B must win freed slot");

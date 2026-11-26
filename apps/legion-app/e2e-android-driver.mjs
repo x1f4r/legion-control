@@ -538,8 +538,8 @@ async function runPhoneSuite() {
 
   // 2. Pair with A (tower) as owner; verify fleet sync summary shows pi received it, and both nodes load.
   log('Step 2: pairing with tower while pi is reached only through the fleet relay');
-  const invite1 = createInvite('tower', { name: 'pixel-e2e', role: 'owner', allowOwner: true });
-  await pairViaUi(page, invite1, 'pixel-e2e');
+  const invite1 = createInvite('tower', { name: 'phone-e2e', role: 'owner', allowOwner: true });
+  await pairViaUi(page, invite1, 'phone-e2e');
   await waitForMachineWithStats(page, 'tower');
   await waitForMachineWithStats(page, 'pi');
   await page.getByText('Paired with tower and shared with pi.').waitFor({ state: 'visible', timeout: 15000 });
@@ -713,15 +713,15 @@ async function runPhoneSuite() {
   const landed = fs.readFileSync(path.join(FILES_B_DIR, 'relayed-upload.bin'));
   assert.deepEqual(landed, uploadPayload, 'Uploaded bytes on pi must match original payload');
 
-  // Confirm pi's sshd has NOT seen any direct authentication from pixel-e2e yet: every single
+  // Confirm pi's sshd has NOT seen any direct authentication from phone-e2e yet: every single
   // file view, ranged media read, download, and upload above traversed the tower relay, and both
-  // relay (tower) and target (pi) wrote stream audit entries for device:pixel-e2e on target pi.
-  const pixelFp = getDeviceFingerprint('pi', 'pixel-e2e');
-  assert.ok(pixelFp, 'Expected pixel-e2e to be present on pi after pairing with tower');
+  // relay (tower) and target (pi) wrote stream audit entries for device:phone-e2e on target pi.
+  const phoneFp = getDeviceFingerprint('pi', 'phone-e2e');
+  assert.ok(phoneFp, 'Expected phone-e2e to be present on pi after pairing with tower');
   const sshdBBeforeLearn = fs.readFileSync(NODES.pi.sshdLog, 'utf8');
   assert.ok(
-    !sshdBBeforeLearn.includes(pixelFp),
-    `Expected zero direct SSH auth on pi before learning direct route, but found ${pixelFp}`,
+    !sshdBBeforeLearn.includes(phoneFp),
+    `Expected zero direct SSH auth on pi before learning direct route, but found ${phoneFp}`,
   );
   for (const nodeName of ['tower', 'pi']) {
     const auditPath = path.join(NODES[nodeName].home, 'state/audit.jsonl');
@@ -735,10 +735,10 @@ async function runPhoneSuite() {
         (e) =>
           e.tool === 'stream.put' &&
           e.target === 'pi' &&
-          e.principal === 'device:pixel-e2e' &&
+          e.principal === 'device:phone-e2e' &&
           e.outcome === 'ok',
       ),
-      `Expected ok stream.put audit entry for device:pixel-e2e targeting pi on ${nodeName}`,
+      `Expected ok stream.put audit entry for device:phone-e2e targeting pi on ${nodeName}`,
     );
   }
   log('Confirmed picture, ranged media read, download, and upload on pi all ran strictly through relay tower');
@@ -803,8 +803,8 @@ async function runPhoneSuite() {
   assert.equal(audioDirect.piRoute?.kind, 'direct', `Expected pi route to switch to direct: ${JSON.stringify(audioDirect.piRoute)}`);
   const sshdBAfterDirectStream = fs.readFileSync(NODES.pi.sshdLog, 'utf8');
   assert.ok(
-    sshdBAfterDirectStream.includes(pixelFp),
-    `Expected pi sshd log to record direct stream auth by ${pixelFp} after learn()`,
+    sshdBAfterDirectStream.includes(phoneFp),
+    `Expected pi sshd log to record direct stream auth by ${phoneFp} after learn()`,
   );
   log('Confirmed ranged media stream on pi switched seamlessly to direct route after learn()');
 
@@ -824,20 +824,20 @@ async function runPhoneSuite() {
     `Pairing sync banner should stay on Machines and not repeat on Connections:\n${connText}`,
   );
   assert.ok(
-    !connText.includes('device:pixel-e2e'),
-    `Plain Connections leaked raw principal string device:pixel-e2e:\n${connText}`,
+    !connText.includes('device:phone-e2e'),
+    `Plain Connections leaked raw principal string device:phone-e2e:\n${connText}`,
   );
   await takeShot(page, '03-connections-direct.png');
 
-  // 4. Run a command on B (pi) and confirm it connected DIRECTLY to pi's sshd using pixel-e2e's key.
+  // 4. Run a command on B (pi) and confirm it connected DIRECTLY to pi's sshd using phone-e2e's key.
   log('Step 4: running a command on pi and proving it went directly to pi');
   await runCommandOnMachine(page, 'pi', 'echo direct-to-pi', 'direct-to-pi');
   const sshdBLog = fs.readFileSync(NODES.pi.sshdLog, 'utf8');
   assert.ok(
-    sshdBLog.includes(pixelFp),
-    `Expected pi sshd log to record direct authentication by ${pixelFp}`,
+    sshdBLog.includes(phoneFp),
+    `Expected pi sshd log to record direct authentication by ${phoneFp}`,
   );
-  log(`Confirmed direct SSH authentication by ${pixelFp} in pi sshd log`);
+  log(`Confirmed direct SSH authentication by ${phoneFp} in pi sshd log`);
   await takeShot(page, '04-direct-command-pi.png');
 
   // 5. Stop A (tower)'s sshd: Machines still shows pi on with live metrics, tower shows under Off,
@@ -945,7 +945,7 @@ async function runPhoneSuite() {
   //    app is refused by B; then after A starts and syncs, refused by A too!
   log('Step 9: removing phone on pi while tower is stopped, verifying refusal by pi');
   await stopSshd('tower');
-  const rmOut = legionNode('pi', ['device.remove', 'name=pixel-e2e']);
+  const rmOut = legionNode('pi', ['device.remove', 'name=phone-e2e']);
   log(`device.remove on pi: ${rmOut.trim().replace(/\s+/g, ' ')}`);
   await killNodeSessions('pi');
 
@@ -997,8 +997,8 @@ async function runPhoneSuite() {
   );
   const afterSyncListA = JSON.parse(legionNode('tower', ['device.list', '--json']));
   assert.ok(
-    !(afterSyncListA.devices || []).some((d) => d.name === 'pixel-e2e'),
-    'Expected pixel-e2e to be removed on tower after sync',
+    !(afterSyncListA.devices || []).some((d) => d.name === 'phone-e2e'),
+    'Expected phone-e2e to be removed on tower after sync',
   );
   await takeShot(page, '13-revoked-on-a-after-sync.png');
 

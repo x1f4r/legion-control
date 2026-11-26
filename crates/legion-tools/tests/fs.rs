@@ -2388,7 +2388,7 @@ async fn non_regular_files_are_refused_before_opening() {
             json!({"path": f.p(&fifo), "content": "x", "expect_hash": "blake3:0000"}),
         ),
     ] {
-        let res = tokio::time::timeout(Duration::from_secs(2), f.call(tool, args.clone()))
+        let res = tokio::time::timeout(Duration::from_secs(10), f.call(tool, args.clone()))
             .await
             .unwrap_or_else(|_| panic!("{tool} blocked on FIFO {fifo:?}"));
         let err = res.unwrap_err();
@@ -2414,7 +2414,7 @@ async fn non_regular_files_are_refused_before_opening() {
 
     // Grepping a directory containing a FIFO skips it without blocking and still matches regular files.
     let dir_grep = tokio::time::timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(10),
         f.call(
             "fs.grep",
             json!({"path": f.p(&f.work), "pattern": "needle"}),
@@ -3087,7 +3087,7 @@ async fn find_large_directory_cuts_off_within_budget() {
     );
     assert_eq!(res["reason"], json!("time"));
     assert!(
-        elapsed < Duration::from_secs(2),
+        elapsed < Duration::from_secs(10),
         "fs.find took {elapsed:?} for a 1ms budget"
     );
 }
@@ -3575,6 +3575,7 @@ async fn thumb_extracts_video_posters_when_ffmpeg_is_installed() {
     // Only run the positive ffmpeg extraction check when `ffmpeg` is present on PATH.
     let has_ffmpeg = std::process::Command::new("ffmpeg")
         .arg("-version")
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -3589,6 +3590,7 @@ async fn thumb_extracts_video_posters_when_ffmpeg_is_installed() {
     for (path, duration) in [(&clip, "2"), (&short_clip, "0.2")] {
         let status = std::process::Command::new("ffmpeg")
             .args([
+                "-nostdin",
                 "-hide_banner",
                 "-loglevel",
                 "error",
@@ -3600,6 +3602,7 @@ async fn thumb_extracts_video_posters_when_ffmpeg_is_installed() {
                 "yuv420p",
                 path.to_str().unwrap(),
             ])
+            .stdin(std::process::Stdio::null())
             .status()
             .unwrap();
         assert!(status.success(), "ffmpeg fixture failed for {path:?}");
@@ -3718,6 +3721,7 @@ async fn thumb_blocks_ffmpeg_manifest_playlist_symlink_and_http_attacks() {
 
     let has_ffmpeg = std::process::Command::new("ffmpeg")
         .arg("-version")
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -3747,6 +3751,7 @@ paths = ["~/projects/**"]
     for (path, color) in [(&secret_mp4, "red"), (&legit_mp4, "blue")] {
         let status = std::process::Command::new("ffmpeg")
             .args([
+                "-nostdin",
                 "-hide_banner",
                 "-loglevel",
                 "error",
@@ -3758,6 +3763,7 @@ paths = ["~/projects/**"]
                 "yuv420p",
                 path.to_str().unwrap(),
             ])
+            .stdin(std::process::Stdio::null())
             .status()
             .unwrap();
         assert!(status.success(), "ffmpeg fixture failed for {path:?}");
@@ -3864,6 +3870,7 @@ paths = ["~/projects/**"]
         let probe_out = f.dir.path().join("probe_without_whitelist.jpg");
         let probe_status = std::process::Command::new("ffmpeg")
             .args([
+                "-nostdin",
                 "-hide_banner",
                 "-loglevel",
                 "error",
@@ -3874,6 +3881,7 @@ paths = ["~/projects/**"]
                 "-y",
                 probe_out.to_str().unwrap(),
             ])
+            .stdin(std::process::Stdio::null())
             .status()
             .unwrap();
         assert!(

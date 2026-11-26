@@ -715,7 +715,7 @@ async fn tags_one(
                 }
                 Ok(TagsItem::from_error(raw_path, error))
             }
-            AudioTagsWorkerOutcome::MemoryLimitExceeded { error, .. } => {
+            AudioTagsWorkerOutcome::MemoryLimitExceeded { error } => {
                 let resolved_check = resolved.clone();
                 let cache_bad = cache.clone();
                 let err_bad = error.clone();

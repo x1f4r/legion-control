@@ -251,7 +251,7 @@ fn real_sshd_pairing_enrol_rpc_gate_revoke_and_expiry() {
         "enrol": 1,
         "id": payload.id,
         "public_key": device_pub,
-        "name": "My Pixel Phone",
+        "name": "My Handset",
     })
     .to_string();
     let mut enrol_child = sshd
@@ -285,7 +285,7 @@ fn real_sshd_pairing_enrol_rpc_gate_revoke_and_expiry() {
             "node": "tower",
             "principal": "phone",
             "role": "observer",
-            "device": "my-pixel-phone",
+            "device": "my-handset",
         })
     );
 
@@ -304,7 +304,7 @@ fn real_sshd_pairing_enrol_rpc_gate_revoke_and_expiry() {
     assert_eq!(enrol_entries[1]["outcome"], json!("conflict"));
     let enrol_entry = enrol_entries[2];
     assert_eq!(enrol_entry["door"], json!("ssh"));
-    assert_eq!(enrol_entry["device"], json!("my-pixel-phone"));
+    assert_eq!(enrol_entry["device"], json!("my-handset"));
     assert_eq!(enrol_entry["principal"], json!("phone"));
     assert_eq!(enrol_entry["outcome"], json!("ok"));
 
@@ -400,7 +400,7 @@ fn real_sshd_pairing_enrol_rpc_gate_revoke_and_expiry() {
     let rpc_status = rpc_child.wait().unwrap();
     assert!(rpc_status.success(), "legion rpc exited {rpc_status}");
 
-    // Every call served through the paired device gate records door="ssh" and device="my-pixel-phone".
+    // Every call served through the paired device gate records door="ssh" and device="my-handset".
     let audit_after_rpc = home.audit();
     for tool_name in ["meta.whoami", "fs.read", "fs.write", "audit.tail"] {
         let entry = audit_after_rpc
@@ -408,7 +408,7 @@ fn real_sshd_pairing_enrol_rpc_gate_revoke_and_expiry() {
             .rfind(|e| e["tool"] == json!(tool_name))
             .unwrap_or_else(|| panic!("missing audit entry for {tool_name}: {audit_after_rpc:?}"));
         assert_eq!(entry["door"], json!("ssh"), "{entry}");
-        assert_eq!(entry["device"], json!("my-pixel-phone"), "{entry}");
+        assert_eq!(entry["device"], json!("my-handset"), "{entry}");
     }
 
     // 5. (b) Any other command over the enrolled device key gets `legion gate:` refusal.
@@ -450,7 +450,7 @@ fn real_sshd_pairing_enrol_rpc_gate_revoke_and_expiry() {
     assert_eq!(listed["invites"].as_array().unwrap().len(), 0);
     let devices = listed["devices"].as_array().unwrap();
     assert_eq!(devices.len(), 1);
-    assert_eq!(devices[0]["name"], json!("my-pixel-phone"));
+    assert_eq!(devices[0]["name"], json!("my-handset"));
     assert_eq!(devices[0]["principal"], json!("phone"));
     assert_eq!(devices[0]["fingerprint"], json!(expected_fp));
 
@@ -479,12 +479,12 @@ fn real_sshd_pairing_enrol_rpc_gate_revoke_and_expiry() {
     let live_hello = read_json_line(&mut live_stdout, "live session hello reply");
     assert_eq!(live_hello["id"], json!(10));
 
-    let removed = home.run(&["device.remove", "name=my-pixel-phone"]);
+    let removed = home.run(&["device.remove", "name=my-handset"]);
     assert_eq!(removed.code, 0, "device.remove failed: {}", removed.stderr);
     let removed_json = removed.json();
     assert_eq!(removed_json["removed"], json!(true));
     assert_eq!(removed_json["kind"], json!("device"));
-    assert_eq!(removed_json["name"], json!("my-pixel-phone"));
+    assert_eq!(removed_json["name"], json!("my-handset"));
     assert_eq!(removed_json["sessions_ended"], json!(1));
 
     // The held-open session must terminate promptly and must not answer further calls.
@@ -4401,7 +4401,7 @@ fn real_sshd_gate_denies_stale_key_on_disk_when_registry_key_differs() {
         ),
     );
 
-    let inv_run = home.run(&["device.invite", "name=pixel", "role=observer"]);
+    let inv_run = home.run(&["device.invite", "name=handset", "role=observer"]);
     assert_eq!(inv_run.code, 0, "{}", inv_run.stderr);
     let payload = InvitePayload::decode(inv_run.json()["invite"].as_str().unwrap()).unwrap();
 
@@ -4418,10 +4418,10 @@ fn real_sshd_gate_denies_stale_key_on_disk_when_registry_key_differs() {
     let k2_path = key_dir.join("k2");
     let k2_pub = generate_ed25519_keypair(sshd.ssh_keygen_bin(), &k2_path, "k2@test").unwrap();
 
-    // Enrol pixel with K1 over real sshd.
+    // Enrol handset with K1 over real sshd.
     let enrol_line = format!(
         "{}\n",
-        json!({"enrol": 1, "id": payload.id, "public_key": k1_pub, "name": "pixel"})
+        json!({"enrol": 1, "id": payload.id, "public_key": k1_pub, "name": "handset"})
     );
     let mut child = sshd
         .ssh_command(&temp_key, &kh)
@@ -4519,7 +4519,7 @@ fn real_sshd_gate_denies_stale_key_on_disk_when_registry_key_differs() {
     let reply: Value = serde_json::from_str(k2_stdout.trim()).unwrap();
     assert_eq!(
         reply["result"]["principal"],
-        json!("device:pixel"),
+        json!("device:handset"),
         "{reply}"
     );
     assert_eq!(reply["result"]["door"], json!("ssh"), "{reply}");

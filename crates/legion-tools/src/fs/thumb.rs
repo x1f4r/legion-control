@@ -1201,7 +1201,7 @@ async fn thumb_audio(
                     }
                     return Ok(ThumbOutcome::Error(error));
                 }
-                AudioCoverWorkerOutcome::MemoryLimitExceeded { error, .. } => {
+                AudioCoverWorkerOutcome::MemoryLimitExceeded { error } => {
                     record_bad_audio_cover(cache, &resolved, file, open_stamp, bad_key, &error)
                         .await;
                     return thumb_audio_folder_cover(
@@ -1597,7 +1597,7 @@ async fn thumb_image(
                 }
                 Ok(ThumbOutcome::Error(error))
             }
-            WorkerOutcome::MemoryLimitExceeded { error, .. } => {
+            WorkerOutcome::MemoryLimitExceeded { error } => {
                 let resolved_check = resolved.clone();
                 let cache_bad = cache.clone();
                 let err_bad = error.clone();
