@@ -55,7 +55,7 @@ unicode-normalization = "0.1.26"
 windows = { version = "0.62.2", default-features = false }
 zeroize = "1.9.2"
 legion-os = { path = "crates/legion-os" }
-nix = { version = "0.31.1", default-features = false, features = ["signal"] }
+nix = { version = "0.32.0", default-features = false, features = ["signal"] }
 # Only what sys.info and sys.procs read: CPUs, memory and processes, disks, and user names.
 sysinfo = { version = "0.40.4", default-features = false, features = ["system", "disk", "user"] }
 base64 = "0.23.1"
