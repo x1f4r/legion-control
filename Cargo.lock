@@ -1314,7 +1314,7 @@ name = "legion-os"
 version = "0.1.0"
 dependencies = [
  "libc",
- "nix",
+ "nix 0.32.0",
  "process-wrap",
  "serde",
  "serde_json",
@@ -1354,7 +1354,7 @@ dependencies = [
  "legion-proto",
  "legion-update",
  "legion-xfer",
- "nix",
+ "nix 0.32.0",
  "regex",
  "same-file",
  "schemars",
@@ -1512,6 +1512,18 @@ name = "nix"
 version = "0.31.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2bc81ce8148d3b4f3274da811f11cdd824ae661ee4ef732cdb229825cf5be7f7"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
+name = "nix"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77730ed34f01f4990cb2ea67fec715ecebc6fab9a6396cf83c5529b13f581bdc"
 dependencies = [
  "bitflags",
  "cfg-if",
@@ -1872,7 +1884,7 @@ checksum = "1f21b97672d2dc848e7b25701ab4535618b92f4861c13cc3f7f7bed52ad3c8da"
 dependencies = [
  "futures",
  "indexmap",
- "nix",
+ "nix 0.31.4",
  "tokio",
  "windows",
 ]
@@ -2133,7 +2145,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3aec6cb630dbe85d72ffd7bcd95f07e1bd69f9f270ee8adfa1afe443a6331438"
 dependencies = [
  "log",
- "nix",
+ "nix 0.31.4",
  "ssh-encoding",
  "windows-sys 0.61.2",
 ]
